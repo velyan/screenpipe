@@ -215,11 +215,23 @@ impl MacosTreeWalker {
     fn walk_focused_window_inner(&self) -> Result<Option<TreeSnapshot>> {
         let start = Instant::now();
 
-        // 1. Get the focused (active) application via NSWorkspace
-        let workspace = ns::Workspace::shared();
-        let apps = workspace.running_apps();
-        let active_app = apps.iter().find(|app| app.is_active());
-        let Some(app) = active_app else {
+        // 1. Get the focused application via AX system-wide element.
+        //
+        // Why not NSWorkspace::running_apps().find(is_active)?
+        // In practice that can stick to the launch-time app for long-running
+        // processes in some setups, which causes event-driven capture to keep
+        // resolving the wrong focused app (often Terminal).
+        let system = ax::UiElement::sys_wide();
+        let ax_app = match system.focused_app() {
+            Ok(app) => app,
+            Err(_) => return Ok(None),
+        };
+        let pid = match ax_app.pid() {
+            Ok(pid) => pid,
+            Err(_) => return Ok(None),
+        };
+        let app = ns::RunningApp::with_pid(pid);
+        let Some(app) = app else {
             return Ok(None);
         };
 
@@ -227,7 +239,6 @@ impl MacosTreeWalker {
             .localized_name()
             .map(|s| s.to_string())
             .unwrap_or_default();
-        let pid = app.pid();
 
         // Skip excluded apps (password managers, etc.)
         let app_lower = app_name.to_lowercase();

@@ -21,7 +21,7 @@ use screenpipe_vision::capture_screenshot_by_window::{
 use screenpipe_vision::frame_comparison::{FrameComparer, FrameComparisonConfig};
 use screenpipe_vision::monitor::{list_monitors, SafeMonitor};
 use screenpipe_vision::snapshot_writer::SnapshotWriter;
-use screenpipe_vision::utils::capture_monitor_image;
+use screenpipe_vision::utils::{capture_monitor_image, capture_windows};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -781,9 +781,50 @@ async fn do_capture(
                     "fallback monitor screenshot captured in {:?} for monitor {}",
                     capture_dur, monitor_id
                 );
-                let app_name = tree_snapshot.as_ref().map(|s| s.app_name.clone());
-                let window_name = tree_snapshot.as_ref().map(|s| s.window_name.clone());
-                let browser_url = tree_snapshot.as_ref().and_then(|s| s.browser_url.clone());
+                let mut app_name = tree_snapshot
+                    .as_ref()
+                    .map(|s| s.app_name.clone())
+                    .filter(|s| !s.trim().is_empty());
+                let mut window_name = tree_snapshot
+                    .as_ref()
+                    .map(|s| s.window_name.clone())
+                    .filter(|s| !s.trim().is_empty());
+                let mut browser_url = tree_snapshot.as_ref().and_then(|s| s.browser_url.clone());
+
+                // Fallback metadata probe: when focused-window resolution fails,
+                // derive app/window from the topmost visible window on this monitor
+                // so snapshot rows don't lose context (`app_name/window_name = NULL`).
+                if app_name.is_none() || window_name.is_none() {
+                    let window_filters = WindowFilters::new(
+                        &tree_walker_config.ignored_windows,
+                        &tree_walker_config.included_windows,
+                        &[],
+                    );
+                    if let Some(topmost_window) = capture_windows(monitor, &window_filters, false)
+                        .await
+                        .into_iter()
+                        .next()
+                    {
+                        debug!(
+                            "fallback metadata resolved from topmost window on monitor {}: app='{}', window='{}'",
+                            monitor_id, topmost_window.app_name, topmost_window.window_name
+                        );
+                        if app_name.is_none() {
+                            app_name = Some(topmost_window.app_name);
+                        }
+                        if window_name.is_none() {
+                            window_name = Some(topmost_window.window_name);
+                        }
+                        if browser_url.is_none() {
+                            browser_url = topmost_window.browser_url;
+                        }
+                    } else {
+                        debug!(
+                            "fallback metadata unavailable on monitor {} (reason={})",
+                            monitor_id, reason
+                        );
+                    }
+                }
                 (image, tree_snapshot, app_name, window_name, browser_url)
             }
         };
