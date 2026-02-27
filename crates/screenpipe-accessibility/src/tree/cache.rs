@@ -99,6 +99,8 @@ mod tests {
         TreeSnapshot {
             app_name: app.to_string(),
             window_name: window.to_string(),
+            process_id: None,
+            window_bounds: None,
             text_content: text.to_string(),
             nodes: vec![],
             browser_url: None,

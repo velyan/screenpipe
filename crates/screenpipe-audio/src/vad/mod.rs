@@ -57,4 +57,3 @@ pub async fn create_vad_engine(engine: VadEngineEnum) -> anyhow::Result<Box<dyn 
 
 unsafe impl Send for WebRtcVad {}
 unsafe impl Send for SileroVad {}
-

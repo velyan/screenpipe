@@ -7,7 +7,9 @@
 //! Reuses the UIA CacheRequest-based capture from `platform::windows_uia` to walk
 //! the focused window's tree and extract all visible text — matching macOS behavior.
 
-use super::{AccessibilityTreeNode, TreeSnapshot, TreeWalkerConfig, TreeWalkerPlatform};
+use super::{
+    AccessibilityTreeNode, TreeSnapshot, TreeWalkerConfig, TreeWalkerPlatform, WindowBounds,
+};
 use crate::events::AccessibilityNode;
 use crate::platform::windows_uia::UiaContext;
 
@@ -17,10 +19,10 @@ use std::cell::UnsafeCell;
 use std::time::Instant;
 use tracing::debug;
 
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+    GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
 };
 
 /// Excluded apps — password managers and security tools (matches macOS list).
@@ -187,6 +189,25 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
             String::from_utf16_lossy(&buf[..len as usize])
         };
 
+        // Resolve focused window geometry.
+        let mut rect = RECT::default();
+        let window_bounds = if unsafe { GetWindowRect(hwnd, &mut rect).is_ok() } {
+            let width = (rect.right - rect.left).max(0) as f64;
+            let height = (rect.bottom - rect.top).max(0) as f64;
+            if width > 0.0 && height > 0.0 {
+                Some(WindowBounds {
+                    x: rect.left as f64,
+                    y: rect.top as f64,
+                    width,
+                    height,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // Skip sensitive windows
         let window_lower = window_name.to_lowercase();
         if SENSITIVE_TITLES.iter().any(|s| window_lower.contains(s)) {
@@ -248,6 +269,8 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
         Ok(Some(TreeSnapshot {
             app_name,
             window_name,
+            process_id: Some(pid),
+            window_bounds,
             text_content: text_buffer,
             nodes,
             browser_url,

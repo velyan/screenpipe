@@ -13,8 +13,7 @@ use vad_rs::{Vad, VadStatus};
 use crate::vad::FRAME_HISTORY;
 
 use super::{
-    VadEngine, DOWNLOADING, MODEL_PATH, SILENCE_THRESHOLD, SPEECH_FRAME_THRESHOLD,
-    SPEECH_THRESHOLD,
+    VadEngine, DOWNLOADING, MODEL_PATH, SILENCE_THRESHOLD, SPEECH_FRAME_THRESHOLD, SPEECH_THRESHOLD,
 };
 
 pub struct SileroVad {
@@ -177,7 +176,6 @@ impl SileroVad {
             VadStatus::Unknown
         }
     }
-
 }
 
 impl VadEngine for SileroVad {
@@ -225,7 +223,6 @@ impl VadEngine for SileroVad {
             _ => Ok(VadStatus::Silence),
         }
     }
-
     fn set_speech_threshold(&mut self, threshold: Option<f32>) {
         self.speech_threshold_override = threshold;
     }

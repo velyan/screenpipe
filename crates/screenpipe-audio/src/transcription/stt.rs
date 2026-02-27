@@ -96,8 +96,15 @@ pub async fn stt(
             // Deepgram implementation
             let api_key = deepgram_api_key.unwrap_or_default();
 
-            match transcribe_with_deepgram(&api_key, audio, device, sample_rate, languages.clone(), vocabulary)
-                .await
+            match transcribe_with_deepgram(
+                &api_key,
+                audio,
+                device,
+                sample_rate,
+                languages.clone(),
+                vocabulary,
+            )
+            .await
             {
                 Ok(transcription) => Ok(transcription),
                 Err(e) => {

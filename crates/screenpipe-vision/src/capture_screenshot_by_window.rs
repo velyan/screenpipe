@@ -215,6 +215,15 @@ pub struct CapturedWindow {
     pub window_height: u32,
 }
 
+/// Focused input window target resolved by the accessibility walker.
+#[derive(Debug, Clone)]
+pub struct FocusedWindowTarget {
+    pub process_id: i32,
+    pub app_name: String,
+    pub window_name: String,
+    pub bounds: Rect,
+}
+
 pub struct WindowFilters {
     ignore_set: HashSet<String>,
     include_set: HashSet<String>,
@@ -239,10 +248,7 @@ impl WindowFilters {
         let title_lower = title.to_lowercase();
 
         // Always reject built-in system apps (lock screen, etc.)
-        if Self::BUILTIN_IGNORED
-            .iter()
-            .any(|b| app_name_lower == *b)
-        {
+        if Self::BUILTIN_IGNORED.iter().any(|b| app_name_lower == *b) {
             return false;
         }
 
@@ -372,6 +378,59 @@ impl WindowFilters {
             word_match || no_space_match || boundary_match
         })
     }
+}
+
+fn title_matches(expected: &str, actual: &str) -> bool {
+    let expected_lower = expected.to_lowercase();
+    let actual_lower = actual.to_lowercase();
+    if expected_lower.is_empty() || actual_lower.is_empty() {
+        return false;
+    }
+    actual_lower == expected_lower
+        || actual_lower.contains(&expected_lower)
+        || expected_lower.contains(&actual_lower)
+}
+
+fn is_valid_capture_target(
+    app_name: &str,
+    window_name: &str,
+    window_filters: &WindowFilters,
+) -> bool {
+    let is_screenpipe_ui = app_name.to_lowercase().contains("screenpipe");
+    !is_screenpipe_ui
+        && !SKIP_APPS.contains(app_name)
+        && !app_name.is_empty()
+        && !window_name.is_empty()
+        && !SKIP_TITLES.contains(window_name)
+        && window_filters.is_valid(app_name, window_name)
+}
+
+fn focused_candidate_score(
+    process_id: i32,
+    window_name: &str,
+    is_focused: bool,
+    window_bounds: &Rect,
+    target: &FocusedWindowTarget,
+) -> Option<(u8, u64, u8)> {
+    let pid_match = process_id == target.process_id;
+    let overlap = window_bounds.intersection_area(&target.bounds);
+    let title_match = title_matches(&target.window_name, window_name);
+
+    if pid_match {
+        return Some((
+            if title_match { 2 } else { 1 },
+            overlap,
+            u8::from(is_focused),
+        ));
+    }
+
+    // Fallback when PID lookup is unstable (e.g. elevated/system windows on Windows):
+    // accept focused windows that overlap the expected bounds.
+    if is_focused && overlap > 0 {
+        return Some((0, overlap, 1));
+    }
+
+    None
 }
 
 /// Intermediate structure for window data extracted from platform-specific Window types
@@ -845,8 +904,7 @@ fn get_process_exe_name(pid: u32) -> Option<String> {
 
     unsafe {
         // Try full access first, fall back to limited (handles elevated processes)
-        let mut handle =
-            OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
+        let mut handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
         if handle == 0 {
             handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         }
@@ -946,6 +1004,478 @@ fn get_all_windows() -> Result<Vec<WindowData>, Box<dyn Error>> {
             }
         })
         .collect())
+}
+
+fn focused_browser_url_if_any(
+    app_name: &str,
+    is_focused: bool,
+    process_id: i32,
+    window_name: &str,
+) -> Option<String> {
+    if !is_focused
+        || !BROWSER_NAMES
+            .iter()
+            .any(|&browser| app_name.to_lowercase().contains(browser))
+    {
+        return None;
+    }
+
+    let detector = create_url_detector();
+    match detector.get_active_url(app_name, process_id, window_name) {
+        Ok(url) => url,
+        Err(e) => {
+            debug!("Failed to get browser URL for {}: {}", app_name, e);
+            None
+        }
+    }
+}
+
+fn focused_window_blocked_by_privacy(
+    app_name: &str,
+    window_name: &str,
+    is_focused: bool,
+    browser_url: &Option<String>,
+    window_filters: &WindowFilters,
+) -> bool {
+    if let Some(ref url) = browser_url {
+        if window_filters.is_url_blocked(url) {
+            tracing::info!(
+                "Privacy filter: Skipping window due to blocked URL: {}",
+                url
+            );
+            return true;
+        }
+    }
+
+    let is_browser = BROWSER_NAMES
+        .iter()
+        .any(|&browser| app_name.to_lowercase().contains(browser));
+
+    if is_browser
+        && browser_url.is_none()
+        && !is_focused
+        && window_filters.is_title_suggesting_blocked_url(window_name)
+    {
+        tracing::info!(
+            "Privacy filter: Skipping unfocused browser window with suspicious title: {}",
+            window_name
+        );
+        return true;
+    }
+
+    false
+}
+
+/// Capture only the focused input window resolved by the accessibility walker.
+/// Returns `None` when no matching valid window could be captured.
+pub async fn capture_focused_window(
+    target: &FocusedWindowTarget,
+    window_filters: &WindowFilters,
+) -> Result<Option<CapturedWindow>, Box<dyn Error>> {
+    #[cfg(target_os = "macos")]
+    {
+        if use_sck_rs() {
+            capture_focused_window_sck(target, window_filters)
+        } else {
+            capture_focused_window_xcap_macos(target, window_filters)
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        capture_focused_window_xcap(target, window_filters)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn capture_focused_window_sck(
+    target: &FocusedWindowTarget,
+    window_filters: &WindowFilters,
+) -> Result<Option<CapturedWindow>, Box<dyn Error>> {
+    let windows = SckWindow::all()?;
+    let mut best: Option<(
+        (u8, u64, u8),
+        SckWindow,
+        String,
+        String,
+        i32,
+        bool,
+        i32,
+        i32,
+        u32,
+        u32,
+    )> = None;
+
+    for window in windows {
+        let app_name = match window.app_name() {
+            Ok(name) => name.to_string(),
+            Err(_) => continue,
+        };
+        let window_name = match window.title() {
+            Ok(title) => title.to_string(),
+            Err(_) => continue,
+        };
+        if window.is_minimized().unwrap_or(false) {
+            continue;
+        }
+
+        let process_id = window.pid().map(|p| p as i32).unwrap_or(-1);
+        let is_focused = window.is_focused().unwrap_or(false);
+        let window_x = window.x().unwrap_or(0);
+        let window_y = window.y().unwrap_or(0);
+        let window_width = window.width().unwrap_or(0);
+        let window_height = window.height().unwrap_or(0);
+        let bounds = Rect {
+            x: window_x,
+            y: window_y,
+            width: window_width,
+            height: window_height,
+        };
+
+        if !is_valid_capture_target(&app_name, &window_name, window_filters) {
+            continue;
+        }
+
+        let Some(score) =
+            focused_candidate_score(process_id, &window_name, is_focused, &bounds, target)
+        else {
+            continue;
+        };
+
+        let should_replace = best
+            .as_ref()
+            .map(|(best_score, _, _, _, _, _, _, _, _, _)| score > *best_score)
+            .unwrap_or(true);
+        if should_replace {
+            best = Some((
+                score,
+                window,
+                app_name,
+                window_name,
+                process_id,
+                is_focused,
+                window_x,
+                window_y,
+                window_width,
+                window_height,
+            ));
+        }
+    }
+
+    let Some((
+        _,
+        window,
+        app_name,
+        window_name,
+        process_id,
+        is_focused,
+        window_x,
+        window_y,
+        window_width,
+        window_height,
+    )) = best
+    else {
+        return Ok(None);
+    };
+
+    let image = match window.capture_image() {
+        Ok(buffer) => DynamicImage::ImageRgba8(buffer),
+        Err(e) => {
+            debug!(
+                "Failed to capture focused window {} ({}): {}",
+                app_name, window_name, e
+            );
+            return Ok(None);
+        }
+    };
+
+    let browser_url = focused_browser_url_if_any(&app_name, is_focused, process_id, &window_name);
+    if focused_window_blocked_by_privacy(
+        &app_name,
+        &window_name,
+        is_focused,
+        &browser_url,
+        window_filters,
+    ) {
+        return Ok(None);
+    }
+
+    Ok(Some(CapturedWindow {
+        image,
+        app_name,
+        window_name,
+        process_id,
+        is_focused,
+        browser_url,
+        window_x,
+        window_y,
+        window_width,
+        window_height,
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn capture_focused_window_xcap_macos(
+    target: &FocusedWindowTarget,
+    window_filters: &WindowFilters,
+) -> Result<Option<CapturedWindow>, Box<dyn Error>> {
+    let windows = XcapWindow::all()?;
+    let mut best: Option<(
+        (u8, u64, u8),
+        XcapWindow,
+        String,
+        String,
+        i32,
+        bool,
+        i32,
+        i32,
+        u32,
+        u32,
+    )> = None;
+
+    for window in windows {
+        let app_name = match window.app_name() {
+            Ok(name) => name.to_string(),
+            Err(_) => continue,
+        };
+        let window_name = match window.title() {
+            Ok(title) => title.to_string(),
+            Err(_) => continue,
+        };
+        if window.is_minimized().unwrap_or(false) {
+            continue;
+        }
+
+        let process_id = window.pid().map(|p| p as i32).unwrap_or(-1);
+        let is_focused = window.is_focused().unwrap_or(false);
+        let window_x = window.x().unwrap_or(0);
+        let window_y = window.y().unwrap_or(0);
+        let window_width = window.width().unwrap_or(0);
+        let window_height = window.height().unwrap_or(0);
+        let bounds = Rect {
+            x: window_x,
+            y: window_y,
+            width: window_width,
+            height: window_height,
+        };
+
+        if !is_valid_capture_target(&app_name, &window_name, window_filters) {
+            continue;
+        }
+
+        let Some(score) =
+            focused_candidate_score(process_id, &window_name, is_focused, &bounds, target)
+        else {
+            continue;
+        };
+
+        let should_replace = best
+            .as_ref()
+            .map(|(best_score, _, _, _, _, _, _, _, _, _)| score > *best_score)
+            .unwrap_or(true);
+        if should_replace {
+            best = Some((
+                score,
+                window,
+                app_name,
+                window_name,
+                process_id,
+                is_focused,
+                window_x,
+                window_y,
+                window_width,
+                window_height,
+            ));
+        }
+    }
+
+    let Some((
+        _,
+        window,
+        app_name,
+        window_name,
+        process_id,
+        is_focused,
+        window_x,
+        window_y,
+        window_width,
+        window_height,
+    )) = best
+    else {
+        return Ok(None);
+    };
+
+    let image = match window.capture_image() {
+        Ok(buffer) => DynamicImage::ImageRgba8(buffer),
+        Err(e) => {
+            debug!(
+                "Failed to capture focused window {} ({}): {}",
+                app_name, window_name, e
+            );
+            return Ok(None);
+        }
+    };
+
+    let browser_url = focused_browser_url_if_any(&app_name, is_focused, process_id, &window_name);
+    if focused_window_blocked_by_privacy(
+        &app_name,
+        &window_name,
+        is_focused,
+        &browser_url,
+        window_filters,
+    ) {
+        return Ok(None);
+    }
+
+    Ok(Some(CapturedWindow {
+        image,
+        app_name,
+        window_name,
+        process_id,
+        is_focused,
+        browser_url,
+        window_x,
+        window_y,
+        window_width,
+        window_height,
+    }))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn capture_focused_window_xcap(
+    target: &FocusedWindowTarget,
+    window_filters: &WindowFilters,
+) -> Result<Option<CapturedWindow>, Box<dyn Error>> {
+    let windows = Window::all()?;
+    let mut best: Option<(
+        (u8, u64, u8),
+        Window,
+        String,
+        String,
+        i32,
+        bool,
+        i32,
+        i32,
+        u32,
+        u32,
+    )> = None;
+
+    for window in windows {
+        let mut app_name = match window.app_name() {
+            Ok(name) => name.to_string(),
+            Err(_) => continue,
+        };
+
+        #[cfg(target_os = "windows")]
+        if app_name.is_empty() {
+            if let Some(pid) = window.pid().ok() {
+                if let Some(exe_name) = get_process_exe_name(pid as u32) {
+                    app_name = exe_name;
+                }
+            }
+        }
+
+        let window_name = match window.title() {
+            Ok(title) => title.to_string(),
+            Err(_) => continue,
+        };
+        if window.is_minimized().unwrap_or(false) {
+            continue;
+        }
+
+        let process_id = window.pid().map(|p| p as i32).unwrap_or(-1);
+        let is_focused = window.is_focused().unwrap_or(false);
+        let window_x = window.x().unwrap_or(0);
+        let window_y = window.y().unwrap_or(0);
+        let window_width = window.width().unwrap_or(0);
+        let window_height = window.height().unwrap_or(0);
+        let bounds = Rect {
+            x: window_x,
+            y: window_y,
+            width: window_width,
+            height: window_height,
+        };
+
+        if !is_valid_capture_target(&app_name, &window_name, window_filters) {
+            continue;
+        }
+
+        let Some(score) =
+            focused_candidate_score(process_id, &window_name, is_focused, &bounds, target)
+        else {
+            continue;
+        };
+
+        let should_replace = best
+            .as_ref()
+            .map(|(best_score, _, _, _, _, _, _, _, _, _)| score > *best_score)
+            .unwrap_or(true);
+        if should_replace {
+            best = Some((
+                score,
+                window,
+                app_name,
+                window_name,
+                process_id,
+                is_focused,
+                window_x,
+                window_y,
+                window_width,
+                window_height,
+            ));
+        }
+    }
+
+    let Some((
+        _,
+        window,
+        app_name,
+        window_name,
+        process_id,
+        is_focused,
+        window_x,
+        window_y,
+        window_width,
+        window_height,
+    )) = best
+    else {
+        return Ok(None);
+    };
+
+    let image = match window.capture_image() {
+        Ok(buffer) => DynamicImage::ImageRgba8(buffer),
+        Err(e) => {
+            debug!(
+                "Failed to capture focused window {} ({}): {}",
+                app_name, window_name, e
+            );
+            return Ok(None);
+        }
+    };
+
+    let browser_url = focused_browser_url_if_any(&app_name, is_focused, process_id, &window_name);
+    if focused_window_blocked_by_privacy(
+        &app_name,
+        &window_name,
+        is_focused,
+        &browser_url,
+        window_filters,
+    ) {
+        return Ok(None);
+    }
+
+    Ok(Some(CapturedWindow {
+        image,
+        app_name,
+        window_name,
+        process_id,
+        is_focused,
+        browser_url,
+        window_x,
+        window_y,
+        window_width,
+        window_height,
+    }))
 }
 
 pub async fn capture_all_visible_windows(

@@ -31,8 +31,7 @@ use crate::{
     AudioResult, AudioResultRaw, ContentType, DeviceType, FrameData, FrameRow, FrameRowLight,
     FrameWindowData, InsertUiEvent, MeetingRecord, OCREntry, OCRResult, OCRResultRaw, OcrEngine,
     OcrTextBlock, Order, SearchMatch, SearchMatchGroup, SearchResult, Speaker, TagContentType,
-    TextBounds, TextPosition, TimeSeriesChunk, UiContent, UiEventRecord, UiEventRow,
-    VideoMetadata,
+    TextBounds, TextPosition, TimeSeriesChunk, UiContent, UiEventRecord, UiEventRow, VideoMetadata,
 };
 
 /// Time window (in seconds) to check for similar transcriptions across devices.
@@ -1962,8 +1961,7 @@ impl DatabaseManager {
 
         // bind parameters in the same order as added to the where clause
         if !query.is_empty() {
-            query_builder =
-                query_builder.bind(crate::text_normalizer::sanitize_fts5_query(query));
+            query_builder = query_builder.bind(crate::text_normalizer::sanitize_fts5_query(query));
         }
         if let Some(start) = start_time {
             query_builder = query_builder.bind(start);
@@ -2441,7 +2439,11 @@ impl DatabaseManager {
                 for val in &bind_values {
                     qb = qb.bind(val);
                 }
-                qb = qb.bind(start_time).bind(start_time).bind(end_time).bind(end_time);
+                qb = qb
+                    .bind(start_time)
+                    .bind(start_time)
+                    .bind(end_time)
+                    .bind(end_time);
                 let count: i64 = qb.fetch_one(&self.pool).await?;
                 return Ok(count as usize);
             }

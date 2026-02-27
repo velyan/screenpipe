@@ -264,7 +264,7 @@ async fn test_remove_tags() {
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/search?content_type=audio")
+                .uri("/search?content_type=all")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -324,13 +324,13 @@ async fn test_search_by_multiple_tags() {
         .await
         .unwrap();
 
-    // Search for items with multiple tags, excluding UI content
+    // Search across all content so both tagged OCR and audio entries are returned.
     let search_response = app
         .clone()
         .oneshot(
             Request::builder()
                 .method("GET")
-                .uri("/search?content_type=audio")
+                .uri("/search?content_type=all")
                 .body(Body::empty())
                 .unwrap(),
         )

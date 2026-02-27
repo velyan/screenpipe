@@ -517,12 +517,9 @@ impl AudioManager {
                         audio.data.as_ref().to_vec()
                     };
                     let path = get_new_file_path(&audio.device.to_string(), out);
-                    if let Err(e) = write_audio_to_file(
-                        &resampled,
-                        SAMPLE_RATE,
-                        &PathBuf::from(&path),
-                        false,
-                    ) {
+                    if let Err(e) =
+                        write_audio_to_file(&resampled, SAMPLE_RATE, &PathBuf::from(&path), false)
+                    {
                         error!("failed to persist audio before deferral: {:?}", e);
                         None
                     } else {
