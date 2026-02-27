@@ -244,13 +244,19 @@ async fn pipeline_with_whisper_dataset() {
     // Load Whisper model (large-v3-turbo quantized — the production default)
     let engine = Arc::new(AudioTranscriptionEngine::WhisperLargeV3TurboQuantized);
     println!("\n  Loading Whisper model (large-v3-turbo-q8_0)...");
-    let transcription_engine =
-        TranscriptionEngine::new(engine.clone(), None, None, vec![Language::English], vec![])
-            .await
-            .expect("failed to create transcription engine");
-    let mut session = transcription_engine
-        .create_session()
-        .expect("failed to create session");
+    let model_path =
+        download_whisper_model(engine.clone()).expect("failed to download whisper model");
+    println!("  Model path: {:?}", model_path);
+
+    let context_params = create_whisper_context_parameters(engine.clone())
+        .expect("failed to create whisper context params");
+    let whisper_context = Arc::new(
+        WhisperContext::new_with_params(&model_path.to_string_lossy(), context_params)
+            .expect("failed to load whisper model"),
+    );
+    let mut whisper_state = whisper_context
+        .create_state()
+        .expect("failed to create whisper state");
 
     let mut scenarios: Vec<_> = std::fs::read_dir(dataset_path)
         .expect("failed to read dataset directory")

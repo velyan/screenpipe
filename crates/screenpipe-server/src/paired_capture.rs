@@ -395,6 +395,8 @@ mod tests {
         let snap = TreeSnapshot {
             app_name: "Safari".to_string(),
             window_name: "Example Page".to_string(),
+            process_id: None,
+            window_bounds: None,
             text_content: "Hello World - Example Page".to_string(),
             nodes: vec![AccessibilityTreeNode {
                 role: "AXStaticText".to_string(),
@@ -451,6 +453,8 @@ mod tests {
         let snap = TreeSnapshot {
             app_name: "TestApp".to_string(),
             window_name: String::new(),
+            process_id: None,
+            window_bounds: None,
             text_content: String::new(),
             nodes: vec![],
             browser_url: None,

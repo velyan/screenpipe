@@ -1031,9 +1031,13 @@ mod pii_redaction_tests {
     use image::{ImageBuffer, Rgb};
 
     fn create_test_jpeg() -> Vec<u8> {
-        // Create a simple 100x100 white image
-        let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
-            ImageBuffer::from_fn(100, 100, |_, _| Rgb([255, 255, 255]));
+        // Use a deterministic non-uniform image so blur redaction changes pixels.
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(100, 100, |x, y| {
+            let r = ((x * 3 + y) % 256) as u8;
+            let g = ((x + y * 5) % 256) as u8;
+            let b = (((x + y) * 7) % 256) as u8;
+            Rgb([r, g, b])
+        });
         let dynamic_img = DynamicImage::ImageRgb8(img);
 
         let mut output = Cursor::new(Vec::new());

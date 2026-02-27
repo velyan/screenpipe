@@ -62,18 +62,21 @@ pub async fn retranscribe_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RetranscribeRequest>,
 ) -> Response {
-    // 1. Query audio chunks — by explicit IDs (preferred) or time range (fallback)
-    let chunks = if let Some(ref ids) = request.audio_chunk_ids {
-        info!("retranscribe request: {} explicit chunk IDs", ids.len());
-        match state.db.get_audio_chunks_by_ids(ids).await {
-            Ok(c) => c,
-            Err(e) => {
-                error!("failed to query audio chunks by IDs: {}", e);
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("db query failed: {}", e),
-                );
-            }
+    info!("retranscribe request: {} to {}", request.start, request.end);
+
+    // 1. Query audio chunks in range
+    let chunks = match state
+        .db
+        .get_audio_chunks_in_range(request.start, request.end)
+        .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            error!("failed to query audio chunks: {}", e);
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("db query failed: {}", e),
+            );
         }
     } else if let (Some(start), Some(end)) = (request.start, request.end) {
         info!("retranscribe request: {} to {}", start, end);

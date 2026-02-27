@@ -54,8 +54,9 @@ pub fn start_calendar_bridge(detector: Arc<MeetingDetector>) -> JoinHandle<()> {
                         })
                         .ok()?;
                     let end = DateTime::parse_from_rfc3339(&item.end)
-                        .inspect_err(|&e| {
+                        .map_err(|e| {
                             warn!("calendar bridge: failed to parse end '{}': {}", item.end, e);
+                            e
                         })
                         .ok()?;
                     Some(CalendarSignal {

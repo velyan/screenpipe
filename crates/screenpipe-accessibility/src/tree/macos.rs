@@ -4,7 +4,9 @@
 
 //! macOS accessibility tree walker using cidre AX APIs.
 
-use super::{AccessibilityTreeNode, TreeSnapshot, TreeWalkerConfig, TreeWalkerPlatform};
+use super::{
+    AccessibilityTreeNode, TreeSnapshot, TreeWalkerConfig, TreeWalkerPlatform, WindowBounds,
+};
 use anyhow::Result;
 use chrono::Utc;
 use cidre::{ax, cf, ns};
@@ -312,12 +314,19 @@ impl MacosTreeWalker {
 
         // 3. Read window frame for normalizing element bounds to 0-1 coords
         let mut state = WalkState::new(&self.config, start);
+        let mut window_bounds = None;
         if let Some((wx, wy, ww, wh)) = get_element_frame(window) {
             if ww > 0.0 && wh > 0.0 {
                 state.window_x = wx;
                 state.window_y = wy;
                 state.window_w = ww;
                 state.window_h = wh;
+                window_bounds = Some(WindowBounds {
+                    x: wx,
+                    y: wy,
+                    width: ww,
+                    height: wh,
+                });
             }
         }
 
@@ -364,6 +373,8 @@ impl MacosTreeWalker {
         Ok(Some(TreeSnapshot {
             app_name,
             window_name,
+            process_id: u32::try_from(pid).ok(),
+            window_bounds,
             text_content,
             nodes: state.nodes,
             browser_url,

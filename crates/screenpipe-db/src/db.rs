@@ -28,11 +28,10 @@ use futures::future::try_join_all;
 
 use crate::{
     text_similarity::is_similar_transcription, AudioChunksResponse, AudioDevice, AudioEntry,
-    AudioResult, AudioResultRaw, ContentType, DeviceType, Element, ElementRow, ElementSource,
-    FrameData, FrameRow, FrameRowLight, FrameWindowData, InsertUiEvent, MeetingRecord, OCREntry,
-    OCRResult, OCRResultRaw, OcrEngine, OcrTextBlock, Order, SearchMatch, SearchMatchGroup,
-    SearchResult, Speaker, TagContentType, TextBounds, TextPosition, TimeSeriesChunk, UiContent,
-    UiEventRecord, UiEventRow, VideoMetadata,
+    AudioResult, AudioResultRaw, ContentType, DeviceType, FrameData, FrameRow, FrameRowLight,
+    FrameWindowData, InsertUiEvent, MeetingRecord, OCREntry, OCRResult, OCRResultRaw, OcrEngine,
+    OcrTextBlock, Order, SearchMatch, SearchMatchGroup, SearchResult, Speaker, TagContentType,
+    TextBounds, TextPosition, TimeSeriesChunk, UiContent, UiEventRecord, UiEventRow, VideoMetadata,
 };
 
 /// Time window (in seconds) to check for similar transcriptions across devices.
