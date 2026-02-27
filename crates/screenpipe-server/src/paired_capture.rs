@@ -279,7 +279,9 @@ pub fn walk_accessibility_tree(config: &TreeWalkerConfig) -> Option<TreeSnapshot
 /// Parses the JSON array, applies `remove_pii` to each "text" field,
 /// and serializes back. Returns the original string on parse failure.
 fn sanitize_ocr_text_json(text_json: &str) -> String {
-    let Ok(entries) = serde_json::from_str::<Vec<std::collections::HashMap<String, String>>>(text_json) else {
+    let Ok(entries) =
+        serde_json::from_str::<Vec<std::collections::HashMap<String, String>>>(text_json)
+    else {
         return text_json.to_string();
     };
     let sanitized = screenpipe_core::pii_removal::remove_pii_from_text_json(&entries);
@@ -357,6 +359,8 @@ mod tests {
         let snap = TreeSnapshot {
             app_name: "Safari".to_string(),
             window_name: "Example Page".to_string(),
+            process_id: None,
+            window_bounds: None,
             text_content: "Hello World - Example Page".to_string(),
             nodes: vec![AccessibilityTreeNode {
                 role: "AXStaticText".to_string(),
@@ -413,6 +417,8 @@ mod tests {
         let snap = TreeSnapshot {
             app_name: "TestApp".to_string(),
             window_name: String::new(),
+            process_id: None,
+            window_bounds: None,
             text_content: String::new(),
             nodes: vec![],
             browser_url: None,
@@ -436,8 +442,14 @@ mod tests {
     fn test_sanitize_ocr_text_json_removes_emails() {
         let json = r#"[{"text":"contact louis@screenpi.pe for info","x":"10","y":"20"}]"#;
         let result = sanitize_ocr_text_json(json);
-        assert!(!result.contains("louis@screenpi.pe"), "email should be redacted");
-        assert!(result.contains("[EMAIL]"), "email should be replaced with [EMAIL]");
+        assert!(
+            !result.contains("louis@screenpi.pe"),
+            "email should be redacted"
+        );
+        assert!(
+            result.contains("[EMAIL]"),
+            "email should be replaced with [EMAIL]"
+        );
     }
 
     #[test]
@@ -451,15 +463,24 @@ mod tests {
     fn test_sanitize_ocr_text_json_invalid_json_passthrough() {
         let bad_json = "not json at all";
         let result = sanitize_ocr_text_json(bad_json);
-        assert_eq!(result, bad_json, "invalid JSON should pass through unchanged");
+        assert_eq!(
+            result, bad_json,
+            "invalid JSON should pass through unchanged"
+        );
     }
 
     #[test]
     fn test_sanitize_ocr_text_json_multiple_entries() {
         let json = r#"[{"text":"user@example.com","x":"0","y":"0"},{"text":"safe text","x":"1","y":"1"},{"text":"key: sk-1234567890abcdef1234567890abcdef","x":"2","y":"2"}]"#;
         let result = sanitize_ocr_text_json(json);
-        assert!(!result.contains("user@example.com"), "email should be redacted");
-        assert!(result.contains("safe text"), "non-PII text should be preserved");
+        assert!(
+            !result.contains("user@example.com"),
+            "email should be redacted"
+        );
+        assert!(
+            result.contains("safe text"),
+            "non-PII text should be preserved"
+        );
     }
 
     #[test]
@@ -467,16 +488,28 @@ mod tests {
         // Verify remove_pii works on plain text with emails
         let text = "Contact louis@screenpi.pe or louis.beaumont@gmail.com for support";
         let sanitized = remove_pii(text);
-        assert!(!sanitized.contains("louis@screenpi.pe"), "email 1 should be redacted");
-        assert!(!sanitized.contains("louis.beaumont@gmail.com"), "email 2 should be redacted");
-        assert!(sanitized.contains("[EMAIL]"), "emails should be replaced with [EMAIL]");
+        assert!(
+            !sanitized.contains("louis@screenpi.pe"),
+            "email 1 should be redacted"
+        );
+        assert!(
+            !sanitized.contains("louis.beaumont@gmail.com"),
+            "email 2 should be redacted"
+        );
+        assert!(
+            sanitized.contains("[EMAIL]"),
+            "emails should be replaced with [EMAIL]"
+        );
     }
 
     #[test]
     fn test_pii_removal_credit_card() {
         let text = "Card: 4111-1111-1111-1111 expires 12/25";
         let sanitized = remove_pii(text);
-        assert!(!sanitized.contains("4111-1111-1111-1111"), "credit card should be redacted");
+        assert!(
+            !sanitized.contains("4111-1111-1111-1111"),
+            "credit card should be redacted"
+        );
     }
 
     #[test]

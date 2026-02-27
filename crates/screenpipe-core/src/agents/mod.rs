@@ -70,7 +70,15 @@ pub trait AgentExecutor: Send + Sync {
         line_tx: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Result<AgentOutput> {
         let output = self
-            .run(prompt, model, working_dir, provider, provider_url, provider_api_key, pid_tx)
+            .run(
+                prompt,
+                model,
+                working_dir,
+                provider,
+                provider_url,
+                provider_api_key,
+                pid_tx,
+            )
             .await?;
         for line in output.stdout.lines() {
             let _ = line_tx.send(line.to_string());

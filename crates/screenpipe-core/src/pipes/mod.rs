@@ -394,7 +394,9 @@ impl PipeManager {
             on_output_line: None,
             store,
             api_port,
-            last_reload: Arc::new(Mutex::new(Instant::now() - std::time::Duration::from_secs(10))),
+            last_reload: Arc::new(Mutex::new(
+                Instant::now() - std::time::Duration::from_secs(10),
+            )),
         }
     }
 
@@ -567,8 +569,7 @@ impl PipeManager {
                 .map(|(name, (config, body, raw))| {
                     let pipe_logs = logs.get(name);
                     let last_log = pipe_logs.and_then(|l| l.back());
-                    let last_error =
-                        last_log.filter(|l| !l.success).map(|l| l.stderr.clone());
+                    let last_error = last_log.filter(|l| !l.success).map(|l| l.stderr.clone());
                     let mut cfg = config.clone();
                     cfg.name = name.clone();
                     let status = PipeStatus {
@@ -613,8 +614,7 @@ impl PipeManager {
             pipes.get(name).map(|(config, body, raw)| {
                 let pipe_logs = logs.get(name);
                 let last_log = pipe_logs.and_then(|l| l.back());
-                let last_error =
-                    last_log.filter(|l| !l.success).map(|l| l.stderr.clone());
+                let last_error = last_log.filter(|l| !l.success).map(|l| l.stderr.clone());
                 let mut cfg = config.clone();
                 cfg.name = name.to_string();
                 PipeStatus {
@@ -729,10 +729,22 @@ impl PipeManager {
                         resolved.api_key,
                         resolved.prompt,
                     ),
-                    None => (config.model.clone(), config.provider.clone(), None, None, None),
+                    None => (
+                        config.model.clone(),
+                        config.provider.clone(),
+                        None,
+                        None,
+                        None,
+                    ),
                 }
             } else {
-                (config.model.clone(), config.provider.clone(), None, None, None)
+                (
+                    config.model.clone(),
+                    config.provider.clone(),
+                    None,
+                    None,
+                    None,
+                )
             };
 
         // Create DB execution row
@@ -818,8 +830,7 @@ impl PipeManager {
             let timeout_duration = std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS);
 
             // Create streaming channel and drainer task
-            let (line_tx, mut line_rx) =
-                tokio::sync::mpsc::unbounded_channel::<String>();
+            let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             let drain_pipe_name = pipe_name.clone();
             let drain_exec_id = exec_id.unwrap_or(0);
             let drain_on_output = on_output.clone();
@@ -1053,12 +1064,20 @@ impl PipeManager {
                             "pipe '{}': preset '{}' not found in settings — \
                              create the preset in Settings → AI or remove the \
                              'preset: {}' line from the pipe config",
-                            name, preset_id, preset_id
+                            name,
+                            preset_id,
+                            preset_id
                         ));
                     }
                 }
             } else {
-                (config.model.clone(), config.provider.clone(), None, None, None)
+                (
+                    config.model.clone(),
+                    config.provider.clone(),
+                    None,
+                    None,
+                    None,
+                )
             };
 
         // Create DB execution row
@@ -1134,8 +1153,7 @@ impl PipeManager {
         // Run with timeout + streaming
         let timeout_duration = std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS);
 
-        let (line_tx, mut line_rx) =
-            tokio::sync::mpsc::unbounded_channel::<String>();
+        let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         let drain_pipe_name = name.to_string();
         let drain_exec_id = exec_id.unwrap_or(0);
         let drain_on_output = self.on_output_line.clone();
@@ -1656,25 +1674,40 @@ impl PipeManager {
                     }
 
                     // Resolve preset → model/provider overrides (same as run_pipe)
-                    let (model, provider, provider_url, api_key, preset_prompt) =
-                        if let Some(ref preset_id) = config.preset {
-                            match resolve_preset(&pipes_dir, preset_id) {
-                                Some(resolved) => {
-                                    info!("scheduler: pipe '{}' using preset '{}' → model={}, provider={:?}",
+                    let (model, provider, provider_url, api_key, preset_prompt) = if let Some(
+                        ref preset_id,
+                    ) =
+                        config.preset
+                    {
+                        match resolve_preset(&pipes_dir, preset_id) {
+                            Some(resolved) => {
+                                info!("scheduler: pipe '{}' using preset '{}' → model={}, provider={:?}",
                                         name, preset_id, resolved.model, resolved.provider);
-                                    (
-                                        resolved.model,
-                                        resolved.provider,
-                                        resolved.url,
-                                        resolved.api_key,
-                                        resolved.prompt,
-                                    )
-                                }
-                                None => (config.model.clone(), config.provider.clone(), None, None, None),
+                                (
+                                    resolved.model,
+                                    resolved.provider,
+                                    resolved.url,
+                                    resolved.api_key,
+                                    resolved.prompt,
+                                )
                             }
-                        } else {
-                            (config.model.clone(), config.provider.clone(), None, None, None)
-                        };
+                            None => (
+                                config.model.clone(),
+                                config.provider.clone(),
+                                None,
+                                None,
+                                None,
+                            ),
+                        }
+                    } else {
+                        (
+                            config.model.clone(),
+                            config.provider.clone(),
+                            None,
+                            None,
+                            None,
+                        )
+                    };
 
                     // Pre-configure pi with the pipe's provider
                     if config.agent == "pi" {
@@ -1689,7 +1722,8 @@ impl PipeManager {
                         }
                     }
 
-                    let prompt = render_prompt_with_port(config, body, api_port, preset_prompt.as_deref());
+                    let prompt =
+                        render_prompt_with_port(config, body, api_port, preset_prompt.as_deref());
                     let pipe_dir = pipes_dir.join(name);
                     let pipe_name = name.clone();
                     let logs_ref = logs.clone();

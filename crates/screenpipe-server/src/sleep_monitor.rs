@@ -14,10 +14,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use tracing::debug;
-#[cfg(target_os = "macos")]
-use tracing::{debug, error, info, warn};
 #[cfg(target_os = "windows")]
 use tracing::info;
+#[cfg(target_os = "macos")]
+use tracing::{debug, error, info, warn};
 
 #[cfg(target_os = "macos")]
 use crate::analytics::capture_event_nonblocking;
@@ -238,7 +238,9 @@ async fn check_recording_health() -> (bool, bool) {
 /// When the interactive desktop is not accessible the screen is locked.
 #[cfg(target_os = "windows")]
 pub fn start_sleep_monitor() {
-    use windows::Win32::System::StationsAndDesktops::{OpenInputDesktop, CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_ACCESS_FLAGS};
+    use windows::Win32::System::StationsAndDesktops::{
+        CloseDesktop, OpenInputDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_CONTROL_FLAGS,
+    };
 
     info!("Starting Windows screen-lock monitor (OpenInputDesktop polling)");
 

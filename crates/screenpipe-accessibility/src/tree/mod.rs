@@ -28,6 +28,15 @@ pub struct NodeBounds {
     pub height: f32,
 }
 
+/// Absolute bounds of the focused window in screen coordinates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowBounds {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
 /// A single node extracted from the accessibility tree, preserving role and hierarchy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccessibilityTreeNode {
@@ -56,6 +65,10 @@ pub enum TruncationReason {
 pub struct TreeSnapshot {
     pub app_name: String,
     pub window_name: String,
+    /// Focused app process identifier, when available.
+    pub process_id: Option<u32>,
+    /// Focused window bounds in screen coordinates, when available.
+    pub window_bounds: Option<WindowBounds>,
     pub text_content: String,
     /// Structured nodes preserving role and hierarchy from the accessibility tree.
     pub nodes: Vec<AccessibilityTreeNode>,

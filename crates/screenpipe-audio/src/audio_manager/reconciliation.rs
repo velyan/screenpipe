@@ -34,7 +34,10 @@ pub async fn reconcile_untranscribed(
     let chunks = match db.get_untranscribed_chunks(since, 50).await {
         Ok(c) => c,
         Err(e) => {
-            error!("reconciliation: failed to query untranscribed chunks: {}", e);
+            error!(
+                "reconciliation: failed to query untranscribed chunks: {}",
+                e
+            );
             return 0;
         }
     };
@@ -62,27 +65,26 @@ pub async fn reconcile_untranscribed(
 
         // Decode audio from file (blocking ffmpeg call — run off the async runtime)
         let path_owned = chunk.file_path.clone();
-        let (samples, sample_rate) = match tokio::task::spawn_blocking(move || {
-            read_audio_from_file(Path::new(&path_owned))
-        })
-        .await
-        {
-            Ok(Ok(result)) => result,
-            Ok(Err(e)) => {
-                error!(
-                    "reconciliation: failed to read audio for chunk {}: {}",
-                    chunk.id, e
-                );
-                continue;
-            }
-            Err(e) => {
-                error!(
-                    "reconciliation: spawn_blocking panicked for chunk {}: {}",
-                    chunk.id, e
-                );
-                continue;
-            }
-        };
+        let (samples, sample_rate) =
+            match tokio::task::spawn_blocking(move || read_audio_from_file(Path::new(&path_owned)))
+                .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(e)) => {
+                    error!(
+                        "reconciliation: failed to read audio for chunk {}: {}",
+                        chunk.id, e
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    error!(
+                        "reconciliation: spawn_blocking panicked for chunk {}: {}",
+                        chunk.id, e
+                    );
+                    continue;
+                }
+            };
 
         // Create a fresh WhisperState (cheap — reuses GPU model)
         let mut state = match whisper_context.create_state() {
@@ -111,10 +113,7 @@ pub async fn reconcile_untranscribed(
         {
             Ok(t) => t,
             Err(e) => {
-                error!(
-                    "reconciliation: stt failed for chunk {}: {}",
-                    chunk.id, e
-                );
+                error!("reconciliation: stt failed for chunk {}: {}", chunk.id, e);
                 continue;
             }
         };

@@ -38,7 +38,9 @@ async fn whisper_hallucination_on_silence() {
     let whisper_context =
         WhisperContext::new_with_params(&model_path.to_string_lossy(), context_params)
             .expect("failed to load model");
-    let mut whisper_state = whisper_context.create_state().expect("failed to create state");
+    let mut whisper_state = whisper_context
+        .create_state()
+        .expect("failed to create state");
 
     // 30 seconds of pure silence at 16kHz
     let silence = vec![0.0f32; SAMPLE_RATE as usize * 30];
@@ -84,7 +86,9 @@ async fn whisper_hallucination_on_noise() {
     let whisper_context =
         WhisperContext::new_with_params(&model_path.to_string_lossy(), context_params)
             .expect("failed to load model");
-    let mut whisper_state = whisper_context.create_state().expect("failed to create state");
+    let mut whisper_state = whisper_context
+        .create_state()
+        .expect("failed to create state");
 
     // 30 seconds of white noise at 0.1 amplitude
     let noise = audio_fixtures::white_noise(0.1, 30.0);
@@ -128,7 +132,9 @@ async fn whisper_hallucination_on_ambient() {
     let whisper_context =
         WhisperContext::new_with_params(&model_path.to_string_lossy(), context_params)
             .expect("failed to load model");
-    let mut whisper_state = whisper_context.create_state().expect("failed to create state");
+    let mut whisper_state = whisper_context
+        .create_state()
+        .expect("failed to create state");
 
     // 30s of very low noise at 0.01 amplitude (typical quiet room)
     let ambient = audio_fixtures::white_noise(0.01, 30.0);
@@ -180,7 +186,9 @@ async fn whisper_real_speech_still_works() {
     let whisper_context =
         WhisperContext::new_with_params(&model_path.to_string_lossy(), context_params)
             .expect("failed to load model");
-    let mut whisper_state = whisper_context.create_state().expect("failed to create state");
+    let mut whisper_state = whisper_context
+        .create_state()
+        .expect("failed to create state");
 
     // Load first scenario with speech
     let dataset_path = std::path::Path::new(&dataset_dir);
@@ -322,9 +330,18 @@ fn bytemuck_i16_to_f32_is_broken() {
     let even_samples: Vec<i16> = vec![0, 16384, -16384, 32767, -32768, 100];
     let broken: &[f32] = bytemuck::cast_slice(&even_samples);
 
-    println!("  bytemuck reinterpretation ({} i16 → {} f32):", even_samples.len(), broken.len());
+    println!(
+        "  bytemuck reinterpretation ({} i16 → {} f32):",
+        even_samples.len(),
+        broken.len()
+    );
     for (i, &v) in broken.iter().enumerate() {
-        println!("    f32[{}] = {:.6e} (raw bits: {:032b})", i, v, v.to_bits());
+        println!(
+            "    f32[{}] = {:.6e} (raw bits: {:032b})",
+            i,
+            v,
+            v.to_bits()
+        );
     }
 
     // The correct values for i16[0]=0, i16[1]=16384 would be 0.0 and 0.5

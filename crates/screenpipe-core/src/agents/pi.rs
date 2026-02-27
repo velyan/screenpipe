@@ -80,15 +80,18 @@ impl PiExecutor {
     /// Ensure screenpipe skills exist in `project_dir/.pi/skills/`.
     pub fn ensure_screenpipe_skill(project_dir: &Path) -> Result<()> {
         let skills: &[(&str, &str)] = &[
-            ("screenpipe-search", include_str!("../../assets/skills/screenpipe-search/SKILL.md")),
-            ("screenpipe-media", include_str!("../../assets/skills/screenpipe-media/SKILL.md")),
+            (
+                "screenpipe-search",
+                include_str!("../../assets/skills/screenpipe-search/SKILL.md"),
+            ),
+            (
+                "screenpipe-media",
+                include_str!("../../assets/skills/screenpipe-media/SKILL.md"),
+            ),
         ];
 
         for (name, content) in skills {
-            let skill_dir = project_dir
-                .join(".pi")
-                .join("skills")
-                .join(name);
+            let skill_dir = project_dir.join(".pi").join("skills").join(name);
             let skill_path = skill_dir.join("SKILL.md");
 
             std::fs::create_dir_all(&skill_dir)?;

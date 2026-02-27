@@ -41,7 +41,10 @@ use crate::{
         stt::{process_audio_input, SAMPLE_RATE},
         whisper::model::{create_whisper_context_parameters, download_whisper_model},
     },
-    utils::{audio::{normalize_v2, resample}, ffmpeg::{get_new_file_path, write_audio_to_file}},
+    utils::{
+        audio::{normalize_v2, resample},
+        ffmpeg::{get_new_file_path, write_audio_to_file},
+    },
     vad::{silero::SileroVad, webrtc::WebRtcVad, VadEngine, VadEngineEnum},
     AudioInput, TranscriptionResult,
 };
@@ -488,12 +491,9 @@ impl AudioManager {
                         audio.data.as_ref().to_vec()
                     };
                     let path = get_new_file_path(&audio.device.to_string(), out);
-                    if let Err(e) = write_audio_to_file(
-                        &resampled,
-                        SAMPLE_RATE,
-                        &PathBuf::from(&path),
-                        false,
-                    ) {
+                    if let Err(e) =
+                        write_audio_to_file(&resampled, SAMPLE_RATE, &PathBuf::from(&path), false)
+                    {
                         error!("failed to persist audio before deferral: {:?}", e);
                         None
                     } else {

@@ -4,7 +4,9 @@
 
 //! macOS accessibility tree walker using cidre AX APIs.
 
-use super::{AccessibilityTreeNode, TreeSnapshot, TreeWalkerConfig, TreeWalkerPlatform};
+use super::{
+    AccessibilityTreeNode, TreeSnapshot, TreeWalkerConfig, TreeWalkerPlatform, WindowBounds,
+};
 use anyhow::Result;
 use chrono::Utc;
 use cidre::{ax, cf, ns};
@@ -45,7 +47,10 @@ fn extract_browser_url(
     // Tier 1: AXDocument attribute on the window
     if let Some(url) = get_string_attr(window, ax::attr::document()) {
         if url.starts_with("http://") || url.starts_with("https://") {
-            debug!("browser_url: tier1 AXDocument hit for {}: {}", app_name, url);
+            debug!(
+                "browser_url: tier1 AXDocument hit for {}: {}",
+                app_name, url
+            );
             return Some(url);
         }
     }
@@ -61,11 +66,17 @@ fn extract_browser_url(
 
     // Tier 3: Shallow walk for AXTextField with URL-like value
     if let Some(url) = find_url_in_children(window, 0, 5) {
-        debug!("browser_url: tier3 AXTextField hit for {}: {}", app_name, url);
+        debug!(
+            "browser_url: tier3 AXTextField hit for {}: {}",
+            app_name, url
+        );
         return Some(url);
     }
 
-    debug!("browser_url: all tiers failed for app={}, window={}", app_name, window_name);
+    debug!(
+        "browser_url: all tiers failed for app={}, window={}",
+        app_name, window_name
+    );
     None
 }
 
@@ -78,11 +89,7 @@ fn get_arc_url(window_name: &str) -> Option<String> {
         return t & "\n" & u
     end tell"#;
 
-    let output = match Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-    {
+    let output = match Command::new("osascript").arg("-e").arg(script).output() {
         Ok(o) => o,
         Err(e) => {
             debug!("get_arc_url: osascript spawn failed: {}", e);
@@ -92,7 +99,11 @@ fn get_arc_url(window_name: &str) -> Option<String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        debug!("get_arc_url: osascript failed (exit={}): {}", output.status, stderr.trim());
+        debug!(
+            "get_arc_url: osascript failed (exit={}): {}",
+            output.status,
+            stderr.trim()
+        );
         return None;
     }
 
@@ -193,7 +204,8 @@ impl TreeWalkerPlatform for MacosTreeWalker {
         // Note: ar_pool requires R: Clone, so we return Result<_, String>
         // and convert back to anyhow::Error.
         cidre::objc::ar_pool(|| -> Result<Option<TreeSnapshot>, String> {
-            self.walk_focused_window_inner().map_err(|e| format!("{}", e))
+            self.walk_focused_window_inner()
+                .map_err(|e| format!("{}", e))
         })
         .map_err(|s| anyhow::anyhow!(s))
     }
@@ -292,12 +304,19 @@ impl MacosTreeWalker {
 
         // 3. Read window frame for normalizing element bounds to 0-1 coords
         let mut state = WalkState::new(&self.config, start);
+        let mut window_bounds = None;
         if let Some((wx, wy, ww, wh)) = get_element_frame(window) {
             if ww > 0.0 && wh > 0.0 {
                 state.window_x = wx;
                 state.window_y = wy;
                 state.window_w = ww;
                 state.window_h = wh;
+                window_bounds = Some(WindowBounds {
+                    x: wx,
+                    y: wy,
+                    width: ww,
+                    height: wh,
+                });
             }
         }
 
@@ -344,6 +363,8 @@ impl MacosTreeWalker {
         Ok(Some(TreeSnapshot {
             app_name,
             window_name,
+            process_id: u32::try_from(pid).ok(),
+            window_bounds,
             text_content,
             nodes: state.nodes,
             browser_url,
@@ -518,8 +539,8 @@ fn walk_element(elem: &ax::UiElement, depth: usize, state: &mut WalkState) {
 /// Extract text attributes from an element, append to the buffer, and collect a structured node.
 fn extract_text(elem: &ax::UiElement, role_str: &str, depth: usize, state: &mut WalkState) {
     // Read element bounds once (used for all text extraction paths)
-    let bounds = get_element_frame(elem)
-        .and_then(|(x, y, w, h)| normalize_bounds(x, y, w, h, state));
+    let bounds =
+        get_element_frame(elem).and_then(|(x, y, w, h)| normalize_bounds(x, y, w, h, state));
 
     // For text fields / text areas, prefer value (the actual content)
     if role_str == "AXTextField" || role_str == "AXTextArea" || role_str == "AXComboBox" {
@@ -616,7 +637,10 @@ fn get_element_frame(elem: &ax::UiElement) -> Option<(f64, f64, f64, f64)> {
 
 /// Normalize an element's screen-absolute frame to 0-1 coords relative to the window.
 fn normalize_bounds(
-    elem_x: f64, elem_y: f64, elem_w: f64, elem_h: f64,
+    elem_x: f64,
+    elem_y: f64,
+    elem_w: f64,
+    elem_h: f64,
     state: &WalkState,
 ) -> Option<super::NodeBounds> {
     if state.window_w <= 0.0 || state.window_h <= 0.0 {

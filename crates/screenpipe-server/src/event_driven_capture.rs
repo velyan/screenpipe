@@ -12,11 +12,14 @@ use crate::hot_frame_cache::{HotFrame, HotFrameCache};
 use crate::paired_capture::{paired_capture, CaptureContext, PairedCaptureResult};
 use anyhow::Result;
 use chrono::Utc;
-use screenpipe_accessibility::tree::TreeWalkerConfig;
+use screenpipe_accessibility::tree::{TreeSnapshot, TreeWalkerConfig, WindowBounds};
 use screenpipe_accessibility::ActivityFeed;
 use screenpipe_db::DatabaseManager;
+use screenpipe_vision::capture_screenshot_by_window::{
+    capture_focused_window, FocusedWindowTarget, Rect, WindowFilters,
+};
 use screenpipe_vision::frame_comparison::{FrameComparer, FrameComparisonConfig};
-use screenpipe_vision::monitor::SafeMonitor;
+use screenpipe_vision::monitor::{list_monitors, SafeMonitor};
 use screenpipe_vision::snapshot_writer::SnapshotWriter;
 use screenpipe_vision::utils::capture_monitor_image;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -264,15 +267,19 @@ pub async fn event_driven_capture_loop(
             Ok(output) => {
                 state.mark_captured();
                 if let Some(ref mut comparer) = frame_comparer {
-                    let _ = comparer.compare(&output.image);
+                    if let Some(ref image) = output.image {
+                        let _ = comparer.compare(image);
+                    }
                 }
                 if let Some(ref result) = output.result {
                     last_content_hash = result.content_hash;
                     last_db_write = Instant::now();
                     vision_metrics.record_capture();
-                    vision_metrics.record_db_write(Duration::from_millis(result.duration_ms as u64));
+                    vision_metrics
+                        .record_db_write(Duration::from_millis(result.duration_ms as u64));
                     if let Some(ref cache) = hot_frame_cache {
-                        push_to_hot_cache(cache, result, &device_name, &CaptureTrigger::Manual).await;
+                        push_to_hot_cache(cache, result, &device_name, &CaptureTrigger::Manual)
+                            .await;
                     }
                     info!(
                         "startup capture for monitor {}: frame_id={}, dur={}ms",
@@ -285,7 +292,10 @@ pub async fn event_driven_capture_loop(
             }
         }
     } else {
-        info!("screen is locked on startup, skipping initial capture for monitor {}", monitor_id);
+        info!(
+            "screen is locked on startup, skipping initial capture for monitor {}",
+            monitor_id
+        );
     }
 
     loop {
@@ -321,7 +331,7 @@ pub async fn event_driven_capture_loop(
             }
         };
 
-        // Visual change detection: periodically screenshot + frame diff
+        // Visual change detection: periodically compare the focused input window.
         if trigger.is_none()
             && visual_check_enabled
             && state.can_capture()
@@ -329,9 +339,9 @@ pub async fn event_driven_capture_loop(
         {
             last_visual_check = Instant::now();
             if let Some(ref mut comparer) = frame_comparer {
-                match capture_monitor_image(&monitor).await {
-                    Ok((image, _dur)) => {
-                        let diff = comparer.compare(&image);
+                match resolve_focused_window_for_monitor(&tree_walker_config, monitor_id).await {
+                    Ok(FocusedWindowResolution::Resolved(resolved)) => {
+                        let diff = comparer.compare(&resolved.captured_window.image);
                         if diff > visual_change_threshold {
                             debug!(
                                 "visual change detected on monitor {} (diff={:.4}, threshold={:.4})",
@@ -340,9 +350,39 @@ pub async fn event_driven_capture_loop(
                             trigger = Some(CaptureTrigger::VisualChange);
                         }
                     }
+                    Ok(FocusedWindowResolution::SkipNotOwner) => {
+                        debug!(
+                            "visual check skipped for monitor {} (no focused window ownership)",
+                            monitor_id
+                        );
+                    }
+                    Ok(FocusedWindowResolution::Fallback { reason, .. }) => {
+                        debug!(
+                            "visual check using monitor fallback for monitor {} (reason={})",
+                            monitor_id, reason
+                        );
+                        match capture_monitor_image(&monitor).await {
+                            Ok((image, _dur)) => {
+                                let diff = comparer.compare(&image);
+                                if diff > visual_change_threshold {
+                                    debug!(
+                                        "visual change detected on monitor {} via fallback (diff={:.4}, threshold={:.4})",
+                                        monitor_id, diff, visual_change_threshold
+                                    );
+                                    trigger = Some(CaptureTrigger::VisualChange);
+                                }
+                            }
+                            Err(e) => {
+                                debug!(
+                                    "visual check fallback screenshot failed for monitor {}: {}",
+                                    monitor_id, e
+                                );
+                            }
+                        }
+                    }
                     Err(e) => {
                         debug!(
-                            "visual check screenshot failed for monitor {}: {}",
+                            "visual check focused-window capture failed for monitor {}: {}",
                             monitor_id, e
                         );
                     }
@@ -394,7 +434,9 @@ pub async fn event_driven_capture_loop(
                         // re-trigger on the same visual state (reuses capture
                         // image — no extra screenshot needed)
                         if let Some(ref mut comparer) = frame_comparer {
-                            let _ = comparer.compare(&output.image);
+                            if let Some(ref image) = output.image {
+                                let _ = comparer.compare(image);
+                            }
                         }
 
                         if let Some(ref result) = output.result {
@@ -417,9 +459,9 @@ pub async fn event_driven_capture_loop(
                                 result.duration_ms
                             );
                         } else {
-                            // Content dedup — capture skipped, still record heartbeat
+                            // Capture skipped (dedup, focus unavailable, non-owner monitor, etc.)
                             debug!(
-                                "content dedup: skipped DB write for monitor {} (trigger={})",
+                                "capture skipped: no DB write for monitor {} (trigger={})",
                                 monitor_id,
                                 trigger.as_str()
                             );
@@ -491,11 +533,182 @@ async fn push_to_hot_cache(
 
 /// Result of do_capture: paired capture result + the screenshot image for comparer reuse.
 struct CaptureOutput {
-    /// None when content dedup skipped the capture (identical accessibility text).
+    /// None when the capture was skipped (dedup, no focus, non-owner monitor, etc.).
     result: Option<PairedCaptureResult>,
-    /// The captured image — reused for frame comparer update to avoid taking
-    /// a redundant extra screenshot after each capture.
-    image: image::DynamicImage,
+    /// Captured focused-window image when available. `None` means this monitor
+    /// was not the owner or focus couldn't be resolved, so no image was captured.
+    image: Option<image::DynamicImage>,
+}
+
+struct ResolvedFocusedWindow {
+    tree_snapshot: TreeSnapshot,
+    captured_window: screenpipe_vision::capture_screenshot_by_window::CapturedWindow,
+}
+
+enum FocusedWindowResolution {
+    Resolved(ResolvedFocusedWindow),
+    /// Focus was resolved, but another monitor worker owns this capture.
+    SkipNotOwner,
+    /// Focused-window mode is unavailable for this trigger; use monitor fallback.
+    Fallback {
+        tree_snapshot: Option<TreeSnapshot>,
+        reason: &'static str,
+    },
+}
+
+fn bounds_to_rect(bounds: &WindowBounds) -> Option<Rect> {
+    if bounds.width <= 0.0 || bounds.height <= 0.0 {
+        return None;
+    }
+    Some(Rect {
+        x: bounds.x.round() as i32,
+        y: bounds.y.round() as i32,
+        width: bounds.width.round().max(0.0) as u32,
+        height: bounds.height.round().max(0.0) as u32,
+    })
+}
+
+fn monitor_overlap_area(bounds: &WindowBounds, monitor: &SafeMonitor) -> f64 {
+    let win_left = bounds.x;
+    let win_top = bounds.y;
+    let win_right = bounds.x + bounds.width;
+    let win_bottom = bounds.y + bounds.height;
+
+    let mon_left = monitor.x() as f64;
+    let mon_top = monitor.y() as f64;
+    let mon_right = mon_left + monitor.width() as f64;
+    let mon_bottom = mon_top + monitor.height() as f64;
+
+    let left = win_left.max(mon_left);
+    let top = win_top.max(mon_top);
+    let right = win_right.min(mon_right);
+    let bottom = win_bottom.min(mon_bottom);
+
+    if right > left && bottom > top {
+        (right - left) * (bottom - top)
+    } else {
+        0.0
+    }
+}
+
+async fn owner_monitor_for_bounds(bounds: &WindowBounds) -> Option<u32> {
+    let monitors = list_monitors().await;
+    let mut best: Option<(u32, f64)> = None;
+
+    for monitor in monitors {
+        let area = monitor_overlap_area(bounds, &monitor);
+        if area <= 0.0 {
+            continue;
+        }
+
+        match best {
+            None => best = Some((monitor.id(), area)),
+            Some((best_id, best_area)) => {
+                if area > best_area
+                    || ((area - best_area).abs() < f64::EPSILON && monitor.id() < best_id)
+                {
+                    best = Some((monitor.id(), area));
+                }
+            }
+        }
+    }
+
+    best.map(|(id, _)| id)
+}
+
+async fn resolve_focused_window_for_monitor(
+    tree_walker_config: &TreeWalkerConfig,
+    monitor_id: u32,
+) -> Result<FocusedWindowResolution> {
+    let config = tree_walker_config.clone();
+    let tree_snapshot = tokio::task::spawn_blocking(move || {
+        crate::paired_capture::walk_accessibility_tree(&config)
+    })
+    .await?;
+
+    let Some(tree_snapshot) = tree_snapshot else {
+        debug!("focused capture unavailable: no focused window from tree walker");
+        return Ok(FocusedWindowResolution::Fallback {
+            tree_snapshot: None,
+            reason: "no_tree_snapshot",
+        });
+    };
+
+    let Some(process_id) = tree_snapshot.process_id else {
+        debug!("focused capture unavailable: focused window missing process_id");
+        return Ok(FocusedWindowResolution::Fallback {
+            tree_snapshot: Some(tree_snapshot),
+            reason: "missing_process_id",
+        });
+    };
+    let Some(bounds) = tree_snapshot.window_bounds.clone() else {
+        debug!("focused capture unavailable: focused window missing bounds");
+        return Ok(FocusedWindowResolution::Fallback {
+            tree_snapshot: Some(tree_snapshot),
+            reason: "missing_window_bounds",
+        });
+    };
+    let Some(owner_monitor_id) = owner_monitor_for_bounds(&bounds).await else {
+        debug!("focused capture unavailable: focused window does not overlap any monitor");
+        return Ok(FocusedWindowResolution::Fallback {
+            tree_snapshot: Some(tree_snapshot),
+            reason: "no_owner_monitor",
+        });
+    };
+    if owner_monitor_id != monitor_id {
+        debug!(
+            "focused capture skipped: owner monitor={} current monitor={}",
+            owner_monitor_id, monitor_id
+        );
+        return Ok(FocusedWindowResolution::SkipNotOwner);
+    }
+
+    let Some(target_bounds) = bounds_to_rect(&bounds) else {
+        debug!("focused capture unavailable: focused window bounds are invalid");
+        return Ok(FocusedWindowResolution::Fallback {
+            tree_snapshot: Some(tree_snapshot),
+            reason: "invalid_window_bounds",
+        });
+    };
+    let window_filters = WindowFilters::new(
+        &tree_walker_config.ignored_windows,
+        &tree_walker_config.included_windows,
+        &[],
+    );
+    let Ok(process_id_i32) = i32::try_from(process_id) else {
+        debug!(
+            "focused capture unavailable: process_id {} cannot fit in i32",
+            process_id
+        );
+        return Ok(FocusedWindowResolution::Fallback {
+            tree_snapshot: Some(tree_snapshot),
+            reason: "process_id_overflow",
+        });
+    };
+    let target = FocusedWindowTarget {
+        process_id: process_id_i32,
+        app_name: tree_snapshot.app_name.clone(),
+        window_name: tree_snapshot.window_name.clone(),
+        bounds: target_bounds,
+    };
+    let focused_capture = capture_focused_window(&target, &window_filters)
+        .await
+        .map_err(|e| anyhow::anyhow!("focused window capture failed: {}", e))?;
+    let Some(captured_window) = focused_capture else {
+        debug!(
+            "focused capture unavailable: failed to capture focused window app='{}' window='{}'",
+            target.app_name, target.window_name
+        );
+        return Ok(FocusedWindowResolution::Fallback {
+            tree_snapshot: Some(tree_snapshot),
+            reason: "capture_focused_window_failed",
+        });
+    };
+
+    Ok(FocusedWindowResolution::Resolved(ResolvedFocusedWindow {
+        tree_snapshot,
+        captured_window,
+    }))
 }
 
 /// Perform a single event-driven capture.
@@ -518,19 +731,62 @@ async fn do_capture(
 ) -> Result<CaptureOutput> {
     let captured_at = Utc::now();
 
-    // Take screenshot
-    let (image, capture_dur) = capture_monitor_image(monitor).await?;
-    debug!(
-        "screenshot captured in {:?} for monitor {}",
-        capture_dur, monitor_id
-    );
+    let resolution = resolve_focused_window_for_monitor(tree_walker_config, monitor_id).await?;
 
-    // Walk accessibility tree on blocking thread (AX APIs are synchronous)
-    let config = tree_walker_config.clone();
-    let tree_snapshot = tokio::task::spawn_blocking(move || {
-        crate::paired_capture::walk_accessibility_tree(&config)
-    })
-    .await?;
+    // Capture image + metadata with strict ownership when focused-window mode works,
+    // but fall back to monitor capture when focus resolution is unavailable.
+    let (image, tree_snapshot, app_name_owned, window_name_owned, browser_url_owned) =
+        match resolution {
+            FocusedWindowResolution::Resolved(resolved) => {
+                let ResolvedFocusedWindow {
+                    tree_snapshot,
+                    captured_window,
+                } = resolved;
+                debug!(
+                    "focused window captured: app='{}', window='{}', monitor={}",
+                    captured_window.app_name, captured_window.window_name, monitor_id
+                );
+                let screenpipe_vision::capture_screenshot_by_window::CapturedWindow {
+                    image,
+                    app_name,
+                    window_name,
+                    browser_url,
+                    ..
+                } = captured_window;
+                let browser_url = browser_url.or_else(|| tree_snapshot.browser_url.clone());
+                (
+                    image,
+                    Some(tree_snapshot),
+                    Some(app_name),
+                    Some(window_name),
+                    browser_url,
+                )
+            }
+            FocusedWindowResolution::SkipNotOwner => {
+                return Ok(CaptureOutput {
+                    result: None,
+                    image: None,
+                });
+            }
+            FocusedWindowResolution::Fallback {
+                tree_snapshot,
+                reason,
+            } => {
+                debug!(
+                    "focused capture fallback to monitor screenshot for monitor {} (reason={})",
+                    monitor_id, reason
+                );
+                let (image, capture_dur) = capture_monitor_image(monitor).await?;
+                debug!(
+                    "fallback monitor screenshot captured in {:?} for monitor {}",
+                    capture_dur, monitor_id
+                );
+                let app_name = tree_snapshot.as_ref().map(|s| s.app_name.clone());
+                let window_name = tree_snapshot.as_ref().map(|s| s.window_name.clone());
+                let browser_url = tree_snapshot.as_ref().and_then(|s| s.browser_url.clone());
+                (image, tree_snapshot, app_name, window_name, browser_url)
+            }
+        };
 
     // Content dedup: skip capture if accessibility text hasn't changed.
     // Never dedup Idle/Manual triggers — these are fallback captures that must
@@ -539,34 +795,26 @@ async fn do_capture(
     let dedup_eligible = !matches!(trigger, CaptureTrigger::Idle | CaptureTrigger::Manual)
         && last_db_write.elapsed() < Duration::from_secs(30);
     if dedup_eligible {
-        if let Some(ref snap) = tree_snapshot {
-            if !snap.text_content.is_empty() {
-                let new_hash = snap.content_hash as i64;
+        if let Some(ref tree_snapshot) = tree_snapshot {
+            if !tree_snapshot.text_content.is_empty() {
+                let new_hash = tree_snapshot.content_hash as i64;
                 if let Some(prev) = previous_content_hash {
                     if prev == new_hash && new_hash != 0 {
                         debug!(
                             "content dedup: skipping capture for monitor {} (hash={}, trigger={})",
-                            monitor_id, new_hash, trigger.as_str()
+                            monitor_id,
+                            new_hash,
+                            trigger.as_str()
                         );
                         return Ok(CaptureOutput {
                             result: None,
-                            image,
+                            image: Some(image),
                         });
                     }
                 }
             }
         }
     }
-
-    // Use tree snapshot metadata for app/window/url if available
-    let (app_name_owned, window_name_owned, browser_url_owned) = match &tree_snapshot {
-        Some(snap) => (
-            Some(snap.app_name.clone()),
-            Some(snap.window_name.clone()),
-            snap.browser_url.clone(),
-        ),
-        None => (None, None, None),
-    };
 
     // Skip lock screen / screensaver — these waste disk and pollute timeline.
     // Also update the global SCREEN_IS_LOCKED flag so subsequent loop iterations
@@ -584,11 +832,14 @@ async fn do_capture(
             crate::sleep_monitor::set_screen_locked(true);
             return Ok(CaptureOutput {
                 result: None,
-                image,
+                image: Some(image),
             });
         } else if crate::sleep_monitor::screen_is_locked() {
             // Screen was marked locked but now a real app is focused — unlock
-            debug!("screen unlocked: app '{}' detected on monitor {}", app, monitor_id);
+            debug!(
+                "screen unlocked: app '{}' detected on monitor {}",
+                app, monitor_id
+            );
             crate::sleep_monitor::set_screen_locked(false);
         }
     }
@@ -611,9 +862,11 @@ async fn do_capture(
     let result = paired_capture(&ctx, tree_snapshot.as_ref()).await?;
     // Extract image from Arc for comparer reuse. Arc::try_unwrap succeeds
     // because paired_capture no longer retains a clone.
-    let image = Arc::try_unwrap(ctx.image)
-        .unwrap_or_else(|arc| (*arc).clone());
-    Ok(CaptureOutput { result: Some(result), image })
+    let image = Arc::try_unwrap(ctx.image).unwrap_or_else(|arc| (*arc).clone());
+    Ok(CaptureOutput {
+        result: Some(result),
+        image: Some(image),
+    })
 }
 
 #[cfg(test)]

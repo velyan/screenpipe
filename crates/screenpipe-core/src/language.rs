@@ -42,7 +42,8 @@ pub enum Language {
     Indonesian,
     #[clap(name = "hindi")]
     Hindi,
-  #[clap(name = "vietnamese")] Vietnamese,
+    #[clap(name = "vietnamese")]
+    Vietnamese,
     #[clap(name = "finnish")]
     Finnish,
     #[clap(name = "hebrew")]

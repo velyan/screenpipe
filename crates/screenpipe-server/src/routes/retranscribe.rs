@@ -50,10 +50,7 @@ pub async fn retranscribe_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<RetranscribeRequest>,
 ) -> Response {
-    info!(
-        "retranscribe request: {} to {}",
-        request.start, request.end
-    );
+    info!("retranscribe request: {} to {}", request.start, request.end);
 
     // 1. Query audio chunks in range
     let chunks = match state
