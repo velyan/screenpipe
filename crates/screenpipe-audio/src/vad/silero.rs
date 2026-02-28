@@ -219,7 +219,4 @@ impl VadEngine for SileroVad {
             _ => Ok(VadStatus::Silence),
         }
     }
-    fn set_speech_threshold(&mut self, threshold: Option<f32>) {
-        self.speech_threshold_override = threshold;
-    }
 }

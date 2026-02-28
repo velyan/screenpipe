@@ -87,18 +87,6 @@ impl PiExecutor {
                 "screenpipe-media",
                 include_str!("../../assets/skills/screenpipe-media/SKILL.md"),
             ),
-            (
-                "screenpipe-retranscribe",
-                include_str!("../../assets/skills/screenpipe-retranscribe/SKILL.md"),
-            ),
-            (
-                "screenpipe-analytics",
-                include_str!("../../assets/skills/screenpipe-analytics/SKILL.md"),
-            ),
-            (
-                "screenpipe-elements",
-                include_str!("../../assets/skills/screenpipe-elements/SKILL.md"),
-            ),
         ];
 
         for (name, content) in skills {

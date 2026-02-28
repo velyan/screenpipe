@@ -279,7 +279,7 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
             text_content: text_buffer,
             nodes,
             focused_element,
-            browser_url,
+            browser_url: None,
             timestamp: Utc::now(),
             node_count,
             walk_duration,
@@ -576,115 +576,6 @@ mod tests {
             !buf.contains("icon.png"),
             "Image should be skipped, got: {}",
             buf
-        );
-    }
-
-    #[test]
-    fn test_document_node_recurses_into_children() {
-        use crate::events::AccessibilityNode;
-
-        // Simulates an Electron app (like Discord): Document node with URL value
-        // and children containing the actual web content.
-        let tree = AccessibilityNode {
-            control_type: "Pane".to_string(),
-            name: Some("Discord".to_string()),
-            automation_id: None,
-            class_name: None,
-            value: None,
-            bounds: None,
-            is_enabled: true,
-            is_focused: None,
-            is_keyboard_focusable: None,
-            children: vec![AccessibilityNode {
-                control_type: "Document".to_string(),
-                name: None,
-                automation_id: None,
-                class_name: None,
-                value: Some("https://discordapp.com/channels/123/456".to_string()),
-                bounds: None,
-                is_enabled: true,
-                is_focused: None,
-                is_keyboard_focusable: None,
-                children: vec![
-                    AccessibilityNode {
-                        control_type: "Text".to_string(),
-                        name: Some("Welcome to the server".to_string()),
-                        automation_id: None,
-                        class_name: None,
-                        value: None,
-                        bounds: None,
-                        is_enabled: true,
-                        is_focused: None,
-                        is_keyboard_focusable: None,
-                        children: vec![],
-                    },
-                    AccessibilityNode {
-                        control_type: "Button".to_string(),
-                        name: Some("Send Message".to_string()),
-                        automation_id: None,
-                        class_name: None,
-                        value: None,
-                        bounds: None,
-                        is_enabled: true,
-                        is_focused: None,
-                        is_keyboard_focusable: None,
-                        children: vec![],
-                    },
-                    AccessibilityNode {
-                        control_type: "Custom".to_string(),
-                        name: Some("User: john_doe".to_string()),
-                        automation_id: None,
-                        class_name: None,
-                        value: None,
-                        bounds: None,
-                        is_enabled: true,
-                        is_focused: None,
-                        is_keyboard_focusable: None,
-                        children: vec![],
-                    },
-                ],
-            }],
-        };
-
-        let mut buf = String::new();
-        let mut nodes = Vec::new();
-        let mut url = None;
-        extract_text_from_tree(&tree, 0, 30, &mut buf, &mut nodes, &mut url);
-
-        // URL should be captured as browser_url, NOT as text
-        assert_eq!(
-            url.as_deref(),
-            Some("https://discordapp.com/channels/123/456"),
-            "Document URL should be captured as browser_url"
-        );
-        assert!(
-            !buf.contains("discordapp.com"),
-            "URL should not appear in text buffer, got: {}",
-            buf
-        );
-
-        // Children of Document should be captured (the bug was: they were skipped)
-        assert!(
-            buf.contains("Welcome to the server"),
-            "Document children text should be captured, got: {}",
-            buf
-        );
-        assert!(
-            buf.contains("Send Message"),
-            "Document children buttons should be captured, got: {}",
-            buf
-        );
-        assert!(
-            buf.contains("User: john_doe"),
-            "Custom elements should be captured, got: {}",
-            buf
-        );
-
-        // Should have nodes for text, button, and custom
-        assert!(
-            nodes.len() >= 3,
-            "Should capture at least 3 nodes from Document children, got {}",
-            nodes.len()
         );
     }
 

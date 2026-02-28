@@ -41,7 +41,7 @@ use crate::{
         stt::{process_audio_input, SAMPLE_RATE},
     },
     utils::{
-        audio::resample,
+        audio::{normalize_v2, resample},
         ffmpeg::{get_new_file_path, write_audio_to_file},
     },
     vad::{silero::SileroVad, webrtc::WebRtcVad, VadEngine, VadEngineEnum},
