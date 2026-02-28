@@ -451,7 +451,15 @@ struct WindowData {
 /// independently queries NSWorkspace, and the active app can change mid-iteration
 /// causing multiple apps to appear as "focused" simultaneously.
 #[cfg(target_os = "macos")]
-fn get_frontmost_pid() -> Option<i32> {
+pub fn get_frontmost_pid() -> Option<i32> {
+    // Prefer CGWindowList front-to-back ordering for focus inference. In practice,
+    // NSWorkspace active-app can intermittently lag and report stale apps.
+    let (cg_windows, _) = get_cg_window_list();
+    if let Some(pid) = find_topmost_pid_global(&cg_windows) {
+        return Some(pid);
+    }
+
+    // Fallback to NSWorkspace when CGWindowList provides no suitable candidate.
     let workspace = cidre::ns::Workspace::shared();
     let apps = workspace.running_apps();
     for app in apps.iter() {
@@ -459,6 +467,11 @@ fn get_frontmost_pid() -> Option<i32> {
             return Some(app.pid());
         }
     }
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn get_frontmost_pid() -> Option<i32> {
     None
 }
 
@@ -702,24 +715,7 @@ pub fn find_topmost_pid_on_monitor(
     monitor_bounds: &Rect,
 ) -> Option<i32> {
     for w in cg_windows {
-        // Skip overlay layers (menu bar, floating panels, etc.)
-        if w.layer != 0 {
-            continue;
-        }
-        // Skip tiny windows (< 100x100 — status icons, tracking areas)
-        if w.bounds.width < 100 || w.bounds.height < 100 {
-            continue;
-        }
-        // Skip system apps
-        if SKIP_APPS.contains(w.owner_name.as_str()) {
-            continue;
-        }
-        // Skip screenpipe's own UI
-        if w.owner_name.to_lowercase().contains("screenpipe") {
-            continue;
-        }
-        // Skip known system title windows
-        if !w.window_name.is_empty() && SKIP_TITLES.contains(w.window_name.as_str()) {
+        if !is_valid_topmost_candidate(w) {
             continue;
         }
         // Check if window overlaps with this monitor
@@ -728,6 +724,42 @@ pub fn find_topmost_pid_on_monitor(
         }
     }
     None
+}
+
+/// Find the PID of the topmost normal (layer 0) window across all monitors.
+#[cfg(target_os = "macos")]
+pub fn find_topmost_pid_global(cg_windows: &[CGWindowInfo]) -> Option<i32> {
+    for w in cg_windows {
+        if is_valid_topmost_candidate(w) {
+            return Some(w.pid);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn is_valid_topmost_candidate(window: &CGWindowInfo) -> bool {
+    // Skip overlay layers (menu bar, floating panels, etc.)
+    if window.layer != 0 {
+        return false;
+    }
+    // Skip tiny windows (status icons, tracking areas)
+    if window.bounds.width < 100 || window.bounds.height < 100 {
+        return false;
+    }
+    // Skip system apps
+    if SKIP_APPS.contains(window.owner_name.as_str()) {
+        return false;
+    }
+    // Skip screenpipe's own UI
+    if window.owner_name.to_lowercase().contains("screenpipe") {
+        return false;
+    }
+    // Skip known system title windows
+    if !window.window_name.is_empty() && SKIP_TITLES.contains(window.window_name.as_str()) {
+        return false;
+    }
+    true
 }
 
 /// Get all visible windows using the appropriate backend
@@ -2432,6 +2464,25 @@ mod tests {
             let windows = vec![make_window(100, 0, 1800, 100, 400, 600, "Arc", "Tab")];
             assert_eq!(find_topmost_pid_on_monitor(&windows, &monitor1), Some(100));
             assert_eq!(find_topmost_pid_on_monitor(&windows, &monitor2), Some(100));
+        }
+
+        #[test]
+        fn test_topmost_global_skips_overlay_and_system() {
+            let windows = vec![
+                make_window(300, 25, 0, 0, 300, 40, "OverlayApp", "Overlay"),
+                make_window(1, 0, 0, 0, 1920, 25, "SystemUIServer", "Menu Bar"),
+                make_window(200, 0, 0, 0, 1920, 1080, "Notion", "Document"),
+            ];
+            assert_eq!(find_topmost_pid_global(&windows), Some(200));
+        }
+
+        #[test]
+        fn test_topmost_global_none_when_no_candidate() {
+            let windows = vec![
+                make_window(300, 25, 0, 0, 300, 40, "OverlayApp", "Overlay"),
+                make_window(1, 0, 0, 0, 1920, 25, "SystemUIServer", "Menu Bar"),
+            ];
+            assert_eq!(find_topmost_pid_global(&windows), None);
         }
 
         #[test]

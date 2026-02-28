@@ -21,11 +21,35 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
-/// Bounding box of an accessibility node, normalized to 0-1.
-///
-/// When monitor dimensions are provided in [`TreeWalkerConfig`], bounds are
-/// relative to the monitor (matching full-screen capture images). Otherwise
-/// they fall back to window-relative coordinates.
+const DEFAULT_BLOCKED_APPS: &[&str] = &[
+    "1password",
+    "bitwarden",
+    "lastpass",
+    "dashlane",
+    "keepassxc",
+    "credential manager",
+    "logonui",
+    "keychain access",
+    "screenpipe",
+    "loginwindow",
+];
+
+const DEFAULT_BLOCKED_TITLE_KEYWORDS: &[&str] = &["password", "incognito", "secret"];
+
+/// Default app-name substrings that should be blocked by the AX tree walker.
+pub fn default_blocked_apps() -> Vec<String> {
+    DEFAULT_BLOCKED_APPS.iter().map(|s| s.to_string()).collect()
+}
+
+/// Default window-title substrings that should be blocked by the AX tree walker.
+pub fn default_blocked_title_keywords() -> Vec<String> {
+    DEFAULT_BLOCKED_TITLE_KEYWORDS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Bounding box of an accessibility node, normalized to 0-1 relative to the window.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeBounds {
     pub left: f32,
@@ -55,6 +79,21 @@ pub struct AccessibilityTreeNode {
     pub bounds: Option<NodeBounds>,
 }
 
+/// Focused element context captured with the active window snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FocusedElementContext {
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_text: Option<String>,
+    /// Bounding box in 0-1 normalized coordinates relative to the focused window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<NodeBounds>,
+}
+
 /// Why the tree walk stopped early (if it did).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TruncationReason {
@@ -78,6 +117,8 @@ pub struct TreeSnapshot {
     pub text_content: String,
     /// Structured nodes preserving role and hierarchy from the accessibility tree.
     pub nodes: Vec<AccessibilityTreeNode>,
+    /// Focused text element context when available.
+    pub focused_element: Option<FocusedElementContext>,
     pub browser_url: Option<String>,
     pub timestamp: DateTime<Utc>,
     pub node_count: usize,
@@ -165,15 +206,10 @@ pub struct TreeWalkerConfig {
     pub ignored_windows: Vec<String>,
     /// User-configured windows to include (whitelist — if non-empty, only these are captured).
     pub included_windows: Vec<String>,
-    /// Monitor origin X in screen points (virtual desktop coordinate space).
-    /// Used to normalize element bounds to monitor-relative 0-1 coords.
-    pub monitor_x: f64,
-    /// Monitor origin Y in screen points.
-    pub monitor_y: f64,
-    /// Monitor width in screen points.
-    pub monitor_width: f64,
-    /// Monitor height in screen points.
-    pub monitor_height: f64,
+    /// App-name substrings that should always be blocked by accessibility capture.
+    pub blocked_apps: Vec<String>,
+    /// Window-title substrings that should be blocked by accessibility capture.
+    pub blocked_title_keywords: Vec<String>,
 }
 
 impl Default for TreeWalkerConfig {
@@ -187,10 +223,8 @@ impl Default for TreeWalkerConfig {
             element_timeout_secs: 0.2,
             ignored_windows: Vec::new(),
             included_windows: Vec::new(),
-            monitor_x: 0.0,
-            monitor_y: 0.0,
-            monitor_width: 0.0,
-            monitor_height: 0.0,
+            blocked_apps: default_blocked_apps(),
+            blocked_title_keywords: default_blocked_title_keywords(),
         }
     }
 }
@@ -259,6 +293,24 @@ mod tests {
         assert_eq!(config.max_nodes, 5000);
         assert_eq!(config.walk_timeout, Duration::from_millis(250));
         assert_eq!(config.max_text_length, 50_000);
+        assert!(!config.blocked_apps.is_empty());
+        assert!(!config.blocked_title_keywords.is_empty());
+    }
+
+    #[test]
+    fn test_default_blocked_apps_include_password_managers() {
+        let blocked_apps = default_blocked_apps();
+        assert!(blocked_apps.iter().any(|app| app == "1password"));
+        assert!(blocked_apps.iter().any(|app| app == "bitwarden"));
+        assert!(blocked_apps.iter().any(|app| app == "credential manager"));
+        assert!(blocked_apps.iter().any(|app| app == "logonui"));
+    }
+
+    #[test]
+    fn test_default_blocked_title_keywords_exclude_private() {
+        let blocked_keywords = default_blocked_title_keywords();
+        assert!(blocked_keywords.iter().any(|keyword| keyword == "password"));
+        assert!(!blocked_keywords.iter().any(|keyword| keyword == "private"));
     }
 
     #[test]

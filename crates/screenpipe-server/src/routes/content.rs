@@ -55,6 +55,7 @@ pub struct OCRContent {
     pub frame_name: Option<String>,
     pub browser_url: Option<String>,
     pub focused: Option<bool>,
+    pub capture_provenance: Option<String>,
     pub device_name: String,
 }
 
