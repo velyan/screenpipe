@@ -44,6 +44,7 @@ pub enum ContentItem {
 pub struct OCRContent {
     pub frame_id: i64,
     pub text: String,
+    pub raw_text: Option<String>,
     pub timestamp: DateTime<Utc>,
     pub file_path: String,
     pub offset_index: i64,

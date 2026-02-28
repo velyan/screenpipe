@@ -27,6 +27,8 @@ pub struct VisionManagerConfig {
     pub included_windows: Vec<String>,
     pub vision_metrics: Arc<PipelineMetrics>,
     pub use_pii_removal: bool,
+    pub enable_main_body_distillation: bool,
+    pub main_body_distillation_threshold: f32,
 }
 
 /// Status of the VisionManager
@@ -220,6 +222,8 @@ impl VisionManager {
         let vision_metrics = self.config.vision_metrics.clone();
         let hot_frame_cache = self.hot_frame_cache.clone();
         let use_pii_removal = self.config.use_pii_removal;
+        let enable_main_body_distillation = self.config.enable_main_body_distillation;
+        let main_body_distillation_threshold = self.config.main_body_distillation_threshold;
 
         info!(
             "Starting event-driven capture for monitor {} (device: {})",
@@ -243,6 +247,8 @@ impl VisionManager {
                 vision_metrics,
                 hot_frame_cache,
                 use_pii_removal,
+                enable_main_body_distillation,
+                main_body_distillation_threshold,
             )
             .await
             {

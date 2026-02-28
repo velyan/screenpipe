@@ -222,6 +222,7 @@ pub(crate) async fn search(
             SearchResult::OCR(ocr) => ContentItem::OCR(OCRContent {
                 frame_id: ocr.frame_id,
                 text: ocr.ocr_text.clone(),
+                raw_text: ocr.raw_text.clone(),
                 timestamp: ocr.timestamp,
                 file_path: ocr.file_path.clone(),
                 offset_index: ocr.offset_index,

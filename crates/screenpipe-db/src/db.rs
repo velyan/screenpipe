@@ -42,6 +42,15 @@ const DEDUP_TIME_WINDOW_SECS: i64 = 45;
 /// Higher = stricter matching, lower = more aggressive deduplication.
 const DEDUP_SIMILARITY_THRESHOLD: f64 = 0.85;
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct TextDistillationCacheRow {
+    pub main_body_text: String,
+    pub excluded_ui_text_json: String,
+    pub confidence: f64,
+    pub provider: String,
+    pub prompt_version: i64,
+}
+
 pub struct DeleteTimeRangeResult {
     pub frames_deleted: u64,
     pub ocr_deleted: u64,
@@ -270,13 +279,15 @@ impl DatabaseManager {
     }
 
     /// Ensure all event-driven capture columns exist on the frames table,
-    /// and that frames_fts includes accessibility_text.
+    /// and that frames_fts includes accessibility_text + main_body_text.
     /// An earlier version of migration 20260220000000 may have been applied
     /// without these columns.
     async fn ensure_event_driven_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         // 1. Fix missing columns on frames table
         let missing_columns: &[(&str, &str)] = &[
             ("accessibility_tree_json", "TEXT DEFAULT NULL"),
+            ("main_body_text", "TEXT DEFAULT NULL"),
+            ("main_body_meta_json", "TEXT DEFAULT NULL"),
             ("content_hash", "INTEGER DEFAULT NULL"),
             ("simhash", "INTEGER DEFAULT NULL"),
         ];
@@ -295,7 +306,7 @@ impl DatabaseManager {
             }
         }
 
-        // 2. Fix frames_fts: if it's missing accessibility_text, rebuild it.
+        // 2. Fix frames_fts: if it's missing accessibility_text/main_body_text, rebuild it.
         // FTS5 tables don't support ALTER TABLE, so we must drop + recreate.
         let fts_has_a11y: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM pragma_table_info('frames_fts') WHERE name = 'accessibility_text'",
@@ -303,9 +314,17 @@ impl DatabaseManager {
         .fetch_one(pool)
         .await
         .unwrap_or((0,));
+        let fts_has_main_body: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM pragma_table_info('frames_fts') WHERE name = 'main_body_text'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap_or((0,));
 
-        if fts_has_a11y.0 == 0 {
-            tracing::info!("Rebuilding frames_fts to include accessibility_text column");
+        if fts_has_a11y.0 == 0 || fts_has_main_body.0 == 0 {
+            tracing::info!(
+                "Rebuilding frames_fts to include accessibility_text/main_body_text columns"
+            );
 
             // Drop old triggers and FTS table
             sqlx::query("DROP TRIGGER IF EXISTS frames_ai")
@@ -321,11 +340,22 @@ impl DatabaseManager {
                 .execute(pool)
                 .await?;
 
-            // Recreate FTS5 table with accessibility_text
+            // Recreate FTS5 table with accessibility_text + main_body_text
             sqlx::query(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS frames_fts USING fts5(\
                     name, browser_url, app_name, window_name, focused, \
-                    accessibility_text, id UNINDEXED, tokenize='unicode61')",
+                    accessibility_text, main_body_text, id UNINDEXED, tokenize='unicode61')",
+            )
+            .execute(pool)
+            .await?;
+
+            // Backfill rows so existing frames stay searchable after rebuild.
+            sqlx::query(
+                "INSERT INTO frames_fts(id, name, browser_url, app_name, window_name, focused, accessibility_text, main_body_text) \
+                 SELECT id, COALESCE(name, ''), COALESCE(browser_url, ''), COALESCE(app_name, ''), \
+                        COALESCE(window_name, ''), COALESCE(focused, 0), COALESCE(accessibility_text, ''), \
+                        COALESCE(main_body_text, '') \
+                 FROM frames",
             )
             .execute(pool)
             .await?;
@@ -333,7 +363,7 @@ impl DatabaseManager {
             // Recreate triggers
             sqlx::query(
                 "CREATE TRIGGER IF NOT EXISTS frames_ai AFTER INSERT ON frames BEGIN \
-                    INSERT INTO frames_fts(id, name, browser_url, app_name, window_name, focused, accessibility_text) \
+                    INSERT INTO frames_fts(id, name, browser_url, app_name, window_name, focused, accessibility_text, main_body_text) \
                     VALUES ( \
                         NEW.id, \
                         COALESCE(NEW.name, ''), \
@@ -341,7 +371,8 @@ impl DatabaseManager {
                         COALESCE(NEW.app_name, ''), \
                         COALESCE(NEW.window_name, ''), \
                         COALESCE(NEW.focused, 0), \
-                        COALESCE(NEW.accessibility_text, '') \
+                        COALESCE(NEW.accessibility_text, ''), \
+                        COALESCE(NEW.main_body_text, '') \
                     ); \
                 END"
             )
@@ -356,8 +387,9 @@ impl DatabaseManager {
                    OR (NEW.window_name IS NOT NULL AND NEW.window_name != '') \
                    OR (NEW.focused IS NOT NULL) \
                    OR (NEW.accessibility_text IS NOT NULL AND NEW.accessibility_text != '') \
+                   OR (NEW.main_body_text IS NOT NULL AND NEW.main_body_text != '') \
                 BEGIN \
-                    INSERT OR REPLACE INTO frames_fts(id, name, browser_url, app_name, window_name, focused, accessibility_text) \
+                    INSERT OR REPLACE INTO frames_fts(id, name, browser_url, app_name, window_name, focused, accessibility_text, main_body_text) \
                     VALUES ( \
                         NEW.id, \
                         COALESCE(NEW.name, ''), \
@@ -365,7 +397,8 @@ impl DatabaseManager {
                         COALESCE(NEW.app_name, ''), \
                         COALESCE(NEW.window_name, ''), \
                         COALESCE(NEW.focused, 0), \
-                        COALESCE(NEW.accessibility_text, '') \
+                        COALESCE(NEW.accessibility_text, ''), \
+                        COALESCE(NEW.main_body_text, '') \
                     ); \
                 END"
             )
@@ -380,7 +413,7 @@ impl DatabaseManager {
             .execute(pool)
             .await?;
 
-            tracing::info!("frames_fts rebuilt with accessibility_text column");
+            tracing::info!("frames_fts rebuilt with accessibility_text/main_body_text columns");
         }
 
         Ok(())
@@ -1147,7 +1180,6 @@ impl DatabaseManager {
     /// The snapshot JPEG path is stored directly on the frame row.
     /// Returns the new frame id.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub async fn insert_snapshot_frame(
         &self,
         device_name: &str,
@@ -1159,8 +1191,10 @@ impl DatabaseManager {
         focused: bool,
         capture_trigger: Option<&str>,
         accessibility_text: Option<&str>,
+        main_body_text: Option<&str>,
         text_source: Option<&str>,
         accessibility_tree_json: Option<&str>,
+        main_body_meta_json: Option<&str>,
         content_hash: Option<i64>,
         simhash: Option<i64>,
     ) -> Result<i64, sqlx::Error> {
@@ -1174,8 +1208,10 @@ impl DatabaseManager {
             focused,
             capture_trigger,
             accessibility_text,
+            main_body_text,
             text_source,
             accessibility_tree_json,
+            main_body_meta_json,
             content_hash,
             simhash,
             None,
@@ -1197,8 +1233,10 @@ impl DatabaseManager {
         focused: bool,
         capture_trigger: Option<&str>,
         accessibility_text: Option<&str>,
+        main_body_text: Option<&str>,
         text_source: Option<&str>,
         accessibility_tree_json: Option<&str>,
+        main_body_meta_json: Option<&str>,
         content_hash: Option<i64>,
         simhash: Option<i64>,
         ocr_data: Option<(&str, &str, &str)>, // (text, text_json, ocr_engine)
@@ -1209,13 +1247,13 @@ impl DatabaseManager {
             r#"INSERT INTO frames (
                 video_chunk_id, offset_index, timestamp, name,
                 browser_url, app_name, window_name, focused, device_name,
-                snapshot_path, capture_trigger, accessibility_text, text_source,
-                accessibility_tree_json, content_hash, simhash
+                snapshot_path, capture_trigger, accessibility_text, main_body_text, text_source,
+                accessibility_tree_json, main_body_meta_json, content_hash, simhash
             ) VALUES (
                 NULL, 0, ?1, ?2,
                 ?3, ?4, ?5, ?6, ?7,
-                ?8, ?9, ?10, ?11,
-                ?12, ?13, ?14
+                ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16
             )"#,
         )
         .bind(timestamp)
@@ -1228,8 +1266,10 @@ impl DatabaseManager {
         .bind(snapshot_path)
         .bind(capture_trigger)
         .bind(accessibility_text)
+        .bind(main_body_text)
         .bind(text_source)
         .bind(accessibility_tree_json)
+        .bind(main_body_meta_json)
         .bind(content_hash)
         .bind(simhash)
         .execute(&mut **tx.conn())
@@ -1322,6 +1362,62 @@ impl DatabaseManager {
             .bind(frame_id)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// Fetch a cached distilled text result by cache key.
+    pub async fn get_text_distillation_cache(
+        &self,
+        cache_key: &str,
+    ) -> Result<Option<TextDistillationCacheRow>, sqlx::Error> {
+        sqlx::query_as::<_, TextDistillationCacheRow>(
+            r#"
+            SELECT main_body_text, excluded_ui_text_json, confidence, provider, prompt_version
+            FROM text_distillation_cache
+            WHERE cache_key = ?1
+            LIMIT 1
+            "#,
+        )
+        .bind(cache_key)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Store/update a distilled text result in the persistent cache.
+    pub async fn upsert_text_distillation_cache(
+        &self,
+        cache_key: &str,
+        main_body_text: &str,
+        excluded_ui_text_json: &str,
+        confidence: f64,
+        provider: &str,
+        prompt_version: i64,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO text_distillation_cache (
+                cache_key, main_body_text, excluded_ui_text_json, confidence, provider, prompt_version, created_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                main_body_text = excluded.main_body_text,
+                excluded_ui_text_json = excluded.excluded_ui_text_json,
+                confidence = excluded.confidence,
+                provider = excluded.provider,
+                prompt_version = excluded.prompt_version,
+                created_at = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(cache_key)
+        .bind(main_body_text)
+        .bind(excluded_ui_text_json)
+        .bind(confidence)
+        .bind(provider)
+        .bind(prompt_version)
+        .execute(&mut **tx.conn())
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1770,73 +1866,66 @@ impl DatabaseManager {
         }
 
         let frame_query = frame_fts_parts.join(" ");
+        let sanitized_query = if query.trim().is_empty() {
+            None
+        } else {
+            Some(crate::text_normalizer::sanitize_fts5_query(query))
+        };
 
         let sql = format!(
             r#"
         SELECT
-            ocr_text.frame_id,
-            ocr_text.text as ocr_text,
-            ocr_text.text_json,
+            frames.id as frame_id,
+            COALESCE(frames.main_body_text, frames.accessibility_text, ocr_text.text, '') as ocr_text,
+            ocr_text.text as raw_ocr_text,
+            COALESCE(ocr_text.text_json, '[]') as text_json,
             frames.timestamp,
-            frames.name as frame_name,
-            video_chunks.file_path,
+            COALESCE(frames.name, '') as frame_name,
+            COALESCE(video_chunks.file_path, frames.snapshot_path, '') as file_path,
             frames.offset_index,
-            frames.app_name,
-            ocr_text.ocr_engine,
-            frames.window_name,
-            video_chunks.device_name,
+            COALESCE(frames.app_name, ocr_text.app_name, '') as app_name,
+            COALESCE(ocr_text.ocr_engine, 'Unknown') as ocr_engine,
+            COALESCE(frames.window_name, ocr_text.window_name, '') as window_name,
+            COALESCE(video_chunks.device_name, frames.device_name) as device_name,
             GROUP_CONCAT(tags.name, ',') as tags,
             frames.browser_url,
             frames.focused
         FROM frames
-        JOIN video_chunks ON frames.video_chunk_id = video_chunks.id
-        JOIN ocr_text ON frames.id = ocr_text.frame_id
+        LEFT JOIN video_chunks ON frames.video_chunk_id = video_chunks.id
+        LEFT JOIN ocr_text ON frames.id = ocr_text.frame_id
         LEFT JOIN vision_tags ON frames.id = vision_tags.vision_id
         LEFT JOIN tags ON vision_tags.tag_id = tags.id
-        {frame_fts_join}
-        {ocr_fts_join}
         WHERE 1=1
             {frame_fts_condition}
-            {ocr_fts_condition}
+            {text_match_condition}
             AND (?2 IS NULL OR frames.timestamp >= ?2)
             AND (?3 IS NULL OR frames.timestamp <= ?3)
-            AND (?4 IS NULL OR COALESCE(ocr_text.text_length, LENGTH(ocr_text.text)) >= ?4)
-            AND (?5 IS NULL OR COALESCE(ocr_text.text_length, LENGTH(ocr_text.text)) <= ?5)
+            AND (?4 IS NULL OR COALESCE(LENGTH(frames.main_body_text), LENGTH(frames.accessibility_text), COALESCE(ocr_text.text_length, LENGTH(ocr_text.text))) >= ?4)
+            AND (?5 IS NULL OR COALESCE(LENGTH(frames.main_body_text), LENGTH(frames.accessibility_text), COALESCE(ocr_text.text_length, LENGTH(ocr_text.text))) <= ?5)
+            AND (?6 IS NULL OR frames.name LIKE '%' || ?6 || '%')
         GROUP BY frames.id
-        ORDER BY {order_clause}
+        ORDER BY frames.timestamp DESC
         LIMIT ?7 OFFSET ?8
         "#,
-            frame_fts_join = if frame_query.trim().is_empty() {
-                ""
-            } else {
-                "JOIN frames_fts ON frames.id = frames_fts.id"
-            },
-            ocr_fts_join = if query.trim().is_empty() {
-                ""
-            } else {
-                "JOIN ocr_text_fts ON ocr_text.frame_id = ocr_text_fts.frame_id"
-            },
             frame_fts_condition = if frame_query.trim().is_empty() {
                 ""
             } else {
-                "AND frames_fts MATCH ?1"
+                "AND frames.id IN (SELECT id FROM frames_fts WHERE frames_fts MATCH ?1)"
             },
-            ocr_fts_condition = if query.trim().is_empty() {
+            text_match_condition = if query.trim().is_empty() {
                 ""
             } else {
-                "AND ocr_text_fts MATCH ?6"
+                "AND ( \
+                    (frames.main_body_text IS NOT NULL AND frames.main_body_text != '' AND \
+                     frames.id IN (SELECT id FROM frames_fts WHERE frames_fts MATCH ?9)) \
+                    OR \
+                    ((frames.main_body_text IS NULL OR frames.main_body_text = '') AND \
+                     frames.id IN (SELECT frame_id FROM ocr_text_fts WHERE ocr_text_fts MATCH ?10)) \
+                )"
             },
-            // Use FTS5 rank (BM25 relevance) when searching, timestamp when browsing
-            order_clause = if query.trim().is_empty() {
-                "frames.timestamp DESC"
-            } else {
-                "ocr_text_fts.rank, frames.timestamp DESC"
-            }
         );
 
-        let query_builder = sqlx::query_as(&sql);
-
-        let raw_results: Vec<OCRResultRaw> = query_builder
+        let mut query_builder = sqlx::query_as::<_, OCRResultRaw>(&sql)
             .bind(if frame_query.trim().is_empty() {
                 None
             } else {
@@ -1846,21 +1935,23 @@ impl DatabaseManager {
             .bind(end_time)
             .bind(min_length.map(|l| l as i64))
             .bind(max_length.map(|l| l as i64))
-            .bind(if query.trim().is_empty() {
-                None
-            } else {
-                Some(crate::text_normalizer::sanitize_fts5_query(query))
-            })
+            .bind(frame_name)
             .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?;
+            .bind(offset);
+
+        if let Some(ref sq) = sanitized_query {
+            let scoped_main_body_query = format!("main_body_text:({sq})");
+            query_builder = query_builder.bind(scoped_main_body_query).bind(sq);
+        }
+
+        let raw_results: Vec<OCRResultRaw> = query_builder.fetch_all(&self.pool).await?;
 
         Ok(raw_results
             .into_iter()
             .map(|raw| OCRResult {
                 frame_id: raw.frame_id,
                 ocr_text: raw.ocr_text,
+                raw_text: raw.raw_ocr_text,
                 text_json: raw.text_json,
                 timestamp: raw.timestamp,
                 frame_name: raw.frame_name,
@@ -2179,6 +2270,21 @@ impl DatabaseManager {
         Ok(row.unwrap_or((None, None)))
     }
 
+    /// Get distilled main-body data for a frame (main_body_text, main_body_meta_json).
+    pub async fn get_frame_main_body_data(
+        &self,
+        frame_id: i64,
+    ) -> Result<(Option<String>, Option<String>), sqlx::Error> {
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT main_body_text, main_body_meta_json FROM frames WHERE id = ?1",
+        )
+        .bind(frame_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.unwrap_or((None, None)))
+    }
+
     /// Get all OCR text positions with bounding boxes for a specific frame.
     /// Returns parsed TextPosition objects ready for text overlay rendering.
     pub async fn get_frame_text_positions(
@@ -2325,26 +2431,32 @@ impl DatabaseManager {
         let sql = match content_type {
             ContentType::OCR => format!(
                 r#"SELECT COUNT(DISTINCT frames.id)
-                   FROM {base_table}
-                   WHERE {where_clause}
+                   FROM frames
+                   LEFT JOIN ocr_text ON frames.id = ocr_text.frame_id
+                   WHERE 1=1
+                       {frame_fts_condition}
+                       {text_match_condition}
                        AND (?2 IS NULL OR frames.timestamp >= ?2)
                        AND (?3 IS NULL OR frames.timestamp <= ?3)
-                       AND (?4 IS NULL OR COALESCE(ocr_text.text_length, LENGTH(ocr_text.text)) >= ?4)
-                       AND (?5 IS NULL OR COALESCE(ocr_text.text_length, LENGTH(ocr_text.text)) <= ?5)
+                       AND (?4 IS NULL OR COALESCE(LENGTH(frames.main_body_text), LENGTH(frames.accessibility_text), COALESCE(ocr_text.text_length, LENGTH(ocr_text.text))) >= ?4)
+                       AND (?5 IS NULL OR COALESCE(LENGTH(frames.main_body_text), LENGTH(frames.accessibility_text), COALESCE(ocr_text.text_length, LENGTH(ocr_text.text))) <= ?5)
                        AND (?6 IS NULL OR frames.name LIKE '%' || ?6 || '%')"#,
-                base_table = if ocr_query.is_empty() {
-                    "frames
-                     JOIN ocr_text ON frames.id = ocr_text.frame_id"
+                frame_fts_condition = if frame_query.is_empty() {
+                    ""
                 } else {
-                    "ocr_text_fts
-                     JOIN ocr_text ON ocr_text_fts.frame_id = ocr_text.frame_id
-                     JOIN frames ON ocr_text.frame_id = frames.id"
+                    "AND frames.id IN (SELECT id FROM frames_fts WHERE frames_fts MATCH ?1)"
                 },
-                where_clause = if ocr_query.is_empty() {
-                    "1=1"
+                text_match_condition = if ocr_query.is_empty() {
+                    ""
                 } else {
-                    "ocr_text_fts MATCH ?1"
-                }
+                    "AND ( \
+                        (frames.main_body_text IS NOT NULL AND frames.main_body_text != '' AND \
+                         frames.id IN (SELECT id FROM frames_fts WHERE frames_fts MATCH ?7)) \
+                        OR \
+                        ((frames.main_body_text IS NULL OR frames.main_body_text = '') AND \
+                         frames.id IN (SELECT frame_id FROM ocr_text_fts WHERE ocr_text_fts MATCH ?8)) \
+                    )"
+                },
             ),
             ContentType::Accessibility => format!(
                 r#"SELECT COUNT(DISTINCT accessibility.id)
@@ -2452,21 +2564,24 @@ impl DatabaseManager {
 
         let count: i64 = match content_type {
             ContentType::OCR => {
-                sqlx::query_scalar(&sql)
+                let mut qb = sqlx::query_scalar(&sql)
                     .bind(if frame_query.is_empty() && ocr_query.is_empty() {
                         "*".to_owned()
                     } else if frame_query.is_empty() {
-                        ocr_query
+                        ocr_query.clone()
                     } else {
-                        frame_query
+                        frame_query.clone()
                     })
                     .bind(start_time)
                     .bind(end_time)
                     .bind(min_length.map(|l| l as i64))
                     .bind(max_length.map(|l| l as i64))
-                    .bind(frame_name)
-                    .fetch_one(&self.pool)
-                    .await?
+                    .bind(frame_name);
+                if !ocr_query.is_empty() {
+                    let scoped_main_body_query = format!("main_body_text:({ocr_query})");
+                    qb = qb.bind(scoped_main_body_query).bind(ocr_query.clone());
+                }
+                qb.fetch_one(&self.pool).await?
             }
             ContentType::Accessibility => {
                 sqlx::query_scalar(&sql)
@@ -2801,7 +2916,7 @@ impl DatabaseManager {
         // Avoid LEFT JOIN ocr_text — it forces a scan of the entire ocr_text
         // table for every frame, taking 60+ seconds on large DBs. Instead, use
         // COALESCE with correlated subqueries: for event-driven frames the frame
-        // columns (accessibility_text, app_name, window_name) are non-null so
+        // columns (main_body_text/accessibility_text, app_name, window_name) are non-null so
         // COALESCE short-circuits and the subquery never executes. For legacy
         // frames the subquery does a fast indexed lookup by frame_id.
         let frames_query = r#"
@@ -2810,6 +2925,7 @@ impl DatabaseManager {
             f.timestamp,
             f.offset_index,
             COALESCE(
+                SUBSTR(f.main_body_text, 1, 200),
                 SUBSTR(f.accessibility_text, 1, 200),
                 (SELECT SUBSTR(ot.text, 1, 200) FROM ocr_text ot WHERE ot.frame_id = f.id LIMIT 1)
             ) as text,
