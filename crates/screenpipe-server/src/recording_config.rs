@@ -28,8 +28,8 @@ pub struct RecordingConfig {
     pub disable_audio: bool,
     pub disable_vision: bool,
     pub use_pii_removal: bool,
-    /// Filter music-dominant audio before transcription using spectral analysis
-    pub filter_music: bool,
+    pub enable_main_body_distillation: bool,
+    pub main_body_distillation_threshold: f32,
     pub enable_input_capture: bool,
     pub enable_accessibility: bool,
 
@@ -126,6 +126,8 @@ impl RecordingConfig {
             included_windows: self.included_windows.clone(),
             vision_metrics,
             use_pii_removal: self.use_pii_removal,
+            enable_main_body_distillation: self.enable_main_body_distillation,
+            main_body_distillation_threshold: self.main_body_distillation_threshold,
         }
     }
 }

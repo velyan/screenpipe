@@ -453,6 +453,10 @@ pub struct FrameContextResponse {
     pub frame_id: i64,
     /// Full text (accessibility_text or OCR fallback)
     pub text: Option<String>,
+    /// Distilled main body text (or raw fallback chosen by distillation stage)
+    pub main_body_text: Option<String>,
+    /// Distillation metadata JSON (excluded_ui_text, confidence, status, ...)
+    pub main_body_meta: Option<String>,
     /// Parsed accessibility tree nodes
     pub nodes: Vec<AccessibilityNode>,
     /// Extracted URLs from link nodes + regex
@@ -468,6 +472,13 @@ pub async fn get_frame_context(
     State(state): State<Arc<AppState>>,
     Path(frame_id): Path<i64>,
 ) -> Result<JsonResponse<FrameContextResponse>, (StatusCode, JsonResponse<Value>)> {
+    let (main_body_text, main_body_meta_json) = state
+        .db
+        .get_frame_main_body_data(frame_id)
+        .await
+        .unwrap_or((None, None));
+    let main_body_meta = main_body_meta_json;
+
     // Try to get accessibility data; gracefully handle missing columns (pre-migration DBs)
     let (a11y_text, a11y_tree_json) = match state.db.get_frame_accessibility_data(frame_id).await {
         Ok(data) => data,
@@ -541,6 +552,8 @@ pub async fn get_frame_context(
         return Ok(JsonResponse(FrameContextResponse {
             frame_id,
             text: a11y_text,
+            main_body_text,
+            main_body_meta,
             nodes,
             urls,
             text_source: "accessibility".to_string(),
@@ -578,6 +591,8 @@ pub async fn get_frame_context(
     Ok(JsonResponse(FrameContextResponse {
         frame_id,
         text,
+        main_body_text,
+        main_body_meta,
         nodes: Vec::new(),
         urls,
         text_source: "ocr".to_string(),

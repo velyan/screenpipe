@@ -76,6 +76,7 @@ pub struct Frame {
 pub struct OCRResultRaw {
     pub frame_id: i64,
     pub ocr_text: String,
+    pub raw_ocr_text: Option<String>,
     pub text_json: String,
     pub frame_name: String,
     pub timestamp: DateTime<Utc>,
@@ -95,6 +96,8 @@ pub struct OCRResult {
     pub frame_id: i64,
     pub frame_name: String,
     pub ocr_text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_text: Option<String>,
     pub text_json: String,
     pub timestamp: DateTime<Utc>,
     pub file_path: String,
