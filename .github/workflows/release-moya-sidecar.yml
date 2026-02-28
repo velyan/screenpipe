@@ -1,0 +1,226 @@
+name: Release Moya Sidecar
+
+on:
+  workflow_dispatch:
+    inputs:
+      sidecar_version:
+        description: "Sidecar version (example: 0.3.158-moya.1)"
+        required: true
+      screenpipe_ref:
+        description: "Git ref to build (branch, tag, or commit SHA)"
+        required: false
+        default: ""
+      prerelease:
+        description: "Mark GitHub release as prerelease"
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - name: Resolve ref
+        id: ref
+        shell: bash
+        run: |
+          if [[ -n "${{ github.event.inputs.screenpipe_ref }}" ]]; then
+            echo "value=${{ github.event.inputs.screenpipe_ref }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.ref.outputs.value }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          brew unlink pkg-config@0.29.2 || true
+          brew install ffmpeg pkg-config
+          brew link --overwrite pkg-config
+
+      - name: Build screenpipe server binary
+        shell: bash
+        run: |
+          export PKG_CONFIG_PATH="/usr/local/opt/ffmpeg/lib/pkgconfig:$PKG_CONFIG_PATH"
+          export PKG_CONFIG_ALLOW_CROSS=1
+          if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
+            export CFLAGS="-mcpu=apple-m1 -U__ARM_FEATURE_MATMUL_INT8"
+            export CXXFLAGS="-mcpu=apple-m1 -U__ARM_FEATURE_MATMUL_INT8"
+          fi
+          cargo build -p screenpipe-server --bin screenpipe --release --features metal --target "${{ matrix.target }}"
+
+      - name: Prepare sidecar payload
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin)
+              ARCH="arm64"
+              FFMPEG_URL="https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-darwin-arm64"
+              FFMPEG_SHA="a90e3db6a3fd35f6074b013f948b1aa45b31c6375489d39e572bea3f18336584"
+              FFPROBE_URL="https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffprobe-darwin-arm64"
+              FFPROBE_SHA="bb2db6f5d8cef919da12fbf592119a987202a8c060a886f3cab091f9cab90b64"
+              ;;
+            x86_64-apple-darwin)
+              ARCH="x64"
+              FFMPEG_URL="https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-darwin-x64"
+              FFMPEG_SHA="ebdddc936f61e14049a2d4b549a412b8a40deeff6540e58a9f2a2da9e6b18894"
+              FFPROBE_URL="https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffprobe-darwin-x64"
+              FFPROBE_SHA="fa3add0ce901f7241abe0dfc0155d958fc834aca3f8ce61f87cc712ae669c1e0"
+              ;;
+            *)
+              echo "Unsupported target: ${{ matrix.target }}" >&2
+              exit 1
+              ;;
+          esac
+
+          mkdir -p out
+          cp "target/${{ matrix.target }}/release/screenpipe" "out/screenpipe-darwin-${ARCH}"
+          chmod +x "out/screenpipe-darwin-${ARCH}"
+
+          curl -fsSL "${FFMPEG_URL}" -o "out/ffmpeg-darwin-${ARCH}"
+          curl -fsSL "${FFPROBE_URL}" -o "out/ffprobe-darwin-${ARCH}"
+          chmod +x "out/ffmpeg-darwin-${ARCH}" "out/ffprobe-darwin-${ARCH}"
+
+          ACTUAL_FFMPEG_SHA="$(shasum -a 256 "out/ffmpeg-darwin-${ARCH}" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
+          ACTUAL_FFPROBE_SHA="$(shasum -a 256 "out/ffprobe-darwin-${ARCH}" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
+          if [[ "${ACTUAL_FFMPEG_SHA}" != "${FFMPEG_SHA}" ]]; then
+            echo "ffmpeg checksum mismatch for ${ARCH}" >&2
+            exit 1
+          fi
+          if [[ "${ACTUAL_FFPROBE_SHA}" != "${FFPROBE_SHA}" ]]; then
+            echo "ffprobe checksum mismatch for ${ARCH}" >&2
+            exit 1
+          fi
+
+      - name: Upload sidecar artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: moya-sidecar-${{ matrix.target }}
+          path: out/*
+
+  publish-release:
+    runs-on: ubuntu-latest
+    needs: build-macos
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files and manifest
+        shell: bash
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ github.event.inputs.sidecar_version }}"
+          export VERSION
+          TAG="moya-sidecar-v${VERSION}"
+
+          mkdir -p release-assets
+          cp artifacts/moya-sidecar-aarch64-apple-darwin/screenpipe-darwin-arm64 release-assets/
+          cp artifacts/moya-sidecar-aarch64-apple-darwin/ffmpeg-darwin-arm64 release-assets/
+          cp artifacts/moya-sidecar-aarch64-apple-darwin/ffprobe-darwin-arm64 release-assets/
+          cp artifacts/moya-sidecar-x86_64-apple-darwin/screenpipe-darwin-x64 release-assets/
+          cp artifacts/moya-sidecar-x86_64-apple-darwin/ffmpeg-darwin-x64 release-assets/
+          cp artifacts/moya-sidecar-x86_64-apple-darwin/ffprobe-darwin-x64 release-assets/
+
+          python3 - <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+
+version = os.environ["VERSION"]
+repo = os.environ["GITHUB_REPOSITORY"]
+commit = os.environ["GITHUB_SHA"]
+tag = f"moya-sidecar-v{version}"
+base_url = f"https://github.com/{repo}/releases/download/{tag}"
+root = Path("release-assets")
+
+def entry(filename: str) -> dict:
+    path = root / filename
+    data = path.read_bytes()
+    return {
+        "url": f"{base_url}/{filename}",
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "sizeBytes": path.stat().st_size,
+    }
+
+manifest = {
+    "version": version,
+    "commit": commit,
+    "assets": {
+        "darwin-arm64": {
+            "screenpipe": entry("screenpipe-darwin-arm64"),
+            "ffmpeg": entry("ffmpeg-darwin-arm64"),
+            "ffprobe": entry("ffprobe-darwin-arm64"),
+        },
+        "darwin-x64": {
+            "screenpipe": entry("screenpipe-darwin-x64"),
+            "ffmpeg": entry("ffmpeg-darwin-x64"),
+            "ffprobe": entry("ffprobe-darwin-x64"),
+        },
+    },
+}
+
+manifest_path = root / "moya-sidecar-manifest.json"
+manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+(root / "moya-sidecar-manifest.sha256").write_text(
+    f"{manifest_hash}  moya-sidecar-manifest.json\n",
+    encoding="utf-8",
+)
+PY
+
+      - name: Create and upload release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ github.event.inputs.sidecar_version }}"
+          TAG="moya-sidecar-v${VERSION}"
+          TITLE="Moya Sidecar ${VERSION}"
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; reusing."
+          else
+            if [[ "${{ github.event.inputs.prerelease }}" == "true" ]]; then
+              gh release create "${TAG}" --title "${TITLE}" --notes "Moya sidecar release ${VERSION}" --prerelease
+            else
+              gh release create "${TAG}" --title "${TITLE}" --notes "Moya sidecar release ${VERSION}"
+            fi
+          fi
+
+          gh release upload "${TAG}" release-assets/screenpipe-darwin-arm64 --clobber
+          gh release upload "${TAG}" release-assets/ffmpeg-darwin-arm64 --clobber
+          gh release upload "${TAG}" release-assets/ffprobe-darwin-arm64 --clobber
+          gh release upload "${TAG}" release-assets/screenpipe-darwin-x64 --clobber
+          gh release upload "${TAG}" release-assets/ffmpeg-darwin-x64 --clobber
+          gh release upload "${TAG}" release-assets/ffprobe-darwin-x64 --clobber
+          gh release upload "${TAG}" release-assets/moya-sidecar-manifest.json --clobber
+          gh release upload "${TAG}" release-assets/moya-sidecar-manifest.sha256 --clobber
