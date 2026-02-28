@@ -576,6 +576,8 @@ impl SettingsStore {
             disable_audio: self.disable_audio,
             disable_vision: self.disable_vision,
             use_pii_removal: self.use_pii_removal,
+            enable_main_body_distillation: false,
+            main_body_distillation_threshold: 0.60,
             enable_input_capture: true, // always enabled, setting removed from UI
             enable_accessibility: true, // always enabled, setting removed from UI
             audio_transcription_engine: audio_engine_str.parse()

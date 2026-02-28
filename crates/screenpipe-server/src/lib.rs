@@ -22,6 +22,7 @@ pub mod routes;
 
 pub mod event_driven_capture;
 pub mod hot_frame_cache;
+pub mod main_body_distillation;
 pub mod meeting_persister;
 pub mod meeting_watcher;
 pub mod paired_capture;

@@ -320,6 +320,14 @@ async fn main() -> anyhow::Result<()> {
                             .collect::<Vec<_>>()),
                     );
                     map.insert("use_pii_removal".into(), json!(cli.use_pii_removal));
+                    map.insert(
+                        "enable_main_body_distillation".into(),
+                        json!(cli.enable_main_body_distillation),
+                    );
+                    map.insert(
+                        "main_body_distillation_threshold".into(),
+                        json!(cli.main_body_distillation_threshold),
+                    );
                     map.insert("disable_vision".into(), json!(cli.disable_vision));
                     map.insert("vad_engine".into(), json!(format!("{:?}", cli.vad_engine)));
                     map.insert(
@@ -480,6 +488,8 @@ async fn main() -> anyhow::Result<()> {
     cli.use_all_monitors = record_args.use_all_monitors;
     cli.language = record_args.language.clone();
     cli.use_pii_removal = record_args.use_pii_removal;
+    cli.enable_main_body_distillation = record_args.enable_main_body_distillation;
+    cli.main_body_distillation_threshold = record_args.main_body_distillation_threshold;
     cli.disable_vision = record_args.disable_vision;
     cli.vad_engine = record_args.vad_engine.clone();
     cli.ignored_windows = record_args.ignored_windows.clone();
@@ -859,6 +869,14 @@ async fn main() -> anyhow::Result<()> {
         !cli.disable_telemetry
     );
     println!("│ use pii removal        │ {:<34} │", cli.use_pii_removal);
+    println!(
+        "│ body distillation      │ {:<34} │",
+        cli.enable_main_body_distillation
+    );
+    println!(
+        "│ distill min confidence │ {:<34} │",
+        format!("{:.2}", cli.main_body_distillation_threshold)
+    );
     println!("│ use all monitors       │ {:<34} │", cli.use_all_monitors);
     println!(
         "│ ignored windows        │ {:<34} │",

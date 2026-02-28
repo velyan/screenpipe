@@ -22,6 +22,10 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, warn};
 
+use crate::main_body_distillation::{
+    distill_main_body_text, DistillationConfig, DistillationInput,
+};
+
 /// Context for a paired capture operation — replaces positional arguments.
 pub struct CaptureContext<'a> {
     pub db: &'a DatabaseManager,
@@ -36,6 +40,8 @@ pub struct CaptureContext<'a> {
     pub focused: bool,
     pub capture_trigger: &'a str,
     pub use_pii_removal: bool,
+    pub enable_main_body_distillation: bool,
+    pub main_body_distillation_threshold: f32,
 }
 
 /// Result of a paired capture operation.
@@ -47,6 +53,10 @@ pub struct PairedCaptureResult {
     pub snapshot_path: String,
     /// Accessibility text (if available)
     pub accessibility_text: Option<String>,
+    /// Distilled main body text (or raw fallback when distillation is unavailable/low confidence)
+    pub main_body_text: Option<String>,
+    /// Distillation status (distilled, low_confidence, unavailable, etc.)
+    pub main_body_status: Option<String>,
     /// How text was extracted: "accessibility", "ocr", or None
     pub text_source: Option<String>,
     /// What triggered this capture
@@ -193,6 +203,33 @@ pub async fn paired_capture(
         ocr_text_json.clone()
     };
 
+    let distillation = if let Some(ref text) = sanitized_text {
+        let distillation_input = DistillationInput {
+            raw_text: text,
+            app_name: ctx.app_name,
+            window_name: ctx.window_name,
+            browser_url: ctx.browser_url,
+            content_hash,
+            nodes: tree_snapshot.map(|s| s.nodes.as_slice()),
+        };
+        Some(
+            distill_main_body_text(
+                ctx.db,
+                distillation_input,
+                &DistillationConfig {
+                    enabled: ctx.enable_main_body_distillation,
+                    min_confidence: ctx.main_body_distillation_threshold,
+                },
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let main_body_text = distillation.as_ref().map(|r| r.main_body_text.clone());
+    let main_body_meta_json = distillation.as_ref().map(|r| r.metadata.to_json_string());
+    let main_body_status = distillation.as_ref().map(|r| r.metadata.status.clone());
+
     // Insert snapshot frame + OCR text positions in a single transaction.
     let ocr_data = if !sanitized_ocr_text.is_empty() {
         Some((
@@ -216,8 +253,10 @@ pub async fn paired_capture(
             ctx.focused,
             Some(ctx.capture_trigger),
             sanitized_text.as_deref(),
+            main_body_text.as_deref(),
             text_source,
             tree_json.as_deref(),
+            main_body_meta_json.as_deref(),
             content_hash,
             simhash,
             ocr_data,
@@ -226,14 +265,16 @@ pub async fn paired_capture(
 
     let duration_ms = start.elapsed().as_millis() as u64;
     debug!(
-        "paired_capture: frame_id={}, trigger={}, text_source={:?}, total={duration_ms}ms",
-        frame_id, ctx.capture_trigger, text_source
+        "paired_capture: frame_id={}, trigger={}, text_source={:?}, main_body_status={:?}, total={duration_ms}ms",
+        frame_id, ctx.capture_trigger, text_source, main_body_status
     );
 
     Ok(PairedCaptureResult {
         frame_id,
         snapshot_path: snapshot_path_str,
         accessibility_text,
+        main_body_text,
+        main_body_status,
         text_source: text_source.map(String::from),
         capture_trigger: ctx.capture_trigger.to_string(),
         captured_at: ctx.captured_at,
@@ -321,6 +362,8 @@ mod tests {
             focused: true,
             capture_trigger: "click",
             use_pii_removal: false,
+            enable_main_body_distillation: false,
+            main_body_distillation_threshold: 0.60,
         };
 
         let result = paired_capture(&ctx, None).await.unwrap();
@@ -354,6 +397,8 @@ mod tests {
             focused: true,
             capture_trigger: "app_switch",
             use_pii_removal: false,
+            enable_main_body_distillation: false,
+            main_body_distillation_threshold: 0.60,
         };
 
         let snap = TreeSnapshot {
@@ -411,6 +456,8 @@ mod tests {
             focused: true,
             capture_trigger: "idle",
             use_pii_removal: false,
+            enable_main_body_distillation: false,
+            main_body_distillation_threshold: 0.60,
         };
 
         // Empty accessibility text should be treated as no text

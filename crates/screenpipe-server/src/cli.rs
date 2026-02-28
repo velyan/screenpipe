@@ -154,6 +154,22 @@ pub struct Cli {
     #[arg(long, default_value_t = true)]
     pub use_pii_removal: bool,
 
+    /// Enable Apple Intelligence main-body text distillation (opt-in).
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "SCREENPIPE_ENABLE_MAIN_BODY_DISTILLATION"
+    )]
+    pub enable_main_body_distillation: bool,
+
+    /// Minimum confidence required to accept distilled text.
+    #[arg(
+        long,
+        default_value_t = 0.60,
+        env = "SCREENPIPE_MAIN_BODY_DISTILLATION_THRESHOLD"
+    )]
+    pub main_body_distillation_threshold: f32,
+
     #[arg(long, default_value_t = false)]
     pub disable_vision: bool,
 
@@ -342,6 +358,22 @@ pub struct RecordArgs {
     #[arg(long, default_value_t = true)]
     pub use_pii_removal: bool,
 
+    /// Enable Apple Intelligence main-body text distillation (opt-in).
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "SCREENPIPE_ENABLE_MAIN_BODY_DISTILLATION"
+    )]
+    pub enable_main_body_distillation: bool,
+
+    /// Minimum confidence required to accept distilled text.
+    #[arg(
+        long,
+        default_value_t = 0.60,
+        env = "SCREENPIPE_MAIN_BODY_DISTILLATION_THRESHOLD"
+    )]
+    pub main_body_distillation_threshold: f32,
+
     /// Disable vision recording
     #[arg(long, default_value_t = false)]
     pub disable_vision: bool,
@@ -427,6 +459,8 @@ impl RecordArgs {
             use_all_monitors: cli.use_all_monitors,
             language: cli.language.clone(),
             use_pii_removal: cli.use_pii_removal,
+            enable_main_body_distillation: cli.enable_main_body_distillation,
+            main_body_distillation_threshold: cli.main_body_distillation_threshold,
             disable_vision: cli.disable_vision,
             vad_engine: cli.vad_engine.clone(),
             ignored_windows: cli.ignored_windows.clone(),
@@ -483,6 +517,8 @@ impl RecordArgs {
             disable_audio: self.disable_audio,
             disable_vision: self.disable_vision,
             use_pii_removal: self.use_pii_removal,
+            enable_main_body_distillation: self.enable_main_body_distillation,
+            main_body_distillation_threshold: self.main_body_distillation_threshold,
             enable_input_capture: self.enable_input_capture,
             enable_accessibility: self.enable_accessibility,
             audio_transcription_engine: self.audio_transcription_engine.into(),

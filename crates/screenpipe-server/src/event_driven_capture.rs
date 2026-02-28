@@ -216,6 +216,8 @@ pub async fn event_driven_capture_loop(
     vision_metrics: Arc<screenpipe_vision::PipelineMetrics>,
     hot_frame_cache: Option<Arc<HotFrameCache>>,
     use_pii_removal: bool,
+    enable_main_body_distillation: bool,
+    main_body_distillation_threshold: f32,
 ) -> Result<()> {
     info!(
         "event-driven capture started for monitor {} (device: {})",
@@ -259,6 +261,8 @@ pub async fn event_driven_capture_loop(
             &tree_walker_config,
             &CaptureTrigger::Manual,
             use_pii_removal,
+            enable_main_body_distillation,
+            main_body_distillation_threshold,
             None, // first capture — no previous hash
             last_db_write,
         )
@@ -420,6 +424,8 @@ pub async fn event_driven_capture_loop(
                         &tree_walker_config,
                         &trigger,
                         use_pii_removal,
+                        enable_main_body_distillation,
+                        main_body_distillation_threshold,
                         last_content_hash,
                         last_db_write,
                     ),
@@ -516,7 +522,7 @@ async fn push_to_hot_cache(
         app_name: result.app_name.clone().unwrap_or_default(),
         window_name: result.window_name.clone().unwrap_or_default(),
         ocr_text_preview: result
-            .accessibility_text
+            .main_body_text
             .as_deref()
             .unwrap_or("")
             .chars()
@@ -726,6 +732,8 @@ async fn do_capture(
     tree_walker_config: &TreeWalkerConfig,
     trigger: &CaptureTrigger,
     use_pii_removal: bool,
+    enable_main_body_distillation: bool,
+    main_body_distillation_threshold: f32,
     previous_content_hash: Option<i64>,
     last_db_write: Instant,
 ) -> Result<CaptureOutput> {
@@ -898,6 +906,8 @@ async fn do_capture(
         focused: true, // event-driven captures are always for the focused window
         capture_trigger: trigger.as_str(),
         use_pii_removal,
+        enable_main_body_distillation,
+        main_body_distillation_threshold,
     };
 
     let result = paired_capture(&ctx, tree_snapshot.as_ref()).await?;
