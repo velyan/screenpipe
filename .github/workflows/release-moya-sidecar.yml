@@ -148,53 +148,53 @@ jobs:
           cp artifacts/moya-sidecar-x86_64-apple-darwin/ffprobe-darwin-x64 release-assets/
 
           python3 - <<'PY'
-import hashlib
-import json
-import os
-from pathlib import Path
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
 
-version = os.environ["VERSION"]
-repo = os.environ["GITHUB_REPOSITORY"]
-commit = os.environ["GITHUB_SHA"]
-tag = f"moya-sidecar-v{version}"
-base_url = f"https://github.com/{repo}/releases/download/{tag}"
-root = Path("release-assets")
+          version = os.environ["VERSION"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          commit = os.environ["GITHUB_SHA"]
+          tag = f"moya-sidecar-v{version}"
+          base_url = f"https://github.com/{repo}/releases/download/{tag}"
+          root = Path("release-assets")
 
-def entry(filename: str) -> dict:
-    path = root / filename
-    data = path.read_bytes()
-    return {
-        "url": f"{base_url}/{filename}",
-        "sha256": hashlib.sha256(data).hexdigest(),
-        "sizeBytes": path.stat().st_size,
-    }
+          def entry(filename: str) -> dict:
+              path = root / filename
+              data = path.read_bytes()
+              return {
+                  "url": f"{base_url}/{filename}",
+                  "sha256": hashlib.sha256(data).hexdigest(),
+                  "sizeBytes": path.stat().st_size,
+              }
 
-manifest = {
-    "version": version,
-    "commit": commit,
-    "assets": {
-        "darwin-arm64": {
-            "screenpipe": entry("screenpipe-darwin-arm64"),
-            "ffmpeg": entry("ffmpeg-darwin-arm64"),
-            "ffprobe": entry("ffprobe-darwin-arm64"),
-        },
-        "darwin-x64": {
-            "screenpipe": entry("screenpipe-darwin-x64"),
-            "ffmpeg": entry("ffmpeg-darwin-x64"),
-            "ffprobe": entry("ffprobe-darwin-x64"),
-        },
-    },
-}
+          manifest = {
+              "version": version,
+              "commit": commit,
+              "assets": {
+                  "darwin-arm64": {
+                      "screenpipe": entry("screenpipe-darwin-arm64"),
+                      "ffmpeg": entry("ffmpeg-darwin-arm64"),
+                      "ffprobe": entry("ffprobe-darwin-arm64"),
+                  },
+                  "darwin-x64": {
+                      "screenpipe": entry("screenpipe-darwin-x64"),
+                      "ffmpeg": entry("ffmpeg-darwin-x64"),
+                      "ffprobe": entry("ffprobe-darwin-x64"),
+                  },
+              },
+          }
 
-manifest_path = root / "moya-sidecar-manifest.json"
-manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+          manifest_path = root / "moya-sidecar-manifest.json"
+          manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
-manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-(root / "moya-sidecar-manifest.sha256").write_text(
-    f"{manifest_hash}  moya-sidecar-manifest.json\n",
-    encoding="utf-8",
-)
-PY
+          manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+          (root / "moya-sidecar-manifest.sha256").write_text(
+              f"{manifest_hash}  moya-sidecar-manifest.json\n",
+              encoding="utf-8",
+          )
+          PY
 
       - name: Create and upload release assets
         shell: bash
