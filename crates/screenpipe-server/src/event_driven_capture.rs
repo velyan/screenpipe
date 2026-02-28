@@ -937,7 +937,7 @@ async fn do_capture(
         );
         return Ok(CaptureOutput {
             result: None,
-            image,
+            image: Some(image),
         });
     }
 
