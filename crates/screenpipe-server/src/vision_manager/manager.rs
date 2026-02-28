@@ -25,6 +25,8 @@ pub struct VisionManagerConfig {
     pub output_path: String,
     pub ignored_windows: Vec<String>,
     pub included_windows: Vec<String>,
+    pub blocked_apps: Vec<String>,
+    pub blocked_title_keywords: Vec<String>,
     pub vision_metrics: Arc<PipelineMetrics>,
     pub use_pii_removal: bool,
     pub enable_main_body_distillation: bool,
@@ -206,6 +208,8 @@ impl VisionManager {
         let tree_walker_config = TreeWalkerConfig {
             ignored_windows: self.config.ignored_windows.clone(),
             included_windows: self.config.included_windows.clone(),
+            blocked_apps: self.config.blocked_apps.clone(),
+            blocked_title_keywords: self.config.blocked_title_keywords.clone(),
             ..TreeWalkerConfig::default()
         };
 

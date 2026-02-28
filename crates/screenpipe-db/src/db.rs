@@ -51,6 +51,19 @@ pub struct TextDistillationCacheRow {
     pub prompt_version: i64,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FrameCaptureMetadata {
+    pub timestamp: DateTime<Utc>,
+    pub snapshot_path: Option<String>,
+    pub app_name: Option<String>,
+    pub window_name: Option<String>,
+    pub browser_url: Option<String>,
+    pub focused: Option<bool>,
+    pub capture_provenance: Option<String>,
+    pub focused_accessibility_json: Option<String>,
+    pub text_source: Option<String>,
+}
+
 pub struct DeleteTimeRangeResult {
     pub frames_deleted: u64,
     pub ocr_deleted: u64,
@@ -288,6 +301,8 @@ impl DatabaseManager {
             ("accessibility_tree_json", "TEXT DEFAULT NULL"),
             ("main_body_text", "TEXT DEFAULT NULL"),
             ("main_body_meta_json", "TEXT DEFAULT NULL"),
+            ("capture_provenance", "TEXT DEFAULT NULL"),
+            ("focused_accessibility_json", "TEXT DEFAULT NULL"),
             ("content_hash", "INTEGER DEFAULT NULL"),
             ("simhash", "INTEGER DEFAULT NULL"),
         ];
@@ -305,6 +320,12 @@ impl DatabaseManager {
                 sqlx::query(&sql).execute(pool).await?;
             }
         }
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_frames_capture_provenance_timestamp \
+             ON frames(capture_provenance, timestamp DESC)",
+        )
+        .execute(pool)
+        .await?;
 
         // 2. Fix frames_fts: if it's missing accessibility_text/main_body_text, rebuild it.
         // FTS5 tables don't support ALTER TABLE, so we must drop + recreate.
@@ -1190,6 +1211,8 @@ impl DatabaseManager {
         text_source: Option<&str>,
         accessibility_tree_json: Option<&str>,
         main_body_meta_json: Option<&str>,
+        capture_provenance: Option<&str>,
+        focused_accessibility_json: Option<&str>,
         content_hash: Option<i64>,
         simhash: Option<i64>,
     ) -> Result<i64, sqlx::Error> {
@@ -1207,6 +1230,8 @@ impl DatabaseManager {
             text_source,
             accessibility_tree_json,
             main_body_meta_json,
+            capture_provenance,
+            focused_accessibility_json,
             content_hash,
             simhash,
             None,
@@ -1232,6 +1257,8 @@ impl DatabaseManager {
         text_source: Option<&str>,
         accessibility_tree_json: Option<&str>,
         main_body_meta_json: Option<&str>,
+        capture_provenance: Option<&str>,
+        focused_accessibility_json: Option<&str>,
         content_hash: Option<i64>,
         simhash: Option<i64>,
         ocr_data: Option<(&str, &str, &str)>, // (text, text_json, ocr_engine)
@@ -1243,12 +1270,12 @@ impl DatabaseManager {
                 video_chunk_id, offset_index, timestamp, name,
                 browser_url, app_name, window_name, focused, device_name,
                 snapshot_path, capture_trigger, accessibility_text, main_body_text, text_source,
-                accessibility_tree_json, main_body_meta_json, content_hash, simhash
+                accessibility_tree_json, main_body_meta_json, capture_provenance, focused_accessibility_json, content_hash, simhash
             ) VALUES (
                 NULL, 0, ?1, ?2,
                 ?3, ?4, ?5, ?6, ?7,
                 ?8, ?9, ?10, ?11, ?12,
-                ?13, ?14, ?15, ?16
+                ?13, ?14, ?15, ?16, ?17, ?18
             )"#,
         )
         .bind(timestamp)
@@ -1265,6 +1292,8 @@ impl DatabaseManager {
         .bind(text_source)
         .bind(accessibility_tree_json)
         .bind(main_body_meta_json)
+        .bind(capture_provenance)
+        .bind(focused_accessibility_json)
         .bind(content_hash)
         .bind(simhash)
         .execute(&mut **tx.conn())
@@ -1623,7 +1652,7 @@ impl DatabaseManager {
     pub async fn search(
         &self,
         query: &str,
-        mut content_type: ContentType,
+        content_type: ContentType,
         limit: u32,
         offset: u32,
         start_time: Option<DateTime<Utc>>,
@@ -1638,10 +1667,51 @@ impl DatabaseManager {
         focused: Option<bool>,
         speaker_name: Option<&str>,
     ) -> Result<Vec<SearchResult>, sqlx::Error> {
+        self.search_with_provenance(
+            query,
+            content_type,
+            limit,
+            offset,
+            start_time,
+            end_time,
+            app_name,
+            window_name,
+            min_length,
+            max_length,
+            speaker_ids,
+            frame_name,
+            browser_url,
+            focused,
+            speaker_name,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_with_provenance(
+        &self,
+        query: &str,
+        mut content_type: ContentType,
+        limit: u32,
+        offset: u32,
+        start_time: Option<DateTime<Utc>>,
+        end_time: Option<DateTime<Utc>>,
+        app_name: Option<&str>,
+        window_name: Option<&str>,
+        min_length: Option<usize>,
+        max_length: Option<usize>,
+        speaker_ids: Option<Vec<i64>>,
+        frame_name: Option<&str>,
+        browser_url: Option<&str>,
+        focused: Option<bool>,
+        speaker_name: Option<&str>,
+        capture_provenance: Option<&str>,
+    ) -> Result<Vec<SearchResult>, sqlx::Error> {
         let mut results = Vec::new();
 
-        // if focused or browser_url is present, we run only on OCR
-        if focused.is_some() || browser_url.is_some() {
+        // if focused/browser_url/provenance is present, we run only on OCR
+        if focused.is_some() || browser_url.is_some() || capture_provenance.is_some() {
             content_type = ContentType::OCR;
         }
 
@@ -1664,6 +1734,7 @@ impl DatabaseManager {
                                 frame_name,
                                 browser_url,
                                 focused,
+                                capture_provenance,
                             ),
                             self.search_audio(
                                 query,
@@ -1703,6 +1774,7 @@ impl DatabaseManager {
                                 frame_name,
                                 browser_url,
                                 focused,
+                                capture_provenance,
                             ),
                             self.search_accessibility(
                                 query,
@@ -1738,6 +1810,7 @@ impl DatabaseManager {
                         frame_name,
                         browser_url,
                         focused,
+                        capture_provenance,
                     )
                     .await?;
                 results.extend(ocr_results.into_iter().map(SearchResult::OCR));
@@ -1833,6 +1906,7 @@ impl DatabaseManager {
         frame_name: Option<&str>,
         browser_url: Option<&str>,
         focused: Option<bool>,
+        capture_provenance: Option<&str>,
     ) -> Result<Vec<OCRResult>, sqlx::Error> {
         let mut frame_fts_parts = Vec::new();
 
@@ -1884,7 +1958,8 @@ impl DatabaseManager {
             COALESCE(video_chunks.device_name, frames.device_name) as device_name,
             GROUP_CONCAT(tags.name, ',') as tags,
             frames.browser_url,
-            frames.focused
+            frames.focused,
+            frames.capture_provenance
         FROM frames
         LEFT JOIN video_chunks ON frames.video_chunk_id = video_chunks.id
         LEFT JOIN ocr_text ON frames.id = ocr_text.frame_id
@@ -1898,9 +1973,10 @@ impl DatabaseManager {
             AND (?4 IS NULL OR COALESCE(LENGTH(frames.main_body_text), LENGTH(frames.accessibility_text), COALESCE(ocr_text.text_length, LENGTH(ocr_text.text))) >= ?4)
             AND (?5 IS NULL OR COALESCE(LENGTH(frames.main_body_text), LENGTH(frames.accessibility_text), COALESCE(ocr_text.text_length, LENGTH(ocr_text.text))) <= ?5)
             AND (?6 IS NULL OR frames.name LIKE '%' || ?6 || '%')
+            AND (?7 IS NULL OR frames.capture_provenance = ?7)
         GROUP BY frames.id
         ORDER BY frames.timestamp DESC
-        LIMIT ?7 OFFSET ?8
+        LIMIT ?8 OFFSET ?9
         "#,
             frame_fts_condition = if frame_query.trim().is_empty() {
                 ""
@@ -1912,10 +1988,10 @@ impl DatabaseManager {
             } else {
                 "AND ( \
                     (frames.main_body_text IS NOT NULL AND frames.main_body_text != '' AND \
-                     frames.id IN (SELECT id FROM frames_fts WHERE frames_fts MATCH ?9)) \
+                     frames.id IN (SELECT id FROM frames_fts WHERE frames_fts MATCH ?10)) \
                     OR \
                     ((frames.main_body_text IS NULL OR frames.main_body_text = '') AND \
-                     frames.id IN (SELECT frame_id FROM ocr_text_fts WHERE ocr_text_fts MATCH ?10)) \
+                     frames.id IN (SELECT frame_id FROM ocr_text_fts WHERE ocr_text_fts MATCH ?11)) \
                 )"
             },
         );
@@ -1931,6 +2007,7 @@ impl DatabaseManager {
             .bind(min_length.map(|l| l as i64))
             .bind(max_length.map(|l| l as i64))
             .bind(frame_name)
+            .bind(capture_provenance)
             .bind(limit)
             .bind(offset);
 
@@ -1962,6 +2039,7 @@ impl DatabaseManager {
                     .unwrap_or_default(),
                 browser_url: raw.browser_url,
                 focused: raw.focused,
+                capture_provenance: raw.capture_provenance,
             })
             .collect())
     }
@@ -2249,6 +2327,47 @@ impl DatabaseManager {
         Ok(result.flatten())
     }
 
+    /// Get raw OCR text + text_json for a frame.
+    pub async fn get_frame_ocr_data(
+        &self,
+        frame_id: i64,
+    ) -> Result<(Option<String>, Option<String>), sqlx::Error> {
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT text, text_json FROM ocr_text WHERE frame_id = ?1 LIMIT 1",
+        )
+        .bind(frame_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.unwrap_or((None, None)))
+    }
+
+    /// Get active-window capture metadata for a frame.
+    pub async fn get_frame_capture_metadata(
+        &self,
+        frame_id: i64,
+    ) -> Result<Option<FrameCaptureMetadata>, sqlx::Error> {
+        sqlx::query_as::<_, FrameCaptureMetadata>(
+            r#"
+            SELECT
+                timestamp,
+                snapshot_path,
+                app_name,
+                window_name,
+                browser_url,
+                focused,
+                capture_provenance,
+                focused_accessibility_json,
+                text_source
+            FROM frames
+            WHERE id = ?1
+            "#,
+        )
+        .bind(frame_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     /// Get accessibility data for a frame (accessibility_text, accessibility_tree_json).
     /// Used by the /frames/:frame_id/context endpoint for copy-all and URL extraction.
     pub async fn get_frame_accessibility_data(
@@ -2301,7 +2420,7 @@ impl DatabaseManager {
     pub async fn count_search_results(
         &self,
         query: &str,
-        mut content_type: ContentType,
+        content_type: ContentType,
         start_time: Option<DateTime<Utc>>,
         end_time: Option<DateTime<Utc>>,
         app_name: Option<&str>,
@@ -2314,14 +2433,51 @@ impl DatabaseManager {
         focused: Option<bool>,
         speaker_name: Option<&str>,
     ) -> Result<usize, sqlx::Error> {
-        // if focused or browser_url is present, we run only on OCR
-        if focused.is_some() || browser_url.is_some() {
+        self.count_search_results_with_provenance(
+            query,
+            content_type,
+            start_time,
+            end_time,
+            app_name,
+            window_name,
+            min_length,
+            max_length,
+            speaker_ids,
+            frame_name,
+            browser_url,
+            focused,
+            speaker_name,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn count_search_results_with_provenance(
+        &self,
+        query: &str,
+        mut content_type: ContentType,
+        start_time: Option<DateTime<Utc>>,
+        end_time: Option<DateTime<Utc>>,
+        app_name: Option<&str>,
+        window_name: Option<&str>,
+        min_length: Option<usize>,
+        max_length: Option<usize>,
+        speaker_ids: Option<Vec<i64>>,
+        frame_name: Option<&str>,
+        browser_url: Option<&str>,
+        focused: Option<bool>,
+        speaker_name: Option<&str>,
+        capture_provenance: Option<&str>,
+    ) -> Result<usize, sqlx::Error> {
+        // if focused/browser_url/provenance is present, we run only on OCR
+        if focused.is_some() || browser_url.is_some() || capture_provenance.is_some() {
             content_type = ContentType::OCR;
         }
 
         if content_type == ContentType::All {
             // Create boxed futures to avoid infinite size issues with recursion
-            let ocr_future = Box::pin(self.count_search_results(
+            let ocr_future = Box::pin(self.count_search_results_with_provenance(
                 query,
                 ContentType::OCR,
                 start_time,
@@ -2335,9 +2491,10 @@ impl DatabaseManager {
                 browser_url,
                 focused,
                 None,
+                capture_provenance,
             ));
 
-            let ui_future = Box::pin(self.count_search_results(
+            let ui_future = Box::pin(self.count_search_results_with_provenance(
                 query,
                 ContentType::Accessibility,
                 start_time,
@@ -2351,10 +2508,11 @@ impl DatabaseManager {
                 None,
                 None,
                 None,
+                None,
             ));
 
             if app_name.is_none() && window_name.is_none() {
-                let audio_future = Box::pin(self.count_search_results(
+                let audio_future = Box::pin(self.count_search_results_with_provenance(
                     query,
                     ContentType::Audio,
                     start_time,
@@ -2368,6 +2526,7 @@ impl DatabaseManager {
                     None,
                     None,
                     speaker_name,
+                    None,
                 ));
 
                 let (ocr_count, audio_count, ui_count) =
@@ -2435,7 +2594,8 @@ impl DatabaseManager {
                        AND (?3 IS NULL OR frames.timestamp <= ?3)
                        AND (?4 IS NULL OR COALESCE(LENGTH(frames.main_body_text), LENGTH(frames.accessibility_text), COALESCE(ocr_text.text_length, LENGTH(ocr_text.text))) >= ?4)
                        AND (?5 IS NULL OR COALESCE(LENGTH(frames.main_body_text), LENGTH(frames.accessibility_text), COALESCE(ocr_text.text_length, LENGTH(ocr_text.text))) <= ?5)
-                       AND (?6 IS NULL OR frames.name LIKE '%' || ?6 || '%')"#,
+                       AND (?6 IS NULL OR frames.name LIKE '%' || ?6 || '%')
+                       AND (?7 IS NULL OR frames.capture_provenance = ?7)"#,
                 frame_fts_condition = if frame_query.is_empty() {
                     ""
                 } else {
@@ -2446,10 +2606,10 @@ impl DatabaseManager {
                 } else {
                     "AND ( \
                         (frames.main_body_text IS NOT NULL AND frames.main_body_text != '' AND \
-                         frames.id IN (SELECT id FROM frames_fts WHERE frames_fts MATCH ?7)) \
+                         frames.id IN (SELECT id FROM frames_fts WHERE frames_fts MATCH ?8)) \
                         OR \
                         ((frames.main_body_text IS NULL OR frames.main_body_text = '') AND \
-                         frames.id IN (SELECT frame_id FROM ocr_text_fts WHERE ocr_text_fts MATCH ?8)) \
+                         frames.id IN (SELECT frame_id FROM ocr_text_fts WHERE ocr_text_fts MATCH ?9)) \
                     )"
                 },
             ),
@@ -2571,7 +2731,8 @@ impl DatabaseManager {
                     .bind(end_time)
                     .bind(min_length.map(|l| l as i64))
                     .bind(max_length.map(|l| l as i64))
-                    .bind(frame_name);
+                    .bind(frame_name)
+                    .bind(capture_provenance);
                 if !ocr_query.is_empty() {
                     let scoped_main_body_query = format!("main_body_text:({ocr_query})");
                     qb = qb.bind(scoped_main_body_query).bind(ocr_query.clone());

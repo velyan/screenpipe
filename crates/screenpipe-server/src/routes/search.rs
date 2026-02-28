@@ -64,6 +64,9 @@ pub(crate) struct SearchQuery {
     focused: Option<bool>,
     #[serde(default)]
     browser_url: Option<String>,
+    /// Filter by frame provenance (e.g., "focused_window", "monitor_fallback")
+    #[serde(default)]
+    capture_provenance: Option<String>,
     /// Filter audio transcriptions by speaker name (case-insensitive partial match)
     #[serde(default)]
     speaker_name: Option<String>,
@@ -116,6 +119,7 @@ pub(crate) fn compute_search_cache_key(query: &SearchQuery) -> u64 {
     query.speaker_ids.hash(&mut hasher);
     query.focused.hash(&mut hasher);
     query.browser_url.hash(&mut hasher);
+    query.capture_provenance.hash(&mut hasher);
     query.speaker_name.hash(&mut hasher);
     query.include_cloud.hash(&mut hasher);
     hasher.finish()
@@ -128,7 +132,7 @@ pub(crate) async fn search(
     State(state): State<Arc<AppState>>,
 ) -> Result<JsonResponse<SearchResponse>, (StatusCode, JsonResponse<serde_json::Value>)> {
     info!(
-        "received search request: query='{}', content_type={:?}, limit={}, offset={}, start_time={:?}, end_time={:?}, app_name={:?}, window_name={:?}, min_length={:?}, max_length={:?}, speaker_ids={:?}, frame_name={:?}, browser_url={:?}, focused={:?}, speaker_name={:?}",
+        "received search request: query='{}', content_type={:?}, limit={}, offset={}, start_time={:?}, end_time={:?}, app_name={:?}, window_name={:?}, min_length={:?}, max_length={:?}, speaker_ids={:?}, frame_name={:?}, browser_url={:?}, focused={:?}, capture_provenance={:?}, speaker_name={:?}",
         query.q.as_deref().unwrap_or(""),
         query.content_type,
         query.pagination.limit,
@@ -143,6 +147,7 @@ pub(crate) async fn search(
         query.frame_name,
         query.browser_url,
         query.focused,
+        query.capture_provenance,
         query.speaker_name,
     );
 
@@ -160,7 +165,7 @@ pub(crate) async fn search(
     let content_type = query.content_type.clone();
 
     let (results, total) = try_join(
-        state.db.search(
+        state.db.search_with_provenance(
             query_str,
             content_type.clone(),
             query.pagination.limit,
@@ -176,8 +181,9 @@ pub(crate) async fn search(
             query.browser_url.as_deref(),
             query.focused,
             query.speaker_name.as_deref(),
+            query.capture_provenance.as_deref(),
         ),
-        state.db.count_search_results(
+        state.db.count_search_results_with_provenance(
             query_str,
             content_type,
             query.start_time,
@@ -191,6 +197,7 @@ pub(crate) async fn search(
             query.browser_url.as_deref(),
             query.focused,
             query.speaker_name.as_deref(),
+            query.capture_provenance.as_deref(),
         ),
     )
     .await
@@ -233,6 +240,7 @@ pub(crate) async fn search(
                 frame_name: Some(ocr.frame_name.clone()),
                 browser_url: ocr.browser_url.clone(),
                 focused: ocr.focused,
+                capture_provenance: ocr.capture_provenance.clone(),
                 device_name: ocr.device_name.clone(),
             }),
             SearchResult::Audio(audio) => ContentItem::Audio(AudioContent {
@@ -512,6 +520,7 @@ mod tests {
             speaker_ids: None,
             focused: None,
             browser_url: None,
+            capture_provenance: None,
             speaker_name: None,
             include_cloud: false,
         };
@@ -534,6 +543,7 @@ mod tests {
             speaker_ids: None,
             focused: None,
             browser_url: None,
+            capture_provenance: None,
             speaker_name: None,
             include_cloud: false,
         };
@@ -564,6 +574,7 @@ mod tests {
             speaker_ids: None,
             focused: None,
             browser_url: None,
+            capture_provenance: None,
             speaker_name: None,
             include_cloud: false,
         };
@@ -586,6 +597,7 @@ mod tests {
             speaker_ids: None,
             focused: None,
             browser_url: None,
+            capture_provenance: None,
             speaker_name: None,
             include_cloud: false,
         };

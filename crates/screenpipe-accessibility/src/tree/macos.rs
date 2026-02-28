@@ -5,7 +5,8 @@
 //! macOS accessibility tree walker using cidre AX APIs.
 
 use super::{
-    AccessibilityTreeNode, TreeSnapshot, TreeWalkerConfig, TreeWalkerPlatform, WindowBounds,
+    AccessibilityTreeNode, FocusedElementContext, TreeSnapshot, TreeWalkerConfig,
+    TreeWalkerPlatform, WindowBounds,
 };
 use anyhow::Result;
 use chrono::Utc;
@@ -240,19 +241,14 @@ impl MacosTreeWalker {
             .map(|s| s.to_string())
             .unwrap_or_default();
 
-        // Skip excluded apps (password managers, etc.)
+        // Skip configured blocked apps (password managers, etc.)
         let app_lower = app_name.to_lowercase();
-        const EXCLUDED_APPS: &[&str] = &[
-            "1password",
-            "bitwarden",
-            "lastpass",
-            "dashlane",
-            "keepassxc",
-            "keychain access",
-            "screenpipe",
-            "loginwindow",
-        ];
-        if EXCLUDED_APPS.iter().any(|ex| app_lower.contains(ex)) {
+        if self
+            .config
+            .blocked_apps
+            .iter()
+            .any(|pattern| app_lower.contains(&pattern.to_lowercase()))
+        {
             return Ok(None);
         }
 
@@ -280,12 +276,13 @@ impl MacosTreeWalker {
 
         let window_name = get_string_attr(window, ax::attr::title()).unwrap_or_default();
 
-        // Skip windows with sensitive titles
+        // Skip windows with configured blocked title keywords
         let window_lower = window_name.to_lowercase();
-        if window_lower.contains("password")
-            || window_lower.contains("private")
-            || window_lower.contains("incognito")
-            || window_lower.contains("secret")
+        if self
+            .config
+            .blocked_title_keywords
+            .iter()
+            .any(|pattern| window_lower.contains(&pattern.to_lowercase()))
         {
             return Ok(None);
         }
@@ -330,6 +327,7 @@ impl MacosTreeWalker {
                 });
             }
         }
+        let focused_element = extract_focused_element_context(window_bounds.as_ref());
 
         // Walk the accessibility tree
         walk_element(window, 0, &mut state);
@@ -378,6 +376,7 @@ impl MacosTreeWalker {
             window_bounds,
             text_content,
             nodes: state.nodes,
+            focused_element,
             browser_url,
             timestamp: Utc::now(),
             node_count: state.node_count,
@@ -389,6 +388,40 @@ impl MacosTreeWalker {
             max_depth_reached: state.max_depth_reached,
         }))
     }
+}
+
+fn extract_focused_element_context(
+    window_bounds: Option<&WindowBounds>,
+) -> Option<FocusedElementContext> {
+    let system = ax::UiElement::sys_wide();
+    let focused = system.attr_value(ax::attr::focused_ui_element()).ok()?;
+    if focused.get_type_id() != ax::UiElement::type_id() {
+        return None;
+    }
+    let elem: &ax::UiElement = unsafe { std::mem::transmute(&*focused) };
+
+    let role = elem.role().ok().map(|r| r.to_string())?;
+    let name = get_string_attr(elem, ax::attr::title())
+        .or_else(|| get_string_attr(elem, ax::attr::desc()))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let input_text = get_string_attr(elem, ax::attr::value())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let selected_text = get_string_attr(elem, ax::attr::selected_text())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let bounds = get_element_frame(elem).and_then(|(x, y, w, h)| {
+        window_bounds.and_then(|wb| normalize_bounds_for_window(x, y, w, h, wb))
+    });
+
+    Some(FocusedElementContext {
+        role,
+        name,
+        input_text,
+        selected_text,
+        bounds,
+    })
 }
 
 /// Mutable state passed through the recursive walk.
@@ -666,11 +699,47 @@ fn normalize_bounds(
     if left < -0.1 || top < -0.1 || width <= 0.0 || height <= 0.0 || left > 1.1 || top > 1.1 {
         return None;
     }
+    clipped_node_bounds(left, top, width, height)
+}
+
+fn normalize_bounds_for_window(
+    elem_x: f64,
+    elem_y: f64,
+    elem_w: f64,
+    elem_h: f64,
+    window: &WindowBounds,
+) -> Option<super::NodeBounds> {
+    if window.width <= 0.0 || window.height <= 0.0 {
+        return None;
+    }
+
+    let left = ((elem_x - window.x) / window.width) as f32;
+    let top = ((elem_y - window.y) / window.height) as f32;
+    let width = (elem_w / window.width) as f32;
+    let height = (elem_h / window.height) as f32;
+
+    if left < -0.1 || top < -0.1 || width <= 0.0 || height <= 0.0 || left > 1.1 || top > 1.1 {
+        return None;
+    }
+
+    clipped_node_bounds(left, top, width, height)
+}
+
+fn clipped_node_bounds(left: f32, top: f32, width: f32, height: f32) -> Option<super::NodeBounds> {
+    let clamped_left = left.clamp(0.0, 1.0);
+    let clamped_top = top.clamp(0.0, 1.0);
+    let clipped_width = width.min((1.0 - clamped_left).max(0.0));
+    let clipped_height = height.min((1.0 - clamped_top).max(0.0));
+
+    if clipped_width <= 0.0 || clipped_height <= 0.0 {
+        return None;
+    }
+
     Some(super::NodeBounds {
-        left: left.clamp(0.0, 1.0),
-        top: top.clamp(0.0, 1.0),
-        width: width.min(1.0 - left.max(0.0)),
-        height: height.min(1.0 - top.max(0.0)),
+        left: clamped_left,
+        top: clamped_top,
+        width: clipped_width,
+        height: clipped_height,
     })
 }
 
@@ -748,6 +817,36 @@ mod tests {
         assert!(!looks_like_url("hello world"));
         assert!(!looks_like_url(".hidden"));
         assert!(!looks_like_url("abc"));
+    }
+
+    #[test]
+    fn test_normalize_bounds_for_window_clips_to_visible_area() {
+        let window = WindowBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        };
+
+        let clipped = normalize_bounds_for_window(98.0, 99.0, 10.0, 5.0, &window)
+            .expect("partially visible element should clip to a positive bounds");
+        assert!(clipped.width > 0.0);
+        assert!(clipped.height > 0.0);
+        assert!(clipped.left <= 1.0);
+        assert!(clipped.top <= 1.0);
+    }
+
+    #[test]
+    fn test_normalize_bounds_for_window_returns_none_when_outside_view() {
+        let window = WindowBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        };
+
+        assert!(normalize_bounds_for_window(105.0, 50.0, 10.0, 10.0, &window).is_none());
+        assert!(normalize_bounds_for_window(50.0, 110.0, 10.0, 10.0, &window).is_none());
     }
 
     #[test]

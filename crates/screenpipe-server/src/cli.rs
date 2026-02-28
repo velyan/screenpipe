@@ -182,6 +182,14 @@ pub struct Cli {
     #[arg(long)]
     pub included_windows: Vec<String>,
 
+    /// App-name substrings to block from accessibility capture (privacy policy).
+    #[arg(long)]
+    pub blocked_apps: Vec<String>,
+
+    /// Window-title substrings to block from accessibility capture (privacy policy).
+    #[arg(long)]
+    pub blocked_title_keywords: Vec<String>,
+
     #[arg(long)]
     pub ignored_urls: Vec<String>,
 
@@ -245,6 +253,16 @@ impl Cli {
             excluded_windows: self.ignored_windows.clone(),
             ignored_windows: self.ignored_windows.clone(),
             included_windows: self.included_windows.clone(),
+            blocked_apps: if self.blocked_apps.is_empty() {
+                screenpipe_accessibility::tree::default_blocked_apps()
+            } else {
+                self.blocked_apps.clone()
+            },
+            blocked_title_keywords: if self.blocked_title_keywords.is_empty() {
+                screenpipe_accessibility::tree::default_blocked_title_keywords()
+            } else {
+                self.blocked_title_keywords.clone()
+            },
             ..Default::default()
         }
     }
@@ -390,6 +408,14 @@ pub struct RecordArgs {
     #[arg(long)]
     pub included_windows: Vec<String>,
 
+    /// App-name substrings to block from accessibility capture (privacy policy).
+    #[arg(long)]
+    pub blocked_apps: Vec<String>,
+
+    /// Window-title substrings to block from accessibility capture (privacy policy).
+    #[arg(long)]
+    pub blocked_title_keywords: Vec<String>,
+
     /// URLs to ignore for browser privacy filtering
     #[arg(long)]
     pub ignored_urls: Vec<String>,
@@ -465,6 +491,8 @@ impl RecordArgs {
             vad_engine: cli.vad_engine.clone(),
             ignored_windows: cli.ignored_windows.clone(),
             included_windows: cli.included_windows.clone(),
+            blocked_apps: cli.blocked_apps.clone(),
+            blocked_title_keywords: cli.blocked_title_keywords.clone(),
             ignored_urls: cli.ignored_urls.clone(),
             deepgram_api_key: cli.deepgram_api_key.clone(),
             auto_destruct_pid: cli.auto_destruct_pid,
@@ -500,6 +528,16 @@ impl RecordArgs {
             excluded_windows: self.ignored_windows.clone(),
             ignored_windows: self.ignored_windows.clone(),
             included_windows: self.included_windows.clone(),
+            blocked_apps: if self.blocked_apps.is_empty() {
+                screenpipe_accessibility::tree::default_blocked_apps()
+            } else {
+                self.blocked_apps.clone()
+            },
+            blocked_title_keywords: if self.blocked_title_keywords.is_empty() {
+                screenpipe_accessibility::tree::default_blocked_title_keywords()
+            } else {
+                self.blocked_title_keywords.clone()
+            },
             ..Default::default()
         }
     }
@@ -511,6 +549,16 @@ impl RecordArgs {
     ) -> crate::recording_config::RecordingConfig {
         let languages = self.unique_languages().unwrap_or_default();
         crate::recording_config::RecordingConfig {
+            blocked_apps: if self.blocked_apps.is_empty() {
+                screenpipe_accessibility::tree::default_blocked_apps()
+            } else {
+                self.blocked_apps
+            },
+            blocked_title_keywords: if self.blocked_title_keywords.is_empty() {
+                screenpipe_accessibility::tree::default_blocked_title_keywords()
+            } else {
+                self.blocked_title_keywords
+            },
             audio_chunk_duration: self.audio_chunk_duration,
             port: self.port,
             data_dir,

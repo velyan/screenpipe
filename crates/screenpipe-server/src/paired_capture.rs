@@ -39,6 +39,8 @@ pub struct CaptureContext<'a> {
     pub browser_url: Option<&'a str>,
     pub focused: bool,
     pub capture_trigger: &'a str,
+    pub capture_provenance: &'a str,
+    pub force_ocr: bool,
     pub use_pii_removal: bool,
     pub enable_main_body_distillation: bool,
     pub main_body_distillation_threshold: f32,
@@ -57,6 +59,8 @@ pub struct PairedCaptureResult {
     pub main_body_text: Option<String>,
     /// Distillation status (distilled, low_confidence, unavailable, etc.)
     pub main_body_status: Option<String>,
+    /// Distillation metadata JSON (excluded_ui_text, confidence, status, ...)
+    pub main_body_meta_json: Option<String>,
     /// How text was extracted: "accessibility", "ocr", or None
     pub text_source: Option<String>,
     /// What triggered this capture
@@ -125,8 +129,9 @@ pub async fn paired_capture(
             .map(|s| !s.text_content.is_empty())
             .unwrap_or(false);
 
-    // Only run OCR when accessibility tree returned no text or app prefers OCR
-    let (ocr_text, ocr_text_json) = if !has_accessibility_text {
+    // Only run OCR when needed by text availability, app policy, or API strict include_ocr.
+    let should_run_ocr = ctx.force_ocr || !has_accessibility_text;
+    let (ocr_text, ocr_text_json) = if should_run_ocr {
         let image_for_ocr = ctx.image.clone();
         let ocr_result = tokio::task::spawn_blocking(move || {
             #[cfg(target_os = "macos")]
@@ -202,15 +207,28 @@ pub async fn paired_capture(
     } else {
         ocr_text_json.clone()
     };
+    let focused_accessibility_json = tree_snapshot
+        .and_then(|snap| snap.focused_element.clone())
+        .map(|mut focused| {
+            if ctx.use_pii_removal {
+                focused.name = focused.name.map(|s| remove_pii(&s));
+                focused.input_text = focused.input_text.map(|s| remove_pii(&s));
+                focused.selected_text = focused.selected_text.map(|s| remove_pii(&s));
+            }
+            focused
+        })
+        .and_then(|focused| serde_json::to_string(&focused).ok());
 
     let distillation = if let Some(ref text) = sanitized_text {
         let distillation_input = DistillationInput {
             raw_text: text,
+            ocr_text_json: Some(sanitized_ocr_json.as_str()),
             app_name: ctx.app_name,
             window_name: ctx.window_name,
             browser_url: ctx.browser_url,
             content_hash,
             nodes: tree_snapshot.map(|s| s.nodes.as_slice()),
+            focused_element: tree_snapshot.and_then(|s| s.focused_element.as_ref()),
         };
         Some(
             distill_main_body_text(
@@ -257,6 +275,8 @@ pub async fn paired_capture(
             text_source,
             tree_json.as_deref(),
             main_body_meta_json.as_deref(),
+            Some(ctx.capture_provenance),
+            focused_accessibility_json.as_deref(),
             content_hash,
             simhash,
             ocr_data,
@@ -265,8 +285,8 @@ pub async fn paired_capture(
 
     let duration_ms = start.elapsed().as_millis() as u64;
     debug!(
-        "paired_capture: frame_id={}, trigger={}, text_source={:?}, main_body_status={:?}, total={duration_ms}ms",
-        frame_id, ctx.capture_trigger, text_source, main_body_status
+        "paired_capture: frame_id={}, trigger={}, provenance={}, text_source={:?}, main_body_status={:?}, total={duration_ms}ms",
+        frame_id, ctx.capture_trigger, ctx.capture_provenance, text_source, main_body_status
     );
 
     Ok(PairedCaptureResult {
@@ -275,6 +295,7 @@ pub async fn paired_capture(
         accessibility_text,
         main_body_text,
         main_body_status,
+        main_body_meta_json,
         text_source: text_source.map(String::from),
         capture_trigger: ctx.capture_trigger.to_string(),
         captured_at: ctx.captured_at,
@@ -361,6 +382,8 @@ mod tests {
             browser_url: None,
             focused: true,
             capture_trigger: "click",
+            capture_provenance: "focused_window",
+            force_ocr: false,
             use_pii_removal: false,
             enable_main_body_distillation: false,
             main_body_distillation_threshold: 0.60,
@@ -396,6 +419,8 @@ mod tests {
             browser_url: Some("https://example.com"),
             focused: true,
             capture_trigger: "app_switch",
+            capture_provenance: "focused_window",
+            force_ocr: false,
             use_pii_removal: false,
             enable_main_body_distillation: false,
             main_body_distillation_threshold: 0.60,
@@ -413,6 +438,7 @@ mod tests {
                 depth: 0,
                 bounds: None,
             }],
+            focused_element: None,
             browser_url: Some("https://example.com".to_string()),
             timestamp: now,
             node_count: 1,
@@ -455,6 +481,8 @@ mod tests {
             browser_url: None,
             focused: true,
             capture_trigger: "idle",
+            capture_provenance: "focused_window",
+            force_ocr: false,
             use_pii_removal: false,
             enable_main_body_distillation: false,
             main_body_distillation_threshold: 0.60,
@@ -468,6 +496,7 @@ mod tests {
             window_bounds: None,
             text_content: String::new(),
             nodes: vec![],
+            focused_element: None,
             browser_url: None,
             timestamp: now,
             node_count: 0,

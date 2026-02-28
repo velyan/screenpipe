@@ -8,7 +8,8 @@
 //! the focused window's tree and extract all visible text — matching macOS behavior.
 
 use super::{
-    AccessibilityTreeNode, TreeSnapshot, TreeWalkerConfig, TreeWalkerPlatform, WindowBounds,
+    AccessibilityTreeNode, FocusedElementContext, TreeSnapshot, TreeWalkerConfig,
+    TreeWalkerPlatform, WindowBounds,
 };
 use crate::events::AccessibilityNode;
 use crate::platform::windows_uia::UiaContext;
@@ -24,20 +25,6 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
 };
-
-/// Excluded apps — password managers and security tools (matches macOS list).
-const EXCLUDED_APPS: &[&str] = &[
-    "1password",
-    "bitwarden",
-    "lastpass",
-    "dashlane",
-    "keepassxc",
-    "credential manager",
-    "logonui",
-];
-
-/// Window title patterns that indicate sensitive content.
-const SENSITIVE_TITLES: &[&str] = &["password", "private", "incognito", "secret"];
 
 /// UIA control types that should be skipped (decorative, not text-bearing).
 const SKIP_TYPES: &[&str] = &[
@@ -176,9 +163,8 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
         let app_name = crate::platform::windows::get_process_name(pid)
             .unwrap_or_else(|| "Unknown".to_string());
 
-        // Skip excluded apps
-        let app_lower = app_name.to_lowercase();
-        if EXCLUDED_APPS.iter().any(|ex| app_lower.contains(ex)) {
+        // Skip configured blocked apps.
+        if matches_any_pattern_case_insensitive(&app_name, &self.config.blocked_apps) {
             return Ok(None);
         }
 
@@ -208,9 +194,8 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
             None
         };
 
-        // Skip sensitive windows
-        let window_lower = window_name.to_lowercase();
-        if SENSITIVE_TITLES.iter().any(|s| window_lower.contains(s)) {
+        // Skip windows that match configured blocked title keywords.
+        if matches_any_pattern_case_insensitive(&window_name, &self.config.blocked_title_keywords) {
             return Ok(None);
         }
 
@@ -224,6 +209,7 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
             Some(tree) => tree,
             None => return Ok(None),
         };
+        let focused_element = extract_focused_element_context(&root);
 
         // Extract text from the tree (matching macOS text extraction behavior)
         let mut text_buffer = String::with_capacity(4096);
@@ -271,6 +257,7 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
             window_bounds,
             text_content: text_buffer,
             nodes,
+            focused_element,
             browser_url: None,
             timestamp: Utc::now(),
             node_count,
@@ -282,6 +269,48 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
             max_depth_reached: 0,
         }))
     }
+}
+
+fn extract_focused_element_context(root: &AccessibilityNode) -> Option<FocusedElementContext> {
+    let node = find_focused_node(root)?;
+    let name = node
+        .name
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let input_text = node
+        .value
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    Some(FocusedElementContext {
+        role: node.control_type.clone(),
+        name,
+        input_text,
+        selected_text: None,
+        bounds: None,
+    })
+}
+
+fn matches_any_pattern_case_insensitive(haystack: &str, patterns: &[String]) -> bool {
+    let haystack_lower = haystack.to_lowercase();
+    patterns
+        .iter()
+        .any(|pattern| haystack_lower.contains(&pattern.to_lowercase()))
+}
+
+fn find_focused_node(node: &AccessibilityNode) -> Option<&AccessibilityNode> {
+    if node.is_focused == Some(true) {
+        return Some(node);
+    }
+
+    for child in &node.children {
+        if let Some(found) = find_focused_node(child) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 /// Recursively extract text from the accessibility tree.
@@ -475,19 +504,31 @@ mod tests {
     }
 
     #[test]
-    fn test_excluded_apps() {
-        assert!(EXCLUDED_APPS.iter().any(|ex| "1password".contains(ex)));
-        assert!(!EXCLUDED_APPS.iter().any(|ex| "notepad".contains(ex)));
+    fn test_default_blocked_apps_patterns() {
+        let defaults = super::default_blocked_apps();
+        assert!(matches_any_pattern_case_insensitive("1Password", &defaults));
+        assert!(!matches_any_pattern_case_insensitive("Notepad", &defaults));
     }
 
     #[test]
-    fn test_sensitive_titles() {
-        assert!(SENSITIVE_TITLES
-            .iter()
-            .any(|s| "enter password".contains(s)));
-        assert!(SENSITIVE_TITLES
-            .iter()
-            .any(|s| "private browsing".contains(s)));
-        assert!(!SENSITIVE_TITLES.iter().any(|s| "calculator".contains(s)));
+    fn test_default_blocked_title_patterns() {
+        let defaults = super::default_blocked_title_keywords();
+        assert!(matches_any_pattern_case_insensitive(
+            "Enter password",
+            &defaults
+        ));
+        assert!(!matches_any_pattern_case_insensitive(
+            "Calculator",
+            &defaults
+        ));
+    }
+
+    #[test]
+    fn test_pattern_matching_is_case_insensitive() {
+        let patterns = vec!["secret".to_string()];
+        assert!(matches_any_pattern_case_insensitive(
+            "Very SECRET data",
+            &patterns
+        ));
     }
 }

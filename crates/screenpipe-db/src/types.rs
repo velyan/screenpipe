@@ -88,6 +88,7 @@ pub struct OCRResultRaw {
     pub tags: Option<String>,
     pub browser_url: Option<String>,
     pub focused: Option<bool>,
+    pub capture_provenance: Option<String>,
     pub device_name: String,
 }
 
@@ -108,6 +109,7 @@ pub struct OCRResult {
     pub tags: Vec<String>,
     pub browser_url: Option<String>,
     pub focused: Option<bool>,
+    pub capture_provenance: Option<String>,
     pub device_name: String,
 }
 
