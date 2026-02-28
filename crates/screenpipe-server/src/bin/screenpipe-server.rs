@@ -494,6 +494,8 @@ async fn main() -> anyhow::Result<()> {
     cli.vad_engine = record_args.vad_engine.clone();
     cli.ignored_windows = record_args.ignored_windows.clone();
     cli.included_windows = record_args.included_windows.clone();
+    cli.blocked_apps = record_args.blocked_apps.clone();
+    cli.blocked_title_keywords = record_args.blocked_title_keywords.clone();
     cli.ignored_urls = record_args.ignored_urls.clone();
     cli.deepgram_api_key = record_args.deepgram_api_key.clone();
     cli.auto_destruct_pid = record_args.auto_destruct_pid;
@@ -632,6 +634,8 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_tx_clone = shutdown_tx.clone();
     let ignored_windows_clone = cli.ignored_windows.clone();
     let included_windows_clone = cli.included_windows.clone();
+    let blocked_apps_clone = cli.blocked_apps.clone();
+    let blocked_title_keywords_clone = cli.blocked_title_keywords.clone();
     // Create UI recorder config early before cli is moved
     let ui_recorder_config = config.to_ui_recorder_config();
 
@@ -765,6 +769,12 @@ async fn main() -> anyhow::Result<()> {
     );
     server.vision_metrics = vision_metrics;
     server.audio_metrics = audio_manager.metrics.clone();
+    server.ignored_windows = config.ignored_windows.clone();
+    server.included_windows = config.included_windows.clone();
+    server.blocked_apps = config.blocked_apps.clone();
+    server.blocked_title_keywords = config.blocked_title_keywords.clone();
+    server.enable_main_body_distillation = config.enable_main_body_distillation;
+    server.main_body_distillation_threshold = config.main_body_distillation_threshold;
     server.hot_frame_cache = Some(hot_frame_cache);
 
     // Attach sync handle if sync is enabled
@@ -885,6 +895,14 @@ async fn main() -> anyhow::Result<()> {
     println!(
         "│ included windows       │ {:<34} │",
         format_cell(&format!("{:?}", &included_windows_clone), VALUE_WIDTH)
+    );
+    println!(
+        "│ blocked apps (AX)      │ {:<34} │",
+        format_cell(&format!("{:?}", &blocked_apps_clone), VALUE_WIDTH)
+    );
+    println!(
+        "│ blocked title keys     │ {:<34} │",
+        format_cell(&format!("{:?}", &blocked_title_keywords_clone), VALUE_WIDTH)
     );
     println!(
         "│ cloud sync             │ {:<34} │",

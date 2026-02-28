@@ -40,6 +40,7 @@ use crate::{
             search_speakers_handler, undo_speaker_reassign_handler, update_speaker_handler,
         },
         streaming::{handle_video_export_post, handle_video_export_ws, stream_frames_handler},
+        vision::{active_window_health, capture_active_window, latest_active_window},
         websocket::{ws_events_handler, ws_health_handler, ws_metrics_handler},
     },
     sync_api::{self, SyncState},
@@ -108,6 +109,15 @@ pub struct AppState {
     pub vision_metrics: Arc<screenpipe_vision::PipelineMetrics>,
     /// Audio pipeline metrics (shared across all devices)
     pub audio_metrics: Arc<screenpipe_audio::metrics::AudioPipelineMetrics>,
+    /// Window filters used by active-window capture endpoints.
+    pub ignored_windows: Vec<String>,
+    pub included_windows: Vec<String>,
+    /// AX privacy policy.
+    pub blocked_apps: Vec<String>,
+    pub blocked_title_keywords: Vec<String>,
+    /// Main-body distillation settings for synchronous active-window capture.
+    pub enable_main_body_distillation: bool,
+    pub main_body_distillation_threshold: f32,
     /// Limits concurrent ffmpeg frame extractions to prevent CPU thrashing
     /// when many thumbnails are requested in parallel (e.g., search results).
     pub frame_extraction_semaphore: Arc<tokio::sync::Semaphore>,
@@ -131,6 +141,12 @@ pub struct SCServer {
     pipe_manager: Option<crate::pipes_api::SharedPipeManager>,
     pub vision_metrics: Arc<screenpipe_vision::PipelineMetrics>,
     pub audio_metrics: Arc<screenpipe_audio::metrics::AudioPipelineMetrics>,
+    pub ignored_windows: Vec<String>,
+    pub included_windows: Vec<String>,
+    pub blocked_apps: Vec<String>,
+    pub blocked_title_keywords: Vec<String>,
+    pub enable_main_body_distillation: bool,
+    pub main_body_distillation_threshold: f32,
     /// Shared hot frame cache — set this before starting the server so AppState uses it.
     pub hot_frame_cache: Option<Arc<HotFrameCache>>,
 }
@@ -161,6 +177,13 @@ impl SCServer {
             pipe_manager: None,
             vision_metrics: Arc::new(screenpipe_vision::PipelineMetrics::new()),
             audio_metrics,
+            ignored_windows: Vec::new(),
+            included_windows: Vec::new(),
+            blocked_apps: screenpipe_accessibility::tree::default_blocked_apps(),
+            blocked_title_keywords: screenpipe_accessibility::tree::default_blocked_title_keywords(
+            ),
+            enable_main_body_distillation: false,
+            main_body_distillation_threshold: 0.60,
             hot_frame_cache: None,
         }
     }
@@ -365,6 +388,12 @@ impl SCServer {
             pipe_manager: self.pipe_manager.clone(),
             vision_metrics: self.vision_metrics.clone(),
             audio_metrics: self.audio_metrics.clone(),
+            ignored_windows: self.ignored_windows.clone(),
+            included_windows: self.included_windows.clone(),
+            blocked_apps: self.blocked_apps.clone(),
+            blocked_title_keywords: self.blocked_title_keywords.clone(),
+            enable_main_body_distillation: self.enable_main_body_distillation,
+            main_body_distillation_threshold: self.main_body_distillation_threshold,
             // Allow up to 3 concurrent ffmpeg extractions. Beyond this, requests
             // queue rather than thrashing CPU with 15+ parallel ffmpeg processes
             // (typical when search results load all thumbnails at once).
@@ -385,6 +414,9 @@ impl SCServer {
             .get("/search", search)
             .get("/audio/list", api_list_audio_devices)
             .get("/vision/list", api_list_monitors)
+            .post("/vision/capture-active-window", capture_active_window)
+            .get("/vision/latest-active-window", latest_active_window)
+            .get("/vision/active-window/health", active_window_health)
             .post("/tags/vision/batch", get_tags_batch)
             .post("/tags/:content_type/:id", add_tags)
             .delete("/tags/:content_type/:id", remove_tags)

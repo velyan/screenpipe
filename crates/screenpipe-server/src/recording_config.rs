@@ -46,6 +46,8 @@ pub struct RecordingConfig {
     // Filters
     pub ignored_windows: Vec<String>,
     pub included_windows: Vec<String>,
+    pub blocked_apps: Vec<String>,
+    pub blocked_title_keywords: Vec<String>,
     pub ignored_urls: Vec<String>,
     pub languages: Vec<Language>,
 
@@ -82,6 +84,8 @@ impl RecordingConfig {
             excluded_windows: self.ignored_windows.clone(),
             ignored_windows: self.ignored_windows.clone(),
             included_windows: self.included_windows.clone(),
+            blocked_apps: self.blocked_apps.clone(),
+            blocked_title_keywords: self.blocked_title_keywords.clone(),
             ..Default::default()
         }
     }
@@ -118,6 +122,8 @@ impl RecordingConfig {
             output_path,
             ignored_windows: self.ignored_windows.clone(),
             included_windows: self.included_windows.clone(),
+            blocked_apps: self.blocked_apps.clone(),
+            blocked_title_keywords: self.blocked_title_keywords.clone(),
             vision_metrics,
             use_pii_removal: self.use_pii_removal,
             enable_main_body_distillation: self.enable_main_body_distillation,

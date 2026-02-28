@@ -54,6 +54,10 @@ pub struct UiRecorderConfig {
     pub ignored_windows: Vec<String>,
     /// User-configured included windows (whitelist for tree walker)
     pub included_windows: Vec<String>,
+    /// App-name substrings blocked by AX privacy policy.
+    pub blocked_apps: Vec<String>,
+    /// Window-title substrings blocked by AX privacy policy.
+    pub blocked_title_keywords: Vec<String>,
     /// Batch size for database inserts
     pub batch_size: usize,
     /// Batch timeout in milliseconds
@@ -84,6 +88,9 @@ impl Default for UiRecorderConfig {
             excluded_windows: Vec::new(),
             ignored_windows: Vec::new(),
             included_windows: Vec::new(),
+            blocked_apps: screenpipe_accessibility::tree::default_blocked_apps(),
+            blocked_title_keywords: screenpipe_accessibility::tree::default_blocked_title_keywords(
+            ),
             batch_size: 100,
             batch_timeout_ms: 1000,
             enable_tree_walker: true,
@@ -382,6 +389,8 @@ pub async fn start_ui_recording(
         let rt_handle = tokio::runtime::Handle::current();
         let ignored_windows_clone = config.ignored_windows.clone();
         let included_windows_clone = config.included_windows.clone();
+        let blocked_apps_clone = config.blocked_apps.clone();
+        let blocked_title_keywords_clone = config.blocked_title_keywords.clone();
 
         // Run the entire tree walker loop in a dedicated thread since AX APIs are synchronous IPC.
         // On Windows we use std::thread instead of spawn_blocking because COM (UIA) requires
@@ -402,6 +411,8 @@ pub async fn start_ui_recording(
                             tree_wake,
                             ignored_windows_clone,
                             included_windows_clone,
+                            blocked_apps_clone,
+                            blocked_title_keywords_clone,
                         );
                     })) {
                         error!("tree-walker thread panicked: {:?}", e);
@@ -425,6 +436,8 @@ pub async fn start_ui_recording(
                         tree_wake,
                         ignored_windows_clone,
                         included_windows_clone,
+                        blocked_apps_clone,
+                        blocked_title_keywords_clone,
                     );
                 })) {
                     error!("tree-walker thread panicked: {:?}", e);
@@ -540,6 +553,8 @@ fn run_tree_walker(
     wake_signal: WakeSignal,
     ignored_windows: Vec<String>,
     included_windows: Vec<String>,
+    blocked_apps: Vec<String>,
+    blocked_title_keywords: Vec<String>,
 ) {
     info!("Starting AX tree walker (interval: {:?})", walk_interval);
 
@@ -547,6 +562,8 @@ fn run_tree_walker(
         walk_interval,
         ignored_windows,
         included_windows,
+        blocked_apps,
+        blocked_title_keywords,
         ..Default::default()
     };
     let walker = create_tree_walker(tree_config);

@@ -743,99 +743,116 @@ async fn do_capture(
 
     // Capture image + metadata with strict ownership when focused-window mode works,
     // but fall back to monitor capture when focus resolution is unavailable.
-    let (image, tree_snapshot, app_name_owned, window_name_owned, browser_url_owned) =
-        match resolution {
-            FocusedWindowResolution::Resolved(resolved) => {
-                let ResolvedFocusedWindow {
-                    tree_snapshot,
-                    captured_window,
-                } = resolved;
-                debug!(
-                    "focused window captured: app='{}', window='{}', monitor={}",
-                    captured_window.app_name, captured_window.window_name, monitor_id
-                );
-                let screenpipe_vision::capture_screenshot_by_window::CapturedWindow {
-                    image,
-                    app_name,
-                    window_name,
-                    browser_url,
-                    ..
-                } = captured_window;
-                let browser_url = browser_url.or_else(|| tree_snapshot.browser_url.clone());
-                (
-                    image,
-                    Some(tree_snapshot),
-                    Some(app_name),
-                    Some(window_name),
-                    browser_url,
-                )
-            }
-            FocusedWindowResolution::SkipNotOwner => {
-                return Ok(CaptureOutput {
-                    result: None,
-                    image: None,
-                });
-            }
-            FocusedWindowResolution::Fallback {
+    let (
+        image,
+        tree_snapshot,
+        app_name_owned,
+        window_name_owned,
+        browser_url_owned,
+        focused,
+        capture_provenance,
+    ) = match resolution {
+        FocusedWindowResolution::Resolved(resolved) => {
+            let ResolvedFocusedWindow {
                 tree_snapshot,
-                reason,
-            } => {
-                debug!(
-                    "focused capture fallback to monitor screenshot for monitor {} (reason={})",
-                    monitor_id, reason
-                );
-                let (image, capture_dur) = capture_monitor_image(monitor).await?;
-                debug!(
-                    "fallback monitor screenshot captured in {:?} for monitor {}",
-                    capture_dur, monitor_id
-                );
-                let mut app_name = tree_snapshot
-                    .as_ref()
-                    .map(|s| s.app_name.clone())
-                    .filter(|s| !s.trim().is_empty());
-                let mut window_name = tree_snapshot
-                    .as_ref()
-                    .map(|s| s.window_name.clone())
-                    .filter(|s| !s.trim().is_empty());
-                let mut browser_url = tree_snapshot.as_ref().and_then(|s| s.browser_url.clone());
+                captured_window,
+            } = resolved;
+            debug!(
+                "focused window captured: app='{}', window='{}', monitor={}",
+                captured_window.app_name, captured_window.window_name, monitor_id
+            );
+            let screenpipe_vision::capture_screenshot_by_window::CapturedWindow {
+                image,
+                app_name,
+                window_name,
+                browser_url,
+                ..
+            } = captured_window;
+            let browser_url = browser_url.or_else(|| tree_snapshot.browser_url.clone());
+            (
+                image,
+                Some(tree_snapshot),
+                Some(app_name),
+                Some(window_name),
+                browser_url,
+                true,
+                "focused_window",
+            )
+        }
+        FocusedWindowResolution::SkipNotOwner => {
+            return Ok(CaptureOutput {
+                result: None,
+                image: None,
+            });
+        }
+        FocusedWindowResolution::Fallback {
+            tree_snapshot,
+            reason,
+        } => {
+            debug!(
+                "focused capture fallback to monitor screenshot for monitor {} (reason={})",
+                monitor_id, reason
+            );
+            let (image, capture_dur) = capture_monitor_image(monitor).await?;
+            debug!(
+                "fallback monitor screenshot captured in {:?} for monitor {}",
+                capture_dur, monitor_id
+            );
+            let mut app_name = tree_snapshot
+                .as_ref()
+                .map(|s| s.app_name.clone())
+                .filter(|s| !s.trim().is_empty());
+            let mut window_name = tree_snapshot
+                .as_ref()
+                .map(|s| s.window_name.clone())
+                .filter(|s| !s.trim().is_empty());
+            let mut browser_url = tree_snapshot.as_ref().and_then(|s| s.browser_url.clone());
 
-                // Fallback metadata probe: when focused-window resolution fails,
-                // derive app/window from the topmost visible window on this monitor
-                // so snapshot rows don't lose context (`app_name/window_name = NULL`).
-                if app_name.is_none() || window_name.is_none() {
-                    let window_filters = WindowFilters::new(
-                        &tree_walker_config.ignored_windows,
-                        &tree_walker_config.included_windows,
-                        &[],
-                    );
-                    if let Some(topmost_window) = capture_windows(monitor, &window_filters, false)
-                        .await
-                        .into_iter()
-                        .next()
-                    {
-                        debug!(
+            // Fallback metadata probe: when focused-window resolution fails,
+            // derive app/window from the topmost visible window on this monitor
+            // so snapshot rows don't lose context (`app_name/window_name = NULL`).
+            if app_name.is_none() || window_name.is_none() {
+                let window_filters = WindowFilters::new(
+                    &tree_walker_config.ignored_windows,
+                    &tree_walker_config.included_windows,
+                    &[],
+                );
+                if let Some(topmost_window) = capture_windows(monitor, &window_filters, false)
+                    .await
+                    .into_iter()
+                    .next()
+                {
+                    debug!(
                             "fallback metadata resolved from topmost window on monitor {}: app='{}', window='{}'",
                             monitor_id, topmost_window.app_name, topmost_window.window_name
                         );
-                        if app_name.is_none() {
-                            app_name = Some(topmost_window.app_name);
-                        }
-                        if window_name.is_none() {
-                            window_name = Some(topmost_window.window_name);
-                        }
-                        if browser_url.is_none() {
-                            browser_url = topmost_window.browser_url;
-                        }
-                    } else {
-                        debug!(
-                            "fallback metadata unavailable on monitor {} (reason={})",
-                            monitor_id, reason
-                        );
+                    if app_name.is_none() {
+                        app_name = Some(topmost_window.app_name);
                     }
+                    if window_name.is_none() {
+                        window_name = Some(topmost_window.window_name);
+                    }
+                    if browser_url.is_none() {
+                        browser_url = topmost_window.browser_url;
+                    }
+                } else {
+                    debug!(
+                        "fallback metadata unavailable on monitor {} (reason={})",
+                        monitor_id, reason
+                    );
                 }
-                (image, tree_snapshot, app_name, window_name, browser_url)
             }
-        };
+            (
+                image,
+                tree_snapshot,
+                app_name,
+                window_name,
+                browser_url,
+                false,
+                "monitor_fallback",
+            )
+        }
+    };
 
     // Content dedup: skip capture if accessibility text hasn't changed.
     // Never dedup Idle/Manual triggers — these are fallback captures that must
@@ -915,8 +932,10 @@ async fn do_capture(
         app_name: app_name_owned.as_deref(),
         window_name: window_name_owned.as_deref(),
         browser_url: browser_url_owned.as_deref(),
-        focused: true, // event-driven captures are always for the focused window
+        focused,
         capture_trigger: trigger.as_str(),
+        capture_provenance,
+        force_ocr: false,
         use_pii_removal,
         enable_main_body_distillation,
         main_body_distillation_threshold,
