@@ -411,23 +411,24 @@ fn focused_candidate_score(
     is_focused: bool,
     window_bounds: &Rect,
     target: &FocusedWindowTarget,
-) -> Option<(u8, u64, u8)> {
+) -> Option<(u8, u64, u8, u8)> {
     let pid_match = process_id == target.process_id;
     let overlap = window_bounds.intersection_area(&target.bounds);
     let title_match = title_matches(&target.window_name, window_name);
 
+    // A same-PID candidate with no overlap is likely stale/off-screen in multi-window apps.
+    // Require positive geometric overlap to keep focused-window capture aligned with target bounds.
     if pid_match {
-        return Some((
-            if title_match { 2 } else { 1 },
-            overlap,
-            u8::from(is_focused),
-        ));
+        if overlap == 0 {
+            return None;
+        }
+        return Some((1, overlap, u8::from(title_match), u8::from(is_focused)));
     }
 
     // Fallback when PID lookup is unstable (e.g. elevated/system windows on Windows):
     // accept focused windows that overlap the expected bounds.
     if is_focused && overlap > 0 {
-        return Some((0, overlap, 1));
+        return Some((0, overlap, 0, 1));
     }
 
     None
@@ -1126,7 +1127,7 @@ fn capture_focused_window_sck(
 ) -> Result<Option<CapturedWindow>, Box<dyn Error>> {
     let windows = SckWindow::all()?;
     let mut best: Option<(
-        (u8, u64, u8),
+        (u8, u64, u8, u8),
         SckWindow,
         String,
         String,
@@ -1253,7 +1254,7 @@ fn capture_focused_window_xcap_macos(
 ) -> Result<Option<CapturedWindow>, Box<dyn Error>> {
     let windows = XcapWindow::all()?;
     let mut best: Option<(
-        (u8, u64, u8),
+        (u8, u64, u8, u8),
         XcapWindow,
         String,
         String,
@@ -1380,7 +1381,7 @@ fn capture_focused_window_xcap(
 ) -> Result<Option<CapturedWindow>, Box<dyn Error>> {
     let windows = Window::all()?;
     let mut best: Option<(
-        (u8, u64, u8),
+        (u8, u64, u8, u8),
         Window,
         String,
         String,
@@ -1698,6 +1699,82 @@ pub async fn capture_all_visible_windows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_focused_target() -> FocusedWindowTarget {
+        FocusedWindowTarget {
+            process_id: 4242,
+            app_name: "Arc".to_string(),
+            window_name: "Target Tab".to_string(),
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+        }
+    }
+
+    #[test]
+    fn test_focused_candidate_score_requires_overlap_for_pid_match() {
+        let target = test_focused_target();
+        let offscreen_bounds = Rect {
+            x: 1000,
+            y: 1000,
+            width: 100,
+            height: 100,
+        };
+
+        let score = focused_candidate_score(
+            target.process_id,
+            &target.window_name,
+            true,
+            &offscreen_bounds,
+            &target,
+        );
+
+        assert!(
+            score.is_none(),
+            "same-PID windows with zero overlap must not be selected"
+        );
+    }
+
+    #[test]
+    fn test_focused_candidate_score_prioritizes_overlap_before_title() {
+        let target = test_focused_target();
+
+        let small_overlap_score = focused_candidate_score(
+            target.process_id,
+            &target.window_name,
+            true,
+            &Rect {
+                x: 95,
+                y: 95,
+                width: 20,
+                height: 20,
+            },
+            &target,
+        )
+        .expect("small overlap same-PID candidate should score");
+
+        let large_overlap_score = focused_candidate_score(
+            target.process_id,
+            "Different Title",
+            true,
+            &Rect {
+                x: 10,
+                y: 10,
+                width: 80,
+                height: 80,
+            },
+            &target,
+        )
+        .expect("large overlap same-PID candidate should score");
+
+        assert!(
+            large_overlap_score > small_overlap_score,
+            "geometry overlap must outrank title similarity for same-PID candidates"
+        );
+    }
 
     // ==================== is_url_blocked tests ====================
 

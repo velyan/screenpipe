@@ -592,6 +592,8 @@ impl SettingsStore {
             use_all_monitors: self.use_all_monitors,
             ignored_windows: self.ignored_windows.clone(),
             included_windows: self.included_windows.clone(),
+            blocked_apps: screenpipe_accessibility::tree::default_blocked_apps(),
+            blocked_title_keywords: screenpipe_accessibility::tree::default_blocked_title_keywords(),
             ignored_urls: self.ignored_urls.clone(),
             languages: self.languages.iter()
                 .filter(|s| s != &"default")
