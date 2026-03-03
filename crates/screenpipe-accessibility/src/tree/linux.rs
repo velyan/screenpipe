@@ -17,7 +17,7 @@
 
 use super::{
     AccessibilityTreeNode, NodeBounds, TreeSnapshot, TreeWalkerConfig, TreeWalkerPlatform,
-    TruncationReason,
+    TruncationReason, WindowBounds,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -860,7 +860,7 @@ impl TreeWalkerPlatform for LinuxTreeWalker {
         let conn = unsafe { self.ensure_init()? };
 
         // Find the focused window
-        let (app_name, window_title, window_ref, _pid) = match find_focused_window(conn) {
+        let (app_name, window_title, window_ref, pid) = match find_focused_window(conn) {
             Some(result) => result,
             None => return Ok(None),
         };
@@ -903,6 +903,17 @@ impl TreeWalkerPlatform for LinuxTreeWalker {
             }
         }
 
+        let window_bounds = if state.window_w > 0.0 && state.window_h > 0.0 {
+            Some(WindowBounds {
+                x: state.window_x,
+                y: state.window_y,
+                width: state.window_w,
+                height: state.window_h,
+            })
+        } else {
+            None
+        };
+
         // Walk the accessibility tree
         walk_accessible(conn, &window_ref, 0, &mut state);
 
@@ -943,8 +954,11 @@ impl TreeWalkerPlatform for LinuxTreeWalker {
         Ok(Some(TreeSnapshot {
             app_name,
             window_name: window_title,
+            process_id: Some(pid),
+            window_bounds,
             text_content,
             nodes: state.nodes,
+            focused_element: None,
             browser_url,
             timestamp: Utc::now(),
             node_count: state.node_count,

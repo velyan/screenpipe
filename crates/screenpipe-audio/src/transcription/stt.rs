@@ -145,13 +145,12 @@ pub async fn stt(
     vocabulary: &[VocabularyEntry],
     alternate_stt: Option<AlternateSttEngine>,
 ) -> Result<String> {
-    let transcription: Result<String> = if *audio_transcription_engine
-        == AudioTranscriptionEngine::Disabled
-    {
-        Ok(String::new())
-    } else if audio_transcription_engine == AudioTranscriptionEngine::Deepgram.into() {
-        // Deepgram implementation
-        let api_key = deepgram_api_key.unwrap_or_default();
+    let transcription: Result<String> =
+        if *audio_transcription_engine == AudioTranscriptionEngine::Disabled {
+            Ok(String::new())
+        } else if audio_transcription_engine == AudioTranscriptionEngine::Deepgram.into() {
+            // Deepgram implementation
+            let api_key = deepgram_api_key.unwrap_or_default();
 
             match transcribe_with_deepgram(
                 &api_key,
@@ -169,14 +168,14 @@ pub async fn stt(
                         "device: {}, deepgram transcription failed, falling back to Whisper: {:?}",
                         device, e
                     );
-                // Fallback to Whisper
-                process_with_whisper(audio, languages.clone(), whisper_state, vocabulary).await
+                    // Fallback to Whisper
+                    process_with_whisper(audio, languages.clone(), whisper_state, vocabulary).await
+                }
             }
-        }
-    } else {
-        // Existing Whisper implementation
-        process_with_whisper(audio, languages, whisper_state, vocabulary).await
-    };
+        } else {
+            // Existing Whisper implementation
+            process_with_whisper(audio, languages, whisper_state, vocabulary).await
+        };
 
     // Post-processing: apply vocabulary replacements
     match transcription {

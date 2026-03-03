@@ -174,6 +174,8 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
             let len = GetWindowTextW(hwnd, &mut buf);
             String::from_utf16_lossy(&buf[..len as usize])
         };
+        let app_lower = app_name.to_lowercase();
+        let window_lower = window_name.to_lowercase();
 
         // Resolve focused window geometry.
         let mut rect = RECT::default();
