@@ -20,8 +20,6 @@ on:
         description: "Force GitHub-hosted runners (skip self-hosted even if online)"
         type: boolean
         default: false
-  push:
-    branches: [main]
 
 jobs:
   check_commit:
