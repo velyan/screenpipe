@@ -28,6 +28,8 @@ pub struct RecordingConfig {
     pub disable_audio: bool,
     pub disable_vision: bool,
     pub use_pii_removal: bool,
+    /// Filter music-dominant audio before transcription using spectral analysis.
+    pub filter_music: bool,
     pub enable_main_body_distillation: bool,
     pub main_body_distillation_threshold: f32,
     pub enable_input_capture: bool,

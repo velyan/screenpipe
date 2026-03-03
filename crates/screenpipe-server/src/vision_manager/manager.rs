@@ -265,6 +265,7 @@ impl VisionManager {
                 use_pii_removal,
                 enable_main_body_distillation,
                 main_body_distillation_threshold,
+                None,
             )
             .await
             {

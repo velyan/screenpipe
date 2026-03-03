@@ -219,6 +219,7 @@ pub async fn event_driven_capture_loop(
     use_pii_removal: bool,
     enable_main_body_distillation: bool,
     main_body_distillation_threshold: f32,
+    power_profile_rx: Option<watch::Receiver<PowerProfile>>,
 ) -> Result<()> {
     info!(
         "event-driven capture started for monitor {} (device: {})",

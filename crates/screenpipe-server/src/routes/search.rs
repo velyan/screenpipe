@@ -21,7 +21,7 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
-use tracing::{debug, error};
+use tracing::{debug, error, info};
 
 use crate::analytics;
 use crate::server::AppState;

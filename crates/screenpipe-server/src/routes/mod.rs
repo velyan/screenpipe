@@ -15,5 +15,6 @@ pub mod retranscribe;
 pub mod search;
 pub mod speakers;
 pub mod streaming;
+pub mod time;
 pub mod vision;
 pub mod websocket;

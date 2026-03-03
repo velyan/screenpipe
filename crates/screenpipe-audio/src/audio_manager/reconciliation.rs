@@ -118,28 +118,13 @@ pub async fn reconcile_untranscribed(
             continue;
         }
 
-        // Decode audio from file (blocking ffmpeg call — run off the async runtime)
-        let path_owned = chunk.file_path.clone();
-        let (samples, sample_rate) =
-            match tokio::task::spawn_blocking(move || read_audio_from_file(Path::new(&path_owned)))
-                .await
-            {
-                Ok(Ok(result)) => result,
-                Ok(Err(e)) => {
-                    error!(
-                        "reconciliation: failed to read audio for chunk {}: {}",
-                        chunk.id, e
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    error!(
-                        "reconciliation: spawn_blocking panicked for chunk {}: {}",
-                        chunk.id, e
-                    );
-                    continue;
-                }
-            };
+        let batch_duration = combined_samples.len() as f64 / sample_rate as f64;
+        debug!(
+            "reconciliation: transcribing batch of {} chunks ({:.0}s) for {}",
+            valid_chunks.len(),
+            batch_duration,
+            device_name
+        );
 
         // Create a session for this batch
         let mut session = match transcription_engine.create_session() {
@@ -166,7 +151,7 @@ pub async fn reconcile_untranscribed(
         {
             Ok(t) => t,
             Err(e) => {
-                error!("reconciliation: stt failed for chunk {}: {}", chunk.id, e);
+                error!("reconciliation: transcription failed for batch: {}", e);
                 continue;
             }
         };

@@ -577,6 +577,7 @@ impl RecordArgs {
             disable_audio: self.disable_audio,
             disable_vision: self.disable_vision,
             use_pii_removal: self.use_pii_removal,
+            filter_music: false,
             enable_main_body_distillation: self.enable_main_body_distillation,
             main_body_distillation_threshold: self.main_body_distillation_threshold,
             enable_input_capture: self.enable_input_capture,

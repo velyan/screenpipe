@@ -132,13 +132,15 @@ pub async fn paired_capture(
     // Only run OCR when needed by text availability, app policy, or API strict include_ocr.
     let should_run_ocr = ctx.force_ocr || !has_accessibility_text;
     let (ocr_text, ocr_text_json) = if should_run_ocr {
-        let image_for_ocr = ctx.image.clone();
-        let ocr_result = tokio::task::spawn_blocking(move || {
-            #[cfg(target_os = "macos")]
-            {
-                let (text, json, _confidence) =
-                    screenpipe_vision::perform_ocr_apple(&image_for_ocr, &[]);
-                (text, json)
+        // Windows native OCR is async, so call it directly (not inside spawn_blocking)
+        #[cfg(target_os = "windows")]
+        {
+            match screenpipe_vision::perform_ocr_windows(&ctx.image).await {
+                Ok((text, json, _confidence)) => (text, json),
+                Err(e) => {
+                    warn!("windows OCR failed: {}", e);
+                    (String::new(), "[]".to_string())
+                }
             }
         }
         // Apple and Tesseract OCR are sync, use spawn_blocking
