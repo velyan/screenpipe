@@ -276,6 +276,7 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
         Ok(Some(TreeSnapshot {
             app_name,
             window_name,
+            window_id: None,
             process_id: Some(pid),
             window_bounds,
             text_content: text_buffer,

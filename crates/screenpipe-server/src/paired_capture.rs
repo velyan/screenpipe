@@ -465,6 +465,7 @@ mod tests {
         let snap = TreeSnapshot {
             app_name: "Safari".to_string(),
             window_name: "Example Page".to_string(),
+            window_id: None,
             process_id: None,
             window_bounds: None,
             text_content: "Hello World - Example Page".to_string(),
@@ -528,6 +529,7 @@ mod tests {
         let snap = TreeSnapshot {
             app_name: "TestApp".to_string(),
             window_name: String::new(),
+            window_id: None,
             process_id: None,
             window_bounds: None,
             text_content: String::new(),

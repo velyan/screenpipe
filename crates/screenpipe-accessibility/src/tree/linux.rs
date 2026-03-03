@@ -954,6 +954,7 @@ impl TreeWalkerPlatform for LinuxTreeWalker {
         Ok(Some(TreeSnapshot {
             app_name,
             window_name: window_title,
+            window_id: None,
             process_id: Some(pid),
             window_bounds,
             text_content,

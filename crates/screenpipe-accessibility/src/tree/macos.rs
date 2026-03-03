@@ -285,6 +285,7 @@ impl MacosTreeWalker {
         let window: &ax::UiElement = unsafe { std::mem::transmute(&*window_val) };
 
         let window_name = get_string_attr(window, ax::attr::title()).unwrap_or_default();
+        let window_id = get_u32_attr_by_name(window, "AXWindowNumber");
 
         // Skip windows with configured blocked title keywords
         let window_lower = window_name.to_lowercase();
@@ -382,6 +383,7 @@ impl MacosTreeWalker {
         Ok(Some(TreeSnapshot {
             app_name,
             window_name,
+            window_id,
             process_id: u32::try_from(pid).ok(),
             window_bounds,
             text_content,
@@ -792,6 +794,16 @@ fn get_string_attr(elem: &ax::UiElement, attr: &ax::Attr) -> Option<String> {
             None
         }
     })
+}
+
+/// Extract a numeric attribute (u32) from an AX element by attribute name.
+fn get_u32_attr_by_name(elem: &ax::UiElement, attr_name: &str) -> Option<u32> {
+    let attr_name = cf::String::from_str(attr_name);
+    let attr = ax::Attr::with_string(&attr_name);
+    elem.attr_value(&attr)
+        .ok()
+        .and_then(|v| v.try_as_number().and_then(|n| n.to_i64()))
+        .and_then(|n| u32::try_from(n).ok())
 }
 
 #[cfg(test)]

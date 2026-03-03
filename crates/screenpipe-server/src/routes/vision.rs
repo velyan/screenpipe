@@ -382,6 +382,7 @@ async fn resolve_active_window(
         process_id: process_id_i32,
         app_name: tree_snapshot.app_name.clone(),
         window_name: tree_snapshot.window_name.clone(),
+        window_id: tree_snapshot.window_id,
         bounds: target_bounds,
     };
 

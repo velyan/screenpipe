@@ -715,6 +715,7 @@ async fn resolve_focused_window_for_monitor(
         process_id: process_id_i32,
         app_name: tree_snapshot.app_name.clone(),
         window_name: tree_snapshot.window_name.clone(),
+        window_id: tree_snapshot.window_id,
         bounds: target_bounds,
     };
     let focused_capture = capture_focused_window(&target, &window_filters)

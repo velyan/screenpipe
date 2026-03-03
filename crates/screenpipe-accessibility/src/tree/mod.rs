@@ -110,6 +110,8 @@ pub enum TruncationReason {
 pub struct TreeSnapshot {
     pub app_name: String,
     pub window_name: String,
+    /// Focused window identifier (platform-specific), when available.
+    pub window_id: Option<u32>,
     /// Focused app process identifier, when available.
     pub process_id: Option<u32>,
     /// Focused window bounds in screen coordinates, when available.

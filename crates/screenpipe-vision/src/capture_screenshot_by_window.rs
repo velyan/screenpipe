@@ -221,6 +221,7 @@ pub struct FocusedWindowTarget {
     pub process_id: i32,
     pub app_name: String,
     pub window_name: String,
+    pub window_id: Option<u32>,
     pub bounds: Rect,
 }
 
@@ -380,15 +381,31 @@ impl WindowFilters {
     }
 }
 
-fn title_matches(expected: &str, actual: &str) -> bool {
+fn title_match_quality(expected: &str, actual: &str) -> u8 {
     let expected_lower = expected.to_lowercase();
     let actual_lower = actual.to_lowercase();
     if expected_lower.is_empty() || actual_lower.is_empty() {
-        return false;
+        return 0;
     }
-    actual_lower == expected_lower
-        || actual_lower.contains(&expected_lower)
-        || expected_lower.contains(&actual_lower)
+    if actual_lower == expected_lower {
+        return 2;
+    }
+    if actual_lower.contains(&expected_lower) || expected_lower.contains(&actual_lower) {
+        return 1;
+    }
+    0
+}
+
+fn rect_area(rect: &Rect) -> u64 {
+    rect.width as u64 * rect.height as u64
+}
+
+fn center_l1_distance(a: &Rect, b: &Rect) -> u64 {
+    let ax = a.x as i64 + (a.width as i64 / 2);
+    let ay = a.y as i64 + (a.height as i64 / 2);
+    let bx = b.x as i64 + (b.width as i64 / 2);
+    let by = b.y as i64 + (b.height as i64 / 2);
+    ax.abs_diff(bx) + ay.abs_diff(by)
 }
 
 fn is_valid_capture_target(
@@ -407,14 +424,21 @@ fn is_valid_capture_target(
 
 fn focused_candidate_score(
     process_id: i32,
+    window_id: Option<u32>,
     window_name: &str,
     is_focused: bool,
     window_bounds: &Rect,
     target: &FocusedWindowTarget,
-) -> Option<(u8, u64, u8, u8)> {
+    z_order_score: u32,
+) -> Option<(u8, u8, u64, u8, u8, u32, u64, u64)> {
     let pid_match = process_id == target.process_id;
     let overlap = window_bounds.intersection_area(&target.bounds);
-    let title_match = title_matches(&target.window_name, window_name);
+    let title_quality = title_match_quality(&target.window_name, window_name);
+    let window_id_match = u8::from(
+        target.window_id.is_some() && window_id.is_some() && target.window_id == window_id,
+    );
+    let area_similarity = u64::MAX - rect_area(window_bounds).abs_diff(rect_area(&target.bounds));
+    let center_proximity = u64::MAX - center_l1_distance(window_bounds, &target.bounds);
 
     // A same-PID candidate with no overlap is likely stale/off-screen in multi-window apps.
     // Require positive geometric overlap to keep focused-window capture aligned with target bounds.
@@ -422,16 +446,65 @@ fn focused_candidate_score(
         if overlap == 0 {
             return None;
         }
-        return Some((1, overlap, u8::from(title_match), u8::from(is_focused)));
+        return Some((
+            window_id_match,
+            1,
+            overlap,
+            title_quality,
+            u8::from(is_focused),
+            z_order_score,
+            area_similarity,
+            center_proximity,
+        ));
     }
 
     // Fallback when PID lookup is unstable (e.g. elevated/system windows on Windows):
     // accept focused windows that overlap the expected bounds.
     if is_focused && overlap > 0 {
-        return Some((0, overlap, 0, 1));
+        return Some((
+            window_id_match,
+            0,
+            overlap,
+            title_quality,
+            1,
+            z_order_score,
+            area_similarity,
+            center_proximity,
+        ));
     }
 
     None
+}
+
+#[cfg(target_os = "macos")]
+fn z_order_score_for_window(
+    cg_windows: &[CGWindowInfo],
+    process_id: i32,
+    window_name: &str,
+    window_bounds: &Rect,
+) -> u32 {
+    let mut best_rank: Option<usize> = None;
+    let mut best_title_quality = 0u8;
+
+    for (rank, cg_window) in cg_windows.iter().enumerate() {
+        if !is_valid_topmost_candidate(cg_window) || cg_window.pid != process_id {
+            continue;
+        }
+        if !cg_window.bounds.overlaps(window_bounds) {
+            continue;
+        }
+
+        let title_quality = title_match_quality(window_name, &cg_window.window_name);
+        let should_replace = title_quality > best_title_quality
+            || (title_quality == best_title_quality
+                && best_rank.map(|best| rank < best).unwrap_or(true));
+        if should_replace {
+            best_title_quality = title_quality;
+            best_rank = Some(rank);
+        }
+    }
+
+    best_rank.map(|rank| u32::MAX - rank as u32).unwrap_or(0)
 }
 
 /// Intermediate structure for window data extracted from platform-specific Window types
@@ -474,6 +547,22 @@ pub fn get_frontmost_pid() -> Option<i32> {
 #[cfg(not(target_os = "macos"))]
 pub fn get_frontmost_pid() -> Option<i32> {
     None
+}
+
+/// Resolve focus for a window with deterministic fallback semantics.
+///
+/// If both frontmost PID and window PID are known, use PID equality as the
+/// authoritative focus signal. If window PID is unknown/invalid, fall back to
+/// the backend's per-window focus flag to preserve PID-mismatch fallback paths.
+fn resolve_window_focus(
+    frontmost_pid: Option<i32>,
+    window_pid: i32,
+    per_window_focus: bool,
+) -> bool {
+    match frontmost_pid {
+        Some(front_pid) if window_pid >= 0 => window_pid == front_pid,
+        _ => per_window_focus,
+    }
 }
 
 /// Rectangle bounds for overlap calculations
@@ -1126,8 +1215,10 @@ fn capture_focused_window_sck(
     window_filters: &WindowFilters,
 ) -> Result<Option<CapturedWindow>, Box<dyn Error>> {
     let windows = SckWindow::all()?;
+    let (cg_windows, _) = get_cg_window_list();
+    let frontmost_pid = get_frontmost_pid();
     let mut best: Option<(
-        (u8, u64, u8, u8),
+        (u8, u8, u64, u8, u8, u32, u64, u64),
         SckWindow,
         String,
         String,
@@ -1152,8 +1243,14 @@ fn capture_focused_window_sck(
             continue;
         }
 
-        let process_id = window.pid().map(|p| p as i32).unwrap_or(-1);
-        let is_focused = window.is_focused().unwrap_or(false);
+        let process_id = window
+            .pid()
+            .ok()
+            .and_then(|p| i32::try_from(p).ok())
+            .unwrap_or(-1);
+        let window_id = window.id().ok();
+        let per_window_focus = window.is_focused().unwrap_or(false);
+        let is_focused = resolve_window_focus(frontmost_pid, process_id, per_window_focus);
         let window_x = window.x().unwrap_or(0);
         let window_y = window.y().unwrap_or(0);
         let window_width = window.width().unwrap_or(0);
@@ -1169,9 +1266,17 @@ fn capture_focused_window_sck(
             continue;
         }
 
-        let Some(score) =
-            focused_candidate_score(process_id, &window_name, is_focused, &bounds, target)
-        else {
+        let z_order_score =
+            z_order_score_for_window(&cg_windows, process_id, &window_name, &bounds);
+        let Some(score) = focused_candidate_score(
+            process_id,
+            window_id,
+            &window_name,
+            is_focused,
+            &bounds,
+            target,
+            z_order_score,
+        ) else {
             continue;
         };
 
@@ -1253,8 +1358,10 @@ fn capture_focused_window_xcap_macos(
     window_filters: &WindowFilters,
 ) -> Result<Option<CapturedWindow>, Box<dyn Error>> {
     let windows = XcapWindow::all()?;
+    let (cg_windows, _) = get_cg_window_list();
+    let frontmost_pid = get_frontmost_pid();
     let mut best: Option<(
-        (u8, u64, u8, u8),
+        (u8, u8, u64, u8, u8, u32, u64, u64),
         XcapWindow,
         String,
         String,
@@ -1279,8 +1386,14 @@ fn capture_focused_window_xcap_macos(
             continue;
         }
 
-        let process_id = window.pid().map(|p| p as i32).unwrap_or(-1);
-        let is_focused = window.is_focused().unwrap_or(false);
+        let process_id = window
+            .pid()
+            .ok()
+            .and_then(|p| i32::try_from(p).ok())
+            .unwrap_or(-1);
+        let window_id = window.id().ok();
+        let per_window_focus = window.is_focused().unwrap_or(false);
+        let is_focused = resolve_window_focus(frontmost_pid, process_id, per_window_focus);
         let window_x = window.x().unwrap_or(0);
         let window_y = window.y().unwrap_or(0);
         let window_width = window.width().unwrap_or(0);
@@ -1296,9 +1409,17 @@ fn capture_focused_window_xcap_macos(
             continue;
         }
 
-        let Some(score) =
-            focused_candidate_score(process_id, &window_name, is_focused, &bounds, target)
-        else {
+        let z_order_score =
+            z_order_score_for_window(&cg_windows, process_id, &window_name, &bounds);
+        let Some(score) = focused_candidate_score(
+            process_id,
+            window_id,
+            &window_name,
+            is_focused,
+            &bounds,
+            target,
+            z_order_score,
+        ) else {
             continue;
         };
 
@@ -1380,8 +1501,9 @@ fn capture_focused_window_xcap(
     window_filters: &WindowFilters,
 ) -> Result<Option<CapturedWindow>, Box<dyn Error>> {
     let windows = Window::all()?;
+    let frontmost_pid = get_frontmost_pid();
     let mut best: Option<(
-        (u8, u64, u8, u8),
+        (u8, u8, u64, u8, u8, u32, u64, u64),
         Window,
         String,
         String,
@@ -1416,8 +1538,14 @@ fn capture_focused_window_xcap(
             continue;
         }
 
-        let process_id = window.pid().map(|p| p as i32).unwrap_or(-1);
-        let is_focused = window.is_focused().unwrap_or(false);
+        let process_id = window
+            .pid()
+            .ok()
+            .and_then(|p| i32::try_from(p).ok())
+            .unwrap_or(-1);
+        let window_id = window.id().ok();
+        let per_window_focus = window.is_focused().unwrap_or(false);
+        let is_focused = resolve_window_focus(frontmost_pid, process_id, per_window_focus);
         let window_x = window.x().unwrap_or(0);
         let window_y = window.y().unwrap_or(0);
         let window_width = window.width().unwrap_or(0);
@@ -1433,9 +1561,15 @@ fn capture_focused_window_xcap(
             continue;
         }
 
-        let Some(score) =
-            focused_candidate_score(process_id, &window_name, is_focused, &bounds, target)
-        else {
+        let Some(score) = focused_candidate_score(
+            process_id,
+            window_id,
+            &window_name,
+            is_focused,
+            &bounds,
+            target,
+            0,
+        ) else {
             continue;
         };
 
@@ -1705,6 +1839,7 @@ mod tests {
             process_id: 4242,
             app_name: "Arc".to_string(),
             window_name: "Target Tab".to_string(),
+            window_id: Some(42),
             bounds: Rect {
                 x: 0,
                 y: 0,
@@ -1712,6 +1847,19 @@ mod tests {
                 height: 100,
             },
         }
+    }
+
+    #[test]
+    fn test_resolve_window_focus_uses_pid_match_when_window_pid_known() {
+        assert!(resolve_window_focus(Some(42), 42, false));
+        assert!(!resolve_window_focus(Some(42), 7, true));
+    }
+
+    #[test]
+    fn test_resolve_window_focus_falls_back_when_window_pid_unknown() {
+        assert!(resolve_window_focus(Some(42), -1, true));
+        assert!(!resolve_window_focus(Some(42), -1, false));
+        assert!(resolve_window_focus(None, -1, true));
     }
 
     #[test]
@@ -1726,10 +1874,12 @@ mod tests {
 
         let score = focused_candidate_score(
             target.process_id,
+            target.window_id,
             &target.window_name,
             true,
             &offscreen_bounds,
             &target,
+            0,
         );
 
         assert!(
@@ -1744,6 +1894,7 @@ mod tests {
 
         let small_overlap_score = focused_candidate_score(
             target.process_id,
+            target.window_id,
             &target.window_name,
             true,
             &Rect {
@@ -1753,11 +1904,13 @@ mod tests {
                 height: 20,
             },
             &target,
+            0,
         )
         .expect("small overlap same-PID candidate should score");
 
         let large_overlap_score = focused_candidate_score(
             target.process_id,
+            target.window_id,
             "Different Title",
             true,
             &Rect {
@@ -1767,12 +1920,87 @@ mod tests {
                 height: 80,
             },
             &target,
+            0,
         )
         .expect("large overlap same-PID candidate should score");
 
         assert!(
             large_overlap_score > small_overlap_score,
             "geometry overlap must outrank title similarity for same-PID candidates"
+        );
+    }
+
+    #[test]
+    fn test_focused_candidate_score_uses_z_order_as_tie_breaker() {
+        let target = test_focused_target();
+        let bounds = Rect {
+            x: 10,
+            y: 10,
+            width: 80,
+            height: 80,
+        };
+
+        let lower_z = focused_candidate_score(
+            target.process_id,
+            target.window_id,
+            "Different Title",
+            true,
+            &bounds,
+            &target,
+            1,
+        )
+        .expect("candidate with low z-order score should score");
+        let higher_z = focused_candidate_score(
+            target.process_id,
+            target.window_id,
+            "Different Title",
+            true,
+            &bounds,
+            &target,
+            10,
+        )
+        .expect("candidate with higher z-order score should score");
+
+        assert!(
+            higher_z > lower_z,
+            "higher z-order score must win when other factors are equal"
+        );
+    }
+
+    #[test]
+    fn test_focused_candidate_score_prioritizes_window_id_match() {
+        let target = test_focused_target();
+        let bounds = Rect {
+            x: 10,
+            y: 10,
+            width: 80,
+            height: 80,
+        };
+
+        let id_mismatch = focused_candidate_score(
+            target.process_id,
+            Some(7),
+            &target.window_name,
+            true,
+            &bounds,
+            &target,
+            100,
+        )
+        .expect("id mismatch candidate should still be scoreable");
+        let id_match = focused_candidate_score(
+            target.process_id,
+            target.window_id,
+            "Different Title",
+            true,
+            &bounds,
+            &target,
+            0,
+        )
+        .expect("id match candidate should score");
+
+        assert!(
+            id_match > id_mismatch,
+            "exact window ID must outrank non-matching IDs for focused selection"
         );
     }
 
