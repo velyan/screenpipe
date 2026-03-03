@@ -57,7 +57,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
-import { Slider } from "@/components/ui/slider";
 import { AIPreset, commands } from "@/lib/utils/tauri";
 
 // Helper to detect UUID-like strings and format preset names nicely
@@ -121,6 +120,52 @@ export const DEFAULT_PROMPT = `Rules:
 - Do not put video in multiline code block it will not render the video (e.g. \`\`\`bash\n.mp4\`\`\` IS WRONG) instead using inline code block with single backtick
 - Always answer my question/intent, do not make up things
 `;
+
+function ChatGptSignInButton() {
+  const [loggedIn, setLoggedIn] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    commands.chatgptOauthStatus().then((res) => {
+      if (res.status === "ok") setLoggedIn(res.data.logged_in);
+    });
+  }, []);
+
+  return (
+    <Button
+      type="button"
+      variant={loggedIn ? "outline" : "default"}
+      disabled={loading}
+      className="h-7 text-xs w-full"
+      onClick={async () => {
+        if (loggedIn) {
+          setLoading(true);
+          await commands.chatgptOauthLogout();
+          setLoggedIn(false);
+          setLoading(false);
+        } else {
+          setLoading(true);
+          try {
+            const res = await commands.chatgptOauthLogin();
+            if (res.status === "ok" && res.data) setLoggedIn(true);
+          } catch (e) {
+            console.error("chatgpt oauth failed:", e);
+          }
+          setLoading(false);
+        }
+      }}
+    >
+      {loading ? (
+        <Loader2 className="h-3 w-3 mr-1 animate-spin" />
+      ) : loggedIn ? (
+        <Check className="h-3 w-3 mr-1 text-green-500" />
+      ) : (
+        <LogIn className="h-3 w-3 mr-1" />
+      )}
+      {loggedIn ? "signed in — sign out" : "sign in with chatgpt"}
+    </Button>
+  );
+}
 
 export function AIProviderConfig({
   onSubmit,
@@ -262,6 +307,34 @@ export function AIProviderConfig({
       formData.apiKey
     ) {
       fetchOpenAIModels(formData.url, formData.apiKey);
+    } else if (selectedProvider === "openai-chatgpt") {
+      // Try fetching from API, fall back to known models
+      (async () => {
+        setIsLoadingModels(true);
+        try {
+          const tokenResult = await commands.chatgptOauthGetToken();
+          if (tokenResult.status === "ok") {
+            const resp = await fetch("https://api.openai.com/v1/models", {
+              headers: { Authorization: `Bearer ${tokenResult.data}` },
+            });
+            if (resp.ok) {
+              const data = await resp.json();
+              if (data.data?.length > 0) {
+                setOpenAIModels(data.data);
+                setIsLoadingModels(false);
+                return;
+              }
+            }
+          }
+        } catch { /* ignore */ }
+        // Fallback: Codex models available via ChatGPT subscription
+        setOpenAIModels([
+          { id: "gpt-5.1-codex-mini" }, { id: "gpt-5.1" },
+          { id: "gpt-5.1-codex-max" }, { id: "gpt-5.2-codex" },
+          { id: "gpt-5.2" },
+        ]);
+        setIsLoadingModels(false);
+      })();
     }
   }, [selectedProvider, formData.apiKey, formData.url]);
 
@@ -327,7 +400,7 @@ export function AIProviderConfig({
 
         <div className={cn(
           "grid gap-1",
-          piAvailable ? "grid-cols-4" : "grid-cols-3"
+          piAvailable ? "grid-cols-5" : "grid-cols-4"
         )}>
           <Button
             type="button"
@@ -376,6 +449,24 @@ export function AIProviderConfig({
           >
             <Icons.settings className="h-3 w-3" />
             <span>custom</span>
+          </Button>
+
+          <Button
+            type="button"
+            variant={selectedProvider === "openai-chatgpt" ? "default" : "outline"}
+            className="flex h-7 items-center justify-center gap-1 text-[10px] px-2"
+            onClick={() => {
+              setSelectedProvider("openai-chatgpt");
+              setFormData({
+                ...formData,
+                provider: "openai-chatgpt",
+                url: "https://api.openai.com/v1",
+                model: "gpt-4o",
+              });
+            }}
+          >
+            <Icons.openai className="h-3 w-3" />
+            <span>chatgpt</span>
           </Button>
 
           {piAvailable && (
@@ -578,6 +669,36 @@ export function AIProviderConfig({
           </div>
         )}
 
+        {selectedProvider === "openai-chatgpt" && (
+          <div className="space-y-1">
+            <div className="space-y-0.5">
+              <Label className="text-xs">chatgpt account</Label>
+              <ChatGptSignInButton />
+            </div>
+            <div className="space-y-0.5">
+              <Label htmlFor="model" className="text-xs">model</Label>
+              <Input
+                id="model"
+                type="text"
+                list="chatgpt-models"
+                placeholder="gpt-4o"
+                value={formData.model || ""}
+                onChange={(e) =>
+                  setFormData({ ...formData, model: e.target.value })
+                }
+                className="h-7 text-xs"
+              />
+              {openaiModels.length > 0 && (
+                <datalist id="chatgpt-models">
+                  {openaiModels.map((model) => (
+                    <option key={model.id} value={model.id} />
+                  ))}
+                </datalist>
+              )}
+            </div>
+          </div>
+        )}
+
         {selectedProvider === "pi" && (
           <div className="space-y-0.5">
             <Label htmlFor="model" className="text-xs">model</Label>
@@ -626,35 +747,25 @@ export function AIProviderConfig({
         >
           <span>{showAdvanced ? "▾" : "▸"}</span>
           <span>advanced</span>
-          <span className="text-muted-foreground/60">
-            ({((formData.maxContextChars || 512000) / 1000).toFixed(0)}k context)
-          </span>
         </button>
 
         {showAdvanced && (
           <div className="space-y-1.5">
             <div className="space-y-0.5">
-              <Label htmlFor="maxContextChars" className="flex items-center text-[10px]">
-                max context
-              </Label>
-              <div className="flex items-center gap-2">
-                <Slider
-                  id="maxContextChars"
-                  min={10000}
-                  max={1000000}
-                  step={10000}
-                  value={[formData.maxContextChars || 512000]}
-                  onValueChange={([value]) =>
-                    setFormData({ ...formData, maxContextChars: value })
-                  }
-                  className="flex-grow"
-                />
-                <span className="min-w-[32px] text-right text-[10px]">
-                  {((formData.maxContextChars || 512000) / 1000).toFixed(0)}k
-                </span>
-              </div>
+              <Label htmlFor="maxTokens" className="text-[10px]">max output tokens</Label>
+              <Input
+                id="maxTokens"
+                type="number"
+                min={256}
+                max={128000}
+                step={256}
+                value={(formData as any).maxTokens ?? 4096}
+                onChange={(e) =>
+                  setFormData({ ...formData, maxTokens: parseInt(e.target.value) || 4096 } as any)
+                }
+                className="h-6 text-[10px]"
+              />
             </div>
-
             <div className="space-y-0.5">
               <Label htmlFor="prompt" className="text-[10px]">prompt</Label>
               <Textarea
@@ -728,6 +839,7 @@ export const AIPresetDialog = ({
       model: providerData.model,  // Fixed: was providerData.modelName
       id: providerData.id,
       maxContextChars: providerData.maxContextChars,
+      maxTokens: (providerData as any).maxTokens ?? 4096,
       prompt: providerData.prompt,
     };
 
@@ -749,6 +861,7 @@ export const AIPresetDialog = ({
         url: preset.url,
         model: preset.model,
         maxContextChars: preset.maxContextChars,
+        maxTokens: (preset as any).maxTokens ?? 4096,
         prompt: preset.prompt,
         defaultPreset: preset.defaultPreset,
         apiKey: preset.apiKey || null,
@@ -1066,7 +1179,7 @@ export const AIPresetsSelector = ({
                   role="combobox"
                   aria-expanded={open}
                   className={cn(
-                    "w-full justify-between",
+                    "w-full justify-between hover:bg-accent hover:text-accent-foreground",
                     compact && "h-8 text-xs",
                     selectedPresetRequiresLogin && "border-amber-500/50"
                   )}
@@ -1099,14 +1212,6 @@ export const AIPresetsSelector = ({
                               (preset) => preset.id === selectedPreset,
                             )?.model
                           }
-                        </span>
-                        <span className="whitespace-nowrap">
-                          {(
-                            (aiPresets.find(
-                              (preset) => preset.id === selectedPreset,
-                            )?.maxContextChars || 0) / 1000
-                          ).toFixed(0)}
-                          k
                         </span>
                       </div>
                     </div>
@@ -1195,9 +1300,6 @@ export const AIPresetsSelector = ({
                                 {preset.model}
                               </span>
                             </div>
-                            <span className="whitespace-nowrap">
-                              {(preset.maxContextChars / 1000).toFixed(0)}k
-                            </span>
                             <div className="flex items-center gap-1">
                               <Button
                                 variant="ghost"
@@ -1286,9 +1388,6 @@ export const AIPresetsSelector = ({
                               {preset.model}
                             </span>
                           </div>
-                          <span className="whitespace-nowrap">
-                            {(preset.maxContextChars / 1000).toFixed(0)}k
-                          </span>
                           <div className="flex items-center gap-1">
                             <Button
                               variant="ghost"

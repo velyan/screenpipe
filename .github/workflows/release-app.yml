@@ -231,7 +231,7 @@ jobs:
             tauri-args: "--target x86_64-apple-darwin --features metal,official-build"
             os_type: "macos"
           - platform: ${{ needs.check_commit.outputs.windows_runner || 'windows-2022' }}
-            args: "--target x86_64-pc-windows-msvc --features mkl"
+            args: "--target x86_64-pc-windows-msvc"
             pre-build-args: ""
             tauri-args: "--target x86_64-pc-windows-msvc --features official-build"
             os_type: "windows"
@@ -413,7 +413,6 @@ jobs:
             apps/screenpipe-app-tauri/src-tauri/target
             apps/screenpipe-app-tauri/.tauri
             apps/screenpipe-app-tauri/src-tauri/WixTools
-            apps/screenpipe-app-tauri/src-tauri/mkl
             apps/screenpipe-app-tauri/src-tauri/vcredist
             # Ollama binaries and libs
             apps/screenpipe-app-tauri/src-tauri/ollama-*
@@ -626,55 +625,6 @@ jobs:
           SKIP_SCREENPIPE_SETUP: true
         run: bun ./scripts/pre_build.js ${{ matrix.pre-build-args }}
         working-directory: ${{ github.workspace }}/apps/screenpipe-app-tauri
-
-      - name: Check Python availability
-        if: matrix.os_type == 'windows'
-        id: check-python
-        shell: powershell
-        run: |
-          if (Get-Command python -ErrorAction SilentlyContinue) {
-            $ver = python --version 2>&1
-            Write-Host "Python already available: $ver"
-            echo "has_python=true" >> $env:GITHUB_OUTPUT
-          } else {
-            echo "has_python=false" >> $env:GITHUB_OUTPUT
-          }
-
-      - uses: actions/setup-python@v5
-        if: matrix.os_type == 'windows' && steps.check-python.outputs.has_python != 'true'
-        with:
-          python-version: '3.13'
-
-      - name: Copy library for MKL
-        if: matrix.os_type == 'windows'
-        shell: powershell
-        run: |
-          # Create target directory
-          $mkl_dir = "apps/screenpipe-app-tauri/src-tauri/mkl"
-          New-Item -ItemType Directory -Force -Path $mkl_dir | Out-Null
-
-          # Install and copy Intel OpenMP
-          python -m pip install --upgrade pip
-          $temp_dir = "temp_omp"
-          New-Item -ItemType Directory -Force -Path $temp_dir | Out-Null
-
-          Write-Host "Installing Intel OpenMP..."
-          python -m pip install intel-openmp --target $temp_dir
-
-          Write-Host "Copying DLL files..."
-          Get-ChildItem -Path $temp_dir -Recurse -Filter "*.dll" | ForEach-Object {
-            Write-Host "Copying $_"
-            Copy-Item $_.FullName -Destination $mkl_dir -Force
-          }
-
-          # Verify DLLs were copied
-          $dll_count = (Get-ChildItem -Path $mkl_dir -Filter "*.dll").Count
-          Write-Host "Found $dll_count DLLs in target directory"
-          if ($dll_count -eq 0) {
-            throw "No DLLs found in target directory!"
-          }
-
-          Remove-Item -Path $temp_dir -Recurse -Force
 
       - name: Download ONNX Runtime (CPU) for Windows
         if: matrix.os_type == 'windows'
@@ -1112,7 +1062,7 @@ jobs:
           Push-Location ..
           # Skip frontend rebuild (already built for stable) and vulkan
           $env:TAURI_CLI_CONFIG = '{"build":{"beforeBuildCommand":""}}'
-          bunx tauri build --target x86_64-pc-windows-msvc --features mkl,official-build
+          bunx tauri build --target x86_64-pc-windows-msvc --features official-build
           Pop-Location
           Write-Host "=== Beta rebuild complete ==="
 

@@ -220,7 +220,7 @@ impl ResourceMonitor {
             total_virtual_memory_gb,
             total_cpu
         );
-        info!("{}", log_message);
+        debug!("{}", log_message);
 
         // Log to file
         self.log_to_file(metrics).await;
@@ -290,7 +290,7 @@ impl ResourceMonitor {
             total_virtual_memory_gb,
             total_cpu
         );
-        info!("{}", log_message);
+        debug!("{}", log_message);
 
         // Log to file
         self.log_to_file(metrics).await;

@@ -5,12 +5,12 @@
 //! Accessibility tree walker — periodically walks the macOS AX tree of the focused window,
 //! extracts all visible text, and stores it in the accessibility table.
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
-#[cfg(target_os = "linux")]
-mod linux;
 
 pub mod cache;
 
@@ -73,7 +73,7 @@ pub struct AccessibilityTreeNode {
     pub role: String,
     pub text: String,
     pub depth: u8,
-    /// Bounding box in 0-1 normalized coordinates relative to the window.
+    /// Bounding box in 0-1 normalized coordinates (monitor-relative when available).
     /// None if the element doesn't expose AXPosition/AXSize.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bounds: Option<NodeBounds>,
@@ -210,6 +210,15 @@ pub struct TreeWalkerConfig {
     pub blocked_apps: Vec<String>,
     /// Window-title substrings that should be blocked by accessibility capture.
     pub blocked_title_keywords: Vec<String>,
+    /// Monitor origin X in screen points (virtual desktop coordinate space).
+    /// Used to normalize element bounds to monitor-relative 0-1 coords.
+    pub monitor_x: f64,
+    /// Monitor origin Y in screen points.
+    pub monitor_y: f64,
+    /// Monitor width in screen points.
+    pub monitor_width: f64,
+    /// Monitor height in screen points.
+    pub monitor_height: f64,
 }
 
 impl Default for TreeWalkerConfig {
@@ -225,6 +234,10 @@ impl Default for TreeWalkerConfig {
             included_windows: Vec::new(),
             blocked_apps: default_blocked_apps(),
             blocked_title_keywords: default_blocked_title_keywords(),
+            monitor_x: 0.0,
+            monitor_y: 0.0,
+            monitor_width: 0.0,
+            monitor_height: 0.0,
         }
     }
 }

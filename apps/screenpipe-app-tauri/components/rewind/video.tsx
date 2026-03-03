@@ -49,9 +49,7 @@ export const VideoComponent = memo(function VideoComponent({
 
     async function loadMedia(attempt: number = 0) {
       try {
-        console.log(`Loading media (attempt ${attempt + 1}/${MAX_RETRIES + 1}):`, filePath);
         const sanitizedPath = sanitizeFilePath(filePath);
-        console.log("Sanitized path:", sanitizedPath);
         if (!sanitizedPath) {
           throw new Error("Invalid file path");
         }
@@ -83,7 +81,6 @@ export const VideoComponent = memo(function VideoComponent({
         setMediaSrc(blobUrl);
         setError(null);
         setRetryCount(0);
-        console.log("Media loaded successfully:", filePath);
       } catch (error) {
         if (isCancelled) return;
 
@@ -93,7 +90,6 @@ export const VideoComponent = memo(function VideoComponent({
         // Retry with exponential backoff for transient errors
         if (attempt < MAX_RETRIES) {
           const delay = INITIAL_RETRY_DELAY * Math.pow(2, attempt);
-          console.log(`Retrying in ${delay}ms...`);
           setRetryCount(attempt + 1);
           retryTimeout = setTimeout(() => {
             if (!isCancelled) {

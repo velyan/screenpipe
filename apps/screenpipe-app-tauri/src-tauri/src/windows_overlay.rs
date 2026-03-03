@@ -9,11 +9,9 @@ use tauri::WebviewWindow;
 use tracing::{error, info};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongW, SetWindowLongW, SetWindowPos,
-    GWL_EXSTYLE, GWL_STYLE, HWND_TOPMOST, SWP_NOACTIVATE, SWP_SHOWWINDOW, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_FRAMECHANGED,
-    WS_EX_LAYERED, WS_EX_TRANSPARENT, WS_EX_TOOLWINDOW,
-    WS_THICKFRAME, WS_CAPTION,
+    GetWindowLongW, SetForegroundWindow, SetWindowLongW, SetWindowPos, GWL_EXSTYLE, GWL_STYLE,
+    HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+    WS_CAPTION, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_THICKFRAME,
 };
 
 /// Extended window styles for overlay behavior
@@ -29,18 +27,16 @@ pub fn get_hwnd(window: &WebviewWindow) -> Option<HWND> {
     use raw_window_handle::HasWindowHandle;
 
     match window.window_handle() {
-        Ok(handle) => {
-            match handle.as_raw() {
-                raw_window_handle::RawWindowHandle::Win32(win32_handle) => {
-                    let hwnd = HWND(win32_handle.hwnd.get() as *mut std::ffi::c_void);
-                    Some(hwnd)
-                }
-                _ => {
-                    error!("Window handle is not Win32");
-                    None
-                }
+        Ok(handle) => match handle.as_raw() {
+            raw_window_handle::RawWindowHandle::Win32(win32_handle) => {
+                let hwnd = HWND(win32_handle.hwnd.get() as *mut std::ffi::c_void);
+                Some(hwnd)
             }
-        }
+            _ => {
+                error!("Window handle is not Win32");
+                None
+            }
+        },
         Err(e) => {
             error!("Failed to get window handle: {}", e);
             None
@@ -87,7 +83,10 @@ pub fn setup_overlay(window: &WebviewWindow, click_through: bool) -> Result<(), 
         let clean_style = style & !(WS_THICKFRAME.0 as i32) & !(WS_CAPTION.0 as i32);
         if clean_style != style {
             SetWindowLongW(hwnd, GWL_STYLE, clean_style);
-            info!("Stripped resize/caption styles: 0x{:X} -> 0x{:X}", style, clean_style);
+            info!(
+                "Stripped resize/caption styles: 0x{:X} -> 0x{:X}",
+                style, clean_style
+            );
         }
 
         // Set as topmost window, keeping Tauri's position and size.
@@ -99,7 +98,10 @@ pub fn setup_overlay(window: &WebviewWindow, click_through: bool) -> Result<(), 
         let pos_result = SetWindowPos(
             hwnd,
             HWND_TOPMOST,
-            0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
             SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED,
         );
 
@@ -187,7 +189,10 @@ pub fn bring_to_front(window: &WebviewWindow) -> Result<(), String> {
         let result = SetWindowPos(
             hwnd,
             HWND_TOPMOST,
-            0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
             SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE,
         );
 
@@ -196,6 +201,35 @@ pub fn bring_to_front(window: &WebviewWindow) -> Result<(), String> {
         }
     }
 
+    Ok(())
+}
+
+/// Brings the overlay window to the front AND activates it so it receives keyboard focus.
+/// Use this when responding to a user action (e.g. global shortcut) where we want
+/// the window to be interactive, not just visible.
+pub fn bring_to_front_and_activate(window: &WebviewWindow) -> Result<(), String> {
+    let hwnd = get_hwnd(window).ok_or("Failed to get HWND")?;
+
+    unsafe {
+        // Bring to front WITH activation (no SWP_NOACTIVATE)
+        let result = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0, 0, 0, 0,
+            SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE,
+        );
+
+        if let Err(e) = result {
+            return Err(format!("Failed to bring to front: {}", e));
+        }
+
+        // SetForegroundWindow gives the window keyboard focus.
+        // This works reliably here because the call originates from a
+        // global hotkey handler, which Windows treats as user-initiated.
+        let _ = SetForegroundWindow(hwnd);
+    }
+
+    info!("Overlay brought to front and activated");
     Ok(())
 }
 

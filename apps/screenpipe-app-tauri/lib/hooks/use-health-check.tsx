@@ -65,6 +65,7 @@ interface HealthCheckHook {
 export function useHealthCheck() {
   const [health, setHealth] = useState<HealthCheckResponse | null>(null);
   const [isServerDown, setIsServerDown] = useState(false);
+  const isServerDownRef = useRef(false);
   const [isLoading, setIsLoading] = useState(true);
   const healthRef = useRef(health);
   const wsRef = useRef<WebSocket | null>(null);
@@ -74,6 +75,12 @@ export function useHealthCheck() {
   const serverDownTimerRef = useRef<NodeJS.Timeout | null>(null);
   const hasLoggedDisconnect = useRef(false);
   const SERVER_DOWN_GRACE_PERIOD_MS = 5000; // Wait 5 seconds before showing "server down"
+
+  // Helper to update both state and ref together
+  const setServerDown = useCallback((value: boolean) => {
+    isServerDownRef.current = value;
+    setIsServerDown(value);
+  }, []);
 
   const fetchHealth = useCallback(async () => {
     // Clean up existing WebSocket connection
@@ -103,7 +110,7 @@ export function useHealthCheck() {
           console.log("health WebSocket reconnected");
         }
         hasLoggedDisconnect.current = false;
-        setIsServerDown(false);
+        setServerDown(false);
         setIsLoading(false);
         if (retryIntervalRef.current) {
           clearInterval(retryIntervalRef.current);
@@ -117,7 +124,7 @@ export function useHealthCheck() {
           if (isHealthChanged(healthRef.current, data)) {
             setHealth(data);
             healthRef.current = data;
-            setIsServerDown(false);
+            setServerDown(false);
           }
 
           if (
@@ -153,9 +160,9 @@ export function useHealthCheck() {
         setIsLoading(false);
 
         // Only show "server down" after grace period (server might be starting)
-        if (!serverDownTimerRef.current && !isServerDown) {
+        if (!serverDownTimerRef.current && !isServerDownRef.current) {
           serverDownTimerRef.current = setTimeout(() => {
-            setIsServerDown(true);
+            setServerDown(true);
             serverDownTimerRef.current = null;
           }, SERVER_DOWN_GRACE_PERIOD_MS);
         }
@@ -185,9 +192,9 @@ export function useHealthCheck() {
         setHealth(errorHealth);
 
         // Only show "server down" after grace period (server might be starting)
-        if (!serverDownTimerRef.current && !isServerDown && event.code !== 1000) {
+        if (!serverDownTimerRef.current && !isServerDownRef.current && event.code !== 1000) {
           serverDownTimerRef.current = setTimeout(() => {
-            setIsServerDown(true);
+            setServerDown(true);
             serverDownTimerRef.current = null;
           }, SERVER_DOWN_GRACE_PERIOD_MS);
         }
@@ -202,9 +209,9 @@ export function useHealthCheck() {
       setIsLoading(false);
 
       // Only show "server down" after grace period
-      if (!serverDownTimerRef.current && !isServerDown) {
+      if (!serverDownTimerRef.current && !isServerDownRef.current) {
         serverDownTimerRef.current = setTimeout(() => {
-          setIsServerDown(true);
+          setServerDown(true);
           serverDownTimerRef.current = null;
         }, SERVER_DOWN_GRACE_PERIOD_MS);
       }
@@ -213,7 +220,7 @@ export function useHealthCheck() {
         retryIntervalRef.current = setInterval(fetchHealth, 3000);
       }
     }
-  }, [isServerDown]);
+  }, [setServerDown]); // stable deps — no cycle
 
   const debouncedFetchHealth = useCallback(() => {
     return new Promise<void>((resolve) => {

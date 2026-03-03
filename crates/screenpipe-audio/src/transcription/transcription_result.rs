@@ -7,7 +7,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use screenpipe_core::pii_removal::remove_pii;
 use screenpipe_db::{DatabaseManager, Speaker};
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 use crate::core::engine::AudioTranscriptionEngine;
 
@@ -79,7 +79,7 @@ pub async fn process_transcription_result(
 
     let speaker = get_or_create_speaker_from_embedding(db, &result.speaker_embedding).await?;
 
-    info!("Detected speaker: {:?}", speaker);
+    debug!("detected speaker id={}", speaker.id);
 
     let raw_transcription = result.transcription.unwrap();
     // Apply PII removal if enabled
@@ -92,10 +92,7 @@ pub async fn process_transcription_result(
     let speaker_id = Some(speaker.id);
     let mut chunk_id: Option<i64> = None;
 
-    info!(
-        "device {} inserting audio chunk: {:?}",
-        result.input.device, result.path
-    );
+    debug!("device {} inserting audio chunk", result.input.device);
     if let Some(id) = previous_transcript_id {
         if let Some(prev_transcript) = previous_transcript {
             // Apply PII removal to previous transcript update as well

@@ -2,7 +2,7 @@ use crate::core::engine::AudioTranscriptionEngine;
 use anyhow::Result;
 use hf_hub::{api::sync::Api, Cache, Repo, RepoType};
 use std::{path::PathBuf, sync::Arc};
-use tracing::info;
+use tracing::{debug, info};
 use whisper_rs::WhisperContextParameters;
 
 pub fn download_whisper_model(engine: Arc<AudioTranscriptionEngine>) -> Result<PathBuf> {
@@ -12,11 +12,7 @@ pub fn download_whisper_model(engine: Arc<AudioTranscriptionEngine>) -> Result<P
         AudioTranscriptionEngine::WhisperTinyQuantized => "ggml-tiny-q8_0.bin",
         AudioTranscriptionEngine::WhisperLargeV3 => "ggml-large-v3.bin",
         AudioTranscriptionEngine::WhisperLargeV3Quantized => "ggml-large-v3-q5_0.bin",
-        // Disabled / Qwen3Asr still need a model loaded to satisfy WhisperState type
-        // requirement. Use the smallest model (tiny quantized, ~40MB) — never used for inference.
-        AudioTranscriptionEngine::Disabled | AudioTranscriptionEngine::Qwen3Asr => {
-            "ggml-tiny-q8_0.bin"
-        }
+        // Only called for Whisper variants now — non-Whisper engines never reach here.
         _ => "ggml-large-v3-turbo-q8_0.bin",
     };
 
@@ -31,7 +27,7 @@ pub fn download_whisper_model(engine: Arc<AudioTranscriptionEngine>) -> Result<P
     let cache_repo = cache.repo(repo.clone());
 
     if let Some(model_path) = cache_repo.get(model_name) {
-        info!("model found at {:?}", model_path);
+        debug!("model found at {:?}", model_path);
         return Ok(model_path);
     }
 

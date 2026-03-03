@@ -10,11 +10,15 @@ use crate::speaker::embedding_manager::EmbeddingManager;
 use crate::speaker::prepare_segments;
 use crate::speaker::segment::SpeechSegment;
 use crate::transcription::deepgram::batch::transcribe_with_deepgram;
+use crate::transcription::engine::TranscriptionSession;
+use crate::transcription::openai_compatible::batch::transcribe_with_openai_compatible;
 use crate::transcription::whisper::batch::process_with_whisper;
+use crate::transcription::VocabularyEntry;
 use crate::utils::audio::resample;
 use crate::utils::ffmpeg::{get_new_file_path, write_audio_to_file};
 use crate::vad::VadEngine;
 use anyhow::Result;
+use reqwest::Client;
 use screenpipe_core::Language;
 use std::path::PathBuf;
 use std::{sync::Arc, sync::Mutex as StdMutex};
@@ -22,7 +26,6 @@ use tokio::sync::Mutex;
 use tracing::error;
 use whisper_rs::WhisperState;
 
-use crate::transcription::VocabularyEntry;
 use crate::{AudioInput, TranscriptionResult};
 
 pub const SAMPLE_RATE: u32 = 16000;
@@ -47,6 +50,56 @@ impl AlternateStt for audiopipe::Model {
     }
 }
 
+/// Default endpoint for OpenAI-compatible transcription servers.
+pub const DEFAULT_OPENAI_COMPATIBLE_ENDPOINT: &str = "http://127.0.0.1:8080";
+
+/// Default model name for OpenAI-compatible transcription.
+pub const DEFAULT_OPENAI_COMPATIBLE_MODEL: &str = "whisper-1";
+
+/// Timeout for OpenAI-compatible transcription requests.
+pub const OPENAI_COMPATIBLE_TIMEOUT_SECS: u64 = 30;
+
+/// Configuration for OpenAI Compatible transcription engine
+#[derive(Clone, Debug)]
+pub struct OpenAICompatibleConfig {
+    pub endpoint: String,
+    pub api_key: Option<String>,
+    pub model: String,
+    pub client: Option<Arc<Client>>,
+}
+
+impl Default for OpenAICompatibleConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: DEFAULT_OPENAI_COMPATIBLE_ENDPOINT.to_string(),
+            api_key: None,
+            model: DEFAULT_OPENAI_COMPATIBLE_MODEL.to_string(),
+            client: None,
+        }
+    }
+}
+
+impl OpenAICompatibleConfig {
+    /// Returns a shared reqwest client, creating one if not already set.
+    /// This ensures connection pooling across calls using the same config.
+    pub fn get_or_create_client(&mut self) -> Arc<Client> {
+        if let Some(ref client) = self.client {
+            client.clone()
+        } else {
+            let client = Arc::new(
+                Client::builder()
+                    .timeout(std::time::Duration::from_secs(
+                        OPENAI_COMPATIBLE_TIMEOUT_SECS,
+                    ))
+                    .build()
+                    .expect("failed to create reqwest client"),
+            );
+            self.client = Some(client.clone());
+            client
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn stt_sync(
     audio: &[f32],
@@ -54,6 +107,7 @@ pub async fn stt_sync(
     device: &str,
     audio_transcription_engine: Arc<AudioTranscriptionEngine>,
     deepgram_api_key: Option<String>,
+    openai_compatible_config: Option<OpenAICompatibleConfig>,
     languages: Vec<Language>,
     whisper_state: &mut WhisperState,
     vocabulary: &[VocabularyEntry],
@@ -69,6 +123,7 @@ pub async fn stt_sync(
         &device,
         audio_transcription_engine,
         deepgram_api_key,
+        openai_compatible_config,
         languages,
         whisper_state,
         vocabulary,
@@ -84,17 +139,19 @@ pub async fn stt(
     device: &str,
     audio_transcription_engine: Arc<AudioTranscriptionEngine>,
     deepgram_api_key: Option<String>,
+    openai_compatible_config: Option<OpenAICompatibleConfig>,
     languages: Vec<Language>,
     whisper_state: &mut WhisperState,
     vocabulary: &[VocabularyEntry],
     alternate_stt: Option<AlternateSttEngine>,
 ) -> Result<String> {
-    let transcription: Result<String> =
-        if *audio_transcription_engine == AudioTranscriptionEngine::Disabled {
-            Ok(String::new())
-        } else if audio_transcription_engine == AudioTranscriptionEngine::Deepgram.into() {
-            // Deepgram implementation
-            let api_key = deepgram_api_key.unwrap_or_default();
+    let transcription: Result<String> = if *audio_transcription_engine
+        == AudioTranscriptionEngine::Disabled
+    {
+        Ok(String::new())
+    } else if audio_transcription_engine == AudioTranscriptionEngine::Deepgram.into() {
+        // Deepgram implementation
+        let api_key = deepgram_api_key.unwrap_or_default();
 
             match transcribe_with_deepgram(
                 &api_key,
@@ -112,22 +169,14 @@ pub async fn stt(
                         "device: {}, deepgram transcription failed, falling back to Whisper: {:?}",
                         device, e
                     );
-                    // Fallback to Whisper
-                    process_with_whisper(audio, languages.clone(), whisper_state, vocabulary).await
-                }
+                // Fallback to Whisper
+                process_with_whisper(audio, languages.clone(), whisper_state, vocabulary).await
             }
-        } else if *audio_transcription_engine == AudioTranscriptionEngine::Qwen3Asr {
-            // Qwen3-ASR via alternate STT engine (audiopipe)
-            if let Some(ref engine) = alternate_stt {
-                let mut engine = engine.lock().map_err(|e| anyhow::anyhow!("stt model lock: {}", e))?;
-                engine.transcribe(audio, sample_rate)
-            } else {
-                Err(anyhow::anyhow!("qwen3-asr model not initialized"))
-            }
-        } else {
-            // Existing Whisper implementation
-            process_with_whisper(audio, languages, whisper_state, vocabulary).await
-        };
+        }
+    } else {
+        // Existing Whisper implementation
+        process_with_whisper(audio, languages, whisper_state, vocabulary).await
+    };
 
     // Post-processing: apply vocabulary replacements
     match transcription {
@@ -153,13 +202,13 @@ pub async fn process_audio_input(
     output_path: &PathBuf,
     audio_transcription_engine: Arc<AudioTranscriptionEngine>,
     deepgram_api_key: Option<String>,
+    openai_compatible_config: Option<OpenAICompatibleConfig>,
     languages: Vec<Language>,
     output_sender: &crossbeam::channel::Sender<TranscriptionResult>,
-    whisper_state: &mut WhisperState,
+    session: &mut TranscriptionSession,
     metrics: Arc<AudioPipelineMetrics>,
-    vocabulary: &[VocabularyEntry],
     pre_written_path: Option<String>,
-    alternate_stt: Option<AlternateSttEngine>,
+    filter_music: bool,
 ) -> Result<()> {
     // NOTE: capture_timestamp is set when audio enters the channel, but smart mode
     // deferral can delay processing by 20+ minutes. The DB now uses Utc::now() at
@@ -181,8 +230,7 @@ pub async fn process_audio_input(
         capture_timestamp: audio.capture_timestamp,
     };
 
-    let is_output_device =
-        audio.device.device_type == crate::core::device::DeviceType::Output;
+    let is_output_device = audio.device.device_type == crate::core::device::DeviceType::Output;
     let (mut segments, speech_ratio_ok, speech_ratio) = prepare_segments(
         &audio_data,
         vad_engine,
@@ -191,6 +239,7 @@ pub async fn process_audio_input(
         embedding_extractor,
         &audio.device.to_string(),
         is_output_device,
+        filter_music,
     )
     .await?;
 
@@ -225,12 +274,11 @@ pub async fn process_audio_input(
             audio.device.clone(),
             audio_transcription_engine.clone(),
             deepgram_api_key.clone(),
+            openai_compatible_config.clone(),
             languages.clone(),
             path,
             timestamp,
-            whisper_state,
-            vocabulary,
-            alternate_stt.clone(),
+            session,
         )
         .await?;
 
@@ -242,33 +290,22 @@ pub async fn process_audio_input(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn run_stt(
     segment: SpeechSegment,
     device: Arc<AudioDevice>,
-    audio_transcription_engine: Arc<AudioTranscriptionEngine>,
-    deepgram_api_key: Option<String>,
-    languages: Vec<Language>,
+    _audio_transcription_engine: Arc<AudioTranscriptionEngine>,
+    _deepgram_api_key: Option<String>,
+    _openai_compatible_config: Option<OpenAICompatibleConfig>,
+    _languages: Vec<Language>,
     path: String,
     timestamp: u64,
-    whisper_state: &mut WhisperState,
-    vocabulary: &[VocabularyEntry],
-    alternate_stt: Option<AlternateSttEngine>,
+    session: &mut TranscriptionSession,
 ) -> Result<TranscriptionResult> {
     let audio = segment.samples.clone();
     let sample_rate = segment.sample_rate;
-    match stt_sync(
-        &audio,
-        sample_rate,
-        &device.to_string(),
-        audio_transcription_engine.clone(),
-        deepgram_api_key.clone(),
-        languages.clone(),
-        whisper_state,
-        vocabulary,
-        alternate_stt,
-    )
-    .await
+    match session
+        .transcribe(&audio, sample_rate, &device.to_string())
+        .await
     {
         Ok(transcription) => Ok(TranscriptionResult {
             input: AudioInput {

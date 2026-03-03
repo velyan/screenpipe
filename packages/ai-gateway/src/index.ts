@@ -10,6 +10,7 @@ import { handleFileTranscription, handleWebSocketUpgrade } from './handlers/tran
 import { handleVoiceTranscription, handleVoiceQuery, handleTextToSpeech, handleVoiceChat } from './handlers/voice';
 import { handleVertexProxy, handleVertexModels } from './handlers/vertex-proxy';
 import { handleWebSearch } from './handlers/web-search';
+import { logCost, getModelCost, inferProvider, getSpendSummary } from './services/cost-tracker';
 // import { handleTTSWebSocketUpgrade } from './handlers/voice-ws';
 
 export { RateLimiter };
@@ -50,8 +51,20 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 
 		// Usage status endpoint - returns current usage without incrementing
 		if (path === '/v1/usage' && request.method === 'GET') {
-			const status = await getUsageStatus(env, authResult.deviceId, authResult.tier);
+			const status = await getUsageStatus(env, authResult.deviceId, authResult.tier, authResult.userId);
 			return addCorsHeaders(createSuccessResponse(status));
+		}
+
+		// Admin spend endpoint - aggregated AI cost data
+		if (path === '/v1/admin/spend' && request.method === 'GET') {
+			const authHeader = request.headers.get('Authorization');
+			const token = authHeader?.replace('Bearer ', '');
+			if (!env.ADMIN_SECRET || token !== env.ADMIN_SECRET) {
+				return addCorsHeaders(createErrorResponse(401, 'unauthorized'));
+			}
+			const range = parseInt(url.searchParams.get('range') || '7', 10);
+			const summary = await getSpendSummary(env, range);
+			return addCorsHeaders(createSuccessResponse(summary));
 		}
 
 		// Chat completions - main AI endpoint
@@ -103,6 +116,46 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 
 			// Add credit info header if paid via credits
 			const response = await handleChatCompletions(body, env);
+
+			// Log cost asynchronously — no latency impact
+			if (body.stream) {
+				ctx.waitUntil(logCost(env, {
+					device_id: authResult.deviceId,
+					user_id: authResult.userId,
+					tier: authResult.tier,
+					provider: inferProvider(body.model),
+					model: body.model,
+					input_tokens: null,
+					output_tokens: null,
+					estimated_cost_usd: getModelCost(body.model, null, null),
+					endpoint: '/v1/chat/completions',
+					stream: true,
+				}));
+			} else {
+				ctx.waitUntil((async () => {
+					try {
+						const cloned = response.clone();
+						const json = await cloned.json() as any;
+						const inputTokens = json?.usage?.prompt_tokens ?? null;
+						const outputTokens = json?.usage?.completion_tokens ?? null;
+						await logCost(env, {
+							device_id: authResult.deviceId,
+							user_id: authResult.userId,
+							tier: authResult.tier,
+							provider: inferProvider(body.model),
+							model: body.model,
+							input_tokens: inputTokens,
+							output_tokens: outputTokens,
+							estimated_cost_usd: getModelCost(body.model, inputTokens, outputTokens),
+							endpoint: '/v1/chat/completions',
+							stream: false,
+						});
+					} catch (e) {
+						console.error('cost log extraction failed:', e);
+					}
+				})());
+			}
+
 			if (usage.paidVia === 'credits' && usage.creditsRemaining !== undefined) {
 				const newResponse = new Response(response.body, response);
 				newResponse.headers.set('X-Credits-Remaining', String(usage.creditsRemaining));
@@ -128,7 +181,20 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 					credits_remaining: usage.creditsRemaining ?? 0,
 				})));
 			}
-			return await handleWebSearch(request, env);
+			const webSearchResponse = await handleWebSearch(request, env);
+			ctx.waitUntil(logCost(env, {
+				device_id: authResult.deviceId,
+				user_id: authResult.userId,
+				tier: authResult.tier,
+				provider: 'google',
+				model: 'gemini-2.5-flash',
+				input_tokens: null,
+				output_tokens: null,
+				estimated_cost_usd: getModelCost('gemini-2.5-flash', null, null),
+				endpoint: '/v1/web-search',
+				stream: false,
+			}));
+			return webSearchResponse;
 		}
 
 		if (path === '/v1/listen' && request.method === 'POST') {
@@ -176,14 +242,17 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 
 			// Check model from body (clone request so proxy can still read it)
 			const clonedRequest = request.clone();
+			let parsedModel = 'claude-haiku-4-5-20251001';
+			let parsedStream = false;
 			try {
-				const body = (await clonedRequest.json()) as { model?: string };
-				const model = body.model || 'claude-haiku-4-5-20251001';
-				if (!isModelAllowed(model, authResult.tier)) {
+				const body = (await clonedRequest.json()) as { model?: string; stream?: boolean };
+				parsedModel = body.model || parsedModel;
+				parsedStream = body.stream === true;
+				if (!isModelAllowed(parsedModel, authResult.tier)) {
 					const allowedModels = TIER_CONFIG[authResult.tier].allowedModels;
 					return addCorsHeaders(createErrorResponse(403, JSON.stringify({
 						error: 'model_not_allowed',
-						message: `Model "${model}" is not available for your tier (${authResult.tier}). Available models: ${allowedModels.join(', ')}`,
+						message: `Model "${parsedModel}" is not available for your tier (${authResult.tier}). Available models: ${allowedModels.join(', ')}`,
 						tier: authResult.tier,
 						allowed_models: allowedModels,
 					})));
@@ -207,7 +276,46 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 				})));
 			}
 
-			return await handleVertexProxy(request, env);
+			const vertexResponse = await handleVertexProxy(request, env);
+			// Log cost — try to extract tokens from non-streaming Anthropic responses
+			ctx.waitUntil((async () => {
+				try {
+					if (parsedStream) {
+						await logCost(env, {
+							device_id: authResult.deviceId,
+							user_id: authResult.userId,
+							tier: authResult.tier,
+							provider: inferProvider(parsedModel),
+							model: parsedModel,
+							input_tokens: null,
+							output_tokens: null,
+							estimated_cost_usd: getModelCost(parsedModel, null, null),
+							endpoint: '/v1/messages',
+							stream: true,
+						});
+					} else {
+						const clonedResp = vertexResponse.clone();
+						const json = await clonedResp.json() as any;
+						const inputTokens = json?.usage?.input_tokens ?? null;
+						const outputTokens = json?.usage?.output_tokens ?? null;
+						await logCost(env, {
+							device_id: authResult.deviceId,
+							user_id: authResult.userId,
+							tier: authResult.tier,
+							provider: inferProvider(parsedModel),
+							model: parsedModel,
+							input_tokens: inputTokens,
+							output_tokens: outputTokens,
+							estimated_cost_usd: getModelCost(parsedModel, inputTokens, outputTokens),
+							endpoint: '/v1/messages',
+							stream: false,
+						});
+					}
+				} catch (e) {
+					console.error('cost log /v1/messages failed:', e);
+				}
+			})());
+			return vertexResponse;
 		}
 
 		// Anthropic-compatible endpoint for OpenCode integration
@@ -222,6 +330,18 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 					error: 'authentication_required',
 					message: 'OpenCode requires authentication. Please log in to screenpipe.',
 				})));
+			}
+
+			// Extract model/stream before proxy consumes the body
+			let ocModel = 'claude-haiku-4-5-20251001';
+			let ocStream = false;
+			try {
+				const clonedReq = request.clone();
+				const reqBody = await clonedReq.json() as { model?: string; stream?: boolean };
+				ocModel = reqBody.model || ocModel;
+				ocStream = reqBody.stream === true;
+			} catch (e) {
+				// body parse failure — proceed with defaults
 			}
 
 			// Track usage for OpenCode requests
@@ -239,7 +359,45 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 				})));
 			}
 
-			return await handleVertexProxy(request, env);
+			const anthropicResponse = await handleVertexProxy(request, env);
+			ctx.waitUntil((async () => {
+				try {
+					if (ocStream) {
+						await logCost(env, {
+							device_id: authResult.deviceId,
+							user_id: authResult.userId,
+							tier: authResult.tier,
+							provider: inferProvider(ocModel),
+							model: ocModel,
+							input_tokens: null,
+							output_tokens: null,
+							estimated_cost_usd: getModelCost(ocModel, null, null),
+							endpoint: '/anthropic/v1/messages',
+							stream: true,
+						});
+					} else {
+						const clonedResp = anthropicResponse.clone();
+						const json = await clonedResp.json() as any;
+						const inputTokens = json?.usage?.input_tokens ?? null;
+						const outputTokens = json?.usage?.output_tokens ?? null;
+						await logCost(env, {
+							device_id: authResult.deviceId,
+							user_id: authResult.userId,
+							tier: authResult.tier,
+							provider: inferProvider(ocModel),
+							model: ocModel,
+							input_tokens: inputTokens,
+							output_tokens: outputTokens,
+							estimated_cost_usd: getModelCost(ocModel, inputTokens, outputTokens),
+							endpoint: '/anthropic/v1/messages',
+							stream: false,
+						});
+					}
+				} catch (e) {
+					console.error('cost log /anthropic/v1/messages failed:', e);
+				}
+			})());
+			return anthropicResponse;
 		}
 
 		// Anthropic models endpoint for OpenCode

@@ -978,15 +978,13 @@ export const CurrentFrameTimeline: FC<CurrentFrameTimelineProps> = ({
 				</div>
 			)}
 
-			{/* Shift+drag region OCR */}
-			{!isLoading && !hasError && renderedImageInfo && naturalDimensions && debouncedFrame?.frameId && (
-				<RegionOcrOverlay
-					frameId={debouncedFrame.frameId}
-					renderedImageInfo={renderedImageInfo}
-					naturalDimensions={naturalDimensions}
-					userToken={settings.user?.token ?? null}
-				/>
-			)}
+			{/* Shift+drag region OCR — always mount so shift key listener is active */}
+			<RegionOcrOverlay
+				frameId={debouncedFrame?.frameId ?? null}
+				renderedImageInfo={renderedImageInfo}
+				naturalDimensions={naturalDimensions}
+				userToken={settings.user?.token ?? null}
+			/>
 
 			{/* URL chips — bottom of frame, when no OCR TextOverlay is showing */}
 			{!isLoading && !hasError && textPositions.length === 0 && detectedUrls.length > 0 && (

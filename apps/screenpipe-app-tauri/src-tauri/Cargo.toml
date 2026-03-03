@@ -69,6 +69,7 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 tracing-appender = "0.2.3"
 
 
+sha2 = "0.10"
 anyhow = "1.0.71"
 arboard = "3.4"
 
@@ -99,6 +100,7 @@ async-stream = "0.3"
 chrono = "0.4.39"
 tauri-plugin-opener = "2.5.3"
 uuid = { version = "1.0", features = ["v4"] }
+urlencoding = "2"
 
 # Cloud sync utilities
 hostname = "0.4"
@@ -127,6 +129,7 @@ tauri-plugin-single-instance = { version = "2.3.7", features = ["deep-link"] }
 tauri-plugin-updater = "2.10.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+tracing-oslog = "0.3.0"
 core-foundation = "0.10"
 cocoa = "0.26.0"
 objc = "0.2.7"
@@ -169,13 +172,11 @@ lazy_static = "1.5.0"
 
 
 [features]
-cudart = []
 metal = ["screenpipe-audio/metal"]
 pulseaudio = ["screenpipe-audio/pulseaudio"]
 vulkan = ["screenpipe-audio/vulkan"]
-mkl = []
 cargo-clippy = []
-default = ["custom-protocol"]
+default = ["custom-protocol", "qwen3-asr"]
 
 # DO NOT REMOVE!!
 custom-protocol = ["tauri/custom-protocol"]
@@ -191,7 +192,6 @@ enterprise-build = []
 # On-device AI via Apple Foundation Models (macOS 26+ / Xcode 26+ only)
 apple-intelligence = ["screenpipe-server/apple-intelligence"]
 
-# Qwen3-ASR speech-to-text engine (ONNX, 0.6B)
 qwen3-asr = ["screenpipe-server/qwen3-asr"]
 
 

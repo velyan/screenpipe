@@ -24,7 +24,7 @@ export function usePi(): UsePiResult {
 
   const refresh = useCallback(async () => {
     try {
-      const result = await commands.piInfo();
+      const result = await commands.piInfo("chat");
       if (result.status === "ok") {
         setInfo(result.data);
       } else {
@@ -53,7 +53,7 @@ export function usePi(): UsePiResult {
     setError(null);
     setLogs([]);
     try {
-      const result = await commands.piStart(projectDir, userToken ?? null, null);
+      const result = await commands.piStart("chat", projectDir, userToken ?? null, null);
       if (result.status === "ok") {
         setInfo(result.data);
         return result.data;
@@ -74,7 +74,7 @@ export function usePi(): UsePiResult {
     setIsLoading(true);
     setError(null);
     try {
-      const result = await commands.piStop();
+      const result = await commands.piStop("chat");
       if (result.status === "ok") {
         setInfo(result.data);
       } else {

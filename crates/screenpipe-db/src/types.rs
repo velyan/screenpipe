@@ -622,6 +622,124 @@ pub struct InsertUiEvent {
     pub frame_id: Option<i64>,
 }
 
+// ============================================================================
+// Elements Types (Unified Screen Content)
+// ============================================================================
+
+/// Source of an element: OCR text detection or accessibility tree
+#[derive(OaSchema, Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ElementSource {
+    Ocr,
+    Accessibility,
+}
+
+impl std::fmt::Display for ElementSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ElementSource::Ocr => write!(f, "ocr"),
+            ElementSource::Accessibility => write!(f, "accessibility"),
+        }
+    }
+}
+
+impl std::str::FromStr for ElementSource {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "ocr" => Ok(ElementSource::Ocr),
+            "accessibility" => Ok(ElementSource::Accessibility),
+            _ => Err(format!("Unknown element source: {}", s)),
+        }
+    }
+}
+
+/// Normalized bounding box (0-1 relative to window/page)
+#[derive(OaSchema, Debug, Clone, Serialize, Deserialize)]
+pub struct ElementBounds {
+    pub left: f64,
+    pub top: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// A single screen content element (OCR word/block or accessibility node)
+#[derive(OaSchema, Debug, Clone, Serialize, Deserialize)]
+pub struct Element {
+    pub id: i64,
+    pub frame_id: i64,
+    pub source: ElementSource,
+    pub role: String,
+    pub text: Option<String>,
+    pub parent_id: Option<i64>,
+    pub depth: i32,
+    pub bounds: Option<ElementBounds>,
+    pub confidence: Option<f64>,
+    pub sort_order: i32,
+}
+
+/// Flat row for bulk insert (parent_id assigned after insert)
+#[derive(Debug, Clone)]
+pub struct InsertElement {
+    pub frame_id: i64,
+    pub source: ElementSource,
+    pub role: String,
+    pub text: Option<String>,
+    pub depth: i32,
+    pub bounds: Option<ElementBounds>,
+    pub confidence: Option<f64>,
+    pub sort_order: i32,
+}
+
+/// Row returned from the elements table query
+#[derive(Debug, FromRow)]
+pub struct ElementRow {
+    pub id: i64,
+    pub frame_id: i64,
+    pub source: String,
+    pub role: String,
+    pub text: Option<String>,
+    pub parent_id: Option<i64>,
+    pub depth: i32,
+    pub left_bound: Option<f64>,
+    pub top_bound: Option<f64>,
+    pub width_bound: Option<f64>,
+    pub height_bound: Option<f64>,
+    pub confidence: Option<f64>,
+    pub sort_order: i32,
+}
+
+impl From<ElementRow> for Element {
+    fn from(row: ElementRow) -> Self {
+        let bounds = match (
+            row.left_bound,
+            row.top_bound,
+            row.width_bound,
+            row.height_bound,
+        ) {
+            (Some(l), Some(t), Some(w), Some(h)) => Some(ElementBounds {
+                left: l,
+                top: t,
+                width: w,
+                height: h,
+            }),
+            _ => None,
+        };
+        Element {
+            id: row.id,
+            frame_id: row.frame_id,
+            source: row.source.parse().unwrap_or(ElementSource::Ocr),
+            role: row.role,
+            text: row.text,
+            parent_id: row.parent_id,
+            depth: row.depth,
+            bounds,
+            confidence: row.confidence,
+            sort_order: row.sort_order,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

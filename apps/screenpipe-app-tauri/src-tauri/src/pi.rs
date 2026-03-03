@@ -10,6 +10,7 @@ use screenpipe_core::agents::pi::screenpipe_cloud_models;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use specta::Type;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -60,9 +61,22 @@ fn build_command_for_path(path: &str) -> Command {
 const PI_PACKAGE: &str = "@mariozechner/pi-coding-agent@0.51.1";
 const SCREENPIPE_API_URL: &str = "https://api.screenpi.pe/v1";
 
-/// State for managing the Pi sidecar process
+/// Pool of Pi sessions — each session_id gets its own PiManager/process.
+pub struct PiPool {
+    pub sessions: HashMap<String, PiManager>,
+}
+
+impl PiPool {
+    pub fn new() -> Self {
+        Self {
+            sessions: HashMap::new(),
+        }
+    }
+}
+
+/// State for managing multiple Pi sidecar processes
 #[derive(Clone)]
-pub struct PiState(pub Arc<Mutex<Option<PiManager>>>);
+pub struct PiState(pub Arc<Mutex<PiPool>>);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
 #[serde(rename_all = "camelCase")]
@@ -111,17 +125,9 @@ pub struct PiManager {
     project_dir: Option<String>,
     request_id: u64,
     app_handle: AppHandle,
-    /// Tracks last activity (creation or send_command) for idle shutdown
+    /// Tracks last activity (creation or send_command)
     last_activity: std::time::Instant,
-    /// Handle to the idle watchdog task so stop() can abort it
-    watchdog_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Shared flag: set by the idle watchdog before stopping Pi, read by the
-    /// stdout reader to decide whether to emit `pi_terminated(0)` (idle) or
-    /// `pi_terminated(pid)` (crash). Each Pi session creates a fresh Arc so
-    /// old reader threads don't interfere with new sessions.
-    idle_stopped: Arc<AtomicBool>,
     /// Guard: ensures only one `pi_terminated` event is emitted per session.
-    /// Both the reader thread and watchdog check-and-set this before emitting.
     terminated_emitted: Arc<AtomicBool>,
 }
 
@@ -134,15 +140,8 @@ impl PiManager {
             request_id: 0,
             app_handle,
             last_activity: std::time::Instant::now(),
-            watchdog_handle: None,
-            idle_stopped: Arc::new(AtomicBool::new(false)),
             terminated_emitted: Arc::new(AtomicBool::new(false)),
         }
-    }
-
-    /// How long since the last send_command() or creation
-    pub fn idle_duration(&self) -> std::time::Duration {
-        self.last_activity.elapsed()
     }
 
     /// Check if the child process is actually alive via try_wait().
@@ -154,7 +153,10 @@ impl PiManager {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     let pid = child.id();
-                    info!("Pi process (pid {}) has exited with status: {}", pid, status);
+                    info!(
+                        "Pi process (pid {}) has exited with status: {}",
+                        pid, status
+                    );
                     self.child = None;
                     self.stdin = None;
                     false
@@ -170,7 +172,7 @@ impl PiManager {
         }
     }
 
-    pub fn snapshot(&mut self) -> PiInfo {
+    pub fn snapshot(&mut self, session_id: &str) -> PiInfo {
         let running = self.check_alive();
         let pid = self.child.as_ref().map(|c| c.id());
 
@@ -178,16 +180,11 @@ impl PiManager {
             running,
             project_dir: self.project_dir.clone(),
             pid,
-            session_id: None,
+            session_id: Some(session_id.to_string()),
         }
     }
 
     pub fn stop(&mut self) {
-        // Abort the idle watchdog first
-        if let Some(handle) = self.watchdog_handle.take() {
-            handle.abort();
-        }
-
         if let Some(mut child) = self.child.take() {
             // Send abort command before killing
             if let Some(ref mut stdin) = self.stdin {
@@ -224,15 +221,27 @@ impl PiManager {
 
         let cmd_str = serde_json::to_string(&cmd).map_err(|e| e.to_string())?;
         let child_pid = self.child.as_ref().map(|c| c.id());
-        let cmd_type = cmd.get("type").and_then(|t| t.as_str()).unwrap_or("?").to_string();
+        let cmd_type = cmd
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("?")
+            .to_string();
 
         let stdin = self.stdin.as_mut().ok_or("Pi not running")?;
 
-        info!("Sending to Pi (req_{}): type={}, child_pid={:?}, bytes={}",
-            self.request_id, cmd_type, child_pid, cmd_str.len() + 1);
+        info!(
+            "Sending to Pi (req_{}): type={}, child_pid={:?}, bytes={}",
+            self.request_id,
+            cmd_type,
+            child_pid,
+            cmd_str.len() + 1
+        );
 
-        writeln!(stdin, "{}", cmd_str).map_err(|e| format!("Failed to write to Pi stdin: {}", e))?;
-        stdin.flush().map_err(|e| format!("Failed to flush Pi stdin: {}", e))?;
+        writeln!(stdin, "{}", cmd_str)
+            .map_err(|e| format!("Failed to write to Pi stdin: {}", e))?;
+        stdin
+            .flush()
+            .map_err(|e| format!("Failed to flush Pi stdin: {}", e))?;
         info!("Sent to Pi (req_{}): flushed ok", self.request_id);
 
         Ok(())
@@ -241,8 +250,7 @@ impl PiManager {
 
 /// Get the Pi config directory (~/.pi/agent)
 fn get_pi_config_dir() -> Result<PathBuf, String> {
-    let home_dir = dirs::home_dir()
-        .ok_or_else(|| "Could not find home directory".to_string())?;
+    let home_dir = dirs::home_dir().ok_or_else(|| "Could not find home directory".to_string())?;
     Ok(home_dir.join(".pi").join("agent"))
 }
 
@@ -252,7 +260,7 @@ fn get_pi_config_dir() -> Result<PathBuf, String> {
 fn parse_where_output(stdout: &str) -> Option<String> {
     // On Windows, prefer .cmd files over shell scripts
     // `where pi` may return multiple results, shell script first then .cmd
-    
+
     // First try to find a .cmd file
     for line in stdout.lines() {
         let path = line.trim();
@@ -260,7 +268,7 @@ fn parse_where_output(stdout: &str) -> Option<String> {
             return Some(path.to_string());
         }
     }
-    
+
     // Fallback to first result if no .cmd found
     if let Some(path) = stdout.lines().next() {
         let path = path.trim().to_string();
@@ -268,7 +276,7 @@ fn parse_where_output(stdout: &str) -> Option<String> {
             return Some(path);
         }
     }
-    
+
     None
 }
 
@@ -338,9 +346,30 @@ fn find_pi_executable() -> Option<String> {
 /// Ensure the screenpipe skills exist in the project's .pi/skills directory
 fn ensure_screenpipe_skill(project_dir: &str) -> Result<(), String> {
     let skills: &[(&str, &str)] = &[
-        ("screenpipe-search", include_str!("../assets/skills/screenpipe-search/SKILL.md")),
-        ("screenpipe-pipe-creator", include_str!("../assets/skills/screenpipe-pipe-creator/SKILL.md")),
-        ("screenpipe-media", include_str!("../assets/skills/screenpipe-media/SKILL.md")),
+        (
+            "screenpipe-search",
+            include_str!("../assets/skills/screenpipe-search/SKILL.md"),
+        ),
+        (
+            "screenpipe-pipe-creator",
+            include_str!("../assets/skills/screenpipe-pipe-creator/SKILL.md"),
+        ),
+        (
+            "screenpipe-media",
+            include_str!("../assets/skills/screenpipe-media/SKILL.md"),
+        ),
+        (
+            "screenpipe-retranscribe",
+            include_str!("../assets/skills/screenpipe-retranscribe/SKILL.md"),
+        ),
+        (
+            "screenpipe-analytics",
+            include_str!("../assets/skills/screenpipe-analytics/SKILL.md"),
+        ),
+        (
+            "screenpipe-elements",
+            include_str!("../assets/skills/screenpipe-elements/SKILL.md"),
+        ),
     ];
 
     for (name, content) in skills {
@@ -364,20 +393,43 @@ fn ensure_screenpipe_skill(project_dir: &str) -> Result<(), String> {
 }
 
 /// Ensure the web-search extension exists in the project's .pi/extensions directory
-fn ensure_web_search_extension(project_dir: &str) -> Result<(), String> {
+/// Install or remove the web-search extension based on provider.
+/// Web search uses the screenpipe cloud backend (Gemini + Google Search),
+/// so we only enable it for screenpipe-cloud presets to avoid sending
+/// user data to our backend when they chose a local/custom provider.
+fn ensure_web_search_extension(
+    project_dir: &str,
+    provider_config: Option<&PiProviderConfig>,
+) -> Result<(), String> {
     let ext_dir = std::path::Path::new(project_dir)
         .join(".pi")
         .join("extensions");
     let ext_path = ext_dir.join("web-search.ts");
 
-    std::fs::create_dir_all(&ext_dir)
-        .map_err(|e| format!("Failed to create extensions dir: {}", e))?;
+    let is_screenpipe_cloud = match provider_config {
+        Some(config) => matches!(config.provider.as_str(), "screenpipe-cloud" | "pi"),
+        None => true, // default preset = screenpipe cloud
+    };
 
-    let ext_content = include_str!("../assets/extensions/web-search.ts");
-    std::fs::write(&ext_path, ext_content)
-        .map_err(|e| format!("Failed to write web-search extension: {}", e))?;
+    if is_screenpipe_cloud {
+        std::fs::create_dir_all(&ext_dir)
+            .map_err(|e| format!("Failed to create extensions dir: {}", e))?;
 
-    debug!("Web search extension installed at {:?}", ext_path);
+        let ext_content = include_str!("../assets/extensions/web-search.ts");
+        std::fs::write(&ext_path, ext_content)
+            .map_err(|e| format!("Failed to write web-search extension: {}", e))?;
+
+        debug!("Web search extension installed at {:?}", ext_path);
+    } else if ext_path.exists() {
+        std::fs::remove_file(&ext_path)
+            .map_err(|e| format!("Failed to remove web-search extension: {}", e))?;
+
+        info!(
+            "Web search extension removed (provider {:?} is not screenpipe-cloud)",
+            provider_config.map(|c| &c.provider)
+        );
+    }
+
     Ok(())
 }
 
@@ -393,11 +445,21 @@ pub struct PiProviderConfig {
     pub model: String,
     /// Optional API key for the provider
     pub api_key: Option<String>,
+    /// Max output tokens (default 4096)
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: i32,
+}
+
+fn default_max_tokens() -> i32 {
+    4096
 }
 
 /// Merge providers into pi's existing config (preserves other providers/auth).
 /// Now supports any OpenAI-compatible provider (OpenAI, Ollama, custom, screenpipe-cloud).
-fn ensure_pi_config(user_token: Option<&str>, provider_config: Option<&PiProviderConfig>) -> Result<(), String> {
+fn ensure_pi_config(
+    user_token: Option<&str>,
+    provider_config: Option<&PiProviderConfig>,
+) -> Result<(), String> {
     let config_dir = get_pi_config_dir()?;
     std::fs::create_dir_all(&config_dir)
         .map_err(|e| format!("Failed to create pi config dir: {}", e))?;
@@ -424,7 +486,10 @@ fn ensure_pi_config(user_token: Option<&str>, provider_config: Option<&PiProvide
         "models": screenpipe_cloud_models()
     });
 
-    if let Some(providers) = models_config.get_mut("providers").and_then(|p| p.as_object_mut()) {
+    if let Some(providers) = models_config
+        .get_mut("providers")
+        .and_then(|p| p.as_object_mut())
+    {
         providers.insert("screenpipe".to_string(), screenpipe_provider);
     } else {
         models_config = json!({"providers": {"screenpipe": screenpipe_provider}});
@@ -434,6 +499,7 @@ fn ensure_pi_config(user_token: Option<&str>, provider_config: Option<&PiProvide
     if let Some(config) = provider_config {
         let provider_name = match config.provider.as_str() {
             "openai" => "openai-byok",
+            "openai-chatgpt" => "openai-chatgpt",
             "native-ollama" => "ollama",
             "custom" => "custom",
             _ => "", // screenpipe-cloud already added above
@@ -442,6 +508,8 @@ fn ensure_pi_config(user_token: Option<&str>, provider_config: Option<&PiProvide
         if !provider_name.is_empty() {
             let base_url = if config.provider == "native-ollama" && config.url.is_empty() {
                 "http://localhost:11434/v1".to_string()
+            } else if config.provider == "openai-chatgpt" {
+                "https://api.openai.com/v1".to_string()
             } else {
                 config.url.clone()
             };
@@ -451,27 +519,36 @@ fn ensure_pi_config(user_token: Option<&str>, provider_config: Option<&PiProvide
             let api_key = match config.provider.as_str() {
                 "native-ollama" => "ollama".to_string(), // Ollama ignores API key but Pi requires one
                 "openai" => "OPENAI_API_KEY".to_string(), // Pi will read from env
+                "openai-chatgpt" => "OPENAI_CHATGPT_TOKEN".to_string(), // OAuth token from env
                 "custom" => "CUSTOM_API_KEY".to_string(), // Pi will read from env
                 _ => "".to_string(),
             };
 
+            let wire_api = if config.provider == "openai-chatgpt" {
+                "openai-codex-responses"
+            } else {
+                "openai-completions"
+            };
+
             let user_provider = json!({
                 "baseUrl": base_url,
-                "api": "openai-completions",
+                "api": wire_api,
                 "apiKey": api_key,
                 "models": [
                     {
                         "id": config.model,
                         "name": config.model,
-                        "input": ["text"],
-                        "contextWindow": 128000,
-                        "maxTokens": 16384,
+                        "input": ["text", "image"],
+                        "maxTokens": config.max_tokens,
                         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
                     }
                 ]
             });
 
-            if let Some(providers) = models_config.get_mut("providers").and_then(|p| p.as_object_mut()) {
+            if let Some(providers) = models_config
+                .get_mut("providers")
+                .and_then(|p| p.as_object_mut())
+            {
                 providers.insert(provider_name.to_string(), user_provider);
             }
         }
@@ -509,10 +586,14 @@ fn ensure_pi_config(user_token: Option<&str>, provider_config: Option<&PiProvide
 /// Get Pi info
 #[tauri::command]
 #[specta::specta]
-pub async fn pi_info(state: State<'_, PiState>) -> Result<PiInfo, String> {
-    let mut manager = state.0.lock().await;
-    match manager.as_mut() {
-        Some(m) => Ok(m.snapshot()),
+pub async fn pi_info(
+    state: State<'_, PiState>,
+    session_id: Option<String>,
+) -> Result<PiInfo, String> {
+    let sid = session_id.unwrap_or_else(|| "chat".to_string());
+    let mut pool = state.0.lock().await;
+    match pool.sessions.get_mut(&sid) {
+        Some(m) => Ok(m.snapshot(&sid)),
         None => Ok(PiInfo::default()),
     }
 }
@@ -520,16 +601,20 @@ pub async fn pi_info(state: State<'_, PiState>) -> Result<PiInfo, String> {
 /// Stop the Pi sidecar
 #[tauri::command]
 #[specta::specta]
-pub async fn pi_stop(state: State<'_, PiState>) -> Result<PiInfo, String> {
-    info!("Stopping pi sidecar");
+pub async fn pi_stop(
+    state: State<'_, PiState>,
+    session_id: Option<String>,
+) -> Result<PiInfo, String> {
+    let sid = session_id.unwrap_or_else(|| "chat".to_string());
+    info!("Stopping pi sidecar for session: {}", sid);
 
-    let mut manager = state.0.lock().await;
-    if let Some(m) = manager.as_mut() {
+    let mut pool = state.0.lock().await;
+    if let Some(m) = pool.sessions.get_mut(&sid) {
         m.stop();
     }
 
-    match manager.as_mut() {
-        Some(m) => Ok(m.snapshot()),
+    match pool.sessions.get_mut(&sid) {
+        Some(m) => Ok(m.snapshot(&sid)),
         None => Ok(PiInfo::default()),
     }
 }
@@ -540,11 +625,13 @@ pub async fn pi_stop(state: State<'_, PiState>) -> Result<PiInfo, String> {
 pub async fn pi_start(
     app: AppHandle,
     state: State<'_, PiState>,
+    session_id: Option<String>,
     project_dir: String,
     user_token: Option<String>,
     provider_config: Option<PiProviderConfig>,
 ) -> Result<PiInfo, String> {
-    pi_start_inner(app, &state, project_dir, user_token, provider_config).await
+    let sid = session_id.unwrap_or_else(|| "chat".to_string());
+    pi_start_inner(app, &state, &sid, project_dir, user_token, provider_config).await
 }
 
 /// Kill orphan Pi RPC processes left over from a previous app crash.
@@ -562,7 +649,10 @@ fn kill_orphan_pi_processes(managed_alive: bool) {
                 if output.status.success() {
                     info!("Killed orphan Pi RPC processes");
                 } else {
-                    debug!("No orphan Pi RPC processes found (pkill exit={})", output.status);
+                    debug!(
+                        "No orphan Pi RPC processes found (pkill exit={})",
+                        output.status
+                    );
                 }
             }
             Err(e) => {
@@ -594,10 +684,11 @@ fn kill_orphan_pi_processes(managed_alive: bool) {
     }
 }
 
-/// Duration after which an idle Pi process is automatically stopped.
-const PI_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-/// How often the watchdog checks for idle / dead Pi processes.
-const PI_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Max time to wait for Pi to emit its first stdout line (readiness handshake).
+/// Pi RPC mode doesn't emit anything until it receives a command, so this is
+/// effectively a "wait for the process to be alive and accepting stdin" timeout.
+/// Keep this short — the process is ready as soon as it starts the readline loop.
+const PI_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Resolve a model name against the screenpipe cloud models list.
 /// Handles mismatches like "claude-haiku-4-5@20251001" when the list only has
@@ -612,11 +703,7 @@ fn resolve_screenpipe_model(requested: &str, provider: &str) -> String {
     let models = screenpipe_cloud_models();
     let model_ids: Vec<&str> = models
         .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m["id"].as_str())
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(|m| m["id"].as_str()).collect())
         .unwrap_or_default();
 
     // Exact match — no resolution needed
@@ -625,10 +712,7 @@ fn resolve_screenpipe_model(requested: &str, provider: &str) -> String {
     }
 
     // Strip date suffix (@20251001 or -20251001) and try again
-    let base = requested
-        .split('@')
-        .next()
-        .unwrap_or(requested);
+    let base = requested.split('@').next().unwrap_or(requested);
     // Also strip trailing -YYYYMMDD pattern
     let base = if base.len() > 9 && base.as_bytes()[base.len() - 9] == b'-' {
         let suffix = &base[base.len() - 8..];
@@ -670,10 +754,14 @@ fn resolve_screenpipe_model(requested: &str, provider: &str) -> String {
     requested.to_string()
 }
 
+/// Maximum number of concurrent Pi sessions before evicting old ones.
+const MAX_PI_SESSIONS: usize = 4;
+
 /// Core Pi start logic — callable from both Tauri commands and Rust boot code.
 pub async fn pi_start_inner(
     app: AppHandle,
     state: &PiState,
+    session_id: &str,
     project_dir: String,
     user_token: Option<String>,
     provider_config: Option<PiProviderConfig>,
@@ -690,8 +778,8 @@ pub async fn pi_start_inner(
     // Ensure screenpipe-search skill exists in project
     ensure_screenpipe_skill(&project_dir)?;
 
-    // Ensure web-search extension exists in project
-    ensure_web_search_extension(&project_dir)?;
+    // Install web-search extension only for screenpipe-cloud presets
+    ensure_web_search_extension(&project_dir, provider_config.as_ref())?;
 
     // Ensure Pi is configured with the user's provider
     ensure_pi_config(user_token.as_deref(), provider_config.as_ref())?;
@@ -701,6 +789,7 @@ pub async fn pi_start_inner(
         Some(config) => {
             let provider_name = match config.provider.as_str() {
                 "openai" => "openai-byok",
+                "openai-chatgpt" => "openai-chatgpt",
                 "native-ollama" => "ollama",
                 "custom" => "custom",
                 "screenpipe-cloud" | "pi" | _ => "screenpipe",
@@ -711,29 +800,52 @@ pub async fn pi_start_inner(
         None => ("screenpipe".to_string(), "claude-haiku-4-5".to_string()),
     };
 
-    let mut manager_guard = state.0.lock().await;
+    let sid = session_id.to_string();
+    let mut pool = state.0.lock().await;
 
-    // Initialize manager if needed
-    if manager_guard.is_none() {
-        *manager_guard = Some(PiManager::new(app.clone()));
-    }
-
-    // Stop any existing instance
-    let managed_alive = if let Some(m) = manager_guard.as_mut() {
+    // Stop existing instance for this session if running
+    let mut any_alive = false;
+    if let Some(m) = pool.sessions.get_mut(&sid) {
         if m.is_running() {
             let old_pid = m.child.as_ref().map(|c| c.id());
-            info!("Stopping existing pi instance (pid {:?}) to start new one", old_pid);
+            info!(
+                "Stopping existing pi instance (pid {:?}) for session '{}' to start new one",
+                old_pid, sid
+            );
             m.stop();
-            false
-        } else {
-            false
         }
-    } else {
-        false
-    };
+    }
 
-    // Kill orphan Pi processes from previous crashes before spawning a new one
-    kill_orphan_pi_processes(managed_alive);
+    // Check if any session has a live process (for orphan cleanup decision)
+    for m in pool.sessions.values_mut() {
+        if m.is_running() {
+            any_alive = true;
+            break;
+        }
+    }
+
+    // Only kill orphans when pool has no live sessions (app startup scenario)
+    kill_orphan_pi_processes(any_alive);
+
+    // Evict least-recently-active non-"chat" session if at capacity
+    if pool.sessions.len() >= MAX_PI_SESSIONS && !pool.sessions.contains_key(&sid) {
+        let evict_key = pool
+            .sessions
+            .iter()
+            .filter(|(k, _)| k.as_str() != "chat" && k.as_str() != sid.as_str())
+            .min_by_key(|(_, m)| m.last_activity)
+            .map(|(k, _)| k.clone());
+        if let Some(key) = evict_key {
+            info!("Evicting Pi session '{}' to make room for '{}'", key, sid);
+            if let Some(mut m) = pool.sessions.remove(&key) {
+                m.stop();
+            }
+        }
+    }
+
+    // Insert a fresh PiManager for this session
+    pool.sessions
+        .insert(sid.clone(), PiManager::new(app.clone()));
 
     // Find pi executable — if not found, wait for background install (up to 60s)
     let pi_path = match find_pi_executable() {
@@ -761,12 +873,21 @@ pub async fn pi_start_inner(
     };
 
     let bun_path = find_bun_executable().unwrap_or_else(|| "NOT FOUND".to_string());
-    info!("Starting pi from {} in dir: {} with provider: {} model: {} bun: {}", pi_path, project_dir, pi_provider, pi_model, bun_path);
+    info!(
+        "Starting pi from {} in dir: {} with provider: {} model: {} bun: {}",
+        pi_path, project_dir, pi_provider, pi_model, bun_path
+    );
 
     // Build command — use cmd.exe /C wrapper for .cmd files on Windows (Rust 1.77+ CVE fix)
     let mut cmd = build_command_for_path(&pi_path);
-    cmd.current_dir(&project_dir)
-        .args(["--mode", "rpc", "--provider", &pi_provider, "--model", &pi_model]);
+    cmd.current_dir(&project_dir).args([
+        "--mode",
+        "rpc",
+        "--provider",
+        &pi_provider,
+        "--model",
+        &pi_model,
+    ]);
 
     // Ensure bun is discoverable by pi.exe shim: the bun global-install shim (pi.exe)
     // needs to find bun.exe to execute the actual JS. If bun isn't in PATH (common on
@@ -804,8 +925,7 @@ pub async fn pi_start_inner(
     // drops large JSON commands (prompts are 2500+ bytes), so pipe is required.
     cmd.stdin(Stdio::piped());
 
-    cmd.stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     // On Windows, prevent console window from appearing
     #[cfg(windows)]
@@ -821,12 +941,26 @@ pub async fn pi_start_inner(
 
     // Pass the user's API key as env var for non-screenpipe providers
     if let Some(ref config) = provider_config {
+        // ChatGPT OAuth: inject token from stored OAuth file (no api_key in config)
+        if config.provider == "openai-chatgpt" {
+            match crate::chatgpt_oauth::get_valid_token().await {
+                Ok(token) => { cmd.env("OPENAI_CHATGPT_TOKEN", token); }
+                Err(e) => {
+                    return Err(format!("ChatGPT OAuth token unavailable: {}. Please sign in again.", e));
+                }
+            }
+        }
+
         if let Some(ref api_key) = config.api_key {
             if !api_key.is_empty() {
                 // Pi resolves apiKey from env vars, so set it
                 match config.provider.as_str() {
-                    "openai" => { cmd.env("OPENAI_API_KEY", api_key); }
-                    "custom" => { cmd.env("CUSTOM_API_KEY", api_key); }
+                    "openai" => {
+                        cmd.env("OPENAI_API_KEY", api_key);
+                    }
+                    "custom" => {
+                        cmd.env("CUSTOM_API_KEY", api_key);
+                    }
                     _ => {}
                 }
             }
@@ -834,73 +968,96 @@ pub async fn pi_start_inner(
     }
 
     // Spawn process
-    let mut child = cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("Failed to spawn pi: {}", e))?;
 
     let pid = child.id();
     info!("Pi started with PID: {}", pid);
 
     // Take stdin for writing commands
-    let stdin = child.stdin.take()
+    let stdin = child
+        .stdin
+        .take()
         .ok_or_else(|| "Failed to get pi stdin".to_string())?;
 
     // Take stdout for reading events
-    let stdout = child.stdout.take()
+    let stdout = child
+        .stdout
+        .take()
         .ok_or_else(|| "Failed to get pi stdout".to_string())?;
 
     // Take stderr for logging
     let stderr = child.stderr.take();
 
-    // Update manager
-    let idle_stopped = Arc::new(AtomicBool::new(false));
+    // Update manager for this session
     let terminated_emitted = Arc::new(AtomicBool::new(false));
-    if let Some(m) = manager_guard.as_mut() {
+    if let Some(m) = pool.sessions.get_mut(&sid) {
         m.child = Some(child);
         m.stdin = Some(stdin);
         m.project_dir = Some(project_dir.clone());
-        // Reset idle timer so the watchdog doesn't use a stale timestamp
-        // from a previous session and immediately kill this new process
         m.last_activity = std::time::Instant::now();
-        // Fresh flags for this session — old reader threads keep their own Arc
-        m.idle_stopped = idle_stopped.clone();
+        // Fresh flag for this session — old reader threads keep their own Arc
         m.terminated_emitted = terminated_emitted.clone();
     }
 
     // Snapshot the state BEFORE dropping the lock, so we don't hold it during I/O
-    let snapshot = match manager_guard.as_mut() {
-        Some(m) => m.snapshot(),
+    let snapshot = match pool.sessions.get_mut(&sid) {
+        Some(m) => m.snapshot(&sid),
         None => PiInfo::default(),
     };
 
     // Drop the lock before spawning reader threads — this is critical to prevent
     // queued pi_start calls from stacking behind a 500ms sleep while holding the lock
-    drop(manager_guard);
+    drop(pool);
+
+    // Readiness signal — stdout reader notifies when first JSON line arrives,
+    // so pi_start_inner can return without a blind 1500ms sleep.
+    let ready_notify = Arc::new(tokio::sync::Notify::new());
+    let ready_notify_reader = ready_notify.clone();
 
     // Spawn stdout reader thread — this is the SOLE emitter of `pi_terminated`.
-    // Using idle_stopped (shared with the watchdog) to distinguish idle stops
-    // from crashes: idle → emit pid=0 (frontend skips restart), crash → emit
-    // real pid (frontend auto-restarts).
     let app_handle = app.clone();
-    let idle_stopped_reader = idle_stopped.clone();
     let terminated_guard = terminated_emitted.clone();
+    let sid_clone = sid.clone();
     std::thread::spawn(move || {
         let reader = BufReader::new(stdout);
-        info!("Pi stdout reader started (pid: {})", pid);
+        info!(
+            "Pi stdout reader started (pid: {}, session: {})",
+            pid, sid_clone
+        );
         let mut line_count = 0u64;
+        let mut ready_signalled = false;
         for line in reader.lines() {
             match line {
                 Ok(line) => {
                     line_count += 1;
-                    let event_type = serde_json::from_str::<Value>(&line)
-                        .ok()
-                        .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|s| s.to_string()));
-                    debug!("Pi stdout #{} (pid {}): type={}", line_count, pid,
-                        event_type.as_deref().unwrap_or("non-json"));
+                    let event_type = serde_json::from_str::<Value>(&line).ok().and_then(|v| {
+                        v.get("type")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.to_string())
+                    });
+                    debug!(
+                        "Pi stdout #{} (pid {}, session {}): type={}",
+                        line_count,
+                        pid,
+                        sid_clone,
+                        event_type.as_deref().unwrap_or("non-json")
+                    );
 
-                    // Try to parse as JSON and emit event
+                    // Signal readiness on first successful JSON line
+                    if !ready_signalled {
+                        if serde_json::from_str::<Value>(&line).is_ok() {
+                            ready_notify_reader.notify_one();
+                            ready_signalled = true;
+                        }
+                    }
+
+                    // Try to parse as JSON and emit event tagged with sessionId
                     match serde_json::from_str::<Value>(&line) {
                         Ok(event) => {
-                            if let Err(e) = app_handle.emit("pi_event", &event) {
+                            let tagged = json!({ "sessionId": sid_clone, "event": event });
+                            if let Err(e) = app_handle.emit("pi_event", &tagged) {
                                 error!("Failed to emit pi_event: {}", e);
                             }
                         }
@@ -920,11 +1077,19 @@ pub async fn pi_start_inner(
                 }
             }
         }
-        info!("Pi stdout reader ended (pid: {}), processed {} lines", pid, line_count);
-        // Only emit once per session — watchdog or overlapping sessions could race
-        if terminated_guard.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-            let terminated_pid = if idle_stopped_reader.load(Ordering::Acquire) { 0u32 } else { pid };
-            let _ = app_handle.emit("pi_terminated", terminated_pid);
+        info!(
+            "Pi stdout reader ended (pid: {}, session: {}), processed {} lines",
+            pid, sid_clone, line_count
+        );
+        // Only emit once per session — overlapping sessions could race
+        if terminated_guard
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _ = app_handle.emit(
+                "pi_terminated",
+                json!({ "sessionId": sid_clone, "pid": pid }),
+            );
         } else {
             debug!("Pi stdout reader: pi_terminated already emitted for this session, skipping");
         }
@@ -934,17 +1099,23 @@ pub async fn pi_start_inner(
     // configurations, so parse and forward them like stdout.
     if let Some(stderr) = stderr {
         let app_handle = app.clone();
+        let sid_stderr = sid.clone();
         std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
-            info!("Pi stderr reader started");
+            info!("Pi stderr reader started (session: {})", sid_stderr);
             for line in reader.lines() {
                 match line {
                     Ok(line) => {
                         // Try to parse as JSON RPC event and forward like stdout
                         if let Ok(event) = serde_json::from_str::<Value>(&line) {
-                            let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("?");
-                            debug!("Pi stderr JSON: type={}", event_type);
-                            if let Err(e) = app_handle.emit("pi_event", &event) {
+                            let event_type =
+                                event.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                            debug!(
+                                "Pi stderr JSON (session {}): type={}",
+                                sid_stderr, event_type
+                            );
+                            let tagged = json!({ "sessionId": sid_stderr, "event": event });
+                            if let Err(e) = app_handle.emit("pi_event", &tagged) {
                                 error!("Failed to emit pi_event from stderr: {}", e);
                             }
                             if let Err(e) = app_handle.emit("pi_output", &line) {
@@ -962,64 +1133,28 @@ pub async fn pi_start_inner(
                     }
                 }
             }
-            info!("Pi stderr reader ended");
+            info!("Pi stderr reader ended (session: {})", sid_stderr);
         });
     }
 
-    // Spawn idle watchdog — auto-stops Pi after PI_IDLE_TIMEOUT of inactivity.
-    // The watchdog does NOT emit `pi_terminated` directly. Instead, it sets
-    // `idle_stopped` and calls stop(). The stdout reader thread detects EOF
-    // from the killed process and emits the single authoritative event.
-    {
-        let state_clone = state.0.clone();
-        let watchdog = tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(PI_WATCHDOG_INTERVAL).await;
-                let mut guard = state_clone.lock().await;
-                if let Some(m) = guard.as_mut() {
-                    if !m.check_alive() {
-                        // Process already dead — stdout reader will emit pi_terminated
-                        info!("Watchdog: Pi process is dead, reader thread will handle termination");
-                        break;
-                    }
-                    let idle = m.idle_duration();
-                    if idle >= PI_IDLE_TIMEOUT {
-                        info!("Watchdog: Pi idle for {:?}, stopping to save resources", idle);
-                        m.idle_stopped.store(true, Ordering::Release);
-                        m.stop();
-                        // stdout reader will see EOF and emit pi_terminated(0)
-                        break;
-                    }
-                } else {
-                    // No manager — nothing to watch
-                    break;
-                }
-            }
-            debug!("Watchdog task exiting");
-        });
-
-        // Store the handle so stop() can abort it
-        let mut guard = state.0.lock().await;
-        if let Some(m) = guard.as_mut() {
-            m.watchdog_handle = Some(watchdog);
+    // Wait for Pi to signal readiness (first JSON line on stdout) instead of
+    // a blind 1500ms sleep. Falls back to process-alive check on timeout.
+    tokio::select! {
+        _ = ready_notify.notified() => {
+            info!("Pi readiness signal received (pid: {})", pid);
+        }
+        _ = tokio::time::sleep(PI_READY_TIMEOUT) => {
+            warn!("Pi readiness timeout after {:?} (pid: {}), checking if alive", PI_READY_TIMEOUT, pid);
         }
     }
-
-    // Wait for Pi to initialize before allowing prompts. Pi v0.51+ needs time
-    // to set up its RPC listener — sending prompts too early causes them to be lost.
-    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
     {
-        let mut manager_guard = state.0.lock().await;
-        if let Some(m) = manager_guard.as_mut() {
+        let mut pool = state.0.lock().await;
+        if let Some(m) = pool.sessions.get_mut(&sid) {
             if let Some(ref mut child) = m.child {
                 match child.try_wait() {
                     Ok(Some(status)) => {
                         let code = status.code().unwrap_or(-1);
                         error!("Pi process exited immediately with code {} — check 'Pi stderr:' warnings above for details (bun path: {})", code, bun_path);
-                        // Clean up: abort watchdog so it doesn't emit stale pi_terminated events
-                        if let Some(handle) = m.watchdog_handle.take() {
-                            handle.abort();
-                        }
                         m.child = None;
                         m.stdin = None;
                         return Err(format!("Pi exited immediately with code {} (bun: {}). Check app logs for 'Pi stderr:' lines.", code, bun_path));
@@ -1053,12 +1188,14 @@ pub struct PiImageContent {
 #[specta::specta]
 pub async fn pi_prompt(
     state: State<'_, PiState>,
+    session_id: Option<String>,
     message: String,
     images: Option<Vec<PiImageContent>>,
 ) -> Result<(), String> {
-    let mut manager = state.0.lock().await;
-    let m = manager.as_mut().ok_or("Pi not initialized")?;
-    
+    let sid = session_id.unwrap_or_else(|| "chat".to_string());
+    let mut pool = state.0.lock().await;
+    let m = pool.sessions.get_mut(&sid).ok_or("Pi not initialized")?;
+
     if !m.is_running() {
         return Err("Pi is not running".to_string());
     }
@@ -1080,10 +1217,11 @@ pub async fn pi_prompt(
 /// Abort current Pi operation
 #[tauri::command]
 #[specta::specta]
-pub async fn pi_abort(state: State<'_, PiState>) -> Result<(), String> {
-    let mut manager = state.0.lock().await;
-    let m = manager.as_mut().ok_or("Pi not initialized")?;
-    
+pub async fn pi_abort(state: State<'_, PiState>, session_id: Option<String>) -> Result<(), String> {
+    let sid = session_id.unwrap_or_else(|| "chat".to_string());
+    let mut pool = state.0.lock().await;
+    let m = pool.sessions.get_mut(&sid).ok_or("Pi not initialized")?;
+
     if !m.is_running() {
         return Err("Pi is not running".to_string());
     }
@@ -1094,10 +1232,14 @@ pub async fn pi_abort(state: State<'_, PiState>) -> Result<(), String> {
 /// Start a new Pi session (clears conversation history)
 #[tauri::command]
 #[specta::specta]
-pub async fn pi_new_session(state: State<'_, PiState>) -> Result<(), String> {
-    let mut manager = state.0.lock().await;
-    let m = manager.as_mut().ok_or("Pi not initialized")?;
-    
+pub async fn pi_new_session(
+    state: State<'_, PiState>,
+    session_id: Option<String>,
+) -> Result<(), String> {
+    let sid = session_id.unwrap_or_else(|| "chat".to_string());
+    let mut pool = state.0.lock().await;
+    let m = pool.sessions.get_mut(&sid).ok_or("Pi not initialized")?;
+
     if !m.is_running() {
         return Err("Pi is not running".to_string());
     }
@@ -1116,14 +1258,51 @@ pub async fn pi_check() -> Result<PiCheckResult, String> {
     })
 }
 
+/// Update Pi config and restart the chat session so the new model takes effect.
+/// Without restart, Pi keeps using the provider/model from its original CLI args.
+#[tauri::command]
+#[specta::specta]
+pub async fn pi_update_config(
+    app: AppHandle,
+    state: State<'_, PiState>,
+    user_token: Option<String>,
+    provider_config: Option<PiProviderConfig>,
+) -> Result<(), String> {
+    info!(
+        "Pi preset changed (provider: {:?}, model: {:?}) — restarting chat session",
+        provider_config.as_ref().map(|c| &c.provider),
+        provider_config.as_ref().map(|c| &c.model),
+    );
+
+    // Resolve the chat project directory
+    let home = dirs::home_dir().ok_or("could not resolve home directory")?;
+    let project_dir = home
+        .join(".screenpipe")
+        .join("pi-chat")
+        .to_string_lossy()
+        .to_string();
+
+    // Restart Pi for the "chat" session with the new provider/model
+    pi_start_inner(
+        app,
+        &state,
+        "chat",
+        project_dir,
+        user_token,
+        provider_config,
+    )
+    .await?;
+
+    Ok(())
+}
+
 /// Install pi via bun
 #[tauri::command]
 #[specta::specta]
 pub async fn pi_install(app: AppHandle) -> Result<(), String> {
     info!("Installing pi via bun...");
 
-    let bun = find_bun_executable()
-        .ok_or("Could not find bun. Install from https://bun.sh")?;
+    let bun = find_bun_executable().ok_or("Could not find bun. Install from https://bun.sh")?;
 
     let app_handle = app.clone();
     std::thread::spawn(move || {
@@ -1164,12 +1343,12 @@ pub async fn pi_install(app: AppHandle) -> Result<(), String> {
 /// Cleanup function to be called on app exit
 pub async fn cleanup_pi(state: &PiState) {
     info!("Cleaning up pi on app exit");
-    let mut manager = state.0.lock().await;
-    if let Some(m) = manager.as_mut() {
+    let mut pool = state.0.lock().await;
+    for (sid, m) in pool.sessions.iter_mut() {
+        info!("Stopping Pi session '{}' on cleanup", sid);
         m.stop();
     }
 }
-
 
 /// Find bun executable (shared by pi_install and ensure_pi_installed_background)
 fn find_bun_executable() -> Option<String> {
@@ -1317,9 +1496,7 @@ mod tests {
     /// parsed JSON values through a channel. This avoids blocking the test
     /// thread on read_line() which would prevent timeout enforcement.
     #[cfg(not(windows))]
-    fn spawn_line_reader(
-        reader: BufReader<std::process::ChildStdout>,
-    ) -> mpsc::Receiver<Value> {
+    fn spawn_line_reader(reader: BufReader<std::process::ChildStdout>) -> mpsc::Receiver<Value> {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let mut reader = reader;
@@ -1401,7 +1578,10 @@ mod tests {
         );
 
         let agent_start = wait_for_type(&rx, "agent_start", Duration::from_secs(15));
-        assert!(agent_start.is_ok(), "should receive agent_start after prompt");
+        assert!(
+            agent_start.is_ok(),
+            "should receive agent_start after prompt"
+        );
 
         let _ = child.kill();
         let _ = child.wait();
@@ -1546,9 +1726,12 @@ mod tests {
     fn test_parse_where_output_prefers_cmd() {
         // Simulates typical `where pi` output on Windows with npm global install
         let output = "C:\\Users\\louis\\AppData\\Roaming\\npm\\pi\r\nC:\\Users\\louis\\AppData\\Roaming\\npm\\pi.cmd\r\n";
-        
+
         let result = parse_where_output(output);
-        assert_eq!(result, Some("C:\\Users\\louis\\AppData\\Roaming\\npm\\pi.cmd".to_string()));
+        assert_eq!(
+            result,
+            Some("C:\\Users\\louis\\AppData\\Roaming\\npm\\pi.cmd".to_string())
+        );
     }
 
     /// Test that parse_where_output works when only .cmd is present
@@ -1556,9 +1739,12 @@ mod tests {
     #[cfg(windows)]
     fn test_parse_where_output_cmd_only() {
         let output = "C:\\Users\\louis\\AppData\\Roaming\\npm\\pi.cmd\r\n";
-        
+
         let result = parse_where_output(output);
-        assert_eq!(result, Some("C:\\Users\\louis\\AppData\\Roaming\\npm\\pi.cmd".to_string()));
+        assert_eq!(
+            result,
+            Some("C:\\Users\\louis\\AppData\\Roaming\\npm\\pi.cmd".to_string())
+        );
     }
 
     /// Test that parse_where_output falls back to first result if no .cmd
@@ -1567,9 +1753,12 @@ mod tests {
     fn test_parse_where_output_no_cmd_fallback() {
         // Edge case: only shell script available (e.g., WSL or custom install)
         let output = "C:\\Users\\louis\\AppData\\Roaming\\npm\\pi\r\n";
-        
+
         let result = parse_where_output(output);
-        assert_eq!(result, Some("C:\\Users\\louis\\AppData\\Roaming\\npm\\pi".to_string()));
+        assert_eq!(
+            result,
+            Some("C:\\Users\\louis\\AppData\\Roaming\\npm\\pi".to_string())
+        );
     }
 
     /// Test that parse_where_output handles empty output
@@ -1577,7 +1766,7 @@ mod tests {
     #[cfg(windows)]
     fn test_parse_where_output_empty() {
         let output = "";
-        
+
         let result = parse_where_output(output);
         assert_eq!(result, None);
     }
@@ -1587,7 +1776,7 @@ mod tests {
     #[cfg(windows)]
     fn test_parse_where_output_whitespace() {
         let output = "   \r\n  \r\n";
-        
+
         let result = parse_where_output(output);
         assert_eq!(result, None);
     }
@@ -1598,7 +1787,7 @@ mod tests {
     fn test_parse_where_output_cmd_not_first() {
         // .cmd file is last in the list
         let output = "C:\\Some\\Path\\pi\r\nC:\\Another\\Path\\pi\r\nC:\\Users\\npm\\pi.cmd\r\n";
-        
+
         let result = parse_where_output(output);
         assert_eq!(result, Some("C:\\Users\\npm\\pi.cmd".to_string()));
     }
@@ -1611,24 +1800,6 @@ mod tests {
 
         let result = parse_where_output(output);
         assert_eq!(result, Some("C:\\Users\\npm\\pi.cmd".to_string()));
-    }
-
-    /// Test that idle_duration tracks time correctly
-    #[test]
-    fn test_idle_duration_tracking() {
-        use std::time::{Duration, Instant};
-        // Simulate the tracking logic without needing a full PiManager
-        let start = Instant::now();
-        std::thread::sleep(Duration::from_millis(50));
-        let elapsed = start.elapsed();
-        assert!(elapsed >= Duration::from_millis(50));
-        assert!(elapsed < Duration::from_secs(2));
-
-        // Simulate activity reset
-        let reset = Instant::now();
-        std::thread::sleep(Duration::from_millis(10));
-        let after_reset = reset.elapsed();
-        assert!(after_reset < elapsed, "activity reset should reduce idle duration");
     }
 
     /// Test that kill_orphan_pi_processes doesn't crash when no processes exist.
@@ -1647,12 +1818,9 @@ mod tests {
         super::kill_orphan_pi_processes(true);
     }
 
-    /// Test PI_IDLE_TIMEOUT and PI_WATCHDOG_INTERVAL constants are sensible
+    /// Test PI_READY_TIMEOUT constant is sensible
     #[test]
-    fn test_idle_timeout_constants() {
-        assert_eq!(super::PI_IDLE_TIMEOUT.as_secs(), 300); // 5 minutes
-        assert_eq!(super::PI_WATCHDOG_INTERVAL.as_secs(), 30);
-        assert!(super::PI_IDLE_TIMEOUT > super::PI_WATCHDOG_INTERVAL);
+    fn test_ready_timeout_constant() {
+        assert_eq!(super::PI_READY_TIMEOUT.as_secs(), 2);
     }
-
 }

@@ -14,7 +14,9 @@ use crate::{
         engine::AudioTranscriptionEngine,
     },
     meeting_detector::MeetingDetector,
-    transcription::{deepgram::CUSTOM_DEEPGRAM_API_TOKEN, VocabularyEntry},
+    transcription::{
+        deepgram::CUSTOM_DEEPGRAM_API_TOKEN, stt::OpenAICompatibleConfig, VocabularyEntry,
+    },
     vad::VadEngineEnum,
 };
 
@@ -23,12 +25,12 @@ use crate::audio_manager::AudioManager;
 /// Controls when Whisper transcription runs.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TranscriptionMode {
-    /// Transcribe immediately as audio is captured (current behavior).
-    #[default]
+    /// Transcribe immediately as audio is captured.
     Realtime,
-    /// Accumulate audio into longer batches (30s-5min) using silence-gap detection.
-    /// Gives Whisper more context for better transcription quality.
-    /// Has no effect on Deepgram (cloud) — always realtime.
+    /// Defer transcription during audio sessions (meetings, YouTube, etc.)
+    /// and batch-transcribe when the session ends or every 2 min.
+    /// Lower CPU during calls, better Whisper context, crash-safe.
+    #[default]
     #[serde(alias = "Smart")]
     Batch,
 }
@@ -39,6 +41,8 @@ pub struct AudioManagerOptions {
     pub vad_engine: VadEngineEnum,
     pub languages: Vec<Language>,
     pub deepgram_api_key: Option<String>,
+    /// Configuration for OpenAI Compatible transcription engine
+    pub openai_compatible_config: Option<OpenAICompatibleConfig>,
     pub enable_diarization: bool,
     pub enable_realtime: bool,
     pub audio_chunk_duration: Duration,
@@ -51,6 +55,8 @@ pub struct AudioManagerOptions {
     pub output_path: Option<PathBuf>,
     /// Enable PII removal from audio transcriptions
     pub use_pii_removal: bool,
+    /// Filter music-dominant audio before transcription using spectral analysis
+    pub filter_music: bool,
     /// When true, automatically follow system default audio devices
     /// and switch when the system default changes (e.g., device plug/unplug)
     pub use_system_default_audio: bool,
@@ -76,6 +82,7 @@ impl Default for AudioManagerOptions {
             vad_engine: VadEngineEnum::Silero,
             languages: vec![],
             deepgram_api_key,
+            openai_compatible_config: None,
             enable_diarization: true,
             enable_realtime: false,
             audio_chunk_duration: Duration::from_secs(30),
@@ -86,6 +93,7 @@ impl Default for AudioManagerOptions {
             deepgram_url,
             deepgram_websocket_url,
             use_pii_removal: false,
+            filter_music: false,
             use_system_default_audio: true,
             transcription_mode: TranscriptionMode::default(),
             meeting_detector: None,
@@ -123,6 +131,12 @@ impl AudioManagerBuilder {
 
     pub fn deepgram_api_key(mut self, deepgram_api_key: Option<String>) -> Self {
         self.options.deepgram_api_key = deepgram_api_key;
+        self
+    }
+
+    /// Set OpenAI Compatible transcription configuration
+    pub fn openai_compatible_config(mut self, config: Option<OpenAICompatibleConfig>) -> Self {
+        self.options.openai_compatible_config = config;
         self
     }
 
@@ -168,6 +182,11 @@ impl AudioManagerBuilder {
 
     pub fn use_pii_removal(mut self, use_pii_removal: bool) -> Self {
         self.options.use_pii_removal = use_pii_removal;
+        self
+    }
+
+    pub fn filter_music(mut self, filter_music: bool) -> Self {
+        self.options.filter_music = filter_music;
         self
     }
 

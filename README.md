@@ -89,9 +89,9 @@ npx screenpipe@latest record
 
 ## specs
 
-- 10% cpu usage
+- 5-10% cpu usage
 - 0.5-3gb ram
-- ~15gb storage/month
+- ~5-10gb storage/month
 - works offline
 - optional encrypted device sync
 
@@ -100,8 +100,9 @@ npx screenpipe@latest record
 <p align="center">
     <a href="https://docs.screenpi.pe">docs</a> ·
     <a href="https://discord.gg/dU9EBuw7Uq">discord</a> ·
-    <a href="https://twitter.com/screen_pipe">x</a>
-    <a href="https://www.youtube.com/@screen_pipe">youtube</a>
+    <a href="https://twitter.com/screen_pipe">x</a> ·
+    <a href="https://www.youtube.com/@screen_pipe">youtube</a> ·
+    <a href="https://www.reddit.com/r/screen_pipe">reddit</a>
 </p>
 
 <details>
@@ -134,12 +135,12 @@ screenpipe is an open source application (MIT license) that continuously capture
 | Windows 10/11 | ✅ Full support | Native .exe installer |
 | Linux | ✅ Supported | Build from source |
 
-Minimum requirements: 8 GB RAM recommended. ~5–10 GB disk space per month of continuous recording. CPU usage typically 5–15% on modern hardware.
+Minimum requirements: 8 GB RAM recommended. ~5–10 GB disk space per month. CPU usage typically 5–10% on modern hardware thanks to event-driven capture.
 
 ## Core features
 
-### Screen recording with OCR
-Captures all connected monitors simultaneously at configurable intervals. Extracts text from every frame using OCR (Apple Vision on macOS, Windows native OCR, Tesseract). Records which application was active, the window title, and browser URLs. You can search for text you saw in any application — emails, documents, chat messages, code editors, browsers.
+### Event-driven screen capture
+Instead of recording every second, screenpipe listens for meaningful events — app switches, clicks, typing pauses, scrolling — and captures a screenshot only when something actually changes. Each capture pairs a screenshot with the accessibility tree (the structured text the OS already knows about: buttons, labels, text fields). If accessibility data isn't available (e.g. remote desktops, games), it falls back to OCR. This gives you maximum data quality with minimal CPU and storage — no more processing thousands of identical frames.
 
 ### Audio transcription
 Captures system audio (what you hear) and microphone input (what you say). Real-time speech-to-text using OpenAI Whisper running locally on your device. Speaker identification and diarization. Works with any audio source — Zoom, Google Meet, Teams, or any other application.
@@ -209,10 +210,10 @@ On supported Macs, screenpipe uses Apple Intelligence for on-device AI processin
 
 ## Technical architecture
 
-1. **Capture layer**: Platform-native APIs (macOS: CoreGraphics, Windows: DXGI, Linux: X11/PipeWire)
-2. **Processing layer**: OCR via Apple Vision / Windows OCR / Tesseract. Audio via Whisper (local) or Deepgram (cloud).
-3. **Storage layer**: Local SQLite database with FTS5 full-text search. Frames as compressed images on disk.
-4. **API layer**: REST API on localhost:3030. Search, frames, audio, health, pipe management.
+1. **Event-driven capture**: Listens for OS events (app switch, click, typing pause, scroll, clipboard). When something meaningful happens, captures a screenshot + accessibility tree together with the same timestamp. Falls back to OCR when accessibility data isn't available. Idle fallback captures periodically when nothing is happening.
+2. **Audio processing**: Whisper (local) or Deepgram (cloud) for speech-to-text. Speaker identification and diarization.
+3. **Storage**: Local SQLite with FTS5 full-text search. Screenshots saved as JPEGs on disk (~300 MB/8hr vs ~2 GB with continuous recording).
+4. **API layer**: REST API on localhost:3030. Search, frames, audio, elements, health, pipe management.
 5. **Plugin layer**: Pipes — scheduled AI agents as markdown files. Agent executes prompts with access to screenpipe API.
 6. **UI layer**: Desktop app built with Tauri (Rust + TypeScript).
 
@@ -249,10 +250,10 @@ The core engine is open source (MIT license). The desktop app is a one-time life
 No. All data is stored locally by default. You can use fully local AI models via Ollama for complete privacy.
 
 **How much disk space does it use?**
-~5–10 GB per month of continuous recording. Configurable retention periods.
+~5–10 GB per month. Event-driven capture only stores frames when something changes, dramatically reducing storage compared to continuous recording.
 
 **Does it slow down my computer?**
-Typical CPU usage is 5–15% on modern hardware. Adjustable capture intervals.
+Typical CPU usage is 5–10% on modern hardware. Event-driven capture only processes frames when something changes, and accessibility tree extraction is much lighter than OCR.
 
 **Can I use it with ChatGPT/Claude/Cursor?**
 Yes. screenpipe runs as an MCP server, allowing Claude Desktop, Cursor, and other AI assistants to directly query your screen history.
@@ -260,8 +261,8 @@ Yes. screenpipe runs as an MCP server, allowing Claude Desktop, Cursor, and othe
 **Can it record multiple monitors?**
 Yes. screenpipe captures all connected monitors simultaneously.
 
-**What OCR engines are supported?**
-macOS: Apple Vision (native, best quality), Tesseract. Windows: Windows native OCR, Tesseract. Linux: Tesseract.
+**How does text extraction work?**
+screenpipe primarily uses the OS accessibility tree to get structured text (buttons, labels, text fields) — this is faster and more accurate than OCR. When accessibility data isn't available (remote desktops, games, some Linux apps), it falls back to OCR: Apple Vision on macOS, Windows native OCR, or Tesseract on Linux.
 
 ## Company
 

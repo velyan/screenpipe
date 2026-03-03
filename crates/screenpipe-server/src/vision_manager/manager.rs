@@ -12,12 +12,13 @@ use screenpipe_vision::PipelineMetrics;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::runtime::Handle;
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::event_driven_capture::{CaptureTrigger, TriggerSender};
 use crate::hot_frame_cache::HotFrameCache;
+use crate::power::PowerProfile;
 
 /// Configuration for VisionManager
 #[derive(Clone)]
@@ -54,6 +55,8 @@ pub struct VisionManager {
     trigger_tx: TriggerSender,
     /// Hot frame cache — capture pushes frames here for zero-DB timeline reads.
     hot_frame_cache: Option<Arc<HotFrameCache>>,
+    /// Power profile receiver — each monitor gets a clone.
+    power_profile_rx: Option<watch::Receiver<PowerProfile>>,
 }
 
 impl VisionManager {
@@ -73,12 +76,19 @@ impl VisionManager {
             recording_tasks: Arc::new(DashMap::new()),
             trigger_tx,
             hot_frame_cache: None,
+            power_profile_rx: None,
         }
     }
 
     /// Set the hot frame cache so captures push frames into it.
     pub fn with_hot_frame_cache(mut self, cache: Arc<HotFrameCache>) -> Self {
         self.hot_frame_cache = Some(cache);
+        self
+    }
+
+    /// Set the power profile receiver so capture loops adapt to battery state.
+    pub fn with_power_profile(mut self, rx: watch::Receiver<PowerProfile>) -> Self {
+        self.power_profile_rx = Some(rx);
         self
     }
 
@@ -205,6 +215,8 @@ impl VisionManager {
         let activity_feed = ActivityFeed::new();
 
         // Tree walker config — pass through user's ignored/included window filters
+        // and monitor dimensions so accessibility bounds are normalized to the
+        // monitor coordinate space (matching the full-screen capture image).
         let tree_walker_config = TreeWalkerConfig {
             ignored_windows: self.config.ignored_windows.clone(),
             included_windows: self.config.included_windows.clone(),
@@ -253,6 +265,7 @@ impl VisionManager {
                 use_pii_removal,
                 enable_main_body_distillation,
                 main_body_distillation_threshold,
+                None,
             )
             .await
             {

@@ -1,5 +1,8 @@
 # CLAUDE.md
 
+## Product vision
+Read `VISION.md` before making product decisions, adding features, or changing UX. Stability over features. Activation over new capabilities. No feature creep.
+
 ## File Headers
 Every source file (.rs, .ts, .tsx, .js, .jsx, .swift, .py) must include this comment at the top (below any shebangs or `use` directives that must be first):
 
@@ -21,11 +24,6 @@ Use `#` for Python, `//` for Rust/TS/JS/Swift. Keep it as the first comment in t
 - `crates/screenpipe-audio/` - Audio capture/transcription (Rust)
 - `crates/screenpipe-vision/` - Screen capture/accessibility text (OCR fallback) (Rust)
 
-## Analytics
-- PostHog API key: source from `.env.local` (gitignored)
-- Project ID: 27525
-- Host: eu.i.posthog.com
-
 ## Testing
 - `cargo test` for Rust
 - `bun test` for JS/TS
@@ -40,8 +38,3 @@ Use `#` for Python, `//` for Rust/TS/JS/Swift. Keep it as the first comment in t
 
 ## git usage
 - make sure to understand there is always bunch of other agents working on the same codebase in parallel, never delete local code or use git reset or such
-
-## Enterprise build
-- Enterprise uses the **same deeplink scheme** `screenpipe` as consumer (see `tauri.enterprise.conf.json` → `plugins.deep-link.desktop.schemes`).
-- **Do not** introduce a separate scheme (e.g. `screenpipe-enterprise`): the app and web auth flows (login, Stripe, settings, etc.) all rely on `screenpipe://` redirects. A different scheme would not be registered by the consumer app and would break normal flows (login, OAuth callbacks, invite links, frame/timeline links).
-

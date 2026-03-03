@@ -8,3 +8,10 @@ CMAKE_POLICY_VERSION_MINIMUM = "3.5"
 # CI can still override via explicit env vars (force = false is default)
 MACOSX_DEPLOYMENT_TARGET = { value = "10.15", force = false }
 CMAKE_OSX_DEPLOYMENT_TARGET = { value = "10.15", force = false }
+
+# On Linux, use gcc linker with -z undefs to allow unresolved symbols
+# for platform-specific execution providers (CoreML, DirectML) that are
+# compiled into ort but not available in the ONNX Runtime library on Linux
+[target.x86_64-unknown-linux-gnu]
+linker = "gcc"
+rustflags = ["-C", "link-arg=-Wl,-z,undefs"]

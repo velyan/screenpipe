@@ -25,6 +25,39 @@ function getSpeakerColorClass(_speakerId?: number): string {
 	return "border-l-border";
 }
 
+const TRUNCATE_LENGTH = 150;
+
+function TranscriptionText({ transcription }: { transcription: string }) {
+	const [expanded, setExpanded] = useState(false);
+
+	if (!transcription) {
+		return (
+			<p className="text-sm italic text-muted-foreground">
+				(no transcription)
+			</p>
+		);
+	}
+
+	const needsTruncation = transcription.length > TRUNCATE_LENGTH;
+	const displayText = needsTruncation && !expanded
+		? transcription.slice(0, TRUNCATE_LENGTH).trimEnd() + "..."
+		: transcription;
+
+	return (
+		<p className="text-sm leading-relaxed text-foreground">
+			{displayText}
+			{needsTruncation && (
+				<button
+					onClick={() => setExpanded(!expanded)}
+					className="ml-1 text-xs text-muted-foreground hover:text-foreground transition-colors duration-150 cursor-pointer"
+				>
+					{expanded ? "show less" : "show more"}
+				</button>
+			)}
+		</p>
+	);
+}
+
 export interface ConversationBubbleProps {
 	audioChunkId: number;
 	speakerId?: number;
@@ -38,6 +71,7 @@ export interface ConversationBubbleProps {
 	isFirstInGroup: boolean;
 	isPlaying: boolean;
 	startOffsetSecs?: number;
+	highlighted?: boolean;
 	onPlay: () => void;
 	onSpeakerAssigned: (newId: number, newName: string) => void;
 	onTimestampClick?: () => void;
@@ -56,6 +90,7 @@ export function ConversationBubble({
 	isFirstInGroup,
 	isPlaying,
 	startOffsetSecs,
+	highlighted,
 	onPlay,
 	onSpeakerAssigned,
 	onTimestampClick,
@@ -74,7 +109,8 @@ export function ConversationBubble({
 					getSpeakerColorClass(speakerId),
 					isFirstInGroup ? "mt-3" : "mt-1",
 					// Brand style: sharp corners, 150ms transitions
-					"animate-in fade-in-0 slide-in-from-bottom-2 duration-150"
+					"animate-in fade-in-0 slide-in-from-bottom-2 duration-150",
+					highlighted && "ring-1 ring-foreground/20 bg-muted/30"
 				)}
 			>
 				{/* Header - only show for first in group */}
@@ -117,15 +153,7 @@ export function ConversationBubble({
 
 				{/* Content */}
 				<div className="px-3 pb-2 pt-2">
-					{transcription ? (
-						<p className="text-sm leading-relaxed text-foreground">
-							{transcription}
-						</p>
-					) : (
-						<p className="text-sm italic text-muted-foreground">
-							(no transcription)
-						</p>
-					)}
+					<TranscriptionText transcription={transcription} />
 
 					{/* Audio controls */}
 					<div className="flex items-center gap-2 mt-2">

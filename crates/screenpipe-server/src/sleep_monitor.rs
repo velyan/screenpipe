@@ -83,8 +83,11 @@ fn check_screen_locked_cgsession() -> bool {
         }
 
         let key_cstr = CString::new("CGSSessionScreenIsLocked").unwrap();
-        let key =
-            CFStringCreateWithCString(std::ptr::null(), key_cstr.as_ptr(), K_CF_STRING_ENCODING_UTF8);
+        let key = CFStringCreateWithCString(
+            std::ptr::null(),
+            key_cstr.as_ptr(),
+            K_CF_STRING_ENCODING_UTF8,
+        );
         if key.is_null() {
             CFRelease(dict);
             return false;
@@ -136,17 +139,15 @@ pub fn start_sleep_monitor() {
     // Thread 1: Poll CGSessionCopyCurrentDictionary every 2s.
     // This catches ALL lock methods (Cmd+Ctrl+Q, menu, hot corner, auto-lock)
     // which NSWorkspace.screensDidSleep does NOT detect.
-    std::thread::spawn(|| {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(2));
-            let locked = check_screen_locked_cgsession();
-            let was_locked = SCREEN_IS_LOCKED.swap(locked, Ordering::SeqCst);
-            if locked != was_locked {
-                if locked {
-                    info!("Screen locked (CGSession poll)");
-                } else {
-                    info!("Screen unlocked (CGSession poll)");
-                }
+    std::thread::spawn(|| loop {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let locked = check_screen_locked_cgsession();
+        let was_locked = SCREEN_IS_LOCKED.swap(locked, Ordering::SeqCst);
+        if locked != was_locked {
+            if locked {
+                info!("Screen locked (CGSession poll)");
+            } else {
+                info!("Screen unlocked (CGSession poll)");
             }
         }
     });

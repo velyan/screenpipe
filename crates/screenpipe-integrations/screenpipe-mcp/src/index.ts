@@ -48,7 +48,7 @@ const SCREENPIPE_API = `http://localhost:${port}`;
 const server = new Server(
   {
     name: "screenpipe",
-    version: "0.8.2",
+    version: "0.8.3",
   },
   {
     capabilities: {
@@ -106,12 +106,12 @@ const BASE_TOOLS: Tool[] = [
         start_time: {
           type: "string",
           format: "date-time",
-          description: "ISO 8601 UTC start time (e.g., 2024-01-15T10:00:00Z)",
+          description: "Start time: ISO 8601 UTC (e.g., 2024-01-15T10:00:00Z) or relative (e.g., '16h ago', '2d ago', 'now')",
         },
         end_time: {
           type: "string",
           format: "date-time",
-          description: "ISO 8601 UTC end time (e.g., 2024-01-15T18:00:00Z)",
+          description: "End time: ISO 8601 UTC (e.g., 2024-01-15T18:00:00Z) or relative (e.g., 'now', '1h ago')",
         },
         app_name: {
           type: "string",
@@ -150,7 +150,7 @@ const BASE_TOOLS: Tool[] = [
     description:
       "Export a video of screen recordings for a specific time range. " +
       "Creates an MP4 video from the recorded frames between the start and end times.\n\n" +
-      "IMPORTANT: Use ISO 8601 UTC timestamps (e.g., 2024-01-15T10:00:00Z)\n\n" +
+      "IMPORTANT: Use ISO 8601 UTC timestamps (e.g., 2024-01-15T10:00:00Z) or relative times (e.g., '16h ago', 'now')\n\n" +
       "EXAMPLES:\n" +
       "- Last 30 minutes: Calculate timestamps from current time\n" +
       "- Specific meeting: Use the meeting's start and end times in UTC",
@@ -165,13 +165,13 @@ const BASE_TOOLS: Tool[] = [
           type: "string",
           format: "date-time",
           description:
-            "Start time in ISO 8601 format UTC. MUST include timezone (Z for UTC). Example: '2024-01-15T10:00:00Z'",
+            "Start time: ISO 8601 UTC (e.g., '2024-01-15T10:00:00Z') or relative (e.g., '16h ago', 'now')",
         },
         end_time: {
           type: "string",
           format: "date-time",
           description:
-            "End time in ISO 8601 format UTC. MUST include timezone (Z for UTC). Example: '2024-01-15T10:30:00Z'",
+            "End time: ISO 8601 UTC (e.g., '2024-01-15T10:30:00Z') or relative (e.g., 'now', '1h ago')",
         },
         fps: {
           type: "number",
@@ -199,12 +199,12 @@ const BASE_TOOLS: Tool[] = [
         start_time: {
           type: "string",
           format: "date-time",
-          description: "ISO 8601 UTC start filter (e.g., 2024-01-15T10:00:00Z)",
+          description: "Start filter: ISO 8601 UTC (e.g., 2024-01-15T10:00:00Z) or relative (e.g., '16h ago', 'now')",
         },
         end_time: {
           type: "string",
           format: "date-time",
-          description: "ISO 8601 UTC end filter (e.g., 2024-01-15T18:00:00Z)",
+          description: "End filter: ISO 8601 UTC (e.g., 2024-01-15T18:00:00Z) or relative (e.g., 'now', '1h ago')",
         },
         limit: {
           type: "integer",
@@ -217,6 +217,120 @@ const BASE_TOOLS: Tool[] = [
           default: 0,
         },
       },
+    },
+  },
+  {
+    name: "activity-summary",
+    description:
+      "Get a lightweight compressed activity overview for a time range (~200-500 tokens). " +
+      "Returns app usage (name, frame count, active minutes, first/last seen), recent accessibility texts, and audio speaker summary. " +
+      "Minutes are based on active session time (consecutive frames with gaps < 5min count as active). " +
+      "first_seen/last_seen show the wall-clock span per app. " +
+      "Use this FIRST for broad questions like 'what was I doing?' before drilling into search-content or search-elements. " +
+      "Much cheaper than search-content for getting an overview.",
+    annotations: {
+      title: "Activity Summary",
+      readOnlyHint: true,
+    },
+    inputSchema: {
+      type: "object",
+      properties: {
+        start_time: {
+          type: "string",
+          format: "date-time",
+          description: "Start of time range: ISO 8601 UTC (e.g., 2024-01-15T10:00:00Z) or relative (e.g., '16h ago', 'now')",
+        },
+        end_time: {
+          type: "string",
+          format: "date-time",
+          description: "End of time range: ISO 8601 UTC (e.g., 2024-01-15T18:00:00Z) or relative (e.g., 'now', '1h ago')",
+        },
+        app_name: {
+          type: "string",
+          description: "Optional app name filter (e.g., 'Google Chrome', 'VS Code')",
+        },
+      },
+      required: ["start_time", "end_time"],
+    },
+  },
+  {
+    name: "search-elements",
+    description:
+      "Search structured UI elements (accessibility tree nodes and OCR text blocks). " +
+      "Returns ~100-500 bytes per element — much lighter than search-content for targeted lookups. " +
+      "Each element has: id, frame_id, source (accessibility/ocr), role (AXButton, AXStaticText, AXLink, etc.), text, bounds, depth.\n\n" +
+      "Use for: finding specific buttons, links, text fields, or UI components. " +
+      "Prefer this over search-content when you need structural UI detail rather than full screen text.",
+    annotations: {
+      title: "Search Elements",
+      readOnlyHint: true,
+    },
+    inputSchema: {
+      type: "object",
+      properties: {
+        q: {
+          type: "string",
+          description: "Full-text search query across element text. Optional.",
+        },
+        frame_id: {
+          type: "integer",
+          description: "Filter to elements from a specific frame",
+        },
+        source: {
+          type: "string",
+          enum: ["accessibility", "ocr"],
+          description: "Filter by element source: 'accessibility' (structured tree) or 'ocr' (text blocks)",
+        },
+        role: {
+          type: "string",
+          description: "Filter by element role (e.g., 'AXButton', 'AXStaticText', 'AXLink', 'AXTextField', 'line')",
+        },
+        start_time: {
+          type: "string",
+          format: "date-time",
+          description: "Start time: ISO 8601 UTC or relative (e.g., '16h ago', 'now')",
+        },
+        end_time: {
+          type: "string",
+          format: "date-time",
+          description: "End time: ISO 8601 UTC or relative (e.g., 'now', '1h ago')",
+        },
+        app_name: {
+          type: "string",
+          description: "Filter by app name",
+        },
+        limit: {
+          type: "integer",
+          description: "Max results. Default: 50",
+          default: 50,
+        },
+        offset: {
+          type: "integer",
+          description: "Skip N results for pagination. Default: 0",
+          default: 0,
+        },
+      },
+    },
+  },
+  {
+    name: "frame-context",
+    description:
+      "Get accessibility text, parsed tree nodes, and extracted URLs for a specific frame. " +
+      "Falls back to OCR data for legacy frames without accessibility data. " +
+      "Use after finding a frame_id from search-content or search-elements to get full structural detail and URLs.",
+    annotations: {
+      title: "Frame Context",
+      readOnlyHint: true,
+    },
+    inputSchema: {
+      type: "object",
+      properties: {
+        frame_id: {
+          type: "integer",
+          description: "The frame ID to get context for (from search results)",
+        },
+      },
+      required: ["frame_id"],
     },
   },
 ];
@@ -312,8 +426,8 @@ Screenpipe captures four types of data:
 | q | Search query | (none - returns all) |
 | content_type | all/ocr/audio/input/accessibility | all |
 | limit | Max results | 10 |
-| start_time | ISO 8601 UTC | (no filter) |
-| end_time | ISO 8601 UTC | (no filter) |
+| start_time | ISO 8601 UTC or relative (e.g. '16h ago') | (no filter) |
+| end_time | ISO 8601 UTC or relative (e.g. 'now') | (no filter) |
 | app_name | Filter by app | (no filter) |
 | include_frames | Include screenshots | false |
 
@@ -324,11 +438,20 @@ Screenpipe captures four types of data:
 4. The q param searches captured text (accessibility/OCR), NOT app names — an app can be visible without its name in the captured text.
 5. NEVER report "no data found" after one filtered search. Verify with unfiltered time-only search first.
 
+## Progressive Disclosure (Token-Efficient Strategy)
+1. **Start with activity-summary** (~200 tokens) for broad questions ("what was I doing?")
+2. **Narrow with search-content** (~500-1000 tokens) using filters from step 1
+3. **Drill into search-elements** (~200 tokens each) for structural UI detail (buttons, links)
+4. **Fetch frame-context** for URLs and accessibility tree of specific frames
+5. **Screenshots** (include_frames=true) only when text isn't enough
+
 ## Tips
 1. Read screenpipe://context first to get current timestamps
-2. Use content_type=input for "what did I type?" queries
-3. Use content_type=accessibility for accessibility tree text
-4. For large aggregations (e.g. "what apps did I use today?"), paginate with offset or suggest the user run raw SQL via \`curl -X POST http://localhost:3030/raw_sql\` for efficient GROUP BY queries
+2. Use activity-summary before search-content for broad overview questions
+3. Use search-elements instead of search-content for targeted UI lookups (10x lighter)
+4. Use content_type=input for "what did I type?" queries
+5. Use content_type=accessibility for accessibility tree text
+6. For large aggregations (e.g. "what apps did I use today?"), paginate with offset or suggest the user run raw SQL via \`curl -X POST http://localhost:3030/raw_sql\` for efficient GROUP BY queries
 
 ## Deep Links (Clickable References)
 When showing search results to users, create clickable links so they can jump to that exact moment.
@@ -853,6 +976,159 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
           ],
         };
+      }
+
+      case "activity-summary": {
+        const params = new URLSearchParams();
+        for (const [key, value] of Object.entries(args)) {
+          if (value !== null && value !== undefined) {
+            params.append(key, String(value));
+          }
+        }
+
+        const response = await fetchAPI(`/activity-summary?${params.toString()}`);
+        if (!response.ok) {
+          throw new Error(`HTTP error: ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        // Format apps
+        const appsLines = (data.apps || []).map(
+          (a: { name: string; frame_count: number; minutes: number; first_seen?: string; last_seen?: string }) => {
+            const timeSpan = a.first_seen && a.last_seen
+              ? `, ${a.first_seen.slice(11, 16)}–${a.last_seen.slice(11, 16)} UTC`
+              : "";
+            return `  ${a.name}: ${a.minutes} min (${a.frame_count} frames${timeSpan})`;
+          }
+        );
+
+        // Format audio
+        const speakerLines = (data.audio_summary?.speakers || []).map(
+          (s: { name: string; segment_count: number }) =>
+            `  ${s.name}: ${s.segment_count} segments`
+        );
+
+        // Format recent texts
+        const textLines = (data.recent_texts || []).map(
+          (t: { text: string; app_name: string; timestamp: string }) =>
+            `  [${t.app_name}] ${t.text}`
+        );
+
+        const summary = [
+          `Activity Summary (${data.time_range?.start} → ${data.time_range?.end})`,
+          `Total frames: ${data.total_frames}`,
+          "",
+          "Apps:",
+          ...(appsLines.length ? appsLines : ["  (none)"]),
+          "",
+          `Audio: ${data.audio_summary?.segment_count || 0} segments`,
+          ...(speakerLines.length ? speakerLines : []),
+          "",
+          "Recent texts:",
+          ...(textLines.length ? textLines.slice(0, 10) : ["  (none)"]),
+        ].join("\n");
+
+        return { content: [{ type: "text", text: summary }] };
+      }
+
+      case "search-elements": {
+        const params = new URLSearchParams();
+        for (const [key, value] of Object.entries(args)) {
+          if (value !== null && value !== undefined) {
+            params.append(key, String(value));
+          }
+        }
+
+        const response = await fetchAPI(`/elements?${params.toString()}`);
+        if (!response.ok) {
+          throw new Error(`HTTP error: ${response.status}`);
+        }
+
+        const data = await response.json();
+        const elements = data.data || [];
+        const pagination = data.pagination || {};
+
+        if (elements.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "No elements found. Try: broader search, different role/source, or wider time range.",
+              },
+            ],
+          };
+        }
+
+        const formatted = elements.map(
+          (e: {
+            id: number;
+            frame_id: number;
+            source: string;
+            role: string;
+            text: string | null;
+            depth: number;
+            bounds: { left: number; top: number; width: number; height: number } | null;
+          }) => {
+            const boundsStr = e.bounds
+              ? ` [${e.bounds.left.toFixed(2)},${e.bounds.top.toFixed(2)} ${e.bounds.width.toFixed(2)}x${e.bounds.height.toFixed(2)}]`
+              : "";
+            return `[${e.source}] ${e.role} (frame:${e.frame_id}, depth:${e.depth})${boundsStr}\n  ${e.text || "(no text)"}`;
+          }
+        );
+
+        const header =
+          `Elements: ${elements.length}/${pagination.total || "?"}` +
+          (pagination.total > elements.length
+            ? ` (use offset=${(pagination.offset || 0) + elements.length} for more)`
+            : "");
+
+        return {
+          content: [{ type: "text", text: header + "\n\n" + formatted.join("\n---\n") }],
+        };
+      }
+
+      case "frame-context": {
+        const frameId = args.frame_id as number;
+        if (!frameId) {
+          return {
+            content: [{ type: "text", text: "Error: frame_id is required" }],
+          };
+        }
+
+        const response = await fetchAPI(`/frames/${frameId}/context`);
+        if (!response.ok) {
+          throw new Error(`HTTP error: ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        const lines = [
+          `Frame ${data.frame_id} (source: ${data.text_source})`,
+        ];
+
+        if (data.urls?.length) {
+          lines.push("", "URLs:", ...data.urls.map((u: string) => `  ${u}`));
+        }
+
+        if (data.nodes?.length) {
+          lines.push("", `Nodes: ${data.nodes.length}`);
+          for (const node of data.nodes.slice(0, 50)) {
+            const indent = "  ".repeat(Math.min(node.depth, 5));
+            lines.push(`${indent}[${node.role}] ${node.text}`);
+          }
+          if (data.nodes.length > 50) {
+            lines.push(`  ... and ${data.nodes.length - 50} more nodes`);
+          }
+        }
+
+        if (data.text) {
+          // Truncate to avoid massive outputs
+          const truncated = data.text.length > 2000 ? data.text.substring(0, 2000) + "..." : data.text;
+          lines.push("", "Full text:", truncated);
+        }
+
+        return { content: [{ type: "text", text: lines.join("\n") }] };
       }
 
       default:

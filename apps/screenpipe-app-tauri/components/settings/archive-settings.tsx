@@ -131,7 +131,7 @@ export function ArchiveSettings() {
 
         await updateSettings({ cloudArchiveEnabled: true });
         await persistArchiveStore(true, retentionDays);
-        toast({ title: "cloud archive enabled" });
+        toast({ title: "Cloud archive enabled" });
       } else {
         // Disable archive
         const res = await fetch("http://localhost:3030/archive/configure", {
@@ -147,13 +147,13 @@ export function ArchiveSettings() {
 
         await updateSettings({ cloudArchiveEnabled: false });
         await persistArchiveStore(false, retentionDays);
-        toast({ title: "cloud archive disabled" });
+        toast({ title: "Cloud archive disabled" });
       }
 
       fetchStatus();
     } catch (error) {
       toast({
-        title: "archive error",
+        title: "Archive error",
         description: String(error),
         variant: "destructive",
       });
@@ -208,7 +208,7 @@ export function ArchiveSettings() {
       }
     } catch (error) {
       toast({
-        title: "failed to start checkout",
+        title: "Failed to start checkout",
         description: String(error),
         variant: "destructive",
       });
@@ -222,14 +222,20 @@ export function ArchiveSettings() {
         <div>
           <div className="flex items-center gap-2">
             <h1 className="text-xl font-bold tracking-tight text-foreground">
-              cloud archive
+              Cloud archive
             </h1>
             <Badge variant="secondary" className="text-[10px]">
               pro
             </Badge>
           </div>
           <p className="text-sm text-muted-foreground mt-1">
-            encrypt and archive old data to the cloud to free disk space.
+            Encrypt and archive old data to the cloud to free disk space.{" "}
+            <button
+              onClick={() => openUrl("https://docs.screenpi.pe/cloud-archive")}
+              className="underline underline-offset-2 hover:text-foreground transition-colors"
+            >
+              Learn more
+            </button>
           </p>
         </div>
 
@@ -238,11 +244,11 @@ export function ArchiveSettings() {
             <div className="flex items-center gap-3 mb-3">
               <Lock className="h-5 w-5 text-muted-foreground" />
               <p className="text-sm text-muted-foreground">
-                cloud archive is available with screenpipe pro.
+                Cloud archive is available with Screenpipe Pro.
               </p>
             </div>
             <Button size="sm" onClick={handleCheckout}>
-              {isLoggedIn ? "upgrade to pro" : "log in to upgrade"}
+              {isLoggedIn ? "Upgrade to pro" : "Log in to upgrade"}
             </Button>
           </CardContent>
         </Card>
@@ -255,14 +261,14 @@ export function ArchiveSettings() {
       <div>
         <div className="flex items-center gap-2">
           <h1 className="text-xl font-bold tracking-tight text-foreground">
-            cloud archive
+            Cloud archive
           </h1>
           <Badge variant="secondary" className="text-[10px]">
             pro
           </Badge>
         </div>
         <p className="text-sm text-muted-foreground mt-1">
-          encrypt and archive data older than{" "}
+          Encrypt and archive data older than{" "}
           <Select
             value={String(retentionDays)}
             onValueChange={handleRetentionChange}
@@ -278,13 +284,19 @@ export function ArchiveSettings() {
               ))}
             </SelectContent>
           </Select>{" "}
-          to free disk space.
+          to free disk space.{" "}
+          <button
+            onClick={() => openUrl("https://docs.screenpi.pe/cloud-archive")}
+            className="underline underline-offset-2 hover:text-foreground transition-colors"
+          >
+            Learn more
+          </button>
         </p>
       </div>
 
       {/* Toggle */}
       <div className="flex items-center justify-between">
-        <span className="text-sm text-foreground">enable cloud archive</span>
+        <span className="text-sm text-foreground">Enable cloud archive</span>
         <Switch
           checked={archiveEnabled}
           onCheckedChange={handleToggle}
@@ -305,7 +317,7 @@ export function ArchiveSettings() {
               <>
                 {/* Status row */}
                 <div className="flex items-center justify-between text-sm">
-                  <span className="text-muted-foreground">status</span>
+                  <span className="text-muted-foreground">Status</span>
                   <span className="text-foreground">
                     {status.is_uploading ? (
                       <span className="flex items-center gap-1.5 text-foreground">
@@ -328,7 +340,7 @@ export function ArchiveSettings() {
                 {status.pending_count > 0 && (
                   <div className="flex items-center justify-between text-sm">
                     <span className="text-muted-foreground">
-                      pending records
+                      Pending records
                     </span>
                     <span className="text-foreground">
                       {status.pending_count.toLocaleString()}
@@ -339,7 +351,7 @@ export function ArchiveSettings() {
                 {/* Last archived */}
                 {status.last_cleanup && (
                   <div className="flex items-center justify-between text-sm">
-                    <span className="text-muted-foreground">last archived</span>
+                    <span className="text-muted-foreground">Last archived</span>
                     <span className="text-foreground">
                       {formatRelativeTime(status.last_cleanup)}
                     </span>
@@ -350,7 +362,7 @@ export function ArchiveSettings() {
                 {(status.storage_used > 0 || status.storage_limit > 0) && (
                   <div className="flex items-center justify-between text-sm">
                     <span className="text-muted-foreground">
-                      cloud storage
+                      Cloud storage
                     </span>
                     <span className="text-foreground">
                       {formatBytes(status.storage_used)}
@@ -380,19 +392,19 @@ export function ArchiveSettings() {
                         await fetch("http://localhost:3030/archive/run", {
                           method: "POST",
                         });
-                        toast({ title: "archive run started" });
+                        toast({ title: "Archive run started" });
                         // Poll faster while uploading
                         setTimeout(fetchStatus, 2000);
                       } catch {
                         toast({
-                          title: "failed to trigger archive",
+                          title: "Failed to trigger archive",
                           variant: "destructive",
                         });
                       }
                     }}
                   >
                     <Play className="h-3 w-3 mr-1.5" />
-                    archive now
+                    Archive now
                   </Button>
                 )}
               </>
@@ -406,8 +418,8 @@ export function ArchiveSettings() {
         <div className="flex items-start gap-2 text-xs text-muted-foreground">
           <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0 mt-0.5" />
           <span>
-            local data older than {retentionDays} days is deleted after upload.
-            download is not yet available.
+            Local data older than {retentionDays} days is deleted after upload.
+            Download is not yet available.
           </span>
         </div>
       )}

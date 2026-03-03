@@ -79,7 +79,6 @@ jobs:
             apps/screenpipe-app-tauri/node_modules
             apps/screenpipe-app-tauri/src-tauri/target
             apps/screenpipe-app-tauri/.tauri
-            apps/screenpipe-app-tauri/src-tauri/mkl
             apps/screenpipe-app-tauri/src-tauri/vcredist
             apps/screenpipe-app-tauri/src-tauri/ollama-*
             apps/screenpipe-app-tauri/src-tauri/lib/ollama
@@ -158,30 +157,6 @@ jobs:
         working-directory: apps/screenpipe-app-tauri
         run: bun ./scripts/pre_build.js
 
-      - name: Check Python
-        id: check-python
-        shell: powershell
-        run: |
-          if (Get-Command python -ErrorAction SilentlyContinue) { echo "has_python=true" >> $env:GITHUB_OUTPUT } else { echo "has_python=false" >> $env:GITHUB_OUTPUT }
-
-      - uses: actions/setup-python@v5
-        if: steps.check-python.outputs.has_python != 'true'
-        with:
-          python-version: "3.13"
-
-      - name: Copy library for MKL
-        shell: powershell
-        run: |
-          $mkl_dir = "apps/screenpipe-app-tauri/src-tauri/mkl"
-          New-Item -ItemType Directory -Force -Path $mkl_dir | Out-Null
-          $temp_dir = "temp_omp"
-          New-Item -ItemType Directory -Force -Path $temp_dir | Out-Null
-          python -m pip install --upgrade pip
-          python -m pip install intel-openmp --target $temp_dir
-          Get-ChildItem -Path $temp_dir -Recurse -Filter "*.dll" | ForEach-Object { Copy-Item $_.FullName -Destination $mkl_dir -Force }
-          if ((Get-ChildItem -Path $mkl_dir -Filter "*.dll").Count -eq 0) { throw "No DLLs found" }
-          Remove-Item -Path $temp_dir -Recurse -Force
-
       - name: Download ONNX Runtime (CPU) for Windows
         shell: pwsh
         run: |
@@ -223,7 +198,7 @@ jobs:
           KNF_STATIC_CRT: "1"
           CMAKE_ARGS: "-DGGML_NATIVE=OFF -DGGML_AVX512=OFF -DGGML_AVX512_VBMI=OFF -DGGML_AVX512_VNNI=OFF -DGGML_AVX512_BF16=OFF"
         with:
-          args: "--target x86_64-pc-windows-msvc --features mkl,enterprise-build"
+          args: "--target x86_64-pc-windows-msvc --features enterprise-build"
           projectPath: "./apps/screenpipe-app-tauri"
           tauriScript: bunx tauri -v
           retryAttempts: 3

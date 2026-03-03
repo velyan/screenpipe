@@ -16,6 +16,7 @@ use crate::{
     analytics,
     hot_frame_cache::HotFrameCache,
     routes::{
+        activity_summary::get_activity_summary,
         audio::{
             api_list_audio_devices, start_audio, start_audio_device, stop_audio, stop_audio_device,
         },
@@ -24,6 +25,7 @@ use crate::{
             remove_tags, validate_media_handler,
         },
         data::delete_time_range_handler,
+        elements::{get_frame_elements, search_elements},
         frames::{
             get_frame_context, get_frame_data, get_frame_metadata, get_frame_ocr_data,
             get_next_valid_frame, run_frame_ocr,
@@ -149,6 +151,8 @@ pub struct SCServer {
     pub main_body_distillation_threshold: f32,
     /// Shared hot frame cache — set this before starting the server so AppState uses it.
     pub hot_frame_cache: Option<Arc<HotFrameCache>>,
+    /// Power manager handle — set this before starting to enable /power endpoints.
+    pub power_manager: Option<Arc<crate::power::PowerManagerHandle>>,
 }
 
 impl SCServer {
@@ -185,6 +189,7 @@ impl SCServer {
             enable_main_body_distillation: false,
             main_body_distillation_threshold: 0.60,
             hot_frame_cache: None,
+            power_manager: None,
         }
     }
 
@@ -341,7 +346,7 @@ impl SCServer {
             let cache = hot_frame_cache.clone();
             let db = self.db.clone();
             tokio::spawn(async move {
-                cache.warm_from_db(&db, 2).await;
+                cache.warm_from_db(&db, 24).await;
             });
         }
 
@@ -447,6 +452,9 @@ impl SCServer {
             .get("/search/keyword", keyword_search_handler)
             .post("/audio/device/start", start_audio_device)
             .post("/audio/device/stop", stop_audio_device)
+            .get("/elements", search_elements)
+            .get("/frames/:frame_id/elements", get_frame_elements)
+            .get("/activity-summary", get_activity_summary)
             .route_yaml_spec("/openapi.yaml")
             .route_json_spec("/openapi.json")
             .freeze();
@@ -462,6 +470,14 @@ impl SCServer {
             .route(
                 "/sync/download",
                 axum::routing::post(sync_api::sync_download),
+            )
+            .route(
+                "/sync/pipes/push",
+                axum::routing::post(sync_api::sync_pipes_push),
+            )
+            .route(
+                "/sync/pipes/pull",
+                axum::routing::post(sync_api::sync_pipes_pull),
             )
             // Cloud Archive API routes
             .route(
@@ -537,6 +553,20 @@ impl SCServer {
                 )
                 .with_state(pm.clone());
             router.nest("/pipes", pipe_routes)
+        } else {
+            router
+        };
+
+        // Power management routes (if power manager is available)
+        let router = if let Some(ref pm) = self.power_manager {
+            let power_routes = Router::new()
+                .route(
+                    "/",
+                    get(crate::routes::power::get_power_status)
+                        .post(crate::routes::power::set_power_mode),
+                )
+                .with_state(pm.clone());
+            router.nest("/power", power_routes)
         } else {
             router
         };

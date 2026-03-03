@@ -389,7 +389,7 @@ export const MultiSelect = React.forwardRef<
             className="w-full"
             filter={(value, search) => {
               if (!search) return 1;
-              return filterOptions(search).some((opt) => opt.value === value)
+              return filterOptions(search).some((opt) => opt.value.toLowerCase() === value.toLowerCase())
                 ? 1
                 : 0;
             }}
@@ -436,6 +436,7 @@ export const MultiSelect = React.forwardRef<
                 ].map((option) => (
                     <CommandItem
                       key={option.value}
+                      value={option.value}
                       onSelect={() => toggleOption(option.value)}
                       className="cursor-pointer w-full"
                     >

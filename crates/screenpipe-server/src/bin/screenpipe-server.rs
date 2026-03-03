@@ -31,7 +31,7 @@ use screenpipe_server::{
     cli_pipe::handle_pipe_command,
     cli_status::handle_status_command,
     hot_frame_cache::HotFrameCache,
-    start_meeting_persister, start_meeting_watcher, start_sleep_monitor,
+    start_meeting_persister, start_meeting_watcher, start_power_manager, start_sleep_monitor,
     start_speaker_identification, start_ui_recording,
     sync_provider::ScreenpipeSyncProvider,
     vision_manager::{start_monitor_watcher, stop_monitor_watcher, VisionManager},
@@ -56,6 +56,9 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter};
 use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, Layer};
+
+#[cfg(target_os = "macos")]
+use tracing_oslog::OsLogger;
 
 /// Set the file descriptor limit for the process.
 /// This helps prevent "Too many open files" errors during heavy WebSocket/video usage.
@@ -220,6 +223,9 @@ fn setup_logging(local_data_dir: &PathBuf, cli: &Cli) -> anyhow::Result<WorkerGu
                 .with_filter(make_env_filter()),
         );
 
+    #[cfg(target_os = "macos")]
+    let tracing_registry = tracing_registry.with(OsLogger::new("pe.screenpi", "server"));
+
     #[cfg(feature = "debug-console")]
     let tracing_registry = tracing_registry.with(
         console_subscriber::spawn().with_filter(
@@ -262,7 +268,8 @@ async fn main() -> anyhow::Result<()> {
             "https://123656092b01a72b0417355ebbfb471f@o4505591122886656.ingest.us.sentry.io/4510761360949248",
             sentry::ClientOptions {
                 release: Some(release_name.into()),
-                traces_sample_rate: 0.1,
+                sample_rate: 0.1,
+                traces_sample_rate: 0.01,
                 send_default_pii: false,
                 server_name: Some("screenpipe-cli".into()),
                 before_send: Some(std::sync::Arc::new(|mut event| {
@@ -708,13 +715,17 @@ async fn main() -> anyhow::Result<()> {
     // Create shared pipeline metrics (used by recording + health endpoint + PostHog)
     let vision_metrics = Arc::new(screenpipe_vision::PipelineMetrics::new());
 
+    // Start power manager — polls battery/thermal state and broadcasts profile changes
+    let power_manager = start_power_manager();
+
     // Create VisionManager for event-driven capture on all monitors
     let (handle, capture_trigger_tx) = if !config.disable_vision {
         let vision_config =
             config.to_vision_manager_config(output_path_clone.to_string(), vision_metrics.clone());
         let vision_manager = Arc::new(
             VisionManager::new(vision_config, db_clone.clone(), vision_handle.clone())
-                .with_hot_frame_cache(hot_frame_cache.clone()),
+                .with_hot_frame_cache(hot_frame_cache.clone())
+                .with_power_profile(power_manager.subscribe()),
         );
 
         // Get the broadcast trigger sender BEFORE moving the VisionManager into
@@ -751,8 +762,9 @@ async fn main() -> anyhow::Result<()> {
         });
         (h, Some(trigger_tx))
     } else {
-        // Vision disabled — spawn a no-op task so `handle` always exists
-        (tokio::spawn(async {}), None)
+        // Vision disabled — spawn a pending task so `handle` never completes
+        // (otherwise the no-op future wins the tokio::select! race and shuts down the server)
+        (tokio::spawn(std::future::pending::<()>()), None)
     };
 
     let local_data_dir_clone_2 = local_data_dir_clone.clone();
@@ -776,6 +788,7 @@ async fn main() -> anyhow::Result<()> {
     server.enable_main_body_distillation = config.enable_main_body_distillation;
     server.main_body_distillation_threshold = config.main_body_distillation_threshold;
     server.hot_frame_cache = Some(hot_frame_cache);
+    server.power_manager = Some(power_manager);
 
     // Attach sync handle if sync is enabled
     let server = if let Some(ref handle) = sync_service_handle {

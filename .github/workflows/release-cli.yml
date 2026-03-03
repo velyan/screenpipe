@@ -279,6 +279,17 @@ jobs:
           Write-Host "ONNX Runtime extracted to $extractDir"
           Get-ChildItem "$extractDir/lib" | ForEach-Object { Write-Host $_.Name }
 
+      - name: Shorten target dir to avoid MAX_PATH
+        shell: powershell
+        run: |
+          $targetDir = "target"
+          $shortDir = "C:\t"
+          if (Test-Path $shortDir) { Remove-Item -Recurse -Force $shortDir }
+          New-Item -ItemType Directory -Force -Path $shortDir | Out-Null
+          if (Test-Path $targetDir) { Remove-Item -Recurse -Force $targetDir }
+          cmd /c mklink /J $targetDir $shortDir
+          Write-Host "Created junction: $targetDir -> $shortDir"
+
       - name: Build CLI
         env:
           CARGO_PROFILE_RELEASE_STRIP: "none"

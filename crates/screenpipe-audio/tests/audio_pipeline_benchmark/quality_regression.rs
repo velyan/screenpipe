@@ -12,11 +12,8 @@
 use crate::audio_fixtures::{self, SAMPLE_RATE};
 
 use screenpipe_audio::core::engine::AudioTranscriptionEngine;
-use screenpipe_audio::transcription::whisper::model::{
-    create_whisper_context_parameters, download_whisper_model,
-};
+use screenpipe_audio::TranscriptionEngine;
 use screenpipe_core::Language;
-use whisper_rs::WhisperContext;
 
 use std::sync::Arc;
 
@@ -45,19 +42,10 @@ async fn whisper_hallucination_on_silence() {
     // 30 seconds of pure silence at 16kHz
     let silence = vec![0.0f32; SAMPLE_RATE as usize * 30];
 
-    let text = screenpipe_audio::stt(
-        &silence,
-        SAMPLE_RATE,
-        "test-silence",
-        engine.clone(),
-        None,
-        vec![Language::English],
-        &mut whisper_state,
-        &[],
-        None,
-    )
-    .await
-    .expect("stt failed");
+    let text = session
+        .transcribe(&silence, SAMPLE_RATE, "test-silence")
+        .await
+        .expect("stt failed");
 
     let trimmed = text.trim();
     println!("  Silence input → output: \"{}\"", trimmed);
@@ -94,19 +82,10 @@ async fn whisper_hallucination_on_noise() {
     // 30 seconds of white noise at 0.1 amplitude
     let noise = audio_fixtures::white_noise(0.1, 30.0);
 
-    let text = screenpipe_audio::stt(
-        &noise,
-        SAMPLE_RATE,
-        "test-noise",
-        engine.clone(),
-        None,
-        vec![Language::English],
-        &mut whisper_state,
-        &[],
-        None,
-    )
-    .await
-    .expect("stt failed");
+    let text = session
+        .transcribe(&noise, SAMPLE_RATE, "test-noise")
+        .await
+        .expect("stt failed");
 
     let trimmed = text.trim();
     println!("  Noise input → output: \"{}\"", trimmed);
@@ -141,19 +120,10 @@ async fn whisper_hallucination_on_ambient() {
     // 30s of very low noise at 0.01 amplitude (typical quiet room)
     let ambient = audio_fixtures::white_noise(0.01, 30.0);
 
-    let text = screenpipe_audio::stt(
-        &ambient,
-        SAMPLE_RATE,
-        "test-ambient",
-        engine.clone(),
-        None,
-        vec![Language::English],
-        &mut whisper_state,
-        &[],
-        None,
-    )
-    .await
-    .expect("stt failed");
+    let text = session
+        .transcribe(&ambient, SAMPLE_RATE, "test-ambient")
+        .await
+        .expect("stt failed");
 
     let trimmed = text.trim();
     println!("  Ambient noise → output: \"{}\"", trimmed);
@@ -249,19 +219,10 @@ async fn whisper_real_speech_still_works() {
             let gt_combined = gt_texts.join(" ");
             let gt_word_count = gt_combined.split_whitespace().count();
 
-            let text = screenpipe_audio::stt(
-                chunk,
-                SAMPLE_RATE,
-                "benchmark",
-                engine.clone(),
-                None,
-                vec![Language::English],
-                &mut whisper_state,
-                &[],
-                None,
-            )
-            .await
-            .expect("stt failed");
+            let text = session
+                .transcribe(chunk, SAMPLE_RATE, "benchmark")
+                .await
+                .expect("stt failed");
 
             // Word recall: what fraction of ground truth words appear in transcription
             let trans_lower = text.to_lowercase();

@@ -3,7 +3,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tracing::{debug, error, trace};
+use tracing::{debug, trace};
 
 #[cfg(target_os = "macos")]
 use sysinfo::{System, SystemExt};
@@ -87,7 +87,7 @@ pub async fn capture_event(event: &str, properties: Value) {
         .send()
         .await
     {
-        error!("Failed to send analytics event: {}", e);
+        debug!("failed to send analytics event: {}", e);
     }
 }
 

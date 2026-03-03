@@ -12,6 +12,7 @@ export type VadSensitivity = "low" | "medium" | "high";
 export type AIProviderType =
 	| "native-ollama"
 	| "openai"
+	| "openai-chatgpt"
 	| "custom"
 	| "embedded"
 	| "pi";
@@ -31,6 +32,7 @@ export enum Shortcut {
 export type AIPreset = {
 	id: string;
 	maxContextChars: number;
+	maxTokens?: number;
 	url: string;
 	model: string;
 	defaultPreset: boolean;
@@ -52,6 +54,9 @@ export type AIPreset = {
 	  }
 	| {
 			provider: "pi";
+	  }
+	| {
+			provider: "openai-chatgpt";
 	  }
 );
 
@@ -110,6 +115,16 @@ export type Settings = SettingsStore & {
 	cloudArchiveEnabled?: boolean;
 	/** Days to keep data locally before archiving (default: 7) */
 	cloudArchiveRetentionDays?: number;
+	/** Sync pipe configurations across devices (requires cloud sync subscription) */
+	pipeSyncEnabled?: boolean;
+	/** OpenAI-compatible transcription endpoint URL */
+	openaiCompatibleEndpoint?: string;
+	/** OpenAI-compatible transcription API key */
+	openaiCompatibleApiKey?: string;
+	/** OpenAI-compatible transcription model name */
+	openaiCompatibleModel?: string;
+	/** Filter music-dominant audio before transcription (reduces Spotify/YouTube music noise) */
+	filterMusic?: boolean;
 }
 
 export function getEffectiveFilters(settings: Settings) {
@@ -257,9 +272,10 @@ let DEFAULT_SETTINGS: Settings = {
 			overlayMode: "fullscreen",
 			showOverlayInScreenRecording: false,
 			videoQuality: "balanced",
-			transcriptionMode: "realtime",
+			transcriptionMode: "batch",
 			cloudArchiveEnabled: false,
 			cloudArchiveRetentionDays: 7,
+			filterMusic: false,
 		};
 
 export function createDefaultSettingsObject(): Settings {
@@ -278,6 +294,11 @@ export function createDefaultSettingsObject(): Settings {
 			DEFAULT_SETTINGS.enableAccessibility = true;
 			DEFAULT_SETTINGS.enableInputCapture = true;
 			DEFAULT_SETTINGS.disableOcr = true;
+			DEFAULT_SETTINGS.overlayMode = "window";
+		}
+
+		if (p === "linux") {
+			DEFAULT_SETTINGS.overlayMode = "window";
 		}
 
 		return DEFAULT_SETTINGS;

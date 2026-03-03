@@ -35,6 +35,7 @@ import posthog from "posthog-js";
 
 const providerIcons: Record<AIPreset["provider"], JSX.Element> = {
 	openai: <Image src="/images/openai.png" alt="OpenAI" width={16} height={16} />,
+	"openai-chatgpt": <Image src="/images/openai.png" alt="ChatGPT" width={16} height={16} />,
 	"native-ollama": <Image src="/images/ollama.png" alt="Ollama" width={16} height={16} />,
 	custom: <Image src="/images/custom.png" alt="Custom" width={16} height={16} />,
 	"screenpipe-cloud": <Image src="/images/screenpipe.png" alt="Screenpipe Cloud" width={16} height={16} />,
@@ -124,23 +125,31 @@ export function AIPanel({
 	};
 
 	useEffect(() => {
+		let rafId: number | null = null;
+
 		const handleGlobalMouseMove = (e: MouseEvent) => {
 			if (isDraggingPanel) {
 				e.preventDefault();
-				const newX = e.clientX - dragOffset.x;
-				const newY = e.clientY - dragOffset.y;
+				if (rafId) return; // skip until previous frame is painted
+				rafId = requestAnimationFrame(() => {
+					rafId = null;
+					const newX = e.clientX - dragOffset.x;
+					const newY = e.clientY - dragOffset.y;
 
-				const maxX = window.innerWidth - chatWindowSize.width;
-				const maxY = window.innerHeight - chatWindowSize.height;
+					const maxX = window.innerWidth - chatWindowSize.width;
+					const maxY = window.innerHeight - chatWindowSize.height;
 
-				onPositionChange({
-					x: Math.max(0, Math.min(maxX, newX)),
-					y: Math.max(0, Math.min(maxY, newY)),
+					onPositionChange({
+						x: Math.max(0, Math.min(maxX, newX)),
+						y: Math.max(0, Math.min(maxY, newY)),
+					});
 				});
 			}
 		};
 
 		const handleGlobalMouseUp = () => {
+			if (rafId) cancelAnimationFrame(rafId);
+			rafId = null;
 			setIsDraggingPanel(false);
 		};
 
@@ -150,6 +159,7 @@ export function AIPanel({
 		}
 
 		return () => {
+			if (rafId) cancelAnimationFrame(rafId);
 			document.removeEventListener("mousemove", handleGlobalMouseMove);
 			document.removeEventListener("mouseup", handleGlobalMouseUp);
 		};
@@ -187,14 +197,20 @@ export function AIPanel({
 		const startY = e.clientY;
 		const startWidth = chatWindowSize.width;
 		const startHeight = chatWindowSize.height;
+		let rafId: number | null = null;
 
 		const handleMouseMove = (moveEvent: MouseEvent) => {
-			const newWidth = Math.max(200, startWidth + moveEvent.clientX - startX);
-			const newHeight = Math.max(200, startHeight + moveEvent.clientY - startY);
-			setChatWindowSize({ width: newWidth, height: newHeight });
+			if (rafId) return;
+			rafId = requestAnimationFrame(() => {
+				rafId = null;
+				const newWidth = Math.max(200, startWidth + moveEvent.clientX - startX);
+				const newHeight = Math.max(200, startHeight + moveEvent.clientY - startY);
+				setChatWindowSize({ width: newWidth, height: newHeight });
+			});
 		};
 
 		const handleMouseUp = () => {
+			if (rafId) cancelAnimationFrame(rafId);
 			document.removeEventListener("mousemove", handleMouseMove);
 			document.removeEventListener("mouseup", handleMouseUp);
 		};
@@ -212,7 +228,7 @@ export function AIPanel({
 	const handleClose = async () => {
 		// Abort any ongoing Pi request
 		if (piStreamingRef.current) {
-			try { await commands.piAbort(); } catch {}
+			try { await commands.piAbort("chat"); } catch {}
 			piStreamingRef.current = false;
 		}
 		if (abortControllerRef.current) {
@@ -284,10 +300,12 @@ export function AIPanel({
 	useEffect(() => {
 		let unlisten: UnlistenFn | null = null;
 		const setup = async () => {
-			unlisten = await listen<PiEvent>("pi_event", (event) => {
+			unlisten = await listen<any>("pi_event", (event) => {
 				if (!piStreamingRef.current) return;
+				const { sessionId, event: piEvent } = event.payload;
+				if (sessionId !== "chat") return;
 
-				const newState = reducePiEvent(piMessageStateRef.current, event.payload);
+				const newState = reducePiEvent(piMessageStateRef.current, piEvent);
 				piMessageStateRef.current = newState;
 				const content = formatPiMessage(newState);
 
@@ -309,7 +327,7 @@ export function AIPanel({
 
 	const handleStopStreaming = async () => {
 		try {
-			await commands.piAbort();
+			await commands.piAbort("chat");
 		} catch (e) {
 			console.warn("Failed to abort Pi:", e);
 		}
@@ -416,7 +434,7 @@ Please analyze the data in context of this question.`;
 				{ id: generateId(), role: "assistant", content: "Processing..." },
 			]);
 
-			const result = await commands.piPrompt(prompt, null);
+			const result = await commands.piPrompt("chat", prompt, null);
 			if (result.status === "error") {
 				piStreamingRef.current = false;
 				setChatMessages((prev) => [

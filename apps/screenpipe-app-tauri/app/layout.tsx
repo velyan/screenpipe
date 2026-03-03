@@ -50,6 +50,14 @@ export default function RootLayout({
     // Focus recovery for Tauri WKWebView (macOS)
     // The webview can silently lose focus, making the entire UI unresponsive
     // to keyboard and sometimes mouse input. Detect and recover by refocusing.
+    const callNativeFocusRecovery = () => {
+      // Call the Rust-side ensure_webview_focus to re-assert WKWebView
+      // as first responder via makeFirstResponder + dispatch_async
+      try {
+        (window as any).__TAURI_INTERNALS__?.invoke("ensure_webview_focus").catch(() => {});
+      } catch {}
+    };
+
     const handleWindowFocus = () => {
       // When the native window regains focus, ensure the webview body is focused
       // so keyboard events work. Small delay to let Tauri finish its focus cycle.
@@ -57,11 +65,12 @@ export default function RootLayout({
         if (document.activeElement === document.body || !document.activeElement) {
           document.body.focus();
         }
+        callNativeFocusRecovery();
       }, 50);
     };
     window.addEventListener("focus", handleWindowFocus);
 
-    // Safety valve: triple-click on the app background to force-dismiss stuck overlays
+    // Safety valve: click on the app background to force-dismiss stuck overlays
     // by blurring and refocusing — helps when overlays block normal interaction
     const handlePointerRecovery = () => {
       // If there are any fixed z-50 overlays that shouldn't be there,
@@ -73,6 +82,29 @@ export default function RootLayout({
     };
     // Re-check focus on any click — if click reaches window, focus should work
     window.addEventListener("mousedown", handlePointerRecovery, true);
+
+    // Periodic focus watchdog: detect silent focus loss that no event catches.
+    // WKWebView can lose first-responder status without firing any JS event
+    // (e.g. after native dialog dismiss, tray interaction, or AppKit race).
+    // Every 2s, test if a keystroke would reach the webview by checking if
+    // the document can receive input. If not, trigger native recovery.
+    let lastKeyTime = Date.now();
+    const markKeyActivity = () => { lastKeyTime = Date.now(); };
+    window.addEventListener("keydown", markKeyActivity, true);
+
+    const focusWatchdog = setInterval(() => {
+      // Only check when the window is visible and focused
+      if (document.hidden || !document.hasFocus()) return;
+      // If we haven't seen a keystroke in 2s and the active element is body
+      // (not an input), the WKWebView may have lost first-responder status.
+      // Recover quickly — 10s was too long and left typing broken after tray open.
+      const now = Date.now();
+      const noRecentKeys = now - lastKeyTime > 2_000;
+      const activeIsBody = document.activeElement === document.body || !document.activeElement;
+      if (noRecentKeys && activeIsBody) {
+        callNativeFocusRecovery();
+      }
+    }, 2_000);
 
     // Auto-reload on IndexedDB disconnect (APP-2E, 27 users on v2.0.379)
     // WKWebView's IndexedDB server can crash; the page becomes unusable.
@@ -136,7 +168,9 @@ export default function RootLayout({
     return () => {
       window.removeEventListener("focus", handleWindowFocus);
       window.removeEventListener("mousedown", handlePointerRecovery, true);
+      window.removeEventListener("keydown", markKeyActivity, true);
       window.removeEventListener("unhandledrejection", handleUnhandledRejection);
+      clearInterval(focusWatchdog);
     };
   }, []);
 

@@ -192,6 +192,16 @@ impl UiRecorderHandle {
             let _ = handle.await;
         }
     }
+
+    /// Create a handle with only a stop flag (for testing shutdown wiring)
+    #[doc(hidden)]
+    pub fn new_for_test(stop_flag: Arc<AtomicBool>) -> Self {
+        Self {
+            stop_flag,
+            task_handle: None,
+            tree_walker_handle: None,
+        }
+    }
 }
 
 /// Start UI event recording.
@@ -502,7 +512,7 @@ impl TreeWalkerMetrics {
             let avg_nodes = self.total_nodes / self.walks_total.max(1);
             let truncation_rate = self.walks_truncated as f64 / self.walks_total as f64;
             let truncation_pct = (truncation_rate * 100.0) as u64;
-            info!(
+            debug!(
                 "tree walker stats (last 60s): walks={}, stored={}, deduped={}, empty={}, errors={}, immediate={}, avg_walk={}ms, max_walk={}ms, total_chars={}, avg_nodes={}, max_depth={}, truncated={}% ({} timeout, {} max_nodes)",
                 self.walks_total, self.walks_stored, self.walks_deduped,
                 self.walks_empty, self.walks_error, self.walks_immediate,
@@ -600,8 +610,6 @@ fn run_tree_walker(
                 }
 
                 if cache.should_store(&snap) {
-                    // Check stop flag before blocking on the runtime — during shutdown
-                    // the tokio context may be tearing down, causing a panic in block_on.
                     if stop.load(std::sync::atomic::Ordering::Relaxed) {
                         debug!("Stop flag set, skipping DB insert for accessibility text");
                         break;
@@ -609,19 +617,23 @@ fn run_tree_walker(
 
                     metrics.total_text_chars += snap.text_content.len() as u64;
 
-                    // Wrap block_on in catch_unwind — during shutdown the tokio
-                    // runtime may be tearing down, causing block_on to panic.
-                    // Losing one DB write on shutdown is harmless.
-                    let db_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        rt_handle.block_on(db.insert_accessibility_text(
-                            &snap.app_name,
-                            &snap.window_name,
-                            &snap.text_content,
-                            snap.browser_url.as_deref(),
-                        ))
-                    }));
+                    // Spawn the DB write on the runtime and wait via std channel.
+                    // Unlike block_on, this won't panic during runtime shutdown —
+                    // the spawned task is silently cancelled and the channel closes.
+                    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+                    let db_c = db.clone();
+                    let app = snap.app_name.clone();
+                    let win = snap.window_name.clone();
+                    let text = snap.text_content.clone();
+                    let url = snap.browser_url.clone();
+                    rt_handle.spawn(async move {
+                        let r = db_c
+                            .insert_accessibility_text(&app, &win, &text, url.as_deref())
+                            .await;
+                        let _ = result_tx.send(r);
+                    });
 
-                    match db_result {
+                    match result_rx.recv_timeout(std::time::Duration::from_secs(5)) {
                         Ok(Ok(_id)) => {
                             debug!(
                                 "Stored accessibility text: app={}, window={}, len={}, nodes={}, walk={}ms",
@@ -639,8 +651,13 @@ fn run_tree_walker(
                             metrics.walks_error += 1;
                         }
                         Err(_) => {
-                            debug!("Runtime shutting down, stopping tree-walker DB writes");
-                            break;
+                            // Channel closed (runtime shutdown) or timed out
+                            if stop.load(Ordering::Relaxed) {
+                                debug!("Runtime shutting down, stopping tree-walker DB writes");
+                                break;
+                            }
+                            debug!("DB insert timed out");
+                            metrics.walks_error += 1;
                         }
                     }
                 } else {
@@ -717,4 +734,104 @@ async fn flush_batch(
         }
     }
     batch.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stop_flag_sets_on_stop() {
+        let handle = UiRecorderHandle {
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            task_handle: None,
+            tree_walker_handle: None,
+        };
+
+        assert!(handle.is_running());
+        handle.stop();
+        assert!(!handle.is_running());
+    }
+
+    #[test]
+    fn test_stop_flag_propagates_to_shared_clone() {
+        // Simulates the real scenario: stop_flag is shared between
+        // UiRecorderHandle and the tree walker thread via Arc.
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = flag.clone();
+
+        let handle = UiRecorderHandle {
+            stop_flag: flag,
+            task_handle: None,
+            tree_walker_handle: None,
+        };
+
+        // The tree walker checks the cloned flag
+        assert!(!flag_clone.load(Ordering::Relaxed));
+        handle.stop();
+        assert!(flag_clone.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn test_spawn_channel_pattern_clean_shutdown() {
+        // Verifies the spawn+channel pattern doesn't panic when the
+        // spawned task is cancelled (simulating runtime shutdown).
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Result<i64, String>>(1);
+
+        // Drop the sender without sending — simulates runtime dropping the task
+        drop(result_tx);
+
+        // recv_timeout should return Err, not panic
+        let result = result_rx.recv_timeout(std::time::Duration::from_millis(100));
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_spawn_channel_pattern_success() {
+        let rt_handle = tokio::runtime::Handle::current();
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Result<i64, String>>(1);
+
+        rt_handle.spawn(async move {
+            let _ = result_tx.send(Ok(42i64));
+        });
+
+        // recv_timeout blocks the thread, so we need multi_thread runtime
+        // to let the spawned task run on another worker
+        let result = result_rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn test_spawn_channel_runtime_shutdown_no_panic() {
+        // Creates a separate runtime, spawns a slow task, then drops the
+        // runtime. The recv should return Err cleanly — no panic.
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<Result<i64, String>>(1);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        let handle = rt.handle().clone();
+        handle.spawn(async move {
+            // Simulate a slow DB write that won't complete before shutdown
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            let _ = result_tx.send(Ok(1));
+        });
+
+        // Shutdown the runtime — the task is cancelled, sender is dropped
+        rt.shutdown_background();
+
+        let result = result_rx.recv_timeout(std::time::Duration::from_millis(500));
+        assert!(result.is_err(), "should get Err when runtime shuts down");
+    }
+
+    #[test]
+    fn test_handle_is_send() {
+        // EmbeddedServerHandle stores UiRecorderHandle and crosses async
+        // boundaries — it must be Send.
+        fn assert_send<T: Send>() {}
+        assert_send::<UiRecorderHandle>();
+    }
 }

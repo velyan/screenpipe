@@ -46,12 +46,11 @@ pub fn start_calendar_bridge(detector: Arc<MeetingDetector>) -> JoinHandle<()> {
                 .filter(|item| !item.is_all_day)
                 .filter_map(|item| {
                     let start = DateTime::parse_from_rfc3339(&item.start)
-                        .map_err(|e| {
+                        .inspect_err(|&e| {
                             warn!(
                                 "calendar bridge: failed to parse start '{}': {}",
                                 item.start, e
                             );
-                            e
                         })
                         .ok()?;
                     let end = DateTime::parse_from_rfc3339(&item.end)

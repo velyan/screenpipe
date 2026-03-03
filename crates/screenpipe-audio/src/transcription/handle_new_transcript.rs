@@ -9,7 +9,7 @@ use crate::{
     transcription::process_transcription_result,
 };
 use screenpipe_db::DatabaseManager;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use super::TranscriptionResult;
 
@@ -65,7 +65,7 @@ pub async fn handle_new_transcript(
             metrics.record_transcription_completed();
         }
 
-        info!(
+        debug!(
             "device {} received transcription ({} chars)",
             transcription.input.device,
             transcription
@@ -150,15 +150,14 @@ pub async fn handle_new_transcript(
             Err(e) => error!("Error processing audio result: {}", e),
             Ok(result) => {
                 if let Some(ref result) = result {
-                    prev_id_by_device
-                        .insert(device_key.clone(), result.audio_chunk_id);
+                    prev_id_by_device.insert(device_key.clone(), result.audio_chunk_id);
                 } else {
                     prev_id_by_device.remove(&device_key);
                 }
                 metrics.record_db_insert(word_count as u64);
 
                 if was_trimmed {
-                    info!(
+                    debug!(
                         "device {} inserted trimmed transcript ({} words)",
                         device_name, word_count
                     );

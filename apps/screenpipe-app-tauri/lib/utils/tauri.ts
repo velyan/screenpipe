@@ -293,6 +293,22 @@ async hideShortcutReminder() : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async showNotificationPanel(payload: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("show_notification_panel", { payload }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async hideNotificationPanel() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("hide_notification_panel") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * Register window-specific shortcuts (Escape, search shortcut) when main window is visible
  * These should only be active when the overlay is open to avoid blocking other apps
@@ -373,6 +389,9 @@ async setTrayHealthIcon() : Promise<void> {
 },
 async writeBrowserLog(level: string, message: string) : Promise<void> {
     await TAURI_INVOKE("write_browser_log", { level, message });
+},
+async writeBrowserLogs(entries: BrowserLogEntry[]) : Promise<void> {
+    await TAURI_INVOKE("write_browser_logs", { entries });
 },
 /**
  * Get current sync status.
@@ -489,9 +508,9 @@ async deleteCloudData() : Promise<Result<null, string>> {
 /**
  * Get Pi info
  */
-async piInfo() : Promise<Result<PiInfo, string>> {
+async piInfo(sessionId: string | null) : Promise<Result<PiInfo, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("pi_info") };
+    return { status: "ok", data: await TAURI_INVOKE("pi_info", { sessionId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -500,9 +519,9 @@ async piInfo() : Promise<Result<PiInfo, string>> {
 /**
  * Start the Pi sidecar in RPC mode (Tauri command wrapper)
  */
-async piStart(projectDir: string, userToken: string | null, providerConfig: PiProviderConfig | null) : Promise<Result<PiInfo, string>> {
+async piStart(sessionId: string | null, projectDir: string, userToken: string | null, providerConfig: PiProviderConfig | null) : Promise<Result<PiInfo, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("pi_start", { projectDir, userToken, providerConfig }) };
+    return { status: "ok", data: await TAURI_INVOKE("pi_start", { sessionId, projectDir, userToken, providerConfig }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -511,9 +530,9 @@ async piStart(projectDir: string, userToken: string | null, providerConfig: PiPr
 /**
  * Stop the Pi sidecar
  */
-async piStop() : Promise<Result<PiInfo, string>> {
+async piStop(sessionId: string | null) : Promise<Result<PiInfo, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("pi_stop") };
+    return { status: "ok", data: await TAURI_INVOKE("pi_stop", { sessionId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -544,9 +563,9 @@ async piInstall() : Promise<Result<null, string>> {
 /**
  * Send a prompt to Pi, optionally with images
  */
-async piPrompt(message: string, images: PiImageContent[] | null) : Promise<Result<null, string>> {
+async piPrompt(sessionId: string | null, message: string, images: PiImageContent[] | null) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("pi_prompt", { message, images }) };
+    return { status: "ok", data: await TAURI_INVOKE("pi_prompt", { sessionId, message, images }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -555,9 +574,9 @@ async piPrompt(message: string, images: PiImageContent[] | null) : Promise<Resul
 /**
  * Abort current Pi operation
  */
-async piAbort() : Promise<Result<null, string>> {
+async piAbort(sessionId: string | null) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("pi_abort") };
+    return { status: "ok", data: await TAURI_INVOKE("pi_abort", { sessionId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -566,9 +585,68 @@ async piAbort() : Promise<Result<null, string>> {
 /**
  * Start a new Pi session (clears conversation history)
  */
-async piNewSession() : Promise<Result<null, string>> {
+async piNewSession(sessionId: string | null) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("pi_new_session") };
+    return { status: "ok", data: await TAURI_INVOKE("pi_new_session", { sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Update Pi config and restart the chat session so the new model takes effect.
+ * Without restart, Pi keeps using the provider/model from its original CLI args.
+ */
+async piUpdateConfig(userToken: string | null, providerConfig: PiProviderConfig | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pi_update_config", { userToken, providerConfig }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async chatgptOauthLogin() : Promise<Result<boolean, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("chatgpt_oauth_login") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async chatgptOauthStatus() : Promise<Result<ChatGptOAuthStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("chatgpt_oauth_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Return the current valid access token (auto-refreshing if needed).
+ * Used by the frontend to call OpenAI APIs directly (e.g. /v1/models).
+ */
+async chatgptOauthGetToken() : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("chatgpt_oauth_get_token") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async chatgptOauthLogout() : Promise<Result<boolean, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("chatgpt_oauth_logout") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Fetch available models from OpenAI using the stored OAuth token.
+ */
+async chatgptOauthModels() : Promise<Result<string[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("chatgpt_oauth_models") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -825,9 +903,10 @@ async getHardwareCapability() : Promise<HardwareCapability> {
 
 /** user-defined types **/
 
-export type AIPreset = { id: string; prompt: string; provider: AIProviderType; url?: string; model?: string; defaultPreset: boolean; apiKey: string | null; maxContextChars: number }
-export type AIProviderType = "openai" | "native-ollama" | "custom" | "screenpipe-cloud" | "pi"
+export type AIPreset = { id: string; prompt: string; provider: AIProviderType; url?: string; model?: string; defaultPreset: boolean; apiKey: string | null; maxContextChars: number; maxTokens?: number }
+export type AIProviderType = "openai" | "openai-chatgpt" | "native-ollama" | "custom" | "screenpipe-cloud" | "pi"
 export type AudioDeviceInfo = { name: string; isDefault: boolean }
+export type BrowserLogEntry = { level: string; message: string }
 export type CachedSuggestions = { suggestions: Suggestion[]; generatedAt: string; mode: string; aiGenerated: boolean; tags: string[] }
 export type CalendarEventItem = { id: string; title: string; 
 /**
@@ -847,6 +926,7 @@ startDisplay: string;
  */
 endDisplay: string; attendees: string[]; location: string | null; calendarName: string; isAllDay: boolean }
 export type CalendarStatus = { available: boolean; authorized: boolean; authorizationStatus: string; calendarCount: number }
+export type ChatGptOAuthStatus = { logged_in: boolean }
 export type Credits = { amount: number }
 export type EmbeddedLLM = { enabled: boolean; model: string; port: number }
 export type HardwareCapability = { hasGpu: boolean; cpuCores: bigint; totalMemoryGb: number; isWeakForLargeModel: boolean; recommendedEngine: string; reason: string }
@@ -888,7 +968,11 @@ model: string;
 /**
  * Optional API key for the provider
  */
-apiKey: string | null }
+apiKey: string | null; 
+/**
+ * Max output tokens (default 4096)
+ */
+maxTokens?: number }
 export type ReminderItem = { identifier: string; title: string; notes: string | null; completed: boolean }
 export type RemindersStatus = { available: boolean; authorized: boolean; authorizationStatus: string; schedulerRunning: boolean; reminderCount: number }
 export type ScanResult = { remindersCreated: bigint; items: ReminderItem[]; contextChars: bigint; error: string | null }
@@ -906,7 +990,11 @@ analyticsId: string; devMode: boolean; audioTranscriptionEngine: string; ocrEngi
 /**
  * When true, automatically follow system default audio devices
  */
-useSystemDefaultAudio?: boolean; usePiiRemoval: boolean; port: number; dataDir: string; disableAudio: boolean; ignoredWindows: string[]; includedWindows: string[]; ignoredUrls?: string[]; fps: number; vadSensitivity: string; analyticsEnabled: boolean; audioChunkDuration: number; useChineseMirror: boolean; languages: string[]; embeddedLLM: EmbeddedLLM; autoStartEnabled: boolean; platform: string; disabledShortcuts: string[]; user: User; showScreenpipeShortcut: string; startRecordingShortcut: string; stopRecordingShortcut: string; startAudioShortcut: string; stopAudioShortcut: string; showChatShortcut: string; searchShortcut: string; realtimeAudioTranscriptionEngine: string; disableVision: boolean; 
+useSystemDefaultAudio?: boolean; usePiiRemoval: boolean; 
+/**
+ * Filter music-dominant audio before transcription using spectral analysis
+ */
+filterMusic?: boolean; port: number; dataDir: string; disableAudio: boolean; ignoredWindows: string[]; includedWindows: string[]; ignoredUrls?: string[]; fps: number; vadSensitivity: string; analyticsEnabled: boolean; audioChunkDuration: number; useChineseMirror: boolean; languages: string[]; embeddedLLM: EmbeddedLLM; autoStartEnabled: boolean; platform: string; disabledShortcuts: string[]; user: User; showScreenpipeShortcut: string; startRecordingShortcut: string; stopRecordingShortcut: string; startAudioShortcut: string; stopAudioShortcut: string; showChatShortcut: string; searchShortcut: string; realtimeAudioTranscriptionEngine: string; disableVision: boolean; 
 /**
  * When true, screen capture continues but OCR text extraction is skipped.
  * Reduces CPU usage significantly while still recording video.

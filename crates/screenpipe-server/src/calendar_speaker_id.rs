@@ -225,13 +225,13 @@ fn names_match(user_name: &str, attendee: &str) -> bool {
 
     // Extract name part if email
     let user_name_part = if let Some(before_at) = user.split('@').next() {
-        before_at.replace('.', " ").replace('_', " ")
+        before_at.replace(['.', '_'], " ")
     } else {
         user.clone()
     };
 
     let att_name_part = if let Some(before_at) = att.split('@').next() {
-        before_at.replace('.', " ").replace('_', " ")
+        before_at.replace(['.', '_'], " ")
     } else {
         att.clone()
     };
@@ -243,18 +243,12 @@ fn names_match(user_name: &str, attendee: &str) -> bool {
 
     // First name prefix: "alice" matches "alice smith"
     if att_name_part.starts_with(&user_name_part)
-        && att_name_part
-            .chars()
-            .nth(user_name_part.len())
-            .map_or(false, |c| c == ' ')
+        && (att_name_part.chars().nth(user_name_part.len()) == Some(' '))
     {
         return true;
     }
     if user_name_part.starts_with(&att_name_part)
-        && user_name_part
-            .chars()
-            .nth(att_name_part.len())
-            .map_or(false, |c| c == ' ')
+        && (user_name_part.chars().nth(att_name_part.len()) == Some(' '))
     {
         return true;
     }

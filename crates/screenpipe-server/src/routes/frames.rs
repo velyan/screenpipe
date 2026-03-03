@@ -428,7 +428,7 @@ pub async fn get_frame_metadata(
     }
 }
 
-/// Bounding box for an accessibility node (0-1 normalized to window)
+/// Bounding box for an accessibility node (0-1 normalized to monitor)
 #[derive(OaSchema, Serialize, Clone)]
 pub struct AccessibilityNodeBounds {
     pub left: f32,
@@ -640,7 +640,8 @@ pub struct FrameOcrResponse {
 
 /// Get OCR text positions with bounding boxes for a specific frame.
 /// Falls back to accessibility tree node bounds when no OCR data exists.
-/// This enables text selection overlay on screenshots.
+/// Both OCR and accessibility bounds are normalized to 0-1 relative to the
+/// monitor (full-screen capture), so they align correctly with the screenshot.
 #[oasgen]
 pub async fn get_frame_ocr_data(
     State(state): State<Arc<AppState>>,
@@ -662,7 +663,6 @@ pub async fn get_frame_ocr_data(
             for n in &nodes {
                 let role = n.get("role").and_then(|v| v.as_str()).unwrap_or("");
                 let role_lower = role.to_lowercase();
-                // Only merge link/hyperlink nodes (they carry full URLs)
                 if !role_lower.contains("link") && !role_lower.contains("hyperlink") {
                     continue;
                 }
@@ -670,7 +670,6 @@ pub async fn get_frame_ocr_data(
                     Some(t) if !t.trim().is_empty() => t,
                     _ => continue,
                 };
-                // Must look like a URL
                 if !text.trim().starts_with("http://")
                     && !text.trim().starts_with("https://")
                     && !text.trim().starts_with("www.")
@@ -702,8 +701,7 @@ pub async fn get_frame_ocr_data(
         }
     }
 
-    // Pure a11y fallback for frames with no OCR at all (already handled above
-    // for link nodes, but also grab all text nodes when OCR is empty)
+    // Pure a11y fallback for frames with no OCR — grab all text nodes with bounds
     if text_positions.is_empty() {
         if let Ok((_, Some(tree_json))) = state.db.get_frame_accessibility_data(frame_id).await {
             if let Ok(nodes) = serde_json::from_str::<Vec<serde_json::Value>>(&tree_json) {

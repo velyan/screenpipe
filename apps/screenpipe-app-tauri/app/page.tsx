@@ -10,6 +10,7 @@ import React, { useEffect, useState, useRef, useCallback, ErrorInfo } from "reac
 import NotificationHandler from "@/components/notification-handler";
 import { useToast } from "@/components/ui/use-toast";
 import { useOnboarding } from "@/lib/hooks/use-onboarding";
+import { checkFirstRunNotification } from "@/lib/notifications";
 import { ChangelogDialog } from "@/components/changelog-dialog";
 
 import { useHealthCheck } from "@/lib/hooks/use-health-check";
@@ -116,6 +117,11 @@ export default function Home() {
   useEffect(() => {
     const { loadOnboardingStatus } = useOnboarding.getState();
     loadOnboardingStatus();
+  }, []);
+
+  // Check if first-run notification should fire
+  useEffect(() => {
+    checkFirstRunNotification();
   }, []);
 
   useEffect(() => {

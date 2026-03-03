@@ -1,12 +1,14 @@
 use super::segment::get_segments;
 use crate::{
-    utils::audio::{average_noise_spectrum, normalize_v2, spectral_subtraction},
+    utils::audio::{
+        average_noise_spectrum, filter_music_frames, normalize_v2, spectral_subtraction,
+    },
     vad::VadEngine,
 };
 use anyhow::Result;
 use std::{path::PathBuf, sync::Arc, sync::Mutex as StdMutex};
 use tokio::sync::Mutex;
-use tracing::{error, info};
+use tracing::{debug, error};
 use vad_rs::VadStatus;
 
 use super::{
@@ -21,9 +23,21 @@ pub async fn prepare_segments(
     embedding_extractor: Arc<StdMutex<EmbeddingExtractor>>,
     device: &str,
     is_output_device: bool,
+    filter_music: bool,
 ) -> Result<(tokio::sync::mpsc::Receiver<SpeechSegment>, bool, f32)> {
-    let audio_data = normalize_v2(audio_data);
+    let mut audio_data = normalize_v2(audio_data);
 
+    if filter_music {
+        filter_music_frames(&mut audio_data);
+    }
+
+    // Silero VAD v5 expects continuous 512-sample chunks at 16kHz (32ms).
+    // On Windows, WASAPI delivers lower audio levels than CoreAudio, so we
+    // must feed Silero at its native frame size to preserve its LSTM temporal
+    // state — using 1600 caused 68ms gaps that broke speech detection.
+    #[cfg(target_os = "windows")]
+    let frame_size = 512;
+    #[cfg(not(target_os = "windows"))]
     let frame_size = 1600;
     let vad_engine = vad_engine.clone();
 
@@ -68,16 +82,17 @@ pub async fn prepare_segments(
     }
 
     let speech_ratio = speech_frame_count as f32 / total_frames as f32;
-    info!(
+    let current_min_ratio = crate::vad::min_speech_ratio();
+    debug!(
         "device: {}, speech ratio: {}, min_speech_ratio: {}, audio_frames: {}, speech_frames: {}",
         device,
         speech_ratio,
-        crate::vad::MIN_SPEECH_RATIO,
+        current_min_ratio,
         audio_frames.len(),
         speech_frame_count
     );
 
-    let threshold_met = speech_ratio > crate::vad::MIN_SPEECH_RATIO;
+    let threshold_met = speech_ratio > current_min_ratio;
 
     let (tx, rx) = tokio::sync::mpsc::channel(100);
     if !audio_frames.is_empty() && threshold_met {

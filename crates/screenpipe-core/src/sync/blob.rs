@@ -29,6 +29,8 @@ pub enum BlobType {
     Accessibility,
     /// User input events (clicks, keystrokes, clipboard)
     Input,
+    /// Pipe configuration manifest (for cross-device pipe sync)
+    PipeConfig,
 }
 
 impl BlobType {
@@ -40,6 +42,7 @@ impl BlobType {
             BlobType::Ocr => "ocr",
             BlobType::Accessibility => "accessibility",
             BlobType::Input => "input",
+            BlobType::PipeConfig => "pipe_config",
         }
     }
 }

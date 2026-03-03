@@ -10,32 +10,59 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use screenpipe_audio::audio_manager::builder::TranscriptionMode;
-use screenpipe_audio::core::device::{default_input_device, default_output_device, parse_audio_device};
-use screenpipe_audio::core::engine::AudioTranscriptionEngine;
+use screenpipe_audio::core::device::{
+    default_input_device, default_output_device, parse_audio_device,
+};
 use screenpipe_audio::meeting_detector::MeetingDetector;
 use screenpipe_db::DatabaseManager;
 use screenpipe_server::{
-    analytics, RecordingConfig,
-    ResourceMonitor, SCServer, start_meeting_watcher,
-    start_sleep_monitor, start_ui_recording,
+    analytics,
     hot_frame_cache::HotFrameCache,
-    vision_manager::{VisionManager, start_monitor_watcher, stop_monitor_watcher},
+    start_meeting_watcher, start_power_manager, start_sleep_monitor, start_ui_recording,
+    vision_manager::{start_monitor_watcher, stop_monitor_watcher, VisionManager},
+    RecordingConfig, ResourceMonitor, SCServer,
 };
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
-
 
 /// Handle for controlling the embedded server
 #[allow(dead_code)]
 pub struct EmbeddedServerHandle {
     shutdown_tx: broadcast::Sender<()>,
+    ui_recorder_handle: Option<screenpipe_server::UiRecorderHandle>,
 }
 
 #[allow(dead_code)]
 impl EmbeddedServerHandle {
     pub fn shutdown(&self) {
         info!("Shutting down embedded screenpipe server");
+        // Signal the UI recorder to stop its tree walker and event loops
+        if let Some(ref ui_handle) = self.ui_recorder_handle {
+            ui_handle.stop();
+        }
         let _ = self.shutdown_tx.send(());
+    }
+
+    /// Signal shutdown AND wait for the UI recorder tasks to finish.
+    /// This prevents the crash where the runtime is torn down while
+    /// the tree walker or event processor is still running.
+    pub async fn shutdown_and_wait(mut self) {
+        info!("Shutting down embedded screenpipe server (waiting for tasks)");
+        // Signal stop first
+        if let Some(ref ui_handle) = self.ui_recorder_handle {
+            ui_handle.stop();
+        }
+        let _ = self.shutdown_tx.send(());
+
+        // Now wait for UI recorder tasks to actually finish
+        if let Some(ui_handle) = self.ui_recorder_handle.take() {
+            info!("Waiting for UI recorder tasks to finish...");
+            // Timeout so we don't hang forever if a task is stuck
+            match tokio::time::timeout(Duration::from_secs(5), ui_handle.join()).await {
+                Ok(()) => info!("UI recorder tasks finished cleanly"),
+                Err(_) => warn!("UI recorder tasks did not finish within 5s, proceeding with exit"),
+            }
+        }
     }
 }
 
@@ -44,7 +71,10 @@ pub async fn start_embedded_server(
     config: RecordingConfig,
     on_pipe_output: Option<screenpipe_core::pipes::OnPipeOutputLine>,
 ) -> Result<EmbeddedServerHandle, String> {
-    info!("Starting embedded screenpipe server on port {}", config.port);
+    info!(
+        "Starting embedded screenpipe server on port {}",
+        config.port
+    );
 
     // Set environment variables for compatibility with CLI behavior
     // File descriptor limit to prevent "Too many open files" errors
@@ -58,13 +88,13 @@ pub async fn start_embedded_server(
 
     // Initialize server-side analytics (PostHog) so events like search_performed fire
     analytics::init(config.analytics_enabled);
-    
+
     // Chinese HuggingFace mirror
     if config.use_chinese_mirror {
         std::env::set_var("HF_ENDPOINT", "https://hf-mirror.com");
         info!("Using Chinese HuggingFace mirror");
     }
-    
+
     // Screenpipe cloud proxy for deepgram
     if config.audio_transcription_engine == AudioTranscriptionEngine::Deepgram {
         if let Some(ref user_id) = config.user_id {
@@ -124,16 +154,41 @@ pub async fn start_embedded_server(
         };
 
     // Build audio manager
+    use screenpipe_audio::core::engine::AudioTranscriptionEngine;
+    use screenpipe_audio::transcription::stt::{
+        OpenAICompatibleConfig, DEFAULT_OPENAI_COMPATIBLE_ENDPOINT, DEFAULT_OPENAI_COMPATIBLE_MODEL,
+    };
+
+    // Build OpenAI Compatible config if applicable
+    let openai_compatible_config =
+        if config.audio_transcription_engine == AudioTranscriptionEngine::OpenAICompatible {
+            Some(OpenAICompatibleConfig {
+                endpoint: config
+                    .openai_compatible_endpoint
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_OPENAI_COMPATIBLE_ENDPOINT.to_string()),
+                api_key: config.openai_compatible_api_key.clone(),
+                model: config
+                    .openai_compatible_model
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_OPENAI_COMPATIBLE_MODEL.to_string()),
+                client: None, // Will be created in TranscriptionEngine::new() via get_or_create_client()
+            })
+        } else {
+            None
+        };
+
     let mut audio_manager_builder = config
         .to_audio_manager_builder(data_path.clone(), audio_devices.clone())
-        .transcription_mode(config.transcription_mode.clone());
+        .transcription_mode(config.transcription_mode.clone())
+        .openai_compatible_config(openai_compatible_config);
 
     // When audio is disabled, override transcription engine to Disabled.
     // This downloads a 40MB tiny placeholder instead of the 834MB default model.
     // The AudioManager type still requires a model path, but it's never used for inference.
     if config.disable_audio {
-        audio_manager_builder = audio_manager_builder
-            .transcription_engine(AudioTranscriptionEngine::Disabled);
+        audio_manager_builder =
+            audio_manager_builder.transcription_engine(AudioTranscriptionEngine::Disabled);
     }
 
     if let Some(ref detector) = meeting_detector {
@@ -164,19 +219,21 @@ pub async fn start_embedded_server(
             let ts = chrono::DateTime::from_timestamp(info.capture_timestamp as i64, 0)
                 .unwrap_or_else(chrono::Utc::now);
             rt.spawn(async move {
-                cache.push_audio(screenpipe_server::hot_frame_cache::HotAudio {
-                    audio_chunk_id: info.audio_chunk_id,
-                    timestamp: ts,
-                    transcription: info.transcription,
-                    device_name: info.device_name,
-                    is_input: info.is_input,
-                    audio_file_path: info.audio_file_path,
-                    duration_secs: info.duration_secs,
-                    start_time: info.start_time,
-                    end_time: info.end_time,
-                    speaker_id: info.speaker_id,
-                    speaker_name: None,
-                }).await;
+                cache
+                    .push_audio(screenpipe_server::hot_frame_cache::HotAudio {
+                        audio_chunk_id: info.audio_chunk_id,
+                        timestamp: ts,
+                        transcription: info.transcription,
+                        device_name: info.device_name,
+                        is_input: info.is_input,
+                        audio_file_path: info.audio_file_path,
+                        duration_secs: info.duration_secs,
+                        start_time: info.start_time,
+                        end_time: info.end_time,
+                        speaker_id: info.speaker_id,
+                        speaker_name: None,
+                    })
+                    .await;
             });
         }));
     }
@@ -193,25 +250,26 @@ pub async fn start_embedded_server(
     // Create shared pipeline metrics (used by recording + health endpoint + PostHog)
     let vision_metrics = Arc::new(screenpipe_vision::PipelineMetrics::new());
 
+    // Start power manager — polls battery/thermal state and broadcasts profile changes
+    let power_manager = start_power_manager();
+
     // Capture trigger sender — set by VisionManager when vision is enabled.
     // Passed to start_ui_recording so UI events (clicks, app switches) trigger captures.
-    let mut capture_trigger_tx: Option<screenpipe_server::event_driven_capture::TriggerSender> = None;
+    let mut capture_trigger_tx: Option<screenpipe_server::event_driven_capture::TriggerSender> =
+        None;
 
     // Start vision recording (event-driven capture via VisionManager)
     if !config.disable_vision {
         let db_clone = db.clone();
         let output_path = data_path.to_string_lossy().into_owned();
 
-        let vision_config = config.to_vision_manager_config(
-            output_path,
-            vision_metrics.clone(),
-        );
+        let vision_config = config.to_vision_manager_config(output_path, vision_metrics.clone());
 
-        let vision_manager = Arc::new(VisionManager::new(
-            vision_config,
-            db_clone,
-            vision_handle.clone(),
-        ).with_hot_frame_cache(hot_frame_cache.clone()));
+        let vision_manager = Arc::new(
+            VisionManager::new(vision_config, db_clone, vision_handle.clone())
+                .with_hot_frame_cache(hot_frame_cache.clone())
+                .with_power_profile(power_manager.subscribe()),
+        );
 
         // Get the broadcast trigger sender BEFORE moving VisionManager into the
         // spawned task. Passed to start_ui_recording so UI events trigger captures.
@@ -261,23 +319,26 @@ pub async fn start_embedded_server(
 
     // Start UI event recording (database recording of accessibility events)
     let ui_enabled = config.enable_input_capture || config.enable_accessibility;
-    info!("UI events setting: enable_input_capture={}, enable_accessibility={}", config.enable_input_capture, config.enable_accessibility);
-    if ui_enabled {
+    info!(
+        "UI events setting: enable_input_capture={}, enable_accessibility={}",
+        config.enable_input_capture, config.enable_accessibility
+    );
+    let ui_recorder_handle = if ui_enabled {
         let ui_config = config.to_ui_recorder_config();
         let db_clone = db.clone();
-        tokio::spawn(async move {
-            match start_ui_recording(db_clone, ui_config, capture_trigger_tx).await {
-                Ok(handle) => {
-                    info!("UI event recording started successfully");
-                    // Keep the handle alive - don't drop it or UI recording stops
-                    std::mem::forget(handle);
-                }
-                Err(e) => {
-                    error!("Failed to start UI event recording: {}", e);
-                }
+        match start_ui_recording(db_clone, ui_config, capture_trigger_tx).await {
+            Ok(handle) => {
+                info!("UI event recording started successfully");
+                Some(handle)
             }
-        });
-    }
+            Err(e) => {
+                error!("Failed to start UI event recording: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Start meeting watcher (standalone accessibility listener for smart mode)
     // Independent of enable_input_capture/enable_accessibility toggles — only needs accessibility permission
@@ -293,16 +354,13 @@ pub async fn start_embedded_server(
         info!("meeting persister started");
 
         // Bridge calendar events from event bus into meeting detector
-        let _calendar_bridge =
-            screenpipe_server::start_calendar_bridge(detector.clone());
+        let _calendar_bridge = screenpipe_server::start_calendar_bridge(detector.clone());
         info!("calendar bridge started for meeting detection");
     }
 
     // Start calendar-assisted speaker identification
-    let _speaker_id_handle = screenpipe_server::start_speaker_identification(
-        db.clone(),
-        config.user_name.clone(),
-    );
+    let _speaker_id_handle =
+        screenpipe_server::start_speaker_identification(db.clone(), config.user_name.clone());
 
     // Start resource monitor
     let resource_monitor = ResourceMonitor::new(config.analytics_enabled);
@@ -326,15 +384,14 @@ pub async fn start_embedded_server(
     server.vision_metrics = vision_metrics;
     server.audio_metrics = audio_manager.metrics.clone();
     server.hot_frame_cache = Some(hot_frame_cache);
+    server.power_manager = Some(power_manager);
 
     // Initialize pipe manager
     let pipes_dir = config.data_dir.join("pipes");
     std::fs::create_dir_all(&pipes_dir).ok();
 
     let user_token = config.user_id.clone();
-    let pi_executor = std::sync::Arc::new(
-        screenpipe_core::agents::pi::PiExecutor::new(user_token),
-    );
+    let pi_executor = std::sync::Arc::new(screenpipe_core::agents::pi::PiExecutor::new(user_token));
     let mut agent_executors: std::collections::HashMap<
         String,
         std::sync::Arc<dyn screenpipe_core::agents::AgentExecutor>,
@@ -342,20 +399,26 @@ pub async fn start_embedded_server(
     agent_executors.insert("pi".to_string(), pi_executor.clone());
 
     // Create pipe store backed by the main SQLite DB
-    let pipe_store: Option<std::sync::Arc<dyn screenpipe_core::pipes::PipeStore>> = Some(
-        std::sync::Arc::new(screenpipe_server::pipe_store::SqlitePipeStore::new(
-            db.pool.clone(),
-        )),
-    );
+    let pipe_store: Option<std::sync::Arc<dyn screenpipe_core::pipes::PipeStore>> =
+        Some(std::sync::Arc::new(
+            screenpipe_server::pipe_store::SqlitePipeStore::new(db.pool.clone()),
+        ));
 
-    let mut pipe_manager =
-        screenpipe_core::pipes::PipeManager::new(pipes_dir, agent_executors, pipe_store, config.port);
+    let mut pipe_manager = screenpipe_core::pipes::PipeManager::new(
+        pipes_dir,
+        agent_executors,
+        pipe_store,
+        config.port,
+    );
     pipe_manager.set_on_run_complete(std::sync::Arc::new(|pipe_name, success, duration_secs| {
-        analytics::capture_event_nonblocking("pipe_scheduled_run", serde_json::json!({
-            "pipe": pipe_name,
-            "success": success,
-            "duration_secs": duration_secs,
-        }));
+        analytics::capture_event_nonblocking(
+            "pipe_scheduled_run",
+            serde_json::json!({
+                "pipe": pipe_name,
+                "success": success,
+                "duration_secs": duration_secs,
+            }),
+        );
     }));
     if let Some(cb) = on_pipe_output {
         pipe_manager.set_on_output_line(cb);
@@ -382,9 +445,10 @@ pub async fn start_embedded_server(
     // Bind the HTTP listener BEFORE returning success.
     // This ensures port conflicts (AddrInUse) are caught and propagated
     // instead of silently failing in a background task.
-    let listener = tokio::net::TcpListener::bind(
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), config.port),
-    )
+    let listener = tokio::net::TcpListener::bind(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        config.port,
+    ))
     .await
     .map_err(|e| format!("Failed to bind port {}: {}", config.port, e))?;
 
@@ -399,5 +463,61 @@ pub async fn start_embedded_server(
 
     info!("Embedded screenpipe server started successfully");
 
-    Ok(EmbeddedServerHandle { shutdown_tx })
+    Ok(EmbeddedServerHandle {
+        shutdown_tx,
+        ui_recorder_handle,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_shutdown_sets_ui_recorder_stop_flag() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_clone = flag.clone();
+
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let handle = EmbeddedServerHandle {
+            shutdown_tx,
+            ui_recorder_handle: Some(screenpipe_server::UiRecorderHandle::new_for_test(flag)),
+        };
+
+        assert!(!flag_clone.load(Ordering::Relaxed));
+        handle.shutdown();
+        assert!(
+            flag_clone.load(Ordering::Relaxed),
+            "shutdown must set stop_flag"
+        );
+    }
+
+    #[test]
+    fn test_shutdown_sends_broadcast() {
+        let (shutdown_tx, mut rx) = broadcast::channel::<()>(1);
+        let handle = EmbeddedServerHandle {
+            shutdown_tx,
+            ui_recorder_handle: None,
+        };
+
+        handle.shutdown();
+        assert!(
+            rx.try_recv().is_ok(),
+            "shutdown must send on broadcast channel"
+        );
+    }
+
+    #[test]
+    fn test_shutdown_without_ui_recorder() {
+        let (shutdown_tx, _) = broadcast::channel::<()>(1);
+        let handle = EmbeddedServerHandle {
+            shutdown_tx,
+            ui_recorder_handle: None,
+        };
+
+        // Should not panic when ui_recorder_handle is None
+        handle.shutdown();
+    }
 }

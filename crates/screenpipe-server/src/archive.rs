@@ -186,8 +186,8 @@ pub async fn archive_init(
 
             // Derive encryption password from the token (only used when sync is not active)
             let password = format!(
-                "screenpipe-archive-{}",
-                format!("{:x}", md5::compute(request.token.as_bytes()))
+                "screenpipe-archive-{:x}",
+                md5::compute(request.token.as_bytes())
             );
 
             mgr.initialize(&password).await.map_err(|e| {

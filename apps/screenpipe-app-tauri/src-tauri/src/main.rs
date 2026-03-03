@@ -11,8 +11,8 @@ use std::env;
 use std::fs::File;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tauri::Emitter;
 use tauri::Manager;
 use tauri_plugin_autostart::MacosLauncher;
@@ -25,6 +25,9 @@ use tracing::{debug, error, info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
+
+#[cfg(target_os = "macos")]
+use tracing_oslog::OsLogger;
 use updates::start_update_check;
 use window_api::ShowRewindWindow;
 
@@ -40,31 +43,32 @@ mod icons;
 use crate::analytics::start_analytics;
 use crate::store::SettingsStore;
 
+mod calendar;
 #[allow(deprecated)]
 mod commands;
 mod disk_usage;
+mod embedded_server;
+mod hardware;
+mod ics_calendar;
 mod permissions;
-mod server;
+mod pi;
 mod recording;
+mod reminders;
+mod server;
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+mod space_monitor;
 mod store;
+mod suggestions;
+mod sync;
 mod tray;
 mod updates;
+mod voice_training;
 #[allow(deprecated)]
 mod window_api;
 #[cfg(target_os = "windows")]
 mod windows_overlay;
-#[cfg(target_os = "macos")]
-#[allow(deprecated)]
-mod space_monitor;
-mod sync;
-mod reminders;
-mod calendar;
-mod ics_calendar;
-mod pi;
-mod embedded_server;
-mod suggestions;
-mod hardware;
-mod voice_training;
+mod chatgpt_oauth;
 
 pub use server::*;
 
@@ -79,20 +83,21 @@ pub use config::get_base_dir;
 pub use commands::set_tray_health_icon;
 pub use commands::set_tray_unhealth_icon;
 pub use commands::write_browser_log;
-pub use server::spawn_server;
+pub use commands::write_browser_logs;
 pub use recording::spawn_screenpipe;
 pub use recording::stop_screenpipe;
+pub use server::spawn_server;
 // Removed: pub use store::get_profiles_store; // Profile functionality has been removed
 
 use crate::commands::hide_main_window;
 pub use permissions::do_permissions_check;
 pub use permissions::open_permission_settings;
 pub use permissions::request_permission;
+use sentry;
 use std::collections::HashMap;
 use tauri::AppHandle;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
-use sentry;
 mod health;
 mod safe_icon;
 use base64::Engine;
@@ -106,8 +111,8 @@ use window_api::RewindWindowId;
 fn setup_dock_menu(app_handle: AppHandle) {
     use cocoa::base::{id, nil};
     use cocoa::foundation::NSString;
-    use objc::{class, msg_send, sel, sel_impl};
     use objc::runtime::{Object, Sel};
+    use objc::{class, msg_send, sel, sel_impl};
 
     unsafe {
         // Store app handle in a global so the dock menu callbacks can use it
@@ -186,11 +191,24 @@ fn setup_dock_menu(app_handle: AppHandle) {
 
         // Register a custom class that handles dock menu
         let superclass = class!(NSObject);
-        let mut decl = objc::declare::ClassDecl::new("ScreenpipeDockMenuDelegate", superclass).unwrap();
-        decl.add_method(sel!(showScreenpipe:), show_screenpipe as extern "C" fn(&Object, Sel, id));
-        decl.add_method(sel!(openSettings:), open_settings as extern "C" fn(&Object, Sel, id));
-        decl.add_method(sel!(checkUpdates:), check_updates as extern "C" fn(&Object, Sel, id));
-        decl.add_method(sel!(applicationDockMenu:), dock_menu as extern "C" fn(&Object, Sel, id) -> id);
+        let mut decl =
+            objc::declare::ClassDecl::new("ScreenpipeDockMenuDelegate", superclass).unwrap();
+        decl.add_method(
+            sel!(showScreenpipe:),
+            show_screenpipe as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
+            sel!(openSettings:),
+            open_settings as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
+            sel!(checkUpdates:),
+            check_updates as extern "C" fn(&Object, Sel, id),
+        );
+        decl.add_method(
+            sel!(applicationDockMenu:),
+            dock_menu as extern "C" fn(&Object, Sel, id) -> id,
+        );
         let delegate_class = decl.register();
 
         let delegate: id = msg_send![delegate_class, new];
@@ -209,12 +227,7 @@ fn setup_dock_menu(app_handle: AppHandle) {
             let imp = objc::runtime::method_getImplementation(method);
             let encoding = b"@:@\0".as_ptr() as *const std::ffi::c_char;
             let delegate_class = object_getClass(current_delegate);
-            objc::runtime::class_addMethod(
-                delegate_class as *mut _,
-                dock_menu_sel,
-                imp,
-                encoding,
-            );
+            objc::runtime::class_addMethod(delegate_class as *mut _, dock_menu_sel, imp, encoding);
             // Also add the action methods
             let void_encoding = b"v:@\0".as_ptr() as *const std::ffi::c_char;
             for sel_name in &[sel!(showScreenpipe:), sel!(openSettings:)] {
@@ -224,7 +237,12 @@ fn setup_dock_menu(app_handle: AppHandle) {
                 );
                 if !m.is_null() {
                     let imp = objc::runtime::method_getImplementation(m);
-                    objc::runtime::class_addMethod(delegate_class as *mut _, *sel_name, imp, void_encoding);
+                    objc::runtime::class_addMethod(
+                        delegate_class as *mut _,
+                        *sel_name,
+                        imp,
+                        void_encoding,
+                    );
                 }
             }
         }
@@ -254,25 +272,19 @@ struct ShortcutConfig {
 
 impl ShortcutConfig {
     async fn from_store(app: &AppHandle) -> Result<Self, String> {
-        let store = SettingsStore::get(app).unwrap_or_default().unwrap_or_default();
+        let store = SettingsStore::get(app)
+            .unwrap_or_default()
+            .unwrap_or_default();
 
         Ok(Self {
-            show: store
-                .show_screenpipe_shortcut,
-            start: store
-                .start_recording_shortcut,
-            stop: store
-                .stop_recording_shortcut,
-            start_audio: store
-                .start_audio_shortcut,
-            stop_audio: store
-                .stop_audio_shortcut,
-            show_chat: store
-                .show_chat_shortcut,
-            search: store
-                .search_shortcut,
-            disabled: store
-                .disabled_shortcuts,
+            show: store.show_screenpipe_shortcut,
+            start: store.start_recording_shortcut,
+            stop: store.stop_recording_shortcut,
+            start_audio: store.start_audio_shortcut,
+            stop_audio: store.stop_audio_shortcut,
+            show_chat: store.show_chat_shortcut,
+            search: store.search_shortcut,
+            disabled: store.disabled_shortcuts,
         })
     }
 
@@ -357,8 +369,8 @@ async fn apply_shortcuts(app: &AppHandle, config: &ShortcutConfig) -> Result<(),
             let _ = app.emit("shortcut-show", ());
             #[cfg(target_os = "macos")]
             {
-                use crate::window_api::main_label_for_mode;
                 use crate::store::SettingsStore;
+                use crate::window_api::main_label_for_mode;
                 // Get current mode to find the right window label
                 let mode = SettingsStore::get(app)
                     .unwrap_or_default()
@@ -384,29 +396,40 @@ async fn apply_shortcuts(app: &AppHandle, config: &ShortcutConfig) -> Result<(),
             }
             #[cfg(not(target_os = "macos"))]
             {
+                use crate::store::SettingsStore;
+                use crate::window_api::main_label_for_mode;
+                let mode = SettingsStore::get(app)
+                    .unwrap_or_default()
+                    .unwrap_or_default()
+                    .overlay_mode;
+                let label = main_label_for_mode(&mode);
+
                 // Debug: list all existing windows
-                for (label, _) in app.webview_windows() {
-                    info!("existing window: {}", label);
+                for (wlabel, _) in app.webview_windows() {
+                    info!("existing window: {}", wlabel);
                 }
 
-                if let Some(window) = app.get_webview_window("main") {
-                    info!("found main window, checking visibility");
+                if let Some(window) = app.get_webview_window(label) {
+                    info!("found {} window, checking visibility", label);
                     match window.is_visible() {
                         Ok(true) => {
-                            info!("main window is visible, hiding it");
+                            info!("{} window is visible, hiding it", label);
                             hide_main_window(app)
                         }
                         Ok(false) => {
-                            info!("main window exists but not visible, showing it");
+                            info!("{} window exists but not visible, showing it", label);
                             show_main_window(app, false)
                         }
                         Err(e) => {
-                            info!("error checking visibility: {}, showing main window anyway", e);
+                            info!(
+                                "error checking visibility: {}, showing main window anyway",
+                                e
+                            );
                             show_main_window(app, false)
                         }
                     }
                 } else {
-                    info!("main window not found, creating it");
+                    info!("{} window not found, creating it", label);
                     show_main_window(app, false)
                 }
             }
@@ -414,7 +437,6 @@ async fn apply_shortcuts(app: &AppHandle, config: &ShortcutConfig) -> Result<(),
     })
     .await?;
 
-  
     // Register start shortcut
     register_shortcut(
         app,
@@ -509,48 +531,50 @@ async fn apply_shortcuts(app: &AppHandle, config: &ShortcutConfig) -> Result<(),
     .await?;
 
     // Register search shortcut (global - opens overlay with search focused) (defer off event stack)
-    register_shortcut(
-        app,
-        &config.search,
-        config.is_disabled("search"),
-        |app| {
-            let app_for_closure = app.clone();
-            let _ = app.run_on_main_thread(move || {
-                let app = &app_for_closure;
-                info!("search shortcut triggered");
-                // Always show the overlay, then emit search event to focus the search input
-                #[cfg(target_os = "macos")]
-                {
-                    use crate::window_api::main_label_for_mode;
-                    use crate::store::SettingsStore;
-                    let mode = SettingsStore::get(app)
-                        .unwrap_or_default()
-                        .unwrap_or_default()
-                        .overlay_mode;
-                    let label = main_label_for_mode(&mode);
-                    if let Some(window) = app.get_webview_window(label) {
-                        if !window.is_visible().unwrap_or(false) {
-                            show_main_window(app, false);
-                        }
-                    } else {
+    register_shortcut(app, &config.search, config.is_disabled("search"), |app| {
+        let app_for_closure = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            let app = &app_for_closure;
+            info!("search shortcut triggered");
+            // Always show the overlay, then emit search event to focus the search input
+            #[cfg(target_os = "macos")]
+            {
+                use crate::store::SettingsStore;
+                use crate::window_api::main_label_for_mode;
+                let mode = SettingsStore::get(app)
+                    .unwrap_or_default()
+                    .unwrap_or_default()
+                    .overlay_mode;
+                let label = main_label_for_mode(&mode);
+                if let Some(window) = app.get_webview_window(label) {
+                    if !window.is_visible().unwrap_or(false) {
                         show_main_window(app, false);
                     }
+                } else {
+                    show_main_window(app, false);
                 }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    if let Some(window) = app.get_webview_window("main") {
-                        if !window.is_visible().unwrap_or(false) {
-                            show_main_window(app, false);
-                        }
-                    } else {
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                use crate::store::SettingsStore;
+                use crate::window_api::main_label_for_mode;
+                let mode = SettingsStore::get(app)
+                    .unwrap_or_default()
+                    .unwrap_or_default()
+                    .overlay_mode;
+                let label = main_label_for_mode(&mode);
+                if let Some(window) = app.get_webview_window(label) {
+                    if !window.is_visible().unwrap_or(false) {
                         show_main_window(app, false);
                     }
+                } else {
+                    show_main_window(app, false);
                 }
-                // Emit event so the frontend opens the search modal
-                let _ = app.emit("open-search", ());
-            });
-        },
-    )
+            }
+            // Emit event so the frontend opens the search modal
+            let _ = app.emit("open-search", ());
+        });
+    })
     .await?;
 
     Ok(())
@@ -611,7 +635,11 @@ async fn get_log_files(app: AppHandle) -> Result<Vec<LogFile>, String> {
         }
     }
 
-    while let Some(entry) = screenpipe_dir.next_entry().await.map_err(|e| e.to_string())? {
+    while let Some(entry) = screenpipe_dir
+        .next_entry()
+        .await
+        .map_err(|e| e.to_string())?
+    {
         // Get metadata immediately for each entry
         if let Ok(metadata) = entry.metadata().await {
             entries.push((entry, metadata));
@@ -947,7 +975,10 @@ async fn is_server_running(app: AppHandle) -> Result<bool, String> {
     let store = app.state::<store::SettingsStore>();
     let port = store.port;
     let client = reqwest::Client::new();
-    let response = client.get(format!("http://localhost:{}", port)).send().await;
+    let response = client
+        .get(format!("http://localhost:{}", port))
+        .send()
+        .await;
     Ok(response.is_ok())
 }
 
@@ -1077,7 +1108,10 @@ async fn main() {
         } else {
             "unknown panic payload".to_string()
         };
-        let location = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column())).unwrap_or_default();
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_default();
 
         // Force-capture a backtrace before abort() kills us
         let backtrace = std::backtrace::Backtrace::force_capture();
@@ -1105,7 +1139,10 @@ async fn main() {
 
         // Also report to Sentry if initialized
         sentry::capture_message(
-            &format!("panic on thread '{}' at {}: {}", thread_name, location, payload),
+            &format!(
+                "panic on thread '{}' at {}: {}",
+                thread_name, location, payload
+            ),
             sentry::Level::Fatal,
         );
         // Flush Sentry so the event is sent before abort
@@ -1143,7 +1180,7 @@ async fn main() {
     // Generate TypeScript bindings in debug mode
     #[cfg(debug_assertions)]
     {
-        use crate::store::{SettingsStore, OnboardingStore};
+        use crate::store::{OnboardingStore, SettingsStore};
 
         info!("Generating TypeScript bindings...");
         let builder = Builder::new()
@@ -1190,6 +1227,9 @@ async fn main() {
                 // Shortcut reminder commands
                 commands::show_shortcut_reminder,
                 commands::hide_shortcut_reminder,
+                // Notification panel commands
+                commands::show_notification_panel,
+                commands::hide_notification_panel,
                 // Window-specific shortcut commands (dynamic registration)
                 commands::register_window_shortcuts,
                 commands::unregister_window_shortcuts,
@@ -1204,6 +1244,7 @@ async fn main() {
                 set_tray_health_icon,
                 // Browser logging
                 write_browser_log,
+                write_browser_logs,
                 // Commands from sync.rs
                 sync::get_sync_status,
                 sync::set_sync_enabled,
@@ -1224,6 +1265,13 @@ async fn main() {
                 pi::pi_prompt,
                 pi::pi_abort,
                 pi::pi_new_session,
+                pi::pi_update_config,
+                // ChatGPT OAuth commands
+                chatgpt_oauth::chatgpt_oauth_login,
+                chatgpt_oauth::chatgpt_oauth_status,
+                chatgpt_oauth::chatgpt_oauth_get_token,
+                chatgpt_oauth::chatgpt_oauth_logout,
+                chatgpt_oauth::chatgpt_oauth_models,
                 // Reminders commands
                 reminders::reminders_status,
                 reminders::reminders_authorize,
@@ -1268,14 +1316,13 @@ async fn main() {
             .typ::<store::IcsCalendarEntry>()
             .typ::<suggestions::CachedSuggestions>()
             .typ::<suggestions::Suggestion>()
-            .typ::<hardware::HardwareCapability>();
+            .typ::<hardware::HardwareCapability>()
+            .typ::<chatgpt_oauth::ChatGptOAuthStatus>();
 
-        if let Err(e) = builder
-            .export(
-                Typescript::default().bigint(specta_typescript::BigIntExportBehavior::BigInt),
-                "../lib/utils/tauri.ts",
-            )
-        {
+        if let Err(e) = builder.export(
+            Typescript::default().bigint(specta_typescript::BigIntExportBehavior::BigInt),
+            "../lib/utils/tauri.ts",
+        ) {
             eprintln!("Warning: Failed to export TypeScript bindings: {e}");
         }
     }
@@ -1284,7 +1331,7 @@ async fn main() {
         handle: Arc::new(tokio::sync::Mutex::new(None)),
         is_starting: Arc::new(AtomicBool::new(false)),
     };
-    let pi_state = pi::PiState(Arc::new(tokio::sync::Mutex::new(None)));
+    let pi_state = pi::PiState(Arc::new(tokio::sync::Mutex::new(pi::PiPool::new())));
     let reminders_state = reminders::RemindersState::new();
     let suggestions_state = suggestions::SuggestionsState::new();
     #[allow(clippy::single_match)]
@@ -1331,41 +1378,40 @@ async fn main() {
         // single-instance plugin uses zbus::blocking on Linux which panics
         // inside an existing tokio runtime (nested block_on), so skip it on Linux
         ;
-        #[cfg(not(target_os = "linux"))]
-        let app = app.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            // Defer off event stack: plugin may invoke this from run loop (nounwind).
-            let app_for_closure = app.clone();
-            let args_clone = args.clone();
-            let _ = app.run_on_main_thread(move || {
-                // Focus the existing window
-                show_main_window(&app_for_closure, false);
+    #[cfg(not(target_os = "linux"))]
+    let app = app.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+        // Defer off event stack: plugin may invoke this from run loop (nounwind).
+        let app_for_closure = app.clone();
+        let args_clone = args.clone();
+        let _ = app.run_on_main_thread(move || {
+            // Focus the existing window
+            show_main_window(&app_for_closure, false);
 
-                // Forward deep-link URL from args
-                if let Some(url) = args_clone.iter().find(|a| a.starts_with("screenpipe://")) {
-                    let _ = app_for_closure.emit("deep-link-received", url.clone());
-                }
+            // Forward deep-link URL from args
+            if let Some(url) = args_clone.iter().find(|a| a.starts_with("screenpipe://")) {
+                let _ = app_for_closure.emit("deep-link-received", url.clone());
+            }
 
-                // Forward CLI args
-                if !args_clone.is_empty() {
-                    let _ = app_for_closure.emit("second-instance-args", args_clone.clone());
-                }
-            });
-        }));
-        let app = app
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build());
+            // Forward CLI args
+            if !args_clone.is_empty() {
+                let _ = app_for_closure.emit("second-instance-args", args_clone.clone());
+            }
+        });
+    }));
+    let app = app.plugin(tauri_plugin_global_shortcut::Builder::new().build());
 
-        // Only add Sentry plugin if telemetry is enabled
-        let app = if let Some(ref _guard) = sentry_guard {
-            let client = sentry::Hub::current().client().unwrap();
-            app.plugin(tauri_plugin_sentry::init(&client))
-        } else {
-            app
-        };
+    // Only add Sentry plugin if telemetry is enabled
+    let app = if let Some(ref _guard) = sentry_guard {
+        let client = sentry::Hub::current().client().unwrap();
+        app.plugin(tauri_plugin_sentry::init(&client))
+    } else {
+        app
+    };
 
-        #[cfg(target_os = "macos")]
-        let app = app.plugin(tauri_nspanel::init());
+    #[cfg(target_os = "macos")]
+    let app = app.plugin(tauri_nspanel::init());
 
-        let app = app.manage(recording_state)
+    let app = app.manage(recording_state)
         .manage(pi_state)
         .manage(reminders_state)
         .manage(suggestions_state)
@@ -1388,6 +1434,7 @@ async fn main() {
             set_tray_unhealth_icon,
             set_tray_health_icon,
             write_browser_log,
+            write_browser_logs,
             commands::update_show_screenpipe_shortcut,
             commands::get_disk_usage,
             commands::open_pipe_window,
@@ -1409,6 +1456,9 @@ async fn main() {
             // Shortcut reminder commands
             commands::show_shortcut_reminder,
             commands::hide_shortcut_reminder,
+            // Notification panel commands
+            commands::show_notification_panel,
+            commands::hide_notification_panel,
             // Window-specific shortcut commands (dynamic registration)
             commands::register_window_shortcuts,
             commands::unregister_window_shortcuts,
@@ -1447,6 +1497,13 @@ async fn main() {
             pi::pi_prompt,
             pi::pi_abort,
             pi::pi_new_session,
+            pi::pi_update_config,
+            // ChatGPT OAuth commands
+            chatgpt_oauth::chatgpt_oauth_login,
+            chatgpt_oauth::chatgpt_oauth_status,
+            chatgpt_oauth::chatgpt_oauth_get_token,
+            chatgpt_oauth::chatgpt_oauth_logout,
+            chatgpt_oauth::chatgpt_oauth_models,
             // Reminders commands
             reminders::reminders_status,
             reminders::reminders_authorize,
@@ -1588,26 +1645,28 @@ async fn main() {
             let file_layer = tracing_subscriber::fmt::layer()
                 .with_writer(file_appender)
                 .with_ansi(false)
-                .with_filter(EnvFilter::new("info,hyper=error,tower_http=error"));
+                .with_filter(EnvFilter::new("info,hyper=error,tower_http=error,whisper_rs=warn"));
 
             // Create a custom layer for console logging
             let console_layer = tracing_subscriber::fmt::layer()
                 .with_writer(std::io::stdout)
-                .with_filter(EnvFilter::new("info,hyper=error,tower_http=error"));
+                .with_filter(EnvFilter::new("info,hyper=error,tower_http=error,whisper_rs=warn"));
 
             // Initialize the tracing subscriber with both layers + optional Sentry layer
             // The Sentry layer captures error!() and warn!() events (not just panics)
+            let registry = tracing_subscriber::registry()
+                .with(file_layer)
+                .with(console_layer);
+
+            #[cfg(target_os = "macos")]
+            let registry = registry.with(OsLogger::new("pe.screenpi", "app"));
+
             if sentry_guard.is_some() {
-                tracing_subscriber::registry()
-                    .with(file_layer)
-                    .with(console_layer)
+                registry
                     .with(sentry::integrations::tracing::layer())
                     .init();
             } else {
-                tracing_subscriber::registry()
-                    .with(file_layer)
-                    .with(console_layer)
-                    .init();
+                registry.init();
             }
 
             // Windows-specific setup
@@ -1796,6 +1855,9 @@ async fn main() {
             // but existing panels with MoveToActiveSpace + level 1001 can.
             // The Chat creation path only configures level/behaviors — it
             // does NOT activate or show, so no blink or focus-steal here.
+            // macOS-only: on Windows/Linux the non-macOS chat builder doesn't
+            // set .visible(false), causing a visible chat window on startup.
+            #[cfg(target_os = "macos")]
             if onboarding_store.is_completed {
                 let app_handle_chat = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
@@ -1915,7 +1977,7 @@ async fn main() {
                             .enable_all()
                             .build()
                             .expect("Failed to create server runtime");
-                        
+
                         server_runtime.block_on(async move {
                             // Check if server already running (with timeout)
                             let server_running = tokio::time::timeout(
@@ -1929,7 +1991,7 @@ async fn main() {
                                         .is_ok()
                                 }
                             ).await.unwrap_or(false);
-                            
+
                             if server_running {
                                 info!("Server already running, skipping embedded server start");
                                 return; // is_starting stays true — the running server is fine
@@ -1960,12 +2022,12 @@ async fn main() {
                                         let mut guard = recording_state_inner.lock().await;
                                         *guard = Some(handle);
                                     }
-                                    
+
                                     // Keep the runtime alive, but check periodically if we should shut down
                                     // When stop_screenpipe is called, the handle is taken from the state
                                     loop {
                                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                                        
+
                                         // Check if handle was taken (indicating shutdown requested)
                                         let guard = recording_state_inner.lock().await;
                                         if guard.is_none() {
@@ -2158,102 +2220,101 @@ async fn main() {
         // triggers panic_cannot_unwind and abort(). Do not use unwrap/expect/panic! here
         // or in any code this synchronously calls (e.g. ShowRewindWindow::show/close).
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-    match event {
-        tauri::RunEvent::Ready { .. } => {
-            debug!("Ready event");
-            // Send app started event
-            let app_handle = app_handle.app_handle().clone();
-            tauri::async_runtime::spawn(async move {
-                if let Some(analytics) = app_handle.try_state::<Arc<AnalyticsManager>>() {
-                    let _ = analytics
-                        .send_event(
-                            "app_started",
-                            Some(json!({
-                                "startup_type": "normal"
-                            })),
-                        )
-                        .await;
+            match event {
+                tauri::RunEvent::Ready { .. } => {
+                    debug!("Ready event");
+                    // Send app started event
+                    let app_handle = app_handle.app_handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(analytics) = app_handle.try_state::<Arc<AnalyticsManager>>() {
+                            let _ = analytics
+                                .send_event(
+                                    "app_started",
+                                    Some(json!({
+                                        "startup_type": "normal"
+                                    })),
+                                )
+                                .await;
+                        }
+                    });
                 }
-            });
-        }
-        tauri::RunEvent::ExitRequested { api, .. } => {
-            // When the user clicks "quit screenpipe" in the tray menu,
-            // QUIT_REQUESTED is set to true — let the exit proceed.
-            // Otherwise, prevent auto-exit so the app stays alive in the
-            // tray when all windows are closed / destroyed.
-            if tray::QUIT_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
-                info!("ExitRequested event — quit was requested, allowing exit");
-            } else {
-                info!("ExitRequested event — preventing (app stays in tray)");
-                api.prevent_exit();
-            }
-        }
-
-        tauri::RunEvent::Exit => {
-            info!("App exiting — running cleanup");
-
-            // Send app closed analytics
-            let app_handle_v2 = app_handle.app_handle().clone();
-            tauri::async_runtime::spawn(async move {
-                if let Some(analytics) = app_handle_v2.try_state::<Arc<AnalyticsManager>>() {
-                    let _ = analytics
-                        .send_event(
-                            "app_closed",
-                            Some(json!({
-                                "shutdown_type": "normal"
-                            })),
-                        )
-                        .await;
-                }
-            });
-
-            // Shutdown server
-            if let Some(server_shutdown_tx) = app_handle.try_state::<mpsc::Sender<()>>() {
-                drop(server_shutdown_tx.send(()));
-            }
-
-            // Cleanup Pi sidecar
-            let app_handle_pi = app_handle.app_handle().clone();
-            tauri::async_runtime::spawn(async move {
-                if let Some(pi_state) = app_handle_pi.try_state::<pi::PiState>() {
-                    pi::cleanup_pi(&pi_state).await;
-                }
-            });
-        }
-
-        tauri::RunEvent::WindowEvent {
-            label,
-            event: tauri::WindowEvent::Destroyed,
-            ..
-        } => {
-            if let Ok(window_id) = RewindWindowId::from_str(label.as_str()) {
-                match window_id {
-                    RewindWindowId::Settings => {
-                        // Closing Settings hides the Main panel (it's always a panel now).
-                        // Defer off the event stack: run handler must stay panic-free.
-                        let app = app_handle.app_handle().clone();
-                        let _ = app_handle.app_handle().run_on_main_thread(move || {
-                            let _ = ShowRewindWindow::Main.close(&app);
-                        });
+                tauri::RunEvent::ExitRequested { api, .. } => {
+                    // When the user clicks "quit screenpipe" in the tray menu,
+                    // QUIT_REQUESTED is set to true — let the exit proceed.
+                    // Otherwise, prevent auto-exit so the app stays alive in the
+                    // tray when all windows are closed / destroyed.
+                    if tray::QUIT_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+                        info!("ExitRequested event — quit was requested, allowing exit");
+                    } else {
+                        info!("ExitRequested event — preventing (app stays in tray)");
+                        api.prevent_exit();
                     }
-                    _ => {}
                 }
-            }
-        }
 
-        #[cfg(target_os = "macos")]
-        tauri::RunEvent::Reopen {
-            ..
-        } => {
-            // Defer off the event stack so run handler stays panic-free.
-            // Open the settings/app window (not the timeline overlay).
-            let app = app_handle.app_handle().clone();
-            let _ = app_handle.app_handle().run_on_main_thread(move || {
-                let _ = ShowRewindWindow::Settings { page: None }.show(&app);
-            });
-        }
-        _ => {}
-    }
+                tauri::RunEvent::Exit => {
+                    info!("App exiting — running cleanup");
+
+                    // Send app closed analytics
+                    let app_handle_v2 = app_handle.app_handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(analytics) = app_handle_v2.try_state::<Arc<AnalyticsManager>>()
+                        {
+                            let _ = analytics
+                                .send_event(
+                                    "app_closed",
+                                    Some(json!({
+                                        "shutdown_type": "normal"
+                                    })),
+                                )
+                                .await;
+                        }
+                    });
+
+                    // Shutdown server
+                    if let Some(server_shutdown_tx) = app_handle.try_state::<mpsc::Sender<()>>() {
+                        drop(server_shutdown_tx.send(()));
+                    }
+
+                    // Cleanup Pi sidecar
+                    let app_handle_pi = app_handle.app_handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        if let Some(pi_state) = app_handle_pi.try_state::<pi::PiState>() {
+                            pi::cleanup_pi(&pi_state).await;
+                        }
+                    });
+                }
+
+                tauri::RunEvent::WindowEvent {
+                    label,
+                    event: tauri::WindowEvent::Destroyed,
+                    ..
+                } => {
+                    if let Ok(window_id) = RewindWindowId::from_str(label.as_str()) {
+                        match window_id {
+                            RewindWindowId::Settings => {
+                                // Closing Settings hides the Main panel (it's always a panel now).
+                                // Defer off the event stack: run handler must stay panic-free.
+                                let app = app_handle.app_handle().clone();
+                                let _ = app_handle.app_handle().run_on_main_thread(move || {
+                                    let _ = ShowRewindWindow::Main.close(&app);
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+
+                #[cfg(target_os = "macos")]
+                tauri::RunEvent::Reopen { .. } => {
+                    // Defer off the event stack so run handler stays panic-free.
+                    // Open the settings/app window (not the timeline overlay).
+                    let app = app_handle.app_handle().clone();
+                    let _ = app_handle.app_handle().run_on_main_thread(move || {
+                        let _ = ShowRewindWindow::Settings { page: None }.show(&app);
+                    });
+                }
+                _ => {}
+            }
         })); // end catch_unwind
         if let Err(e) = result {
             error!("panic in run event handler: {:?}", e);

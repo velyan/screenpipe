@@ -149,6 +149,8 @@ export interface Env {
 	// Auto-reload settings
 	WEBSITE_URL: string;
 	AUTO_RELOAD_SECRET: string;
+	// Admin API auth
+	ADMIN_SECRET: string;
 }
 
 // User tier for rate limiting and model access
@@ -191,6 +193,7 @@ export interface UsageStatus {
 	remaining: number;
 	resets_at: string;
 	model_access: string[];
+	credits_balance?: number;
 	upgrade_options?: {
 		login?: { benefit: string };
 		subscribe?: { benefit: string };

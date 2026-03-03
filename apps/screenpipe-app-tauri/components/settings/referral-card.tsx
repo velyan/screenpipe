@@ -113,7 +113,7 @@ export function ReferralCard() {
       <Card className="p-5">
         <div className="flex items-center gap-2 mb-2">
           <Gift className="h-5 w-5 text-muted-foreground" />
-          <h3 className="text-lg font-semibold">refer a friend</h3>
+          <h3 className="text-lg font-semibold">Refer a friend</h3>
         </div>
         <p className="text-sm text-muted-foreground">loading referral info...</p>
       </Card>
@@ -125,7 +125,7 @@ export function ReferralCard() {
       <Card className="p-5">
         <div className="flex items-center gap-2 mb-2">
           <Gift className="h-5 w-5 text-muted-foreground" />
-          <h3 className="text-lg font-semibold">refer a friend</h3>
+          <h3 className="text-lg font-semibold">Refer a friend</h3>
         </div>
         <p className="text-sm text-muted-foreground">
           purchase any plan to unlock your referral code
@@ -141,7 +141,7 @@ export function ReferralCard() {
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-2">
           <Gift className="h-5 w-5 text-primary" />
-          <h3 className="text-lg font-semibold">refer a friend</h3>
+          <h3 className="text-lg font-semibold">Refer a friend</h3>
         </div>
         <Badge variant="secondary" className="font-mono text-xs">
           {referral.redemptions} / {referral.maxRedemptions} used

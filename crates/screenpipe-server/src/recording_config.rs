@@ -28,6 +28,8 @@ pub struct RecordingConfig {
     pub disable_audio: bool,
     pub disable_vision: bool,
     pub use_pii_removal: bool,
+    /// Filter music-dominant audio before transcription using spectral analysis.
+    pub filter_music: bool,
     pub enable_main_body_distillation: bool,
     pub main_body_distillation_threshold: f32,
     pub enable_input_capture: bool,
@@ -54,6 +56,11 @@ pub struct RecordingConfig {
     // Cloud/auth
     pub deepgram_api_key: Option<String>,
     pub user_id: Option<String>,
+
+    // OpenAI Compatible transcription
+    pub openai_compatible_endpoint: Option<String>,
+    pub openai_compatible_api_key: Option<String>,
+    pub openai_compatible_model: Option<String>,
 
     // Speaker identification
     /// User's display name for calendar-assisted speaker ID.
@@ -108,6 +115,7 @@ impl RecordingConfig {
             .deepgram_api_key(self.deepgram_api_key.clone())
             .output_path(output_path)
             .use_pii_removal(self.use_pii_removal)
+            .filter_music(self.filter_music)
             .transcription_mode(self.transcription_mode.clone())
             .vocabulary(self.vocabulary.clone())
     }

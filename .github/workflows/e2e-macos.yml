@@ -557,8 +557,8 @@ jobs:
             kill -INT $RECORDING_PID 2>/dev/null || true
             sleep 3  # Give it time to finalize
           fi
-          # Kill the CLI server
-          if [ -n "$SERVER_PID" ]; then kill $SERVER_PID 2>/dev/null || true; fi
+          # Kill the CLI server (skip if PID is 0 — kill 0 sends SIGTERM to the process group)
+          if [ -n "$SERVER_PID" ] && [ "$SERVER_PID" -gt 0 ] 2>/dev/null; then kill $SERVER_PID 2>/dev/null || true; fi
           # Kill the app
           pkill -f "screenpipe-app" 2>/dev/null || true
           pkill -f "screenpipe" 2>/dev/null || true

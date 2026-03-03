@@ -184,6 +184,77 @@ impl PipeStore for SqlitePipeStore {
 
         Ok(())
     }
+
+    async fn cleanup_old_executions(&self, keep_per_pipe: i32) -> Result<u32> {
+        // Delete all rows except the newest `keep_per_pipe` per pipe_name.
+        // Uses a CTE to find the cutoff id per pipe.
+        let result = sqlx::query(
+            r#"DELETE FROM pipe_executions
+               WHERE id NOT IN (
+                   SELECT id FROM (
+                       SELECT id, ROW_NUMBER() OVER (
+                           PARTITION BY pipe_name ORDER BY id DESC
+                       ) AS rn
+                       FROM pipe_executions
+                   )
+                   WHERE rn <= ?
+               )"#,
+        )
+        .bind(keep_per_pipe)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() as u32)
+    }
+
+    async fn get_all_scheduler_states(
+        &self,
+    ) -> Result<std::collections::HashMap<String, SchedulerState>> {
+        let rows = sqlx::query_as::<_, SchedulerStateWithNameRow>(
+            "SELECT pipe_name, last_run_at, last_success_at, consecutive_failures FROM pipe_scheduler_state",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let name = r.pipe_name.clone();
+                (name, r.into())
+            })
+            .collect())
+    }
+
+    async fn get_all_executions(
+        &self,
+        limit_per_pipe: i32,
+    ) -> Result<std::collections::HashMap<String, Vec<PipeExecution>>> {
+        // Use ROW_NUMBER to get the newest N executions per pipe in 1 query
+        let rows = sqlx::query_as::<_, PipeExecutionRow>(
+            r#"SELECT id, pipe_name, status, trigger_type, pid, model, provider,
+                      started_at, finished_at, stdout, stderr, exit_code,
+                      error_type, error_message, duration_ms
+               FROM (
+                   SELECT *, ROW_NUMBER() OVER (
+                       PARTITION BY pipe_name ORDER BY id DESC
+                   ) AS rn
+                   FROM pipe_executions
+               )
+               WHERE rn <= ?
+               ORDER BY pipe_name, id DESC"#,
+        )
+        .bind(limit_per_pipe)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut map: std::collections::HashMap<String, Vec<PipeExecution>> =
+            std::collections::HashMap::new();
+        for row in rows {
+            let name = row.pipe_name.clone();
+            map.entry(name).or_default().push(row.into());
+        }
+        Ok(map)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +311,30 @@ struct SchedulerStateRow {
 
 impl From<SchedulerStateRow> for SchedulerState {
     fn from(r: SchedulerStateRow) -> Self {
+        SchedulerState {
+            last_run_at: r
+                .last_run_at
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc)),
+            last_success_at: r
+                .last_success_at
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(|dt| dt.with_timezone(&chrono::Utc)),
+            consecutive_failures: r.consecutive_failures.unwrap_or(0),
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct SchedulerStateWithNameRow {
+    pipe_name: String,
+    last_run_at: Option<String>,
+    last_success_at: Option<String>,
+    consecutive_failures: Option<i32>,
+}
+
+impl From<SchedulerStateWithNameRow> for SchedulerState {
+    fn from(r: SchedulerStateWithNameRow) -> Self {
         SchedulerState {
             last_run_at: r
                 .last_run_at
@@ -572,6 +667,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_cleanup_old_executions() {
+        let store = setup_test_store().await;
+
+        // Create 5 executions for pipe-a and 3 for pipe-b
+        for _ in 0..5 {
+            store
+                .create_execution("pipe-a", "scheduled", "m", None)
+                .await
+                .unwrap();
+        }
+        for _ in 0..3 {
+            store
+                .create_execution("pipe-b", "scheduled", "m", None)
+                .await
+                .unwrap();
+        }
+
+        // Keep only 2 per pipe — should delete 3 from pipe-a and 1 from pipe-b
+        let deleted = store.cleanup_old_executions(2).await.unwrap();
+        assert_eq!(deleted, 4);
+
+        let execs_a = store.get_executions("pipe-a", 10).await.unwrap();
+        assert_eq!(execs_a.len(), 2);
+
+        let execs_b = store.get_executions("pipe-b", 10).await.unwrap();
+        assert_eq!(execs_b.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_noop_when_under_limit() {
+        let store = setup_test_store().await;
+        store
+            .create_execution("pipe-a", "manual", "m", None)
+            .await
+            .unwrap();
+
+        let deleted = store.cleanup_old_executions(50).await.unwrap();
+        assert_eq!(deleted, 0);
+
+        let execs = store.get_executions("pipe-a", 10).await.unwrap();
+        assert_eq!(execs.len(), 1);
+    }
+
+    #[tokio::test]
     async fn test_full_execution_lifecycle() {
         let store = setup_test_store().await;
 
@@ -618,5 +757,58 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(state.consecutive_failures, 0);
+    }
+
+    // -- Batch query tests ---------------------------------------------------
+
+    #[tokio::test]
+    async fn test_get_all_scheduler_states() {
+        let store = setup_test_store().await;
+        store.upsert_scheduler_state("pipe-a", true).await.unwrap();
+        store.upsert_scheduler_state("pipe-b", false).await.unwrap();
+        store.upsert_scheduler_state("pipe-b", false).await.unwrap();
+
+        let states = store.get_all_scheduler_states().await.unwrap();
+        assert_eq!(states.len(), 2);
+        assert_eq!(states["pipe-a"].consecutive_failures, 0);
+        assert_eq!(states["pipe-b"].consecutive_failures, 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_all_scheduler_states_empty() {
+        let store = setup_test_store().await;
+        let states = store.get_all_scheduler_states().await.unwrap();
+        assert!(states.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_all_executions() {
+        let store = setup_test_store().await;
+        for _ in 0..5 {
+            store
+                .create_execution("pipe-a", "manual", "m", None)
+                .await
+                .unwrap();
+        }
+        for _ in 0..3 {
+            store
+                .create_execution("pipe-b", "scheduled", "m", None)
+                .await
+                .unwrap();
+        }
+
+        let all = store.get_all_executions(3).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all["pipe-a"].len(), 3); // limited to 3
+        assert_eq!(all["pipe-b"].len(), 3);
+        // newest first
+        assert!(all["pipe-a"][0].id > all["pipe-a"][1].id);
+    }
+
+    #[tokio::test]
+    async fn test_get_all_executions_empty() {
+        let store = setup_test_store().await;
+        let all = store.get_all_executions(5).await.unwrap();
+        assert!(all.is_empty());
     }
 }

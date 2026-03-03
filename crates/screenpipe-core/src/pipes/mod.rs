@@ -10,6 +10,8 @@
 //! parses configs, runs the scheduler, and delegates execution to an
 //! [`AgentExecutor`].
 
+pub mod sync;
+
 use crate::agents::{
     pi::{PiExecutor, SCREENPIPE_API_URL},
     AgentExecutor, ExecutionHandle,
@@ -187,6 +189,19 @@ pub trait PipeStore: Send + Sync {
 
     /// Update scheduler state after a run.
     async fn upsert_scheduler_state(&self, pipe_name: &str, success: bool) -> Result<()>;
+
+    /// Delete old executions, keeping only the newest `keep_per_pipe` per pipe.
+    /// Returns the number of rows deleted.
+    async fn cleanup_old_executions(&self, keep_per_pipe: i32) -> Result<u32>;
+
+    /// Get scheduler state for all pipes in a single query.
+    async fn get_all_scheduler_states(&self) -> Result<HashMap<String, SchedulerState>>;
+
+    /// Get recent executions for all pipes in a single query.
+    async fn get_all_executions(
+        &self,
+        limit_per_pipe: i32,
+    ) -> Result<HashMap<String, Vec<PipeExecution>>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -259,6 +274,7 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
             "pi" => Some("screenpipe"),
             "native-ollama" => Some("ollama"),
             "openai" => Some("openai"),
+            "openai-chatgpt" => Some("openai-chatgpt"),
             "custom" => Some("custom"), // custom uses openai-compatible API at a user-specified URL
             _ => None,
         })
@@ -270,11 +286,26 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
 
-    let api_key = preset
+    let mut api_key = preset
         .get("apiKey")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+
+    // ChatGPT OAuth: read token from stored file (no apiKey in preset)
+    if provider.as_deref() == Some("openai-chatgpt") && api_key.is_none() {
+        let token_path = dirs::home_dir().map(|h| h.join(".screenpipe").join("chatgpt-oauth.json"));
+        if let Some(path) = token_path {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(token_data) = serde_json::from_str::<serde_json::Value>(&content) {
+                    api_key = token_data
+                        .get("access_token")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                }
+            }
+        }
+    }
 
     let prompt = preset
         .get("prompt")
@@ -411,7 +442,8 @@ impl PipeManager {
         self.on_output_line = Some(cb);
     }
 
-    /// Mark orphaned 'running' executions as failed on startup.
+    /// Mark orphaned 'running' executions as failed on startup,
+    /// then prune old executions (keep 50 per pipe).
     pub async fn startup_recovery(&self) {
         if let Some(ref store) = self.store {
             match store.mark_orphaned_running().await {
@@ -425,6 +457,24 @@ impl PipeManager {
                 }
                 Err(e) => {
                     warn!("startup recovery failed: {}", e);
+                }
+            }
+            // Prune old executions to prevent DB bloat
+            self.cleanup_executions().await;
+        }
+    }
+
+    /// Delete old pipe executions, keeping only the newest 50 per pipe.
+    pub async fn cleanup_executions(&self) {
+        if let Some(ref store) = self.store {
+            match store.cleanup_old_executions(50).await {
+                Ok(count) => {
+                    if count > 0 {
+                        info!("pipe cleanup: deleted {} old executions", count);
+                    }
+                }
+                Err(e) => {
+                    warn!("pipe cleanup failed: {}", e);
                 }
             }
         }
@@ -590,13 +640,17 @@ impl PipeManager {
         };
         // locks released
 
-        // Pass 2: query DB for scheduler state (consecutive_failures)
+        // Pass 2: batch-query DB for all scheduler states (1 query instead of N)
+        let states = if let Some(ref store) = self.store {
+            store.get_all_scheduler_states().await.unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
         let mut result = Vec::with_capacity(partial.len());
         for (name, mut status) in partial {
-            if let Some(ref store) = self.store {
-                if let Ok(Some(state)) = store.get_scheduler_state(&name).await {
-                    status.consecutive_failures = state.consecutive_failures;
-                }
+            if let Some(state) = states.get(&name) {
+                status.consecutive_failures = state.consecutive_failures;
             }
             result.push(status);
         }
@@ -666,15 +720,24 @@ impl PipeManager {
         exec_limit: i32,
     ) -> Vec<(PipeStatus, Vec<PipeExecution>)> {
         let statuses = self.list_pipes().await;
-        let mut result = Vec::with_capacity(statuses.len());
-        for status in statuses {
-            let execs = self
-                .get_executions(&status.config.name, exec_limit)
+
+        // Batch-fetch all executions in 1 query instead of N
+        let mut all_execs = if let Some(ref store) = self.store {
+            store
+                .get_all_executions(exec_limit)
                 .await
-                .unwrap_or_default();
-            result.push((status, execs));
-        }
-        result
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+
+        statuses
+            .into_iter()
+            .map(|status| {
+                let execs = all_execs.remove(&status.config.name).unwrap_or_default();
+                (status, execs)
+            })
+            .collect()
     }
 
     /// Run a pipe once (manual trigger or scheduled).
@@ -891,8 +954,8 @@ impl PipeManager {
                             .finish_execution(
                                 id,
                                 status,
-                                &output.stdout,
-                                &output.stderr,
+                                &truncate_string(&output.stdout, 50_000),
+                                &truncate_string(&output.stderr, 10_000),
                                 None,
                                 error_type.as_deref(),
                                 error_message.as_deref(),
@@ -1217,8 +1280,8 @@ impl PipeManager {
                         .finish_execution(
                             id,
                             status,
-                            &output.stdout,
-                            &output.stderr,
+                            &truncate_string(&output.stdout, 50_000),
+                            &truncate_string(&output.stderr, 10_000),
                             None,
                             error_type.as_deref(),
                             error_message.as_deref(),
@@ -1600,6 +1663,7 @@ impl PipeManager {
         tokio::spawn(async move {
             info!("pipe scheduler started");
             let mut last_run: HashMap<String, DateTime<Utc>> = HashMap::new();
+            let mut last_cleanup = Instant::now();
 
             // Load last_run from DB on first tick
             if let Some(ref store) = store {
@@ -1859,8 +1923,8 @@ impl PipeManager {
                                         .finish_execution(
                                             id,
                                             status,
-                                            &output.stdout,
-                                            &output.stderr,
+                                            &truncate_string(&output.stdout, 50_000),
+                                            &truncate_string(&output.stderr, 10_000),
                                             None,
                                             error_type.as_deref(),
                                             error_message.as_deref(),
@@ -1985,6 +2049,20 @@ impl PipeManager {
                             cb(&name_for_cb, success, duration_secs);
                         }
                     });
+                }
+
+                // Daily cleanup: prune old executions every 24h
+                if last_cleanup.elapsed() >= std::time::Duration::from_secs(86400) {
+                    if let Some(ref store) = store {
+                        match store.cleanup_old_executions(50).await {
+                            Ok(count) if count > 0 => {
+                                info!("scheduler cleanup: deleted {} old executions", count);
+                            }
+                            Err(e) => warn!("scheduler cleanup failed: {}", e),
+                            _ => {}
+                        }
+                    }
+                    last_cleanup = Instant::now();
                 }
 
                 // Sleep 30s between checks

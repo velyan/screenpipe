@@ -410,6 +410,35 @@ impl MeetingDetector {
         false
     }
 
+    /// Returns true if the output device (speakers) had speech within the given window.
+    /// Used by batch mode to detect audio sessions (YouTube, podcasts, etc.)
+    /// independently of meeting detection.
+    pub fn has_recent_output_speech(&self, within: Duration) -> bool {
+        let last_output = self.last_output_speech_ts.load(Ordering::Relaxed);
+        if last_output == 0 {
+            return false;
+        }
+        let now = now_millis();
+        (now - last_output) < within.as_millis() as i64
+    }
+
+    /// Returns true if the user is in an "audio session" — either a meeting
+    /// (calendar, app-based, or audio-based) or sustained output audio
+    /// (YouTube, podcast, etc.). Used by batch mode for deferral decisions.
+    ///
+    /// Priority:
+    /// 1. Calendar meeting (2+ attendees, event time overlap)
+    /// 2. App-based meeting (Zoom, Meet, Teams focused)
+    /// 3. Audio-based meeting extension (bidirectional + recent app)
+    /// 4. Output audio activity (any speaker output within last 45s)
+    pub fn is_in_audio_session(&self) -> bool {
+        if self.is_in_meeting() {
+            return true;
+        }
+        // Fallback: any output audio playing (YouTube, podcast, etc.)
+        self.has_recent_output_speech(AUDIO_CALL_DETECTION_WINDOW)
+    }
+
     /// Returns the current meeting app name, if any.
     /// Priority: app-based > calendar-based > audio-based extension.
     pub async fn current_meeting_app(&self) -> Option<String> {

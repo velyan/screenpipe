@@ -111,7 +111,7 @@ pub async fn paired_capture(
     // which returns non-empty but low-quality text (raw buffer content
     // without visual formatting). For these apps we always run OCR to get
     // proper bounding-box text positions for the selectable overlay.
-    let app_prefers_ocr = ctx.app_name.map_or(false, |name| {
+    let app_prefers_ocr = ctx.app_name.is_some_and(|name| {
         let n = name.to_lowercase();
         // Terminal emulators whose AX text is raw buffer and not useful
         // for bounding-box overlay. OCR produces better results.
@@ -132,45 +132,74 @@ pub async fn paired_capture(
     // Only run OCR when needed by text availability, app policy, or API strict include_ocr.
     let should_run_ocr = ctx.force_ocr || !has_accessibility_text;
     let (ocr_text, ocr_text_json) = if should_run_ocr {
-        let image_for_ocr = ctx.image.clone();
-        let ocr_result = tokio::task::spawn_blocking(move || {
-            #[cfg(target_os = "macos")]
-            {
-                let (text, json, _confidence) =
-                    screenpipe_vision::perform_ocr_apple(&image_for_ocr, &[]);
-                (text, json)
+        // Windows native OCR is async, so call it directly (not inside spawn_blocking)
+        #[cfg(target_os = "windows")]
+        {
+            match screenpipe_vision::perform_ocr_windows(&ctx.image).await {
+                Ok((text, json, _confidence)) => (text, json),
+                Err(e) => {
+                    warn!("windows OCR failed: {}", e);
+                    (String::new(), "[]".to_string())
+                }
             }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = image_for_ocr;
-                (String::new(), "[]".to_string())
-            }
-        })
-        .await
-        .unwrap_or_else(|_| (String::new(), "[]".to_string()));
-        ocr_result
+        }
+        // Apple and Tesseract OCR are sync, use spawn_blocking
+        #[cfg(not(target_os = "windows"))]
+        {
+            let image_for_ocr = ctx.image.clone();
+            let ocr_result = tokio::task::spawn_blocking(move || {
+                #[cfg(target_os = "macos")]
+                {
+                    let (text, json, _confidence) =
+                        screenpipe_vision::perform_ocr_apple(&image_for_ocr, &[]);
+                    (text, json)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let (text, json, _confidence) =
+                        screenpipe_vision::perform_ocr_tesseract(&image_for_ocr, vec![]);
+                    (text, json)
+                }
+            })
+            .await
+            .unwrap_or_else(|_| (String::new(), "[]".to_string()));
+            ocr_result
+        }
     } else {
         (String::new(), "[]".to_string())
     };
 
     // --- Extract data from tree snapshot, fall back to OCR text ---
-    let (accessibility_text, tree_json, content_hash, simhash) = match tree_snapshot {
-        Some(snap) if !snap.text_content.is_empty() => {
-            let json = serde_json::to_string(&snap.nodes).ok();
-            (
-                Some(snap.text_content.clone()),
-                json,
-                Some(snap.content_hash as i64),
-                Some(snap.simhash as i64),
-            )
+    // When app_prefers_ocr (terminals), always prefer OCR over accessibility tree
+    // because the tree only returns window chrome (Minimize/Maximize/Close), not
+    // the actual terminal content.
+    let (accessibility_text, tree_json, content_hash, simhash) = if app_prefers_ocr {
+        // Terminal apps: OCR is the only useful source. The accessibility tree
+        // only returns window chrome ("System, Minimize, Restore, Close") which
+        // is noise. If OCR fails, store nothing rather than chrome.
+        if !ocr_text.is_empty() {
+            (Some(ocr_text.clone()), None, None, None)
+        } else {
+            (None, None, None, None)
         }
-        _ => {
-            // OCR fallback: accessibility returned no text (games, bad a11y apps)
-            // or app_prefers_ocr forced OCR (terminals).
-            if ocr_text.is_empty() {
-                (None, None, None, None)
-            } else {
-                (Some(ocr_text.clone()), None, None, None)
+    } else {
+        match tree_snapshot {
+            Some(snap) if !snap.text_content.is_empty() => {
+                let json = serde_json::to_string(&snap.nodes).ok();
+                (
+                    Some(snap.text_content.clone()),
+                    json,
+                    Some(snap.content_hash as i64),
+                    Some(snap.simhash as i64),
+                )
+            }
+            _ => {
+                // OCR fallback: accessibility returned no text (games, bad a11y apps)
+                if ocr_text.is_empty() {
+                    (None, None, None, None)
+                } else {
+                    (Some(ocr_text.clone()), None, None, None)
+                }
             }
         }
     };
@@ -193,7 +222,7 @@ pub async fn paired_capture(
     // This sanitizes emails, API keys, credit cards, SSNs, etc. from OCR/accessibility text
     // so pipes (like obsidian-sync) never see raw PII in search results.
     let sanitized_text = if ctx.use_pii_removal {
-        final_text.map(|t| remove_pii(t))
+        final_text.map(remove_pii)
     } else {
         final_text.map(|t| t.to_string())
     };
@@ -249,11 +278,18 @@ pub async fn paired_capture(
     let main_body_status = distillation.as_ref().map(|r| r.metadata.status.clone());
 
     // Insert snapshot frame + OCR text positions in a single transaction.
+    let ocr_engine_name = if cfg!(target_os = "macos") {
+        "AppleNative"
+    } else if cfg!(target_os = "windows") {
+        "WindowsNative"
+    } else {
+        "Tesseract"
+    };
     let ocr_data = if !sanitized_ocr_text.is_empty() {
         Some((
             sanitized_ocr_text.as_str(),
             sanitized_ocr_json.as_str(),
-            "AppleNative",
+            ocr_engine_name,
         ))
     } else {
         None

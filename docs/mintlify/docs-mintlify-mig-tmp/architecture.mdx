@@ -1,52 +1,57 @@
 ---
 title: "architecture"
 sidebarTitle: "architecture"
-description: "How screenpipe captures screens, processes OCR, stores data locally in SQLite, and provides APIs for AI."
+description: "How screenpipe uses event-driven capture, accessibility tree extraction, and OCR fallback to build a searchable local memory."
 icon: "sitemap"
 ---
 
 ## overview
 
-screenpipe is a Rust application that continuously captures your screen and audio, processes them locally, and stores everything in a SQLite database. it serves a REST API on `localhost:3030` for querying your data.
+screenpipe is a Rust application that captures your screen and audio using an event-driven architecture, processes them locally, and stores everything in a SQLite database. instead of recording every second, it listens for meaningful OS events and captures only when something actually changes — pairing each screenshot with accessibility tree data for maximum quality at minimal cost.
 
 ```mermaid
 graph LR
-    subgraph capture["capture"]
-        S[screen]
-        A[audio]
-        U[UI events]
+    subgraph trigger["event triggers"]
+        E1[app switch]
+        E2[click / scroll]
+        E3[typing pause]
+        E4[idle timer]
     end
 
-    subgraph process["processing"]
-        OCR[OCR]
+    subgraph capture["paired capture"]
+        SS[screenshot]
+        A11Y[accessibility tree]
+        OCR[OCR fallback]
+    end
+
+    subgraph audio["audio"]
+        MIC[microphone]
+        SYS[system audio]
         STT[speech-to-text]
-        SID[speaker ID]
     end
 
     subgraph store["storage"]
         DB[(SQLite)]
-        FS[media files]
+        FS[JPEG files]
     end
 
     subgraph serve["API · localhost:3030"]
         REST[REST API]
         MCP[MCP server]
-        WS[WebSocket]
     end
 
-    S --> OCR
-    A --> STT
-    A --> SID
-    U --> DB
-
+    E1 & E2 & E3 & E4 --> SS
+    SS --> A11Y
+    A11Y -->|empty?| OCR
+    A11Y --> DB
     OCR --> DB
-    STT --> DB
-    S --> FS
-    A --> FS
+    SS --> FS
+
+    MIC & SYS --> STT --> DB
 
     DB --> REST
     DB --> MCP
-    FS --> WS
+    FS --> REST
 
     REST --> P[pipes / AI agents]
     MCP --> AI[Claude · Cursor · etc.]
@@ -56,22 +61,28 @@ graph LR
 
 ```mermaid
 sequenceDiagram
-    participant Screen
+    participant OS as OS Events
+    participant Capture
+    participant A11Y as Accessibility
+    participant OCR as OCR (fallback)
     participant Audio
-    participant OCR/STT
     participant SQLite
     participant API
     participant AI
 
-    loop every frame (1 FPS)
-        Screen->>OCR/STT: frame
-        OCR/STT->>SQLite: extracted text + metadata
-        Screen->>SQLite: MP4 recording
+    OS->>Capture: meaningful event (click, app switch, typing pause...)
+    Capture->>Capture: screenshot
+    Capture->>A11Y: walk accessibility tree
+    alt accessibility data available
+        A11Y->>SQLite: structured text + metadata
+    else accessibility empty (remote desktop, games)
+        A11Y->>OCR: fallback
+        OCR->>SQLite: extracted text + metadata
     end
+    Capture->>SQLite: JPEG frame
 
     loop every 30s chunk
-        Audio->>OCR/STT: audio chunk
-        OCR/STT->>SQLite: transcription + speaker
+        Audio->>SQLite: transcription + speaker
         Audio->>SQLite: audio file
     end
 
@@ -114,23 +125,36 @@ graph TD
 
 ## layers
 
-### 1. capture
+### 1. event-driven capture
+
+screenpipe listens for meaningful OS events instead of polling at a fixed FPS. when an event fires, it captures a screenshot and walks the accessibility tree together — same timestamp, same frame.
+
+| trigger | description |
+|---------|-------------|
+| **app switch** | user switched to a different application |
+| **window focus** | a new window gained focus |
+| **click / scroll** | user interacted with the UI |
+| **typing pause** | user stopped typing (debounced) |
+| **clipboard copy** | content copied to clipboard |
+| **idle fallback** | periodic capture every ~5s when nothing is happening |
 
 | what | how | crate |
 |------|-----|-------|
-| **screen** | per-monitor frame capture at configurable FPS (default 1.0, macOS 0.5) | `screenpipe-vision` |
+| **screen** | event-triggered screenshot of the active monitor | `screenpipe-vision` |
+| **text extraction** | accessibility tree walk (structured text: buttons, labels, fields) | `screenpipe-accessibility` |
+| **OCR fallback** | when accessibility data is empty (remote desktops, games, some Linux apps) | `screenpipe-vision` |
 | **audio** | multiple input/output devices in configurable chunks (default 30s) | `screenpipe-audio` |
-| **UI events** | keyboard, mouse, app switches, clipboard via accessibility APIs | `screenpipe-accessibility` |
 
 ### 2. processing
 
-| engine | type | platform |
-|--------|------|----------|
-| Apple Vision | OCR | macOS |
-| Windows native | OCR | Windows |
-| Tesseract | OCR | Linux |
-| Whisper | speech-to-text | local, all platforms |
-| Deepgram | speech-to-text | cloud API |
+| engine | type | platform | when used |
+|--------|------|----------|-----------|
+| accessibility tree | text extraction | macOS, Windows | primary — used for every capture |
+| Apple Vision | OCR | macOS | fallback when accessibility is empty |
+| Windows native | OCR | Windows | fallback when accessibility is empty |
+| Tesseract | OCR | Linux | primary (accessibility support varies) |
+| Whisper | speech-to-text | local, all platforms | audio transcription |
+| Deepgram | speech-to-text | cloud API | optional cloud audio |
 
 additional processing: speaker identification, PII redaction, frame deduplication (skips identical frames).
 
@@ -138,8 +162,8 @@ additional processing: speaker identification, PII redaction, frame deduplicatio
 
 all data stays local on your machine:
 
-- **SQLite** at `~/.screenpipe/db.sqlite` — metadata, OCR text, transcriptions, speakers, tags
-- **media** at `~/.screenpipe/data/` — MP4 screen recordings, audio chunks
+- **SQLite** at `~/.screenpipe/db.sqlite` — metadata, accessibility text, OCR text, transcriptions, speakers, tags, UI elements
+- **media** at `~/.screenpipe/data/` — JPEG screenshots (event-driven frames), audio chunks
 
 ### 4. API
 
@@ -147,9 +171,11 @@ REST API on `localhost:3030`:
 
 | endpoint | description |
 |----------|-------------|
-| `/search` | filtered content retrieval (OCR, audio, UI events) |
+| `/search` | filtered content retrieval (OCR, audio, accessibility) |
 | `/search/keyword` | keyword search with text positions |
+| `/elements` | lightweight UI element search (accessibility tree data) |
 | `/frames/{id}` | access captured frames |
+| `/frames/{id}/context` | accessibility text + URLs + OCR fallback for a frame |
 | `/health` | system status and metrics |
 | `/raw_sql` | direct database queries |
 | `/ai/chat/completions` | Apple Intelligence (macOS 26+) |
@@ -196,9 +222,9 @@ key tables:
 
 | table | stores |
 |-------|--------|
-| `frames` | captured screen frame metadata |
-| `ocr_text` | text extracted from frames |
-| `video_chunks` | video recording file metadata |
+| `frames` | captured screen frame metadata (includes `snapshot_path`, `accessibility_text`, `capture_trigger`) |
+| `ocr_text` | OCR fallback text extracted from frames |
+| `elements` | UI elements from accessibility tree (buttons, labels, text fields) with FTS5 search |
 | `audio_chunks` | audio recording metadata |
 | `audio_transcriptions` | text from audio |
 | `speakers` | identified speakers |
@@ -218,8 +244,8 @@ runs 24/7 on a MacBook Pro M3 (32 GB) or a $400 Windows laptop:
 | metric | typical value |
 |--------|---------------|
 | RAM | ~600 MB |
-| CPU | ~10% |
-| storage | ~30 GB/month at 1 FPS |
+| CPU | ~5-10% |
+| storage | ~5-10 GB/month (event-driven capture only stores frames when something changes) |
 
 ## source code
 

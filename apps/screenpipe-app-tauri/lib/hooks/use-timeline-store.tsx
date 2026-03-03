@@ -29,6 +29,9 @@ const MAX_REQUEST_RETRIES = 3; // Retry request 3 times before giving up
 
 // Reconnect timeout - must be tracked to prevent cascade
 let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 10;
+const RECONNECT_BASE_DELAY_MS = 2000;
 
 // Suppress repeated disconnect logs - only log on state transitions
 let hasLoggedTimelineDisconnect = false;
@@ -144,7 +147,6 @@ export const useTimelineStore = create<TimelineState>((set, get) => ({
 					error: null,
 				});
 				
-				console.log(`Loaded ${cached.frames.length} frames from cache (isToday: ${isToday})`);
 			}
 		} catch (error) {
 			console.warn("Failed to load from cache:", error);
@@ -362,8 +364,9 @@ export const useTimelineStore = create<TimelineState>((set, get) => ({
 			// Ignore events from old WebSocket instances
 			if (thisWsId !== currentWsId) return;
 
-			// Reset retry counter on successful connection
+			// Reset retry counters on successful connection
 			connectionAttempts = 0;
+			reconnectAttempts = 0;
 			if (errorGraceTimer) {
 				clearTimeout(errorGraceTimer);
 				errorGraceTimer = null;
@@ -378,11 +381,6 @@ export const useTimelineStore = create<TimelineState>((set, get) => ({
 				loadingProgress: { loaded: currentFrames.length, isStreaming: true },
 				isConnected: true,
 			});
-			if (hasLoggedTimelineDisconnect) {
-				console.log("timeline WebSocket reconnected");
-			} else {
-				console.log("timeline WebSocket connected");
-			}
 			hasLoggedTimelineDisconnect = false;
 
 			// After successful connection/reconnection, trigger a fetch for current date
@@ -427,6 +425,35 @@ export const useTimelineStore = create<TimelineState>((set, get) => ({
 					if (currentFrames.length === 0) {
 						set({ error: data.error, isLoading: false });
 					}
+					return;
+				}
+
+				// Handle audio updates from batch/reconciliation — merge
+				// transcription into existing frames near the audio timestamp.
+				if (data.type === "audio_update" && data.audio) {
+					set((state) => {
+						const audioTs = new Date(data.timestamp).getTime();
+						const pad = 60_000; // ±60s window matching server
+						let updated = false;
+						const updatedFrames = state.frames.map((frame) => {
+							const frameTs = new Date(frame.timestamp).getTime();
+							if (Math.abs(frameTs - audioTs) > pad) return frame;
+							// Check if this audio is already attached
+							const isDuplicate = frame.devices?.some((d: any) =>
+								d.audio?.some((a: any) => a.audio_chunk_id === data.audio.audio_chunk_id)
+							);
+							if (isDuplicate) return frame;
+							updated = true;
+							return {
+								...frame,
+								devices: frame.devices?.map((d: any) => ({
+									...d,
+									audio: [...(d.audio || []), data.audio],
+								})),
+							};
+						});
+						return updated ? { frames: updatedFrames } : {};
+					});
 					return;
 				}
 
@@ -527,7 +554,6 @@ export const useTimelineStore = create<TimelineState>((set, get) => ({
 		ws.onclose = () => {
 			// Ignore events from old WebSocket instances (e.g., when refresh button is clicked)
 			if (thisWsId !== currentWsId) {
-				console.log("Ignoring onclose from old WebSocket instance");
 				return;
 			}
 
@@ -560,70 +586,86 @@ export const useTimelineStore = create<TimelineState>((set, get) => ({
 				set({ isConnected: false });
 			}
 
-			// Reset attempts and reconnect after delay (tracked to prevent cascade)
-			reconnectTimeout = setTimeout(() => {
-				reconnectTimeout = null;
-				connectionAttempts = 0; // Fresh start for reconnection
-				get().connectWebSocket();
-			}, 5000);
+			// Reconnect with exponential backoff (2s, 3s, 4.5s, ... capped at 30s)
+			reconnectAttempts++;
+			if (reconnectAttempts <= MAX_RECONNECT_ATTEMPTS) {
+				const delay = Math.min(RECONNECT_BASE_DELAY_MS * Math.pow(1.5, reconnectAttempts - 1), 30000);
+				reconnectTimeout = setTimeout(() => {
+					reconnectTimeout = null;
+					connectionAttempts = 0; // Fresh start for reconnection
+					get().connectWebSocket();
+				}, delay);
+			}
 		};
 	},
 
 	fetchTimeRange: async (startTime: Date, endTime: Date) => {
-		const { websocket, sentRequests } = get();
-		// Use ISO range as key so narrow-window and full-day fetches get distinct keys
-		const requestKey = `${startTime.toISOString()}_${endTime.toISOString()}`;
+		const sendOrRetry = (attempt: number) => {
+			const { websocket, sentRequests } = get();
+			// Use ISO range as key so narrow-window and full-day fetches get distinct keys
+			const requestKey = `${startTime.toISOString()}_${endTime.toISOString()}`;
 
-		if (sentRequests.has(requestKey)) {
-			console.log("Request already sent, skipping...");
-			return;
-		}
-
-		if (websocket && websocket.readyState === WebSocket.OPEN) {
-			console.log("sending request for", requestKey);
-			websocket.send(
-				JSON.stringify({
-					start_time: startTime.toISOString(),
-					end_time: endTime.toISOString(),
-					order: "descending",
-				}),
-			);
-
-			set((state) => ({
-				sentRequests: new Set(state.sentRequests).add(requestKey),
-			}));
-
-			// Start timeout - if no frames arrive, retry
-			if (requestTimeoutTimer) {
-				clearTimeout(requestTimeoutTimer);
+			if (sentRequests.has(requestKey)) {
+				return;
 			}
-			requestTimeoutTimer = setTimeout(() => {
-				requestTimeoutTimer = null;
-				const { frames: currentFrames, pendingDateSwap: stillSwapping } = get();
 
-				// Retry if no frames arrived (or still waiting for date swap to complete)
-				if ((currentFrames.length === 0 || stillSwapping) && requestRetryCount < MAX_REQUEST_RETRIES) {
-					requestRetryCount++;
-					console.log(`No frames received, retrying (${requestRetryCount}/${MAX_REQUEST_RETRIES})...`);
+			if (websocket && websocket.readyState === WebSocket.OPEN) {
+				websocket.send(
+					JSON.stringify({
+						start_time: startTime.toISOString(),
+						end_time: endTime.toISOString(),
+						order: "descending",
+					}),
+				);
 
-					// Clear this date from sentRequests to allow retry
-					set((state) => {
-						const newSentRequests = new Set(state.sentRequests);
-						newSentRequests.delete(requestKey);
-						return { sentRequests: newSentRequests };
-					});
+				set((state) => ({
+					sentRequests: new Set(state.sentRequests).add(requestKey),
+				}));
 
-					// Retry the request
-					get().fetchTimeRange(startTime, endTime);
-				} else if ((currentFrames.length === 0 || stillSwapping) && requestRetryCount >= MAX_REQUEST_RETRIES) {
-					console.log("Max retries reached, no frames available");
-					set({
-						isLoading: false,
-						message: "No data available for this time range"
-					});
+				// Start timeout - if no frames arrive, retry
+				if (requestTimeoutTimer) {
+					clearTimeout(requestTimeoutTimer);
 				}
-			}, REQUEST_TIMEOUT_MS);
-		}
+				requestTimeoutTimer = setTimeout(() => {
+					requestTimeoutTimer = null;
+					const { frames: currentFrames, pendingDateSwap: stillSwapping } = get();
+
+					// Retry if no frames arrived (or still waiting for date swap to complete)
+					if ((currentFrames.length === 0 || stillSwapping) && requestRetryCount < MAX_REQUEST_RETRIES) {
+						requestRetryCount++;
+
+						// Clear this date from sentRequests to allow retry
+						set((state) => {
+							const newSentRequests = new Set(state.sentRequests);
+							newSentRequests.delete(requestKey);
+							return { sentRequests: newSentRequests };
+						});
+
+						// Retry the request
+						get().fetchTimeRange(startTime, endTime);
+					} else if ((currentFrames.length === 0 || stillSwapping) && requestRetryCount >= MAX_REQUEST_RETRIES) {
+						set({
+							isLoading: false,
+							message: "No data available for this time range"
+						});
+					}
+				}, REQUEST_TIMEOUT_MS);
+			} else if (attempt < 5) {
+				// WebSocket not open — retry after a short delay instead of silently dropping.
+				// This happens during cross-date navigation when the WS may be reconnecting.
+				const delay = 500 * (attempt + 1); // 500ms, 1s, 1.5s, 2s, 2.5s
+				console.warn(`[fetchTimeRange] WebSocket not open, retrying in ${delay}ms (attempt ${attempt + 1}/5)`);
+				setTimeout(() => sendOrRetry(attempt + 1), delay);
+			} else {
+				console.error("[fetchTimeRange] WebSocket not open after 5 retries, giving up");
+				set({
+					isLoading: false,
+					message: "Connection lost — please try again",
+				});
+			}
+		};
+
+		sendOrRetry(0);
 	},
 
 	fetchNextDayData: async (date: Date) => {
@@ -644,7 +686,6 @@ export const useTimelineStore = create<TimelineState>((set, get) => ({
 		const requestKey = `${nextDay.toISOString()}_${endTime.toISOString()}`;
 
 		if (sentRequests.has(requestKey)) {
-			console.log("Request already sent, skipping...");
 			return;
 		}
 
@@ -693,8 +734,6 @@ export const useTimelineStore = create<TimelineState>((set, get) => ({
 			};
 		});
 
-		console.log("Window focused, cleared sentRequests for:", todayStr);
-
 		// If WebSocket is open, fetch today's data
 		if (websocket && websocket.readyState === WebSocket.OPEN) {
 			const startTime = new Date(today);
@@ -704,7 +743,6 @@ export const useTimelineStore = create<TimelineState>((set, get) => ({
 			fetchTimeRange(startTime, endTime);
 		} else {
 			// WebSocket is closed, reconnect (which will fetch on open)
-			console.log("WebSocket not open, reconnecting...");
 			connectWebSocket();
 		}
 	},

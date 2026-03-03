@@ -4,6 +4,8 @@
 
 "use client";
 
+const DEFAULT_OPENAI_COMPATIBLE_ENDPOINT = "http://127.0.0.1:8080";
+
 import React, { useEffect, useState, useMemo, useCallback, useRef } from "react";
 import { Label } from "@/components/ui/label";
 import {
@@ -39,8 +41,14 @@ import {
   Globe,
   Shield,
   Zap,
+  Music,
   User,
   Users,
+  ChevronUp,
+  ChevronDown,
+  CheckCircle2,
+  XCircle,
+  Circle,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import {
@@ -80,6 +88,7 @@ import { useSqlAutocomplete } from "@/lib/hooks/use-sql-autocomplete";
 import * as Sentry from "@sentry/react";
 import { defaultOptions } from "tauri-plugin-sentry-api";
 import { useLoginDialog } from "../login-dialog";
+import { BatterySaverSection } from "./battery-saver-section";
 import { ValidatedInput } from "../ui/validated-input";
 import {
   validateField,
@@ -189,6 +198,21 @@ const getAudioDeviceIcon = (name: string) => {
   return Volume2;
 };
 
+type TxDiagnosticStatus = "pass" | "fail" | "skip" | "pending" | "running";
+type TxDiagnosticStep = { status: TxDiagnosticStatus; message: string; latencyMs?: number };
+type TxDiagnostics = {
+  endpoint: TxDiagnosticStep;
+  auth: TxDiagnosticStep;
+  models: TxDiagnosticStep;
+  transcribe: TxDiagnosticStep;
+};
+const INITIAL_TX_DIAGNOSTICS: TxDiagnostics = {
+  endpoint: { status: "pending", message: "" },
+  auth: { status: "pending", message: "" },
+  models: { status: "pending", message: "" },
+  transcribe: { status: "pending", message: "" },
+};
+
 export function RecordingSettings() {
   const { settings, updateSettings, getDataDir, loadUser } = useSettings();
   const [openLanguages, setOpenLanguages] = React.useState(false);
@@ -215,6 +239,7 @@ export function RecordingSettings() {
   const isDisabled = health?.status_code === 500;
   const [isMacOS, setIsMacOS] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
+  const [showOpenAIApiKey, setShowOpenAIApiKey] = useState(false);
   const [isRefreshingSubscription, setIsRefreshingSubscription] = useState(false);
   const { checkLogin } = useLoginDialog();
   const team = useTeam();
@@ -224,9 +249,39 @@ export function RecordingSettings() {
   const overlayData = useOverlayData();
   const [hwCapability, setHwCapability] = useState<HardwareCapability | null>(null);
 
+  // OpenAI Compatible model fetching state
+  const [openAIModels, setOpenAIModels] = useState<string[]>([]);
+  const [allOpenAIModels, setAllOpenAIModels] = useState<string[]>([]); // Store all models
+  const [isLoadingModels, setIsLoadingModels] = useState(false);
+  const [filterTranscriptionModels, setFilterTranscriptionModels] = useState(true); // Default to filtered
+
+  // Transcription diagnostics state
+  const [txTestStatus, setTxTestStatus] = useState<"idle" | "testing" | "done">("idle");
+  const [txTestResults, setTxTestResults] = useState<TxDiagnostics>(INITIAL_TX_DIAGNOSTICS);
+  const [txDiagnosticsOpen, setTxDiagnosticsOpen] = useState(false);
+  const txDiagnosticsAbortRef = useRef<AbortController | null>(null);
+
   useEffect(() => {
     commands.getHardwareCapability().then(setHwCapability).catch(() => {});
   }, []);
+
+  // Transcription model name patterns
+  const TRANSCRIPTION_MODEL_PATTERNS = [
+    /^whisper/i,
+    /whisper/i,
+    /^canary/i,
+    /^parakeet/i,
+    /^speech/i,
+    /audio.*transcri/i,
+    /^transcribe/i,
+    /stt/i,
+    /^moonshine/i,
+    /^sensevoice/i,
+  ];
+
+  const isLikelyTranscriptionModel = (modelId: string): boolean => {
+    return TRANSCRIPTION_MODEL_PATTERNS.some(pattern => pattern.test(modelId));
+  };
 
   const handlePushFilterToTeam = async (configType: string, key: string, filters: string[]) => {
     setPushingFilter(key);
@@ -237,6 +292,25 @@ export function RecordingSettings() {
       toast({ title: "failed to push to team", description: err.message, variant: "destructive" });
     } finally {
       setPushingFilter(null);
+    }
+  };
+
+  const handleRemoveTeamFilter = async (configType: string, key: string, filterToRemove: string) => {
+    const config = team.configs?.find(
+      (c) => c.config_type === configType && c.key === key && c.scope === "team"
+    );
+    if (!config) return;
+    const currentFilters = (config.value as { filters?: string[] })?.filters || [];
+    const updated = currentFilters.filter((f) => f !== filterToRemove);
+    try {
+      if (updated.length === 0) {
+        await team.deleteConfig(config.id);
+      } else {
+        await team.pushConfig(configType, key, { filters: updated });
+      }
+      toast({ title: "filter removed from team" });
+    } catch (err: any) {
+      toast({ title: "failed to remove filter", description: err.message, variant: "destructive" });
     }
   };
 
@@ -423,6 +497,295 @@ export function RecordingSettings() {
     loadDevices();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Fetch OpenAI Compatible models when endpoint changes
+  // Tries /v1/models (OpenAI), then /api/tags (Ollama) as fallback
+  const fetchOpenAIModels = useCallback(async (endpoint: string, apiKey?: string) => {
+    setIsLoadingModels(true);
+    try {
+      const headers: Record<string, string> = {};
+      if (apiKey) {
+        headers['Authorization'] = `Bearer ${apiKey}`;
+      }
+
+      // Try OpenAI-style /v1/models first
+      let models: string[] = [];
+      try {
+        const response = await fetch(`${endpoint}/v1/models`, {
+          headers,
+          signal: AbortSignal.timeout(5000),
+        });
+        if (response.ok) {
+          const data = await response.json();
+          models = (data.data || []).map((m: any) => m.id).filter(Boolean);
+        }
+      } catch {
+        // endpoint may not support /v1/models — try Ollama fallback
+      }
+
+      // Fallback: try Ollama-style /api/tags
+      if (models.length === 0) {
+        try {
+          const ollamaResponse = await fetch(`${endpoint}/api/tags`, {
+            headers,
+            signal: AbortSignal.timeout(5000),
+          });
+          if (ollamaResponse.ok) {
+            const ollamaData = await ollamaResponse.json();
+            models = (ollamaData.models || []).map((m: any) => m.name).filter(Boolean);
+          }
+        } catch {
+          // Ollama endpoint also not available — models stays empty
+        }
+      }
+
+      setAllOpenAIModels(models);
+    } catch (error) {
+      console.error('Failed to fetch OpenAI models:', error);
+      setAllOpenAIModels(['!API_Error']);
+      setOpenAIModels(['!API_Error']);
+    } finally {
+      setIsLoadingModels(false);
+    }
+  }, []);
+
+  // Update displayed models when filter toggle or all models change
+  useEffect(() => {
+    if (allOpenAIModels.length === 0) return;
+    
+    if (allOpenAIModels.includes('!API_Error')) {
+      setOpenAIModels(allOpenAIModels);
+      return;
+    }
+    
+    if (filterTranscriptionModels) {
+      const filtered = allOpenAIModels.filter(isLikelyTranscriptionModel);
+      setOpenAIModels(filtered.length > 0 ? filtered : allOpenAIModels);
+    } else {
+      setOpenAIModels(allOpenAIModels);
+    }
+  }, [allOpenAIModels, filterTranscriptionModels]);
+
+  // Fetch models when OpenAI Compatible is selected - manually triggered
+  // (not on every keystroke - only on focus change or enter key)
+  useEffect(() => {
+    if (settings.audioTranscriptionEngine === 'openai-compatible') {
+      const apiKey = settings.openaiCompatibleApiKey;
+      // Use default endpoint if not set
+      const endpoint = settings.openaiCompatibleEndpoint || DEFAULT_OPENAI_COMPATIBLE_ENDPOINT;
+      fetchOpenAIModels(endpoint, apiKey);
+    }
+  }, [settings.audioTranscriptionEngine, settings.openaiCompatibleApiKey, fetchOpenAIModels]);
+
+  // Run transcription diagnostics (endpoint → auth → models → transcription test)
+  const runTranscriptionDiagnostics = useCallback(async () => {
+    txDiagnosticsAbortRef.current?.abort();
+    const abort = new AbortController();
+    txDiagnosticsAbortRef.current = abort;
+
+    setTxTestStatus("testing");
+    setTxTestResults({
+      endpoint: { status: "pending", message: "" },
+      auth: { status: "pending", message: "" },
+      models: { status: "pending", message: "" },
+      transcribe: { status: "pending", message: "" },
+    });
+    setTxDiagnosticsOpen(true);
+
+    const endpoint = settings.openaiCompatibleEndpoint || DEFAULT_OPENAI_COMPATIBLE_ENDPOINT;
+    const apiKey = settings.openaiCompatibleApiKey;
+
+    const headers: Record<string, string> = {};
+    if (apiKey) {
+      headers["Authorization"] = `Bearer ${apiKey}`;
+    }
+
+    const skipRemaining = (failStep: string, message: string) => {
+      const steps = ["endpoint", "auth", "models", "transcribe"] as const;
+      const failIdx = steps.indexOf(failStep as any);
+      setTxTestResults((prev) => ({
+        ...prev,
+        [failStep]: { status: "fail" as const, message },
+        ...Object.fromEntries(
+          steps
+            .filter((_, i) => i > failIdx)
+            .map((k) => [k, { status: "skip" as const, message: "Skipped" }])
+        ),
+      }));
+      setTxTestStatus("done");
+    };
+
+    // Step 1: Endpoint connectivity — try root URL or /v1/models
+    setTxTestResults((prev) => ({
+      ...prev,
+      endpoint: { status: "running", message: "Connecting..." },
+    }));
+
+    let endpointReachable = false;
+    try {
+      await fetch(endpoint, { signal: abort.signal, method: "GET" });
+      endpointReachable = true;
+    } catch {
+      // root URL failed, try /v1/models as fallback
+      try {
+        await fetch(`${endpoint}/v1/models`, { headers, signal: abort.signal });
+        endpointReachable = true;
+      } catch {
+        // neither worked
+      }
+    }
+
+    if (abort.signal.aborted) return;
+
+    if (!endpointReachable) {
+      skipRemaining("endpoint", `Connection failed. Is the server running at ${endpoint}?`);
+      return;
+    }
+
+    setTxTestResults((prev) => ({
+      ...prev,
+      endpoint: { status: "pass", message: `Server reachable` },
+      auth: { status: "running", message: "Checking..." },
+    }));
+
+    // Step 2+3: Try to list models (also tests auth)
+    let modelCount = 0;
+    // Try OpenAI-style /v1/models
+    try {
+      const modelsResponse = await fetch(`${endpoint}/v1/models`, {
+        headers,
+        signal: abort.signal,
+      });
+      if (modelsResponse.status === 401 || modelsResponse.status === 403) {
+        skipRemaining("auth", `${modelsResponse.status} Unauthorized. Check your API key.`);
+        return;
+      }
+      if (modelsResponse.ok) {
+        const data = await modelsResponse.json();
+        modelCount = (data.data || []).filter((m: any) => m.id).length;
+      }
+    } catch {
+      // /v1/models not available, try Ollama fallback
+    }
+
+    // Fallback: try Ollama-style /api/tags
+    if (modelCount === 0) {
+      try {
+        const ollamaResponse = await fetch(`${endpoint}/api/tags`, {
+          headers,
+          signal: abort.signal,
+        });
+        if (ollamaResponse.ok) {
+          const ollamaData = await ollamaResponse.json();
+          modelCount = (ollamaData.models || []).filter((m: any) => m.name).length;
+        }
+      } catch {
+        // no models endpoint available
+      }
+    }
+
+    if (abort.signal.aborted) return;
+
+    setTxTestResults((prev) => ({
+      ...prev,
+      auth: { status: "pass", message: apiKey ? "API key accepted" : "No auth required" },
+      models: {
+        status: "pass",
+        message: modelCount > 0
+          ? `${modelCount} model${modelCount !== 1 ? "s" : ""} available`
+          : "No models listed (you can still type a model name)",
+      },
+      transcribe: { status: "running", message: "Sending test audio..." },
+    }));
+
+    // Step 4: Test transcription with a short silent WAV
+    const model = settings.openaiCompatibleModel || "";
+    const txStart = performance.now();
+    try {
+      // Generate a minimal 1-second silent 16kHz mono WAV
+      const sampleRate = 16000;
+      const numSamples = sampleRate; // 1 second
+      const dataSize = numSamples * 2; // 16-bit = 2 bytes per sample
+      const buffer = new ArrayBuffer(44 + dataSize);
+      const view = new DataView(buffer);
+      // WAV header
+      const writeStr = (offset: number, str: string) => {
+        for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+      };
+      writeStr(0, "RIFF");
+      view.setUint32(4, 36 + dataSize, true);
+      writeStr(8, "WAVE");
+      writeStr(12, "fmt ");
+      view.setUint32(16, 16, true); // subchunk size
+      view.setUint16(20, 1, true); // PCM
+      view.setUint16(22, 1, true); // mono
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, sampleRate * 2, true); // byte rate
+      view.setUint16(32, 2, true); // block align
+      view.setUint16(34, 16, true); // bits per sample
+      writeStr(36, "data");
+      view.setUint32(40, dataSize, true);
+      // samples are zero (silence)
+
+      const blob = new Blob([buffer], { type: "audio/wav" });
+      const formData = new FormData();
+      formData.append("file", blob, "test.wav");
+      formData.append("model", model);
+      formData.append("response_format", "json");
+
+      const txResponse = await fetch(`${endpoint}/v1/audio/transcriptions`, {
+        method: "POST",
+        headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+        body: formData,
+        signal: abort.signal,
+      });
+
+      const latencyMs = Math.round(performance.now() - txStart);
+
+      if (!txResponse.ok) {
+        const errText = await txResponse.text().catch(() => "");
+        setTxTestResults((prev) => ({
+          ...prev,
+          transcribe: {
+            status: "fail",
+            message: `${txResponse.status}: ${errText.slice(0, 120) || "Request failed"}`,
+            latencyMs,
+          },
+        }));
+        setTxTestStatus("done");
+        return;
+      }
+
+      const txData = await txResponse.json();
+      const text = txData.text ?? "";
+
+      if (abort.signal.aborted) return;
+
+      setTxTestResults((prev) => ({
+        ...prev,
+        transcribe: {
+          status: "pass",
+          message: text
+            ? `OK (${latencyMs}ms): "${text.slice(0, 80)}"`
+            : `OK (${latencyMs}ms): empty transcription (silent audio)`,
+          latencyMs,
+        },
+      }));
+    } catch (err: any) {
+      if (abort.signal.aborted) return;
+      const latencyMs = Math.round(performance.now() - txStart);
+      setTxTestResults((prev) => ({
+        ...prev,
+        transcribe: {
+          status: "fail",
+          message: `Transcription failed: ${err.message || "Unknown error"}`,
+          latencyMs,
+        },
+      }));
+    }
+
+    setTxTestStatus("done");
+  }, [settings.openaiCompatibleEndpoint, settings.openaiCompatibleApiKey, settings.openaiCompatibleModel]);
 
   // Enhanced validation for specific fields
   const validateDeepgramApiKey = useCallback((apiKey: string): FieldValidationResult => {
@@ -843,6 +1206,12 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         </p>
       </div>
 
+      {/* Battery Saver / Power Mode */}
+      <Card className="border-border bg-card">
+        <CardContent className="px-3 py-3">
+          <BatterySaverSection />
+        </CardContent>
+      </Card>
 
       {/* Data Directory */}
       <div className="space-y-2">
@@ -979,7 +1348,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 <Mic className="h-4 w-4 text-muted-foreground shrink-0" />
                 <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
                   Transcription engine
-                  <HelpTooltip text="Deepgram: cloud-based, higher quality, requires API key or screenpipe cloud. Whisper: runs locally, no API key needed, may be slower. Disabled: capture audio only without transcription, useful for external ASR." />
+                  <HelpTooltip text="Deepgram: cloud-based, higher quality, requires API key or screenpipe cloud. Whisper: runs locally, no API key needed, may be slower. OpenAI Compatible: use any OpenAI-compatible API endpoint." />
                 </h3>
               </div>
               <Select
@@ -993,12 +1362,13 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <SelectItem value="screenpipe-cloud" disabled={!settings.user?.cloud_subscribed}>
                     Screenpipe Cloud {!settings.user?.cloud_subscribed && "(pro)"}{hwCapability?.recommendedEngine === "screenpipe-cloud" && " (recommended)"}
                   </SelectItem>
-                  <SelectItem value="whisper-tiny">Whisper Tiny{hwCapability?.recommendedEngine === "whisper-tiny" && " (recommended)"}</SelectItem>
-                  <SelectItem value="whisper-tiny-quantized">Whisper Tiny Quantized{hwCapability?.recommendedEngine === "whisper-tiny-quantized" && " (recommended)"}</SelectItem>
-                  <SelectItem value="whisper-large">Whisper Large V3{hwCapability?.recommendedEngine === "whisper-large" && " (recommended)"}</SelectItem>
-                  <SelectItem value="whisper-large-quantized">Whisper Large V3 Quantized{hwCapability?.recommendedEngine === "whisper-large-quantized" && " (recommended)"}</SelectItem>
-                  <SelectItem value="whisper-large-v3-turbo">Whisper Large V3 Turbo{hwCapability?.recommendedEngine === "whisper-large-v3-turbo" && " (recommended)"}</SelectItem>
-                  <SelectItem value="whisper-large-v3-turbo-quantized">Whisper Large V3 Turbo Quantized{hwCapability?.recommendedEngine === "whisper-large-v3-turbo-quantized" && " (recommended)"}</SelectItem>
+                  <SelectItem value="whisper-tiny">Whisper Tiny</SelectItem>
+                  <SelectItem value="whisper-tiny-quantized">Whisper Tiny Quantized</SelectItem>
+                  <SelectItem value="whisper-large">Whisper Large V3</SelectItem>
+                  <SelectItem value="whisper-large-quantized">Whisper Large V3 Quantized</SelectItem>
+                  <SelectItem value="whisper-large-v3-turbo">Whisper Large V3 Turbo</SelectItem>
+                  <SelectItem value="whisper-large-v3-turbo-quantized">Whisper Large V3 Turbo Quantized</SelectItem>
+                  <SelectItem value="openai-compatible">OpenAI Compatible</SelectItem>
                   <SelectItem value="qwen3-asr">Qwen3-ASR (0.6B, ONNX)</SelectItem>
                   <SelectItem value="deepgram">Deepgram</SelectItem>
                   <SelectItem value="disabled">Disabled (capture only)</SelectItem>
@@ -1034,13 +1404,212 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 </Button>
               </div>
             )}
+            {settings.audioTranscriptionEngine === "openai-compatible" && (
+              <div className="mt-2 ml-[26px] space-y-2">
+                {/* API Endpoint Input */}
+                <ValidatedInput
+                  id="openaiCompatibleEndpoint"
+                  label=""
+                  value={settings.openaiCompatibleEndpoint || DEFAULT_OPENAI_COMPATIBLE_ENDPOINT}
+                  onChange={(value: string) => handleSettingsChange({ openaiCompatibleEndpoint: value }, true)}
+                  onBlur={() => fetchOpenAIModels(settings.openaiCompatibleEndpoint || DEFAULT_OPENAI_COMPATIBLE_ENDPOINT, settings.openaiCompatibleApiKey)}
+                  onKeyDown={(e: React.KeyboardEvent) => {
+                    if (e.key === 'Enter') {
+                      fetchOpenAIModels(settings.openaiCompatibleEndpoint || DEFAULT_OPENAI_COMPATIBLE_ENDPOINT, settings.openaiCompatibleApiKey);
+                    }
+                  }}
+                  placeholder="API Endpoint (e.g., http://127.0.0.1:8080)"
+                  className="h-7 text-xs"
+                />
+                
+                {/* API Key Input */}
+                <div className="relative">
+                  <ValidatedInput
+                    id="openaiCompatibleApiKey"
+                    label=""
+                    type={showOpenAIApiKey ? "text" : "password"}
+                    value={settings.openaiCompatibleApiKey || ""}
+                    onChange={(value: string) => handleSettingsChange({ openaiCompatibleApiKey: value }, true)}
+                    placeholder="API Key (optional)"
+                    className="pr-8 h-7 text-xs"
+                  />
+                  <Button type="button" variant="ghost" size="icon" className="absolute right-0 top-0 h-7 w-7" onClick={() => setShowOpenAIApiKey(!showOpenAIApiKey)}>
+                    {showOpenAIApiKey ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
+                  </Button>
+                </div>
+                
+                {/* Model Input — editable with dropdown suggestions */}
+                <div className="space-y-1.5">
+                  <div className="relative">
+                    <Input
+                      value={settings.openaiCompatibleModel || ""}
+                      onChange={(e) => handleSettingsChange({ openaiCompatibleModel: e.target.value }, true)}
+                      placeholder={isLoadingModels ? "Loading models..." : "Model name (e.g., whisper-large-v3-turbo)"}
+                      className="h-7 text-xs pr-8"
+                    />
+                    {isLoadingModels && (
+                      <Loader2 className="h-3 w-3 animate-spin absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground" />
+                    )}
+                  </div>
+                  {openAIModels.length > 0 && !openAIModels.includes('!API_Error') && (
+                    <div className="space-y-1">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs text-muted-foreground">
+                          Available models ({openAIModels.length})
+                        </span>
+                        {allOpenAIModels.length > 0 && (
+                          <button
+                            type="button"
+                            className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+                            onClick={() => setFilterTranscriptionModels(!filterTranscriptionModels)}
+                          >
+                            {filterTranscriptionModels ? "show all" : "filter STT only"}
+                          </button>
+                        )}
+                      </div>
+                      <div className="flex flex-wrap gap-1">
+                        {openAIModels.map((model) => (
+                          <button
+                            key={model}
+                            type="button"
+                            className={cn(
+                              "px-2 py-0.5 rounded text-xs border transition-colors",
+                              settings.openaiCompatibleModel === model
+                                ? "bg-foreground text-background border-foreground"
+                                : "hover:bg-accent border-border"
+                            )}
+                            onClick={() => handleSettingsChange({ openaiCompatibleModel: model }, true)}
+                          >
+                            {model}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {openAIModels.includes('!API_Error') && (
+                    <p className="text-xs text-muted-foreground">Could not list models from the API — type the model name manually.</p>
+                  )}
+                  {allOpenAIModels.length === 0 && !openAIModels.includes('!API_Error') && !isLoadingModels && (
+                    <p className="text-xs text-muted-foreground">No models listed by the API — type the model name manually.</p>
+                  )}
+                </div>
+
+                {/* Connection Test Panel */}
+                <div className="border rounded-lg">
+                  <button
+                    type="button"
+                    className="flex items-center justify-between w-full px-3 py-2 text-xs font-medium text-left hover:bg-accent/50 transition-colors rounded-lg"
+                    onClick={() => setTxDiagnosticsOpen(!txDiagnosticsOpen)}
+                  >
+                    <div className="flex items-center gap-2">
+                      <Zap className="h-3.5 w-3.5" />
+                      <span>Connection Test</span>
+                      {txTestStatus === "done" && (
+                        <span className="text-xs text-muted-foreground">
+                          {txTestResults.transcribe.status === "pass"
+                            ? "All checks passed"
+                            : txTestResults.endpoint.status === "fail"
+                            ? "Connection failed"
+                            : txTestResults.auth.status === "fail"
+                            ? "Auth failed"
+                            : txTestResults.models.status === "fail"
+                            ? "Models failed"
+                            : txTestResults.transcribe.status === "fail"
+                            ? "Transcription failed"
+                            : ""}
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {txTestStatus === "testing" && (
+                        <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />
+                      )}
+                      {txDiagnosticsOpen ? (
+                        <ChevronUp className="h-3.5 w-3.5 text-muted-foreground" />
+                      ) : (
+                        <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
+                      )}
+                    </div>
+                  </button>
+
+                  {txDiagnosticsOpen && (
+                    <div className="px-3 pb-3 space-y-2">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={runTranscriptionDiagnostics}
+                        disabled={txTestStatus === "testing"}
+                        className="flex items-center gap-2 h-7 text-xs"
+                      >
+                        {txTestStatus === "testing" ? (
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <Zap className="h-3 w-3" />
+                        )}
+                        {txTestStatus === "testing" ? "Testing..." : "Run diagnostics"}
+                      </Button>
+
+                      <div className="space-y-1.5 text-xs">
+                        {(
+                          [
+                            ["endpoint", "1", "Endpoint reachable"],
+                            ["auth", "2", "Auth valid"],
+                            ["models", "3", "Models loaded"],
+                            ["transcribe", "4", "Test transcription"],
+                          ] as const
+                        ).map(([key, num, label]) => {
+                          const result = txTestResults[key];
+                          return (
+                            <div key={key} className="flex items-start gap-2">
+                              <div className="flex items-center gap-1.5 min-w-[150px]">
+                                {result.status === "pass" ? (
+                                  <CheckCircle2 className="h-3.5 w-3.5 text-foreground shrink-0" />
+                                ) : result.status === "fail" ? (
+                                  <XCircle className="h-3.5 w-3.5 text-destructive shrink-0" />
+                                ) : result.status === "running" ? (
+                                  <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground shrink-0" />
+                                ) : (
+                                  <Circle className="h-3.5 w-3.5 text-muted-foreground/40 shrink-0" />
+                                )}
+                                <span
+                                  className={cn(
+                                    result.status === "skip" || result.status === "pending"
+                                      ? "text-muted-foreground/40"
+                                      : result.status === "fail"
+                                      ? "text-destructive"
+                                      : ""
+                                  )}
+                                >
+                                  {num}. {label}
+                                </span>
+                              </div>
+                              {result.message && (
+                                <span
+                                  className={cn(
+                                    "text-xs",
+                                    result.status === "fail"
+                                      ? "text-destructive"
+                                      : "text-muted-foreground"
+                                  )}
+                                >
+                                  {result.message}
+                                </span>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
           </CardContent>
         </Card>
         )}
 
-        {/* Transcription Mode - only for local Whisper engines */}
-        {!settings.disableAudio && settings.audioTranscriptionEngine !== "deepgram" &&
-         settings.audioTranscriptionEngine !== "screenpipe-cloud" &&
+        {/* Transcription Mode - available for all engines except disabled */}
+        {!settings.disableAudio &&
          settings.audioTranscriptionEngine !== "disabled" && (
           <Card className="border-border bg-card">
             <CardContent className="px-3 py-2.5">
@@ -1060,6 +1629,34 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   checked={["smart", "batch"].includes(settings.transcriptionMode ?? "realtime")}
                   onCheckedChange={(checked) =>
                     handleSettingsChange({ transcriptionMode: checked ? "batch" : "realtime" }, true)
+                  }
+                />
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Filter Music */}
+        {!settings.disableAudio &&
+         settings.audioTranscriptionEngine !== "disabled" && (
+          <Card className="border-border bg-card">
+            <CardContent className="px-3 py-2.5">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-2.5">
+                  <Music className="h-4 w-4 text-muted-foreground shrink-0" />
+                  <div>
+                    <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                      Filter music
+                      <HelpTooltip text="Detect and filter out music-dominant audio (e.g. Spotify, YouTube) before transcription using spectral analysis. Reduces garbage transcriptions from background music." />
+                    </h3>
+                    <p className="text-xs text-muted-foreground">Remove background music from transcriptions</p>
+                  </div>
+                </div>
+                <Switch
+                  id="filterMusic"
+                  checked={settings.filterMusic ?? false}
+                  onCheckedChange={(checked) =>
+                    handleSettingsChange({ filterMusic: checked }, true)
                   }
                 />
               </div>
@@ -1521,12 +2118,18 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     value={settings.ignoredWindows}
                     onValueChange={handleIgnoredWindowsChange}
                     placeholder="Select apps to ignore..."
+                    allowCustomValues
                   />
                   {filterView === "all" && (settings.teamFilters?.ignoredWindows?.length ?? 0) > 0 && (
                     <div className="flex flex-wrap gap-1 mt-1">
                       {settings.teamFilters!.ignoredWindows.map((w) => (
-                        <Badge key={w} variant="outline" className="text-[10px] h-5">
+                        <Badge key={w} variant="outline" className="text-[10px] h-5 gap-0.5">
                           <Users className="h-2.5 w-2.5 mr-0.5" />{w}
+                          {isTeamAdmin && (
+                            <button onClick={() => handleRemoveTeamFilter("window_filter", "ignored_windows", w)} className="ml-0.5 hover:text-destructive">
+                              <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                            </button>
+                          )}
                         </Badge>
                       ))}
                     </div>
@@ -1569,12 +2172,18 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     value={settings.includedWindows}
                     onValueChange={handleIncludedWindowsChange}
                     placeholder="Only capture these apps (optional)..."
+                    allowCustomValues
                   />
                   {filterView === "all" && (settings.teamFilters?.includedWindows?.length ?? 0) > 0 && (
                     <div className="flex flex-wrap gap-1 mt-1">
                       {settings.teamFilters!.includedWindows.map((w) => (
-                        <Badge key={w} variant="outline" className="text-[10px] h-5">
+                        <Badge key={w} variant="outline" className="text-[10px] h-5 gap-0.5">
                           <Users className="h-2.5 w-2.5 mr-0.5" />{w}
+                          {isTeamAdmin && (
+                            <button onClick={() => handleRemoveTeamFilter("window_filter", "included_windows", w)} className="ml-0.5 hover:text-destructive">
+                              <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                            </button>
+                          )}
                         </Badge>
                       ))}
                     </div>
@@ -1630,8 +2239,13 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   {filterView === "all" && (settings.teamFilters?.ignoredUrls?.length ?? 0) > 0 && (
                     <div className="flex flex-wrap gap-1 mt-1">
                       {settings.teamFilters!.ignoredUrls.map((u) => (
-                        <Badge key={u} variant="outline" className="text-[10px] h-5">
+                        <Badge key={u} variant="outline" className="text-[10px] h-5 gap-0.5">
                           <Users className="h-2.5 w-2.5 mr-0.5" />{u}
+                          {isTeamAdmin && (
+                            <button onClick={() => handleRemoveTeamFilter("url_filter", "ignored_urls", u)} className="ml-0.5 hover:text-destructive">
+                              <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                            </button>
+                          )}
                         </Badge>
                       ))}
                     </div>
@@ -1654,8 +2268,13 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   </div>
                   <div className="flex flex-wrap gap-1 ml-[26px]">
                     {settings.teamFilters!.ignoredWindows.map((w) => (
-                      <Badge key={w} variant="outline" className="text-[10px] h-5">
+                      <Badge key={w} variant="outline" className="text-[10px] h-5 gap-0.5">
                         <Users className="h-2.5 w-2.5 mr-0.5" />{w}
+                        {isTeamAdmin && (
+                          <button onClick={() => handleRemoveTeamFilter("window_filter", "ignored_windows", w)} className="ml-0.5 hover:text-destructive">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                          </button>
+                        )}
                       </Badge>
                     ))}
                   </div>
@@ -1672,8 +2291,13 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   </div>
                   <div className="flex flex-wrap gap-1 ml-[26px]">
                     {settings.teamFilters!.includedWindows.map((w) => (
-                      <Badge key={w} variant="outline" className="text-[10px] h-5">
+                      <Badge key={w} variant="outline" className="text-[10px] h-5 gap-0.5">
                         <Users className="h-2.5 w-2.5 mr-0.5" />{w}
+                        {isTeamAdmin && (
+                          <button onClick={() => handleRemoveTeamFilter("window_filter", "included_windows", w)} className="ml-0.5 hover:text-destructive">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                          </button>
+                        )}
                       </Badge>
                     ))}
                   </div>
@@ -1690,8 +2314,13 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   </div>
                   <div className="flex flex-wrap gap-1 ml-[26px]">
                     {settings.teamFilters!.ignoredUrls.map((u) => (
-                      <Badge key={u} variant="outline" className="text-[10px] h-5">
+                      <Badge key={u} variant="outline" className="text-[10px] h-5 gap-0.5">
                         <Users className="h-2.5 w-2.5 mr-0.5" />{u}
+                        {isTeamAdmin && (
+                          <button onClick={() => handleRemoveTeamFilter("url_filter", "ignored_urls", u)} className="ml-0.5 hover:text-destructive">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+                          </button>
+                        )}
                       </Badge>
                     ))}
                   </div>
@@ -1786,7 +2415,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         }
       }}>
         <DialogContent className="max-w-lg">
-          <DialogTitle className="text-sm font-medium">read this aloud</DialogTitle>
+          <DialogTitle className="text-sm font-medium">Read this aloud</DialogTitle>
           <DialogDescription className="text-xs text-muted-foreground">
             speak naturally at your normal pace — this helps screenpipe learn your voice
           </DialogDescription>

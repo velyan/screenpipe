@@ -157,11 +157,7 @@ impl SileroVad {
         }
 
         let threshold = self.effective_speech_threshold();
-        let speech_frames = self
-            .prob_history
-            .iter()
-            .filter(|&&p| p > threshold)
-            .count();
+        let speech_frames = self.prob_history.iter().filter(|&&p| p > threshold).count();
         let silence_frames = self
             .prob_history
             .iter()
@@ -223,6 +219,7 @@ impl VadEngine for SileroVad {
             _ => Ok(VadStatus::Silence),
         }
     }
+
     fn set_speech_threshold(&mut self, threshold: Option<f32>) {
         self.speech_threshold_override = threshold;
     }

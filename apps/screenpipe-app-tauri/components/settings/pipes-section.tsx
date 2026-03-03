@@ -120,11 +120,12 @@ the pipe.md file MUST start with --- on the very first line (YAML front-matter).
 create the pipe.md file, install it, and enable it. here is what the user wants:`;
 
 function parsePipeError(stderr: string): {
-  type: "daily_limit" | "rate_limit" | "unknown";
+  type: "daily_limit" | "credits_exhausted" | "rate_limit" | "unknown";
   message: string;
   used?: number;
   limit?: number;
   resets_at?: string;
+  credits_remaining?: number;
 } {
   // stderr format: '429 "{\"error\":...}"\n' — inner quotes are backslash-escaped
   const jsonMatch = stderr.match(/\d{3}\s+"(.+)"/s);
@@ -149,8 +150,9 @@ function parsePipeError(stderr: string): {
       }
       if (parsed.error === "credits_exhausted") {
         return {
-          type: "daily_limit",
-          message: parsed.message || "free credits exhausted",
+          type: "credits_exhausted",
+          message: parsed.message || "no credits remaining — buy more at screenpi.pe",
+          credits_remaining: parsed.credits_remaining ?? 0,
         };
       }
     } catch {}
@@ -230,46 +232,127 @@ function formatDuration(ms: number): string {
 }
 
 /** Extract human-readable text from Pi JSON-mode stdout.
- *  Parses structured events and pulls out only the text deltas
- *  that form the actual assistant response. Falls back to showing
- *  non-JSON lines as-is. */
-function cleanPipeStdout(raw: string): string {
+ *  Pi emits NDJSON events on stdout. This function extracts only the
+ *  human-readable assistant text. It handles:
+ *  - text_delta events (main assistant text stream)
+ *  - text_end events (final text for a content block)
+ *  - message_end with assistant text content blocks
+ *  - agent_end with assistant messages containing text
+ *  - turn_end with assistant error messages
+ *  - thinking_delta / thinking_end events (skipped — internal reasoning)
+ *  - tool calls, tool results, user messages (skipped)
+ *  - Truncated / multi-line JSON from tool output (skipped gracefully)
+ *  - LLM errors (credits_exhausted, rate limits, etc.) */
+export function cleanPipeStdout(raw: string): string {
   const parts: string[] = [];
+  let errorMessage: string | null = null;
+  let hasTextDelta = false;
+
   for (const line of raw.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed) continue;
-    // Try to parse as JSON event
-    if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+
+    // Only attempt JSON parse on lines that look like complete JSON objects.
+    // Pi emits one JSON object per line (NDJSON). Lines that start with {
+    // but don't end with } are fragments from multi-line tool output embedded
+    // inside a JSON string — skip them.
+    if (trimmed.startsWith("{")) {
+      if (!trimmed.endsWith("}")) continue;
+
       try {
         const evt = JSON.parse(trimmed);
-        // text_delta — the main assistant text stream
-        if (
-          evt.type === "message_update" &&
-          evt.assistantMessageEvent?.type === "text_delta" &&
-          evt.assistantMessageEvent.delta
-        ) {
-          parts.push(evt.assistantMessageEvent.delta);
+        const evtType = evt.type;
+
+        if (evtType === "message_update") {
+          const ae = evt.assistantMessageEvent;
+          if (!ae) continue;
+
+          // text_delta — the main assistant text stream
+          if (ae.type === "text_delta" && ae.delta) {
+            parts.push(ae.delta);
+            hasTextDelta = true;
+          }
+          // All other sub-types skipped: thinking_start, thinking_delta,
+          // thinking_end, text_start, text_end, toolcall_start/delta/end
           continue;
         }
-        // message_start may contain initial text content
-        if (evt.type === "message_start" && evt.message?.content) {
-          for (const block of evt.message.content) {
-            if (block.type === "text" && block.text) {
-              parts.push(block.text);
+
+        // message_start/message_end — only extract errors here.
+        // Text content is skipped because text_delta already streamed it
+        // (extracting both would double-count).
+        if (evtType === "message_start" || evtType === "message_end") {
+          const msg = evt.message;
+          if (msg?.role !== "assistant") continue;
+          if (msg.stopReason === "error" && msg.errorMessage) {
+            errorMessage = msg.errorMessage;
+          }
+          // Only extract text content if we never saw text_delta events.
+          // This handles edge cases where stdout was truncated before any
+          // text_delta but message_end has the full content.
+          if (!hasTextDelta && msg.content) {
+            for (const block of msg.content) {
+              if (block.type === "text" && block.text) {
+                parts.push(block.text);
+              }
             }
           }
           continue;
         }
-        // Skip all other JSON events (session, agent_start, tool calls, etc.)
+
+        // agent_end — extract text from the last assistant message
+        if (evtType === "agent_end" && Array.isArray(evt.messages)) {
+          for (let i = evt.messages.length - 1; i >= 0; i--) {
+            const msg = evt.messages[i];
+            if (msg.role !== "assistant") continue;
+            if (msg.stopReason === "error" && msg.errorMessage) {
+              errorMessage = msg.errorMessage;
+            }
+            if (!hasTextDelta && msg.content) {
+              for (const block of msg.content) {
+                if (block.type === "text" && block.text) {
+                  parts.push(block.text);
+                }
+              }
+            }
+            break; // only the last assistant message
+          }
+          continue;
+        }
+
+        // turn_end — may carry error info on the assistant message
+        if (evtType === "turn_end") {
+          const msg = evt.message;
+          if (msg?.role === "assistant" && msg.stopReason === "error" && msg.errorMessage) {
+            errorMessage = msg.errorMessage;
+          }
+          continue;
+        }
+
+        // All other JSON events are skipped (session, agent_start, turn_start,
+        // tool_execution_start/end/update, auto_retry_start/end,
+        // auto_compaction_start, message_start/end for user/toolResult, etc.)
         continue;
       } catch {
-        // Not valid JSON — fall through to treat as plain text
+        // Invalid JSON despite starting with { and ending with } — likely a
+        // truncated line or a fragment that happens to end with }.
+        continue;
       }
     }
-    // Non-JSON line — keep as-is
+
+    // Non-JSON lines: skip anything that looks like a JSON fragment
+    // (contains quotes, braces, or brackets). Only keep genuinely plain
+    // text lines for backwards compat with pipes that print plain text.
+    if (/["{}\[\]]/.test(trimmed)) {
+      continue;
+    }
     parts.push(trimmed);
   }
-  return parts.join("").trim();
+
+  const text = parts.join("").trim();
+  if (!text && errorMessage) {
+    return `error: ${errorMessage}`;
+  }
+  return text;
 }
 
 function ElapsedTimer({ startedAt }: { startedAt: string }) {
@@ -345,7 +428,7 @@ export function PipesSection() {
   const pendingSaves = useRef<Record<string, string>>({});
   // Track in-flight config saves so runPipe can await them
   const pendingConfigSaves = useRef<Record<string, Promise<void>>>({});
-  const { settings } = useSettings();
+  const { settings, updateSettings } = useSettings();
   const team = useTeam();
   const { toast } = useToast();
   const isTeamAdmin = !!team.team && team.role === "admin";
@@ -493,12 +576,30 @@ export function PipesSection() {
 
   const togglePipe = async (name: string, enabled: boolean) => {
     posthog.capture("pipe_toggled", { pipe: name, enabled });
-    await fetch(`http://localhost:3030/pipes/${name}/enable`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ enabled }),
-    });
-    fetchPipes();
+    // Optimistic update — flip the switch immediately
+    setPipes((prev) =>
+      prev.map((p) =>
+        p.config.name === name
+          ? { ...p, config: { ...p.config, enabled } }
+          : p
+      )
+    );
+    try {
+      await fetch(`http://localhost:3030/pipes/${name}/enable`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled }),
+      });
+    } catch {
+      // Revert on failure
+      setPipes((prev) =>
+        prev.map((p) =>
+          p.config.name === name
+            ? { ...p, config: { ...p.config, enabled: !enabled } }
+            : p
+        )
+      );
+    }
   };
 
   const runPipe = async (name: string) => {
@@ -667,7 +768,7 @@ export function PipesSection() {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
-          <h3 className="text-lg font-medium">pipes</h3>
+          <h3 className="text-lg font-medium">Pipes</h3>
           <p className="text-sm text-muted-foreground">
             scheduled agents that run on your screen data
             {" · "}
@@ -755,17 +856,21 @@ export function PipesSection() {
         </Card>
       ) : (
         <div className="space-y-2">
-          {/* Global daily limit banner — shown once at top */}
+          {/* Global daily limit / credits exhausted banner — shown once at top */}
           {(() => {
-            const limitError = filteredPipes
+            const errors = filteredPipes
               .filter((p) => p.last_success === false && p.last_error)
-              .map((p) => parsePipeError(p.last_error!))
-              .find((e) => e.type === "daily_limit");
+              .map((p) => parsePipeError(p.last_error!));
+            const limitError = errors.find(
+              (e) => e.type === "credits_exhausted" || e.type === "daily_limit"
+            );
             if (!limitError) return null;
             return (
               <div className="flex items-center gap-2 text-xs px-4 py-2 border rounded-md">
                 <span className="text-muted-foreground">
-                  {limitError.message}
+                  {limitError.type === "credits_exhausted"
+                    ? "no credits remaining — buy more at screenpi.pe"
+                    : limitError.message}
                   {limitError.resets_at && (
                     <> · resets {new Date(limitError.resets_at).toLocaleTimeString()}</>
                   )}
@@ -891,10 +996,10 @@ export function PipesSection() {
                   </div>
                 )}
 
-                {/* Per-pipe error (skip daily_limit — shown globally above) */}
+                {/* Per-pipe error (skip daily_limit/credits_exhausted — shown globally above) */}
                 {!isRunning && pipe.last_success === false && pipe.last_error && (() => {
                   const error = parsePipeError(pipe.last_error);
-                  if (error.type === "daily_limit") return null;
+                  if (error.type === "daily_limit" || error.type === "credits_exhausted") return null;
                   if (error.type === "rate_limit") {
                     return (
                       <p className="mt-2 text-xs text-muted-foreground">{error.message}</p>
@@ -932,11 +1037,13 @@ export function PipesSection() {
                               JSON.stringify({
                                 pipeName: pipe.config.name,
                                 executionId: exec.id,
+                                presetId: pipe.config.preset || null,
                               })
                             );
                             emit("watch_pipe", {
                               pipeName: pipe.config.name,
                               executionId: exec.id,
+                              presetId: pipe.config.preset || null,
                             });
                           }}
                           title="watch live output"

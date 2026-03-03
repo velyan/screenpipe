@@ -15,28 +15,57 @@ export const Providers = forwardRef<
   HTMLDivElement,
   { children: React.ReactNode }
 >(({ children }, ref) => {
-  // Hook console to write to disk
+  // Hook console to write to disk — batched to avoid IPC-per-log CPU drain
   useEffect(() => {
     const origLog = console.log;
     const origError = console.error;
     const origWarn = console.warn;
     const origDebug = console.debug;
 
+    let buffer: { level: string; message: string }[] = [];
+    let flushTimer: ReturnType<typeof setTimeout> | null = null;
+    const MAX_BUFFER = 100;
+    const FLUSH_INTERVAL_MS = 2000;
+
+    function flush() {
+      if (buffer.length === 0) return;
+      const entries = buffer;
+      buffer = [];
+      invoke("write_browser_logs", { entries }).catch(() => {});
+    }
+
+    function enqueue(level: string, args: unknown[]) {
+      const message = args
+        .map((a) => (typeof a === "object" ? JSON.stringify(a) : String(a)))
+        .join(" ");
+      buffer.push({ level, message });
+      if (buffer.length >= MAX_BUFFER) {
+        if (flushTimer) clearTimeout(flushTimer);
+        flushTimer = null;
+        flush();
+      } else if (!flushTimer) {
+        flushTimer = setTimeout(() => {
+          flushTimer = null;
+          flush();
+        }, FLUSH_INTERVAL_MS);
+      }
+    }
+
     console.log = (...args) => {
       origLog(...args);
-      invoke("write_browser_log", { level: "info", message: args.map(a => typeof a === "object" ? JSON.stringify(a) : String(a)).join(" ") }).catch(() => {});
+      enqueue("info", args);
     };
     console.error = (...args) => {
       origError(...args);
-      invoke("write_browser_log", { level: "error", message: args.map(a => typeof a === "object" ? JSON.stringify(a) : String(a)).join(" ") }).catch(() => {});
+      enqueue("error", args);
     };
     console.warn = (...args) => {
       origWarn(...args);
-      invoke("write_browser_log", { level: "warn", message: args.map(a => typeof a === "object" ? JSON.stringify(a) : String(a)).join(" ") }).catch(() => {});
+      enqueue("warn", args);
     };
     console.debug = (...args) => {
       origDebug(...args);
-      invoke("write_browser_log", { level: "debug", message: args.map(a => typeof a === "object" ? JSON.stringify(a) : String(a)).join(" ") }).catch(() => {});
+      enqueue("debug", args);
     };
 
     return () => {
@@ -44,6 +73,8 @@ export const Providers = forwardRef<
       console.error = origError;
       console.warn = origWarn;
       console.debug = origDebug;
+      if (flushTimer) clearTimeout(flushTimer);
+      flush(); // drain remaining logs on unmount
     };
   }, []);
 

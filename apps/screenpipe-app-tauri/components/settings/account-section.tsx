@@ -8,14 +8,19 @@ import { useSettings } from "@/lib/hooks/use-settings";
 import {
   UserCog,
   ExternalLinkIcon,
+  CreditCard,
   Sparkles,
   Zap,
   Shield,
+  RefreshCw,
+  Lock,
 } from "lucide-react";
 import { toast } from "@/components/ui/use-toast";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { commands } from "@/lib/utils/tauri";
 import { Card } from "../ui/card";
+import { Switch } from "@/components/ui/switch";
+import { Label } from "@/components/ui/label";
 import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { PricingToggle } from "./pricing-toggle";
 import { ReferralCard } from "./referral-card";
@@ -25,6 +30,7 @@ import posthog from "posthog-js";
 export function AccountSection() {
   const { settings, updateSettings, loadUser } = useSettings();
   const [isAnnual, setIsAnnual] = useState(true);
+  const [pipeSyncing, setPipeSyncing] = useState(false);
 
   useEffect(() => {
     if (!settings.user?.email) {
@@ -102,10 +108,12 @@ export function AccountSection() {
         if (data.url) {
           openUrl(data.url);
 
-          // Poll for subscription status every 1 second after checkout
+          // Poll for subscription status with exponential backoff after checkout
           let pollCount = 0;
-          const maxPolls = 300; // 5 minutes
-          const checkInterval = setInterval(async () => {
+          const maxPolls = 60;
+          let delay = 2000;
+          let pollTimer: ReturnType<typeof setTimeout> | null = null;
+          const poll = async () => {
             pollCount++;
             try {
               const subResponse = await fetch(
@@ -116,9 +124,10 @@ export function AccountSection() {
               );
               if (subResponse.ok) {
                 const subData = await subResponse.json();
-                if (subData.hasSubscription) {
-                  clearInterval(checkInterval);
-                  // Update user state with subscription
+                // Treat trialing subscriptions as active (API returns hasSubscription: false for trials)
+                const subStatus = subData.subscription?.status;
+                const isActive = subData.hasSubscription || subStatus === "trialing" || subStatus === "active";
+                if (isActive) {
                   updateSettings({
                     user: { ...settings.user!, cloud_subscribed: true },
                   });
@@ -126,15 +135,18 @@ export function AccountSection() {
                     title: "subscription activated",
                     description: "welcome to screenpipe pro!",
                   });
+                  return; // stop polling
                 }
               }
             } catch (e) {
               console.error("polling error:", e);
             }
-            if (pollCount >= maxPolls) {
-              clearInterval(checkInterval);
+            if (pollCount < maxPolls) {
+              delay = Math.min(delay * 1.5, 30000);
+              pollTimer = setTimeout(poll, delay);
             }
-          }, 1000);
+          };
+          pollTimer = setTimeout(poll, delay);
         } else {
           throw new Error(data.error || "failed to create checkout");
         }
@@ -202,10 +214,18 @@ export function AccountSection() {
           <div className="flex items-center justify-between mb-4">
             <div className="flex items-center gap-2">
               <Sparkles className="h-5 w-5 text-primary" />
-              <h3 className="text-lg font-semibold">screenpipe pro</h3>
+              <h3 className="text-lg font-semibold">Screenpipe Pro</h3>
               <span className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full font-medium">active</span>
             </div>
             <div className="flex gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => openUrl("https://screenpi.pe/billing")}
+              >
+                <CreditCard className="w-3.5 h-3.5 mr-1.5" />
+                Billing <ExternalLinkIcon className="w-3.5 h-3.5 ml-1.5" />
+              </Button>
               <Button
                 variant="outline"
                 size="sm"
@@ -217,7 +237,7 @@ export function AccountSection() {
                   )
                 }
               >
-                manage subscription <ExternalLinkIcon className="w-3.5 h-3.5 ml-1.5" />
+                Manage subscription <ExternalLinkIcon className="w-3.5 h-3.5 ml-1.5" />
               </Button>
             </div>
           </div>
@@ -234,6 +254,63 @@ export function AccountSection() {
             <div className="flex items-center gap-2">
               <span>✓</span> priority support
             </div>
+            <div className="flex items-center gap-2">
+              <span>✓</span> encrypted pipe sync across devices
+            </div>
+          </div>
+
+          {/* Pipe sync */}
+          <div className="mt-4 pt-4 border-t border-border/50">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium">pipe sync across devices</p>
+                <p className="text-xs text-muted-foreground">
+                  sync your pipes & configs to all devices linked to your account
+                </p>
+              </div>
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-1.5">
+                  <Switch
+                    id="pipe-sync-toggle"
+                    checked={!!settings.pipeSyncEnabled}
+                    onCheckedChange={async (checked) => {
+                      await updateSettings({ pipeSyncEnabled: checked });
+                      toast({
+                        title: checked ? "pipe sync enabled" : "pipe sync disabled",
+                        description: checked
+                          ? "pipes will sync across your devices"
+                          : "pipes will no longer sync",
+                      });
+                    }}
+                  />
+                  <Label htmlFor="pipe-sync-toggle" className="text-xs text-muted-foreground cursor-pointer sr-only">
+                    sync
+                  </Label>
+                </div>
+                {settings.pipeSyncEnabled && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={pipeSyncing}
+                    onClick={async () => {
+                      setPipeSyncing(true);
+                      try {
+                        await fetch("http://localhost:3030/sync/pipes/pull", { method: "POST" });
+                        await fetch("http://localhost:3030/sync/pipes/push", { method: "POST" });
+                        toast({ title: "pipes synced" });
+                      } catch (e: any) {
+                        toast({ title: "sync failed", description: e.message, variant: "destructive" });
+                      } finally {
+                        setPipeSyncing(false);
+                      }
+                    }}
+                  >
+                    <RefreshCw className={`h-3 w-3 mr-1 ${pipeSyncing ? "animate-spin" : ""}`} />
+                    sync now
+                  </Button>
+                )}
+              </div>
+            </div>
           </div>
         </Card>
       ) : !settings.user?.token ? (
@@ -241,7 +318,7 @@ export function AccountSection() {
         <>
           <Card className="p-8 flex flex-col items-center text-center">
             <UserCog className="h-10 w-10 text-muted-foreground mb-4" />
-            <h3 className="text-lg font-semibold mb-1">sign in to screenpipe</h3>
+            <h3 className="text-lg font-semibold mb-1">Sign in to Screenpipe</h3>
             <p className="text-sm text-muted-foreground mb-6">
               free account — no credit card required
             </p>
@@ -250,7 +327,7 @@ export function AccountSection() {
               size="lg"
               onClick={() => commands.openLoginWindow()}
             >
-              log in
+              Log in
               <ExternalLinkIcon className="w-4 h-4 ml-2" />
             </Button>
           </Card>
@@ -259,7 +336,7 @@ export function AccountSection() {
           <details className="group">
             <summary className="flex items-center gap-2 cursor-pointer text-sm text-muted-foreground hover:text-foreground transition-colors">
               <Sparkles className="h-4 w-4" />
-              optional: upgrade to screenpipe pro
+              Optional: upgrade to Screenpipe Pro
               <span className="text-xs ml-auto group-open:hidden">show details</span>
             </summary>
             <Card className="mt-3 p-5">
@@ -267,7 +344,7 @@ export function AccountSection() {
                 <div>
                   <div className="flex items-center gap-2 mb-1">
                     <Sparkles className="h-5 w-5" />
-                    <h3 className="text-lg font-semibold">screenpipe pro</h3>
+                    <h3 className="text-lg font-semibold">Screenpipe Pro</h3>
                   </div>
                   <div className="flex items-baseline gap-2">
                     <span className="text-2xl font-bold">{isAnnual ? "$26" : "$39"}</span>
@@ -302,6 +379,10 @@ export function AccountSection() {
                   <Sparkles className="h-3.5 w-3.5 shrink-0" />
                   priority support
                 </div>
+                <div className="flex items-center gap-2 text-foreground">
+                  <RefreshCw className="h-3.5 w-3.5 shrink-0" />
+                  encrypted pipe sync across devices
+                </div>
               </div>
 
               <Button
@@ -314,6 +395,28 @@ export function AccountSection() {
               </Button>
             </Card>
           </details>
+
+          {/* Locked pipe sync toggle — not logged in */}
+          <Card className="p-4 opacity-75">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium">pipe sync across devices</p>
+                <p className="text-xs text-muted-foreground">
+                  sync your pipes & configs to all devices linked to your account
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <Switch disabled checked={false} />
+                <button
+                  onClick={() => commands.openLoginWindow()}
+                  className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full font-medium flex items-center gap-1 hover:bg-primary/20 transition-colors cursor-pointer"
+                >
+                  <Lock className="h-3 w-3" />
+                  Pro
+                </button>
+              </div>
+            </div>
+          </Card>
         </>
       ) : (
         /* Logged in, free tier: show upsell */
@@ -333,7 +436,7 @@ export function AccountSection() {
                 <div>
                   <div className="flex items-center gap-2 mb-1">
                     <Sparkles className="h-5 w-5" />
-                    <h3 className="text-lg font-semibold">screenpipe pro</h3>
+                    <h3 className="text-lg font-semibold">Screenpipe Pro</h3>
                   </div>
                   <div className="flex items-baseline gap-2">
                     <span className="text-2xl font-bold">{isAnnual ? "$26" : "$39"}</span>
@@ -368,6 +471,10 @@ export function AccountSection() {
                   <Sparkles className="h-3.5 w-3.5 shrink-0" />
                   priority support
                 </div>
+                <div className="flex items-center gap-2 text-foreground">
+                  <RefreshCw className="h-3.5 w-3.5 shrink-0" />
+                  encrypted pipe sync across devices
+                </div>
               </div>
 
               <Button
@@ -381,6 +488,28 @@ export function AccountSection() {
 
             </Card>
           </div>
+
+          {/* Locked pipe sync toggle — free tier */}
+          <Card className="p-4 opacity-75">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium">pipe sync across devices</p>
+                <p className="text-xs text-muted-foreground">
+                  sync your pipes & configs to all devices linked to your account
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <Switch disabled checked={false} />
+                <button
+                  onClick={handleCheckout}
+                  className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full font-medium flex items-center gap-1 hover:bg-primary/20 transition-colors cursor-pointer"
+                >
+                  <Lock className="h-3 w-3" />
+                  Pro
+                </button>
+              </div>
+            </div>
+          </Card>
 
           {/* Current free tier - compact */}
           <div className="px-3 py-2 rounded-lg border border-border/50">

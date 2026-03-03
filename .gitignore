@@ -66,4 +66,7 @@ screenpipe-app-tauri/src-tauri/.next/
 
 
 .playwright*
-crates/screenpipe-audio/onnxruntime-win-x64-1.19.2.zip
+
+# Claude Code
+.claude/worktrees/
+.claude/*.local* # local changes are specific to the individual developer, let's not check them in for everyone.

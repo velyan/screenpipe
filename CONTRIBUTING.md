@@ -94,32 +94,7 @@ before you begin:
       git clone https://github.com/screenpipe/screenpipe.git
       cd screenpipe
    ```
-6. **setup Intel OpenMP DLLs**:
-   - make sure your in root of the project i.e screenpipe
-   - Ensure Python and `pip` are installed before running the script.
-   
-   ```powershell
-   cd screenpipe
-   # Define the target directory where Intel OpenMP DLLs will be copied 
-   $mkl_dir = (pwd).Path + "\apps\screenpipe-app-tauri\src-tauri\mkl"
-   New-Item -ItemType Directory -Force -Path $mkl_dir | Out-Null
-
-   python -m pip install --upgrade pip
-   $temp_dir = "temp_omp"
-   New-Item -ItemType Directory -Force -Path $temp_dir | Out-Null
-
-   Write-Host "Installing Intel OpenMP..."
-   python -m pip install intel-openmp --target $temp_dir
-
-   Write-Host "Copying DLL files..."
-   Get-ChildItem -Path $temp_dir -Recurse -Filter "*.dll" | ForEach-Object {
-       Write-Host "Copying $_"
-       Copy-Item $_.FullName -Destination $mkl_dir -Force
-   }
-   # Clean up the temporary directory
-   Remove-Item -Path $temp_dir -Recurse -Force
-   ```
-7. **make sure vcredist is present on system**:
+6. **make sure vcredist is present on system**:
    - make sure your in root of the project i.e screenpipe
 
    ```powershell

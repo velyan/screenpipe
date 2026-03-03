@@ -13,15 +13,12 @@ use crate::ground_truth::{synthetic_manifest, ScenarioManifest, SpeechSegment};
 use crate::metrics::PipelineResult;
 
 use screenpipe_audio::core::engine::AudioTranscriptionEngine;
-use screenpipe_audio::transcription::whisper::model::{
-    create_whisper_context_parameters, download_whisper_model,
-};
 use screenpipe_audio::utils::audio::normalize_v2;
 use screenpipe_audio::vad::silero::SileroVad;
 use screenpipe_audio::vad::VadEngine;
+use screenpipe_audio::TranscriptionEngine;
 use screenpipe_core::Language;
 use vad_rs::VadStatus;
-use whisper_rs::WhisperContext;
 
 use std::sync::Arc;
 
@@ -327,19 +324,7 @@ async fn pipeline_with_whisper_dataset() {
                 let gt_combined = gt_texts.join(" ");
 
                 // Transcribe the full 30-second chunk
-                match screenpipe_audio::stt(
-                    chunk,
-                    SAMPLE_RATE,
-                    "benchmark",
-                    engine.clone(),
-                    None,
-                    vec![Language::English],
-                    &mut whisper_state,
-                    &[],
-                    None,
-                )
-                .await
-                {
+                match session.transcribe(chunk, SAMPLE_RATE, "benchmark").await {
                     Ok(text) => {
                         if !text.is_empty() {
                             let wr = word_recall(&gt_combined, &text);

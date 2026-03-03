@@ -169,13 +169,43 @@ async function copyBunBinary() {
 		bunDest1 = path.join(cwd, 'bun-x86_64-pc-windows-msvc.exe');
 		console.log('copying bun from:', bunSrc);
 		console.log('copying bun to:', bunDest1);
-	} else if (platform === 'macos') {
-		bunSrc = path.join(os.homedir(), '.bun', 'bin', 'bun');
-		bunDest1 = path.join(cwd, 'bun-aarch64-apple-darwin');
-		bunDest2 = path.join(cwd, 'bun-x86_64-apple-darwin');
-	} else if (platform === 'linux') {
-		bunSrc = path.join(os.homedir(), '.bun', 'bin', 'bun');
-		bunDest1 = path.join(cwd, 'bun-x86_64-unknown-linux-gnu');
+	} else if (platform === 'macos' || platform === 'linux') {
+		const possibleBunPaths = [
+			path.join(os.homedir(), '.bun', 'bin', 'bun'),
+		];
+
+		// Try to find bun via `which`
+		try {
+			const whichBun = (await $`which bun`.text()).trim();
+			if (whichBun) {
+				possibleBunPaths.unshift(whichBun);
+			}
+		} catch {
+			// which failed, rely on default paths
+		}
+
+		bunSrc = null;
+		for (const possiblePath of possibleBunPaths) {
+			try {
+				await fs.access(possiblePath);
+				console.log('found bun at:', possiblePath);
+				bunSrc = possiblePath;
+				break;
+			} catch {
+				continue;
+			}
+		}
+
+		if (!bunSrc) {
+			throw new Error('Could not find bun binary. Please check if bun is installed correctly');
+		}
+
+		if (platform === 'macos') {
+			bunDest1 = path.join(cwd, 'bun-aarch64-apple-darwin');
+			bunDest2 = path.join(cwd, 'bun-x86_64-apple-darwin');
+		} else {
+			bunDest1 = path.join(cwd, 'bun-x86_64-unknown-linux-gnu');
+		}
 	}
 
 	if (await fs.exists(bunDest1)) {

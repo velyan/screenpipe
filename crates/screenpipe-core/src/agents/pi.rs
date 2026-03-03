@@ -11,7 +11,6 @@ use super::{AgentExecutor, AgentOutput, ExecutionHandle};
 use anyhow::{anyhow, Result};
 use serde_json::json;
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncBufReadExt;
 use tracing::{debug, error, info, warn};
 
 const PI_PACKAGE: &str = "@mariozechner/pi-coding-agent@0.53.0";
@@ -98,18 +97,36 @@ impl PiExecutor {
             std::fs::write(&skill_path, content)?;
             debug!("{} skill installed at {:?}", name, skill_path);
         }
+
         Ok(())
     }
 
-    /// Ensure the web-search extension exists in `project_dir/.pi/extensions/`.
-    pub fn ensure_web_search_extension(project_dir: &Path) -> Result<()> {
+    /// Install or remove the web-search extension based on provider.
+    /// Web search uses the screenpipe cloud backend, so we only enable it
+    /// for screenpipe-cloud to avoid sending data to our backend when the
+    /// user chose a local/custom provider.
+    pub fn ensure_web_search_extension(project_dir: &Path, provider: Option<&str>) -> Result<()> {
         let ext_dir = project_dir.join(".pi").join("extensions");
         let ext_path = ext_dir.join("web-search.ts");
 
-        std::fs::create_dir_all(&ext_dir)?;
-        let ext_content = include_str!("../../assets/extensions/web-search.ts");
-        std::fs::write(&ext_path, ext_content)?;
-        debug!("web-search extension installed at {:?}", ext_path);
+        let is_screenpipe_cloud = matches!(
+            provider,
+            None | Some("screenpipe") | Some("screenpipe-cloud") | Some("pi")
+        );
+
+        if is_screenpipe_cloud {
+            std::fs::create_dir_all(&ext_dir)?;
+            let ext_content = include_str!("../../assets/extensions/web-search.ts");
+            std::fs::write(&ext_path, ext_content)?;
+            debug!("web-search extension installed at {:?}", ext_path);
+        } else if ext_path.exists() {
+            std::fs::remove_file(&ext_path)?;
+            info!(
+                "web-search extension removed (provider {:?} is not screenpipe-cloud)",
+                provider
+            );
+        }
+
         Ok(())
     }
 
@@ -142,25 +159,36 @@ impl PiExecutor {
             json!({"providers": {}})
         };
 
-        // Use actual token value in apiKey (not env var name) — Pi v0.51.1+ may not
-        // resolve env var names reliably, causing tier=anonymous on the gateway.
-        // Falls back to env var name for backwards compatibility when token is absent.
-        let api_key_value = user_token.unwrap_or("SCREENPIPE_API_KEY");
-        let screenpipe_provider = json!({
-            "baseUrl": api_url,
-            "api": "openai-completions",
-            "apiKey": api_key_value,
-            "authHeader": true,
-            "models": screenpipe_cloud_models()
-        });
+        // Only add screenpipe cloud provider if it's the intended provider
+        // (or no provider specified). If the user explicitly chose ollama/openai/custom,
+        // do NOT write screenpipe into models.json to avoid silent credit drain via fallback.
+        let should_add_screenpipe = match provider {
+            None => true,
+            Some("screenpipe") | Some("screenpipe-cloud") | Some("pi") => true,
+            Some(_) => false,
+        };
 
-        if let Some(providers) = models_config
-            .get_mut("providers")
-            .and_then(|p| p.as_object_mut())
-        {
-            providers.insert("screenpipe".to_string(), screenpipe_provider);
-        } else {
-            models_config = json!({"providers": {"screenpipe": screenpipe_provider}});
+        if should_add_screenpipe {
+            // Use actual token value in apiKey (not env var name) — Pi v0.51.1+ may not
+            // resolve env var names reliably, causing tier=anonymous on the gateway.
+            // Falls back to env var name for backwards compatibility when token is absent.
+            let api_key_value = user_token.unwrap_or("SCREENPIPE_API_KEY");
+            let screenpipe_provider = json!({
+                "baseUrl": api_url,
+                "api": "openai-completions",
+                "apiKey": api_key_value,
+                "authHeader": true,
+                "models": screenpipe_cloud_models()
+            });
+
+            if let Some(providers) = models_config
+                .get_mut("providers")
+                .and_then(|p| p.as_object_mut())
+            {
+                providers.insert("screenpipe".to_string(), screenpipe_provider);
+            } else {
+                models_config = json!({"providers": {"screenpipe": screenpipe_provider}});
+            }
         }
 
         // Add the pipe's own provider (ollama, openai, custom) if specified
@@ -177,19 +205,29 @@ impl PiExecutor {
                         provider_url.unwrap_or("https://api.openai.com/v1"),
                         "OPENAI_API_KEY",
                     ),
+                    "openai-chatgpt" => (
+                        "openai-chatgpt",
+                        "https://api.openai.com/v1",
+                        "OPENAI_CHATGPT_TOKEN",
+                    ),
                     other => (other, provider_url.unwrap_or(""), "CUSTOM_API_KEY"),
+                };
+
+                let wire_api = if prov == "openai-chatgpt" {
+                    "openai-codex-responses"
+                } else {
+                    "openai-completions"
                 };
 
                 let user_provider = json!({
                     "baseUrl": base_url,
-                    "api": "openai-completions",
+                    "api": wire_api,
                     "apiKey": api_key,
                     "models": [{
                         "id": mdl,
                         "name": mdl,
-                        "input": ["text"],
-                        "contextWindow": 128000,
-                        "maxTokens": 16384,
+                        "input": ["text", "image"],
+                        "maxTokens": 4096,
                         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
                     }]
                 });
@@ -214,29 +252,32 @@ impl PiExecutor {
         std::fs::rename(&models_tmp, &models_path)?;
 
         // -- auth.json: merge screenpipe token, preserve other providers --
-        if let Some(token) = user_token {
-            let auth_path = config_dir.join("auth.json");
-            let mut auth: serde_json::Value = if auth_path.exists() {
-                let content = std::fs::read_to_string(&auth_path).unwrap_or_default();
-                serde_json::from_str(&content).unwrap_or_else(|_| json!({}))
-            } else {
-                json!({})
-            };
+        // Only write screenpipe auth when screenpipe provider is actually being used
+        if should_add_screenpipe {
+            if let Some(token) = user_token {
+                let auth_path = config_dir.join("auth.json");
+                let mut auth: serde_json::Value = if auth_path.exists() {
+                    let content = std::fs::read_to_string(&auth_path).unwrap_or_default();
+                    serde_json::from_str(&content).unwrap_or_else(|_| json!({}))
+                } else {
+                    json!({})
+                };
 
-            if let Some(obj) = auth.as_object_mut() {
-                obj.insert("screenpipe".to_string(), json!(token));
-            }
+                if let Some(obj) = auth.as_object_mut() {
+                    obj.insert("screenpipe".to_string(), json!(token));
+                }
 
-            let auth_tmp = config_dir.join("auth.json.tmp");
-            std::fs::write(&auth_tmp, serde_json::to_string_pretty(&auth)?)?;
-            std::fs::rename(&auth_tmp, &auth_path)?;
+                let auth_tmp = config_dir.join("auth.json.tmp");
+                std::fs::write(&auth_tmp, serde_json::to_string_pretty(&auth)?)?;
+                std::fs::rename(&auth_tmp, &auth_path)?;
 
-            // Set restrictive permissions (user read/write only)
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let perms = std::fs::Permissions::from_mode(0o600);
-                let _ = std::fs::set_permissions(&auth_path, perms);
+                // Set restrictive permissions (user read/write only)
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perms = std::fs::Permissions::from_mode(0o600);
+                    let _ = std::fs::set_permissions(&auth_path, perms);
+                }
             }
         }
 
@@ -291,10 +332,11 @@ impl PiExecutor {
     ) -> Result<AgentOutput> {
         let mut cmd = build_async_command(pi_path);
         cmd.current_dir(working_dir);
-        cmd.arg("-p").arg(prompt);
+        // Flags MUST come before -p on Windows (see spawn_pi_streaming comment)
         cmd.arg("--no-session");
         cmd.arg("--provider").arg(resolved_provider);
         cmd.arg("--model").arg(model);
+        cmd.arg("-p").arg(prompt);
 
         if let Some(ref token) = self.user_token {
             cmd.env("SCREENPIPE_API_KEY", token);
@@ -307,6 +349,9 @@ impl PiExecutor {
                 match resolved_provider {
                     "openai" | "openai-byok" => {
                         cmd.env("OPENAI_API_KEY", key);
+                    }
+                    "openai-chatgpt" => {
+                        cmd.env("OPENAI_CHATGPT_TOKEN", key);
                     }
                     "custom" => {
                         cmd.env("CUSTOM_API_KEY", key);
@@ -378,11 +423,14 @@ impl PiExecutor {
     ) -> Result<AgentOutput> {
         let mut cmd = build_async_command(pi_path);
         cmd.current_dir(working_dir);
-        cmd.arg("-p").arg(prompt);
+        // Flags MUST come before -p on Windows: cmd.exe /C passes everything
+        // as a single string, and the long prompt text can break arg parsing
+        // if flags come after it.
         cmd.arg("--mode").arg("json");
         cmd.arg("--no-session");
         cmd.arg("--provider").arg(resolved_provider);
         cmd.arg("--model").arg(model);
+        cmd.arg("-p").arg(prompt);
 
         if let Some(ref token) = self.user_token {
             cmd.env("SCREENPIPE_API_KEY", token);
@@ -393,6 +441,9 @@ impl PiExecutor {
                 match resolved_provider {
                     "openai" | "openai-byok" => {
                         cmd.env("OPENAI_API_KEY", key);
+                    }
+                    "openai-chatgpt" => {
+                        cmd.env("OPENAI_CHATGPT_TOKEN", key);
                     }
                     "custom" => {
                         cmd.env("CUSTOM_API_KEY", key);
@@ -438,30 +489,85 @@ impl PiExecutor {
             .take()
             .ok_or_else(|| anyhow!("failed to capture pi stdout"))?;
 
-        let mut reader = tokio::io::BufReader::new(child_stdout).lines();
+        // Use raw byte-level reads with lossy UTF-8 conversion instead of
+        // BufReader::lines() which crashes on invalid UTF-8 bytes.
+        // See: toggl-sync crash "stream did not contain valid UTF-8".
+        let mut reader = tokio::io::BufReader::new(child_stdout);
         let mut stdout_buf = String::new();
+        let mut llm_error: Option<String> = None;
+        let mut line_bytes = Vec::new();
 
-        while let Some(line) = reader.next_line().await? {
+        loop {
+            line_bytes.clear();
+            let n =
+                tokio::io::AsyncBufReadExt::read_until(&mut reader, b'\n', &mut line_bytes).await?;
+            if n == 0 {
+                break;
+            }
+            // Strip trailing newline
+            if line_bytes.last() == Some(&b'\n') {
+                line_bytes.pop();
+            }
+            let line = String::from_utf8_lossy(&line_bytes).into_owned();
             let _ = line_tx.send(line.clone());
+
+            // Detect LLM-level errors (e.g. credits_exhausted) even when
+            // the process exits 0.  We look for assistant message events
+            // with stopReason "error".
+            if llm_error.is_none() {
+                if let Ok(evt) = serde_json::from_str::<serde_json::Value>(&line) {
+                    let is_assistant = evt
+                        .get("message")
+                        .and_then(|m| m.get("role"))
+                        .and_then(|r| r.as_str())
+                        == Some("assistant");
+                    let stop_reason = evt
+                        .get("message")
+                        .and_then(|m| m.get("stopReason"))
+                        .and_then(|r| r.as_str());
+                    if is_assistant && stop_reason == Some("error") {
+                        llm_error = evt
+                            .get("message")
+                            .and_then(|m| m.get("errorMessage"))
+                            .and_then(|e| e.as_str())
+                            .map(|s| s.to_string());
+                    }
+                }
+            }
+
             stdout_buf.push_str(&line);
             stdout_buf.push('\n');
         }
 
         let status = child.wait().await?;
 
-        // Read remaining stderr
-        let stderr = if let Some(mut stderr_handle) = child.stderr.take() {
-            let mut buf = String::new();
-            tokio::io::AsyncReadExt::read_to_string(&mut stderr_handle, &mut buf).await?;
-            buf
+        // Read remaining stderr (lossy — same reason as stdout above)
+        let mut stderr = if let Some(mut stderr_handle) = child.stderr.take() {
+            let mut raw = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut stderr_handle, &mut raw).await?;
+            String::from_utf8_lossy(&raw).into_owned()
         } else {
             String::new()
+        };
+
+        // If the process exited cleanly but the LLM returned an error
+        // (e.g. 429 credits_exhausted), treat it as a failure.
+        let success = if let Some(ref err) = llm_error {
+            if stderr.is_empty() {
+                stderr = err.clone();
+            } else {
+                stderr.push_str(&format!("\nLLM error: {}", err));
+            }
+            warn!("pi exited 0 but LLM returned error: {}", err);
+            false
+        } else {
+            status.success()
         };
 
         Ok(AgentOutput {
             stdout: stdout_buf,
             stderr,
-            success: status.success(),
+            success,
             pid,
         })
     }
@@ -487,15 +593,16 @@ impl AgentExecutor for PiExecutor {
             provider_url,
         )?;
         Self::ensure_screenpipe_skill(working_dir)?;
-        Self::ensure_web_search_extension(working_dir)?;
-
-        let pi_path = find_pi_executable()
-            .ok_or_else(|| anyhow!("pi not found. install with: bun add -g {}", PI_PACKAGE))?;
 
         // Provider resolution:
         // 1. Explicit provider from pipe frontmatter → use it
         // 2. No provider specified → screenpipe cloud (default)
         let resolved_provider = provider.unwrap_or("screenpipe").to_string();
+
+        Self::ensure_web_search_extension(working_dir, Some(&resolved_provider))?;
+
+        let pi_path = find_pi_executable()
+            .ok_or_else(|| anyhow!("pi not found. install with: bun add -g {}", PI_PACKAGE))?;
         let resolved_model = Self::resolve_model(model, &resolved_provider);
 
         info!(
@@ -570,7 +677,7 @@ impl AgentExecutor for PiExecutor {
             provider_url,
         )?;
         Self::ensure_screenpipe_skill(working_dir)?;
-        Self::ensure_web_search_extension(working_dir)?;
+        Self::ensure_web_search_extension(working_dir, Some(&resolved_provider))?;
 
         let pi_path = find_pi_executable()
             .ok_or_else(|| anyhow!("pi not found. install with: bun add -g {}", PI_PACKAGE))?;
@@ -790,14 +897,43 @@ pub fn find_pi_executable() -> Option<String> {
 /// Build an async command for launching pi.
 ///
 /// Pi's shebang is `#!/usr/bin/env node`, but screenpipe only bundles bun
-/// (not node). On Unix we run `bun <pi_path>` so the script executes under
-/// bun's Node-compatible runtime regardless of whether node is installed.
-/// On Windows, .cmd files need `cmd.exe /C` and bun injected into PATH
-/// because the .cmd shim created by `bun add -g` needs to find bun.exe.
+/// (not node). On both platforms we resolve the actual JS entry point and
+/// run it with bun so the script executes under bun's Node-compatible
+/// runtime regardless of whether node is installed.
+///
+/// On Windows, `cmd.exe /C` mangles arguments that contain newlines and
+/// shell metacharacters (`|`, `&`, `>`, `<`, `^`), which breaks multi-line
+/// prompts passed via `-p`. To avoid this we resolve the JS entry point
+/// from the `.cmd` shim and run it directly — no cmd.exe involved.
 fn build_async_command(path: &str) -> tokio::process::Command {
     #[cfg(windows)]
     {
-        let mut cmd = if path.ends_with(".cmd") || path.ends_with(".bat") {
+        // Try to resolve the JS entry point from .cmd shim to avoid cmd.exe.
+        let js_entry = if path.ends_with(".cmd") || path.ends_with(".bat") {
+            resolve_cmd_js_entry(path)
+        } else {
+            None
+        };
+
+        let mut cmd = if let Some(ref js_path) = js_entry {
+            // Run JS entry point directly with bun (preferred) or node.
+            if let Some(bun) = find_bun_executable() {
+                let mut c = tokio::process::Command::new(&bun);
+                c.arg(js_path);
+                debug!("bypassing cmd.exe, running pi via bun: {} {}", bun, js_path);
+                c
+            } else {
+                let mut c = tokio::process::Command::new("node");
+                c.arg(js_path);
+                debug!("bypassing cmd.exe, running pi via node: {}", js_path);
+                c
+            }
+        } else if path.ends_with(".cmd") || path.ends_with(".bat") {
+            // Fallback: use cmd.exe /C (may mangle multi-line args)
+            warn!(
+                "could not resolve JS entry from {}, falling back to cmd.exe /C",
+                path
+            );
             let mut c = tokio::process::Command::new("cmd.exe");
             c.args(["/C", path]);
             c
@@ -805,9 +941,7 @@ fn build_async_command(path: &str) -> tokio::process::Command {
             tokio::process::Command::new(path)
         };
 
-        // Inject bundled bun directory into PATH so the .cmd shim can find bun.exe.
-        // Without this, fresh Windows installs where bun is only bundled (not in
-        // system PATH) fail with "bun is not installed in %PATH%".
+        // Inject bundled bun directory into PATH so node_modules resolve correctly.
         if let Some(bun_path) = find_bun_executable() {
             if let Some(bun_dir) = std::path::Path::new(&bun_path).parent() {
                 let current_path = std::env::var("PATH").unwrap_or_default();
@@ -830,6 +964,38 @@ fn build_async_command(path: &str) -> tokio::process::Command {
             tokio::process::Command::new(path)
         }
     }
+}
+
+/// Resolve the JS entry point from a Windows `.cmd` shim.
+///
+/// npm/bun global `.cmd` shims contain a line referencing the JS entry point,
+/// e.g. `"%_prog%"  "%dp0%\node_modules\@pkg\dist\cli.js" %*`.
+/// We extract the `node_modules\...\*.js` path and resolve it relative to
+/// the `.cmd` file's directory.
+#[cfg(windows)]
+fn resolve_cmd_js_entry(cmd_path: &str) -> Option<String> {
+    let content = std::fs::read_to_string(cmd_path).ok()?;
+    let cmd_dir = std::path::Path::new(cmd_path).parent()?;
+
+    for line in content.lines() {
+        // Look for node_modules references pointing to .js files
+        if let Some(nm_idx) = line.find("node_modules") {
+            let rest = &line[nm_idx..];
+            if let Some(js_end) = rest.find(".js") {
+                let js_rel = &rest[..js_end + 3];
+                // Normalise separators
+                let js_rel = js_rel.replace('/', "\\");
+                let full_path = cmd_dir.join(&js_rel);
+                if full_path.exists() {
+                    let resolved = full_path.to_string_lossy().to_string();
+                    debug!("resolved .cmd JS entry: {} -> {}", cmd_path, resolved);
+                    return Some(resolved);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 /// Kill a process group (SIGTERM → 5s → SIGKILL).
@@ -873,6 +1039,42 @@ pub fn kill_process_group(pid: u32) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Verifies that `from_utf8_lossy` handles invalid UTF-8 gracefully.
+    /// This is the fix for the toggl-sync crash: "stream did not contain valid UTF-8".
+    /// The fix replaces strict UTF-8 `BufReader::lines()` with raw byte-level
+    /// reading + `String::from_utf8_lossy`.
+    #[test]
+    fn test_lossy_utf8_handles_invalid_bytes() {
+        // Simulate raw bytes from a pipe: "Hi" + 0xFF 0xFE (invalid UTF-8) + newline + "OK" + newline
+        let raw_bytes: &[u8] = b"Hi\xff\xfe\nOK\n";
+
+        // Strict UTF-8 should fail
+        assert!(
+            std::str::from_utf8(raw_bytes).is_err(),
+            "raw bytes should not be valid UTF-8"
+        );
+
+        // Lossy conversion should succeed — this is what our fix does
+        let mut lines = Vec::new();
+        for line in raw_bytes.split(|&b| b == b'\n') {
+            if !line.is_empty() {
+                lines.push(String::from_utf8_lossy(line).into_owned());
+            }
+        }
+
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].starts_with("Hi"),
+            "first line should start with Hi, got: {}",
+            lines[0]
+        );
+        assert!(
+            lines[0].contains('\u{FFFD}'),
+            "invalid bytes should become replacement chars"
+        );
+        assert_eq!(lines[1], "OK");
+    }
+
     #[test]
     fn test_ensure_pi_config_adds_ollama_provider() {
         // Call ensure_pi_config with ollama provider info
@@ -893,10 +1095,11 @@ mod tests {
 
         let providers = config.get("providers").unwrap().as_object().unwrap();
 
-        // Should have both screenpipe and ollama providers
+        // When a non-screenpipe provider is explicitly set, screenpipe provider
+        // is intentionally NOT added (to avoid silent credit drain via fallback).
         assert!(
-            providers.contains_key("screenpipe"),
-            "missing screenpipe provider"
+            !providers.contains_key("screenpipe"),
+            "screenpipe provider should NOT be added when ollama is explicitly chosen"
         );
         assert!(providers.contains_key("ollama"), "missing ollama provider");
 

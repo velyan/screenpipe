@@ -14,10 +14,11 @@ lazy_static! {
         // Contact info
         (Regex::new(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b").unwrap(), "EMAIL"),
 
-        // Phone numbers - various formats:
-        // +1-234-567-8901, (234) 567-8901, 234-567-8901, 234.567.8901, 2345678901
-        // Area code must start with 2-9, but exchange is lenient for PII detection
-        (Regex::new(r"(?:\+?1[-.\s]?)?\(?[2-9]\d{2}\)?[-.\s]?\d{3}[-.\s]?\d{4}").unwrap(), "PHONE"),
+        // Phone numbers - require formatting to distinguish from numeric IDs (#2340):
+        // +1-234-567-8901, (234) 567-8901, 234-567-8901, 234.567.8901, +12345678901
+        // Must have at least one of: country code (+), parenthesized area code, or separators
+        // Bare digit sequences like "215805592" or "2345678901" are NOT matched (likely IDs)
+        (Regex::new(r"\+\d{1,3}[-.\s]?\(?[2-9]\d{2}\)?[-.\s]?\d{3}[-.\s]?\d{4}|\(?[2-9]\d{2}\)[-.\s]?\d{3}[-.\s]?\d{4}|[2-9]\d{2}[-.\s]\d{3}[-.\s]\d{4}").unwrap(), "PHONE"),
 
         // IP addresses (IPv4)
         (Regex::new(r"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b").unwrap(), "IP_ADDRESS"),
@@ -457,14 +458,15 @@ mod tests {
 
     #[test]
     fn test_contains_pii_phone_numbers() {
-        // US formats
+        // US formats with formatting (separators, parens, or country code)
         assert!(contains_pii("Call me at 234-567-8901"));
         assert!(contains_pii("Phone: (234) 567-8901"));
         assert!(contains_pii("Cell: 234.567.8901"));
         assert!(contains_pii("+1-234-567-8901"));
-        assert!(contains_pii("2345678901"));
+        assert!(contains_pii("+12345678901")); // country code makes it a phone
 
-        // Should NOT match short numbers
+        // Bare digit sequences should NOT match (#2340)
+        assert!(!contains_pii("2345678901"));
         assert!(!contains_pii("Room 1234"));
         assert!(!contains_pii("Order #12345"));
     }
@@ -1021,11 +1023,14 @@ mod tests {
 
     #[test]
     fn test_telegram_token_detection() {
-        // Format: bot_id:secret
+        // Format: bot_id:secret (8-10 digit bot ID, 35 char secret)
         assert!(contains_pii(
             "123456789:ABCdefGHIjklMNOpqrsTUVwxyz123456789"
         ));
-        assert!(contains_pii("9876543210:abcdefghijklmnopqrstuvwxyz12345"));
+        // 35-char secret required by regex
+        assert!(contains_pii(
+            "9876543210:abcdefghijklmnopqrstuvwxyz123456789"
+        ));
     }
 
     #[test]
@@ -1131,5 +1136,120 @@ mod tests {
         // This is harder - we'd need entropy detection for unlabeled passwords
         // For now, we detect common password manager field labels
         assert!(contains_pii("encryption password MyS3cretPass123"));
+    }
+
+    // ==================== #2340: PHONE REGEX FALSE POSITIVE TESTS ====================
+
+    #[test]
+    fn test_phone_should_not_match_database_ids() {
+        // The exact case from issue #2340
+        assert_eq!(
+            remove_pii("LinkedAccountId: 215805592"),
+            "LinkedAccountId: 215805592",
+            "9-digit database ID should not be redacted as PHONE"
+        );
+    }
+
+    #[test]
+    fn test_phone_should_not_match_numeric_identifiers() {
+        // Various numeric IDs that should NOT be redacted
+        let cases = vec![
+            ("user_id: 3847561290", "10-digit user ID"),
+            ("order #2581473960", "10-digit order number"),
+            ("Account 215805592", "9-digit account number"),
+            ("Transaction: 9182736450", "10-digit transaction ID"),
+            ("frame_id=4829371650", "10-digit frame ID in URL param"),
+            ("entity/2581473960/details", "ID in URL path"),
+            ("Row 847392", "6-digit row number"),
+            ("PID: 29384", "5-digit process ID"),
+            ("build 20250301142530", "timestamp-style build number"),
+        ];
+
+        for (input, desc) in cases {
+            assert_eq!(
+                remove_pii(input),
+                input,
+                "{} should not be redacted: {}",
+                desc,
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn test_phone_should_not_match_bare_10_digit_number() {
+        // A bare 10-digit number without any phone formatting
+        assert_eq!(
+            remove_pii("2345678901"),
+            "2345678901",
+            "bare 10-digit number without formatting should not match as PHONE"
+        );
+    }
+
+    #[test]
+    fn test_phone_should_match_formatted_numbers() {
+        // Real phone numbers WITH formatting should still be detected
+        let cases = vec![
+            ("Call 234-567-8901", "dashed format"),
+            ("Phone: (234) 567-8901", "parenthesized area code"),
+            ("Cell: 234.567.8901", "dotted format"),
+            ("+1-234-567-8901", "country code with dashes"),
+            ("+1 234 567 8901", "country code with spaces"),
+            ("Reach me at (800) 555-1234", "toll-free parenthesized"),
+            ("fax: 555-123-4567", "dashed in context"),
+            ("+12345678901", "country code prefix, no separators"),
+        ];
+
+        for (input, desc) in &cases {
+            let result = remove_pii(input);
+            assert!(
+                result.contains("[PHONE]"),
+                "{} should be detected as PHONE: {} -> {}",
+                desc,
+                input,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn test_phone_should_not_corrupt_clipboard_data() {
+        // Real-world clipboard content from issue #2340
+        let clipboard = "LinkedAccountId: 215805592\nSessionToken: abc123\nTimestamp: 1709312530";
+        let result = remove_pii(clipboard);
+        assert!(
+            result.contains("215805592"),
+            "database ID in clipboard should be preserved: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_phone_should_not_match_ids_in_urls() {
+        let url = "https://app.example.com/users/3847561290/settings";
+        assert_eq!(
+            remove_pii(url),
+            url,
+            "numeric ID in URL path should not be redacted"
+        );
+    }
+
+    #[test]
+    fn test_phone_should_not_match_timestamp_digits() {
+        // Unix timestamps, date-based IDs
+        let cases = vec![
+            "created_at: 1709312530",
+            "modified: 1709400000",
+            "id: 20250301142530",
+        ];
+
+        for input in cases {
+            assert_eq!(
+                remove_pii(input),
+                input,
+                "timestamp-like number should not be redacted: {}",
+                input
+            );
+        }
     }
 }
