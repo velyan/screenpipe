@@ -50,6 +50,9 @@ pub struct RecordingConfig {
     pub included_windows: Vec<String>,
     pub blocked_apps: Vec<String>,
     pub blocked_title_keywords: Vec<String>,
+    /// Identity hints for outgoing/incoming message direction classification.
+    /// Format: kind:value, e.g. email:me@x.com, name:John Doe, handle:@john
+    pub user_identities: Vec<String>,
     pub ignored_urls: Vec<String>,
     pub languages: Vec<Language>,
 

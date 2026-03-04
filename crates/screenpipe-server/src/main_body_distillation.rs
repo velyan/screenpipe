@@ -23,6 +23,9 @@ const MIN_VERTICAL_OVERLAP: f32 = 0.40;
 const MIN_HORIZONTAL_OVERLAP: f32 = 0.18;
 const MIN_TEXT_ONLY_MATCH_SCORE: f32 = 0.72;
 const MIN_OCR_CONFIDENCE_FOR_FALLBACK: f32 = 0.80;
+const BROWSER_TOP_CHROME_CUTOFF: f32 = 0.09;
+const BROWSER_PRIMARY_BAND_HALF_WIDTH: f32 = 0.24;
+const BROWSER_MIN_PRIMARY_SCORE: f32 = 18.0;
 
 #[derive(Debug, Clone)]
 pub struct DistillationConfig {
@@ -457,6 +460,113 @@ fn parse_ocr_lines(ocr_text_json: Option<&str>) -> Vec<OcrLine> {
         .collect()
 }
 
+fn is_browser_shell_context(input: &DistillationInput<'_>) -> bool {
+    let mut haystack = String::new();
+    if let Some(app) = input.app_name {
+        haystack.push_str(app);
+        haystack.push(' ');
+    }
+    if let Some(window) = input.window_name {
+        haystack.push_str(window);
+        haystack.push(' ');
+    }
+    if let Some(url) = input.browser_url {
+        haystack.push_str(url);
+    }
+    let l = haystack.to_lowercase();
+    l.contains("arc")
+        || l.contains("chrome")
+        || l.contains("safari")
+        || l.contains("firefox")
+        || l.contains("brave")
+        || l.contains("edge")
+        || l.contains("vivaldi")
+        || l.contains("opera")
+}
+
+fn ocr_line_center_x(line: &OcrLine) -> f32 {
+    line.bounds.left + line.bounds.width * 0.5
+}
+
+fn ocr_primary_line_score(line: &OcrLine) -> f32 {
+    let normalized = normalize_for_match(&line.text);
+    if normalized.is_empty() {
+        return 0.0;
+    }
+    let text_weight = normalized.len().min(140) as f32;
+    let width_weight = (0.45 + line.bounds.width).clamp(0.45, 1.45);
+    let confidence_weight = line.confidence.clamp(0.15, 1.0);
+    text_weight * width_weight * confidence_weight
+}
+
+fn infer_browser_primary_band(ocr_lines: &[OcrLine]) -> Option<(f32, f32)> {
+    if ocr_lines.is_empty() {
+        return None;
+    }
+
+    const BUCKET_COUNT: usize = 20;
+    const BUCKET_WIDTH: f32 = 1.0 / BUCKET_COUNT as f32;
+    let mut bucket_scores = [0.0_f32; BUCKET_COUNT];
+
+    for line in ocr_lines {
+        let center = ocr_line_center_x(line).clamp(0.0, 0.999);
+        let idx = ((center / BUCKET_WIDTH).floor() as usize).min(BUCKET_COUNT - 1);
+        bucket_scores[idx] += ocr_primary_line_score(line);
+    }
+
+    let (best_idx, best_score) = bucket_scores
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))?;
+
+    if best_score < BROWSER_MIN_PRIMARY_SCORE {
+        return None;
+    }
+
+    let center = (best_idx as f32 + 0.5) * BUCKET_WIDTH;
+    Some((
+        (center - BROWSER_PRIMARY_BAND_HALF_WIDTH).clamp(0.0, 1.0),
+        (center + BROWSER_PRIMARY_BAND_HALF_WIDTH).clamp(0.0, 1.0),
+    ))
+}
+
+fn line_overlaps_band(
+    bounds: &screenpipe_accessibility::tree::NodeBounds,
+    band: (f32, f32),
+) -> bool {
+    let left = bounds.left;
+    let right = bounds.left + bounds.width;
+    right >= band.0 && left <= band.1
+}
+
+fn filter_browser_shell_ocr_lines(
+    ocr_lines: Vec<OcrLine>,
+    excluded: &mut Vec<String>,
+) -> Vec<OcrLine> {
+    let mut prefiltered = Vec::with_capacity(ocr_lines.len());
+    for line in ocr_lines {
+        if looks_like_ui_chrome_line(&line.text) {
+            push_excluded(excluded, &line.text);
+            continue;
+        }
+        if line.bounds.top < BROWSER_TOP_CHROME_CUTOFF {
+            push_excluded(excluded, &line.text);
+            continue;
+        }
+        prefiltered.push(line);
+    }
+
+    let Some(primary_band) = infer_browser_primary_band(&prefiltered) else {
+        return prefiltered;
+    };
+
+    prefiltered
+        .into_iter()
+        .filter(|line| line_overlaps_band(&line.bounds, primary_band))
+        .collect()
+}
+
 fn visual_order(left_a: f32, top_a: f32, left_b: f32, top_b: f32) -> Ordering {
     top_a
         .partial_cmp(&top_b)
@@ -724,21 +834,59 @@ fn heuristic_main_body(input: &DistillationInput<'_>) -> HeuristicMainBody {
     let mut accepted = Vec::new();
     let mut excluded = Vec::new();
     let mut seen = HashSet::new();
-    let focus_band = focus_band_from_element(input.focused_element);
+    let browser_shell = is_browser_shell_context(input);
+    let focus_band = if browser_shell {
+        None
+    } else {
+        focus_band_from_element(input.focused_element)
+    };
     let mut ocr_lines = parse_ocr_lines(input.ocr_text_json);
 
-    ocr_lines.retain(|line| {
-        if looks_like_ui_chrome_line(&line.text) {
-            push_excluded(&mut excluded, &line.text);
-            return false;
-        }
-        if let Some(band) = focus_band {
-            return bounds_overlaps_focus_band(&line.bounds, band);
-        }
-        true
-    });
+    if browser_shell {
+        ocr_lines = filter_browser_shell_ocr_lines(ocr_lines, &mut excluded);
+    } else {
+        ocr_lines.retain(|line| {
+            if looks_like_ui_chrome_line(&line.text) {
+                push_excluded(&mut excluded, &line.text);
+                return false;
+            }
+            if let Some(band) = focus_band {
+                return bounds_overlaps_focus_band(&line.bounds, band);
+            }
+            true
+        });
+    }
     ocr_lines
         .sort_by(|a, b| visual_order(a.bounds.left, a.bounds.top, b.bounds.left, b.bounds.top));
+
+    if browser_shell && !ocr_lines.is_empty() {
+        for line in &ocr_lines {
+            if line.confidence < MIN_OCR_CONFIDENCE_FOR_FALLBACK {
+                continue;
+            }
+            push_unique_output(
+                &mut accepted,
+                &mut seen,
+                &line.text,
+                line.bounds.top,
+                line.bounds.left,
+            );
+        }
+
+        if !accepted.is_empty() {
+            accepted.sort_by(|a, b| {
+                visual_order(a.left, a.top, b.left, b.top).then_with(|| a.order.cmp(&b.order))
+            });
+            return HeuristicMainBody {
+                main_body_text: accepted
+                    .into_iter()
+                    .map(|line| line.text)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                excluded_ui_text: excluded,
+            };
+        }
+    }
 
     if let Some(nodes) = input.nodes {
         let mut in_focus_candidates: Vec<AxCandidate> = Vec::new();
@@ -1290,7 +1438,7 @@ mod tests {
             },
             AccessibilityTreeNode {
                 role: "AXStaticText".to_string(),
-                text: "Yehyon, Yeah let’s try maybe next Saturday, 12:49 pm".to_string(),
+                text: "Contact A, Yeah let’s try maybe next Saturday, 12:49 pm".to_string(),
                 depth: 1,
                 bounds: None,
             },
@@ -1310,7 +1458,7 @@ mod tests {
         };
 
         let input = DistillationInput {
-            raw_text: "Today 12:49 pm\nYehyon, Yeah let’s try maybe next Saturday, 12:49 pm",
+            raw_text: "Today 12:49 pm\nContact A, Yeah let’s try maybe next Saturday, 12:49 pm",
             ocr_text_json: Some(
                 r#"[
                     {"text":"Today 12:49pm","left":"0.515","top":"0.754","width":"0.111","height":"0.022","conf":"1"},
@@ -1328,5 +1476,33 @@ mod tests {
         let out = heuristic_main_body(&input);
         assert!(out.main_body_text.contains("Today 12:49 pm"));
         assert!(out.main_body_text.contains("Yeah let"));
+    }
+
+    #[test]
+    fn heuristic_main_body_browser_shell_prefers_primary_ocr_column() {
+        let input = DistillationInput {
+            raw_text: "Hide sidebar\nGo back\nArticle tab\nSidebar item",
+            ocr_text_json: Some(
+                r#"[
+                    {"text":"Hide sidebar","left":"0.02","top":"0.02","width":"0.10","height":"0.03","conf":"1"},
+                    {"text":"Sidebar item","left":"0.04","top":"0.35","width":"0.16","height":"0.03","conf":"1"},
+                    {"text":"A Pitch Deck Masterclass","left":"0.30","top":"0.21","width":"0.42","height":"0.05","conf":"1"},
+                    {"text":"Lessons for founders from reviewing ~1000+ pitch decks","left":"0.30","top":"0.28","width":"0.52","height":"0.04","conf":"1"},
+                    {"text":"Recently the kind folks at AWS invited me to lead a workshop","left":"0.30","top":"0.45","width":"0.60","height":"0.04","conf":"1"}
+                ]"#,
+            ),
+            app_name: Some("Arc"),
+            window_name: Some("medium.com"),
+            browser_url: Some("https://medium.com"),
+            content_hash: Some(130),
+            nodes: None,
+            focused_element: None,
+        };
+
+        let out = heuristic_main_body(&input);
+        assert!(out.main_body_text.contains("A Pitch Deck Masterclass"));
+        assert!(out.main_body_text.contains("Lessons for founders"));
+        assert!(!out.main_body_text.contains("Sidebar item"));
+        assert!(!out.main_body_text.contains("Hide sidebar"));
     }
 }

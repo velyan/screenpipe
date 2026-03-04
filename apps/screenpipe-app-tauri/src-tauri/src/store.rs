@@ -665,6 +665,7 @@ impl SettingsStore {
             included_windows: self.included_windows.clone(),
             blocked_apps: screenpipe_accessibility::tree::default_blocked_apps(),
             blocked_title_keywords: screenpipe_accessibility::tree::default_blocked_title_keywords(),
+            user_identities: vec![],
             ignored_urls: self.ignored_urls.clone(),
             languages: self
                 .languages

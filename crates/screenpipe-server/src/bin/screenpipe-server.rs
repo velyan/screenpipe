@@ -503,6 +503,7 @@ async fn main() -> anyhow::Result<()> {
     cli.included_windows = record_args.included_windows.clone();
     cli.blocked_apps = record_args.blocked_apps.clone();
     cli.blocked_title_keywords = record_args.blocked_title_keywords.clone();
+    cli.user_identity = record_args.user_identity.clone();
     cli.ignored_urls = record_args.ignored_urls.clone();
     cli.deepgram_api_key = record_args.deepgram_api_key.clone();
     cli.auto_destruct_pid = record_args.auto_destruct_pid;
@@ -785,6 +786,7 @@ async fn main() -> anyhow::Result<()> {
     server.included_windows = config.included_windows.clone();
     server.blocked_apps = config.blocked_apps.clone();
     server.blocked_title_keywords = config.blocked_title_keywords.clone();
+    server.user_identities = config.user_identities.clone();
     server.enable_main_body_distillation = config.enable_main_body_distillation;
     server.main_body_distillation_threshold = config.main_body_distillation_threshold;
     server.hot_frame_cache = Some(hot_frame_cache);

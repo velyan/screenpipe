@@ -13,6 +13,7 @@ pub mod cli;
 pub mod cli_pipe;
 pub mod cli_status;
 pub mod cloud_search;
+pub mod conversation_extraction;
 pub mod core;
 pub mod logging;
 pub mod pipe_store;

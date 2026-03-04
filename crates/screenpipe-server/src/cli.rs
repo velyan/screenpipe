@@ -202,6 +202,15 @@ pub struct Cli {
     #[arg(long)]
     pub blocked_title_keywords: Vec<String>,
 
+    /// Identity hints for outgoing/incoming direction classification.
+    /// Format: kind:value (email:me@example.com, name:My Name, handle:@me)
+    #[arg(
+        long = "user-identity",
+        env = "SCREENPIPE_USER_IDENTITIES",
+        value_delimiter = ','
+    )]
+    pub user_identity: Vec<String>,
+
     #[arg(long)]
     pub ignored_urls: Vec<String>,
 
@@ -428,6 +437,15 @@ pub struct RecordArgs {
     #[arg(long)]
     pub blocked_title_keywords: Vec<String>,
 
+    /// Identity hints for outgoing/incoming direction classification.
+    /// Format: kind:value (email:me@example.com, name:My Name, handle:@me)
+    #[arg(
+        long = "user-identity",
+        env = "SCREENPIPE_USER_IDENTITIES",
+        value_delimiter = ','
+    )]
+    pub user_identity: Vec<String>,
+
     /// URLs to ignore for browser privacy filtering
     #[arg(long)]
     pub ignored_urls: Vec<String>,
@@ -505,6 +523,7 @@ impl RecordArgs {
             included_windows: cli.included_windows.clone(),
             blocked_apps: cli.blocked_apps.clone(),
             blocked_title_keywords: cli.blocked_title_keywords.clone(),
+            user_identity: cli.user_identity.clone(),
             ignored_urls: cli.ignored_urls.clone(),
             deepgram_api_key: cli.deepgram_api_key.clone(),
             auto_destruct_pid: cli.auto_destruct_pid,
@@ -590,6 +609,7 @@ impl RecordArgs {
             use_all_monitors: self.use_all_monitors,
             ignored_windows: self.ignored_windows,
             included_windows: self.included_windows,
+            user_identities: self.user_identity,
             ignored_urls: self.ignored_urls,
             languages,
             deepgram_api_key: self.deepgram_api_key,

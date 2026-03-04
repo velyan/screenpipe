@@ -554,10 +554,10 @@ mod tests {
 
     #[test]
     fn test_sanitize_ocr_text_json_removes_emails() {
-        let json = r#"[{"text":"contact louis@screenpi.pe for info","x":"10","y":"20"}]"#;
+        let json = r#"[{"text":"contact person.one@example.test for info","x":"10","y":"20"}]"#;
         let result = sanitize_ocr_text_json(json);
         assert!(
-            !result.contains("louis@screenpi.pe"),
+            !result.contains("person.one@example.test"),
             "email should be redacted"
         );
         assert!(
@@ -600,14 +600,14 @@ mod tests {
     #[test]
     fn test_pii_removal_on_text() {
         // Verify remove_pii works on plain text with emails
-        let text = "Contact louis@screenpi.pe or louis.beaumont@gmail.com for support";
+        let text = "Contact person.one@example.test or person.two@example.test for support";
         let sanitized = remove_pii(text);
         assert!(
-            !sanitized.contains("louis@screenpi.pe"),
+            !sanitized.contains("person.one@example.test"),
             "email 1 should be redacted"
         );
         assert!(
-            !sanitized.contains("louis.beaumont@gmail.com"),
+            !sanitized.contains("person.two@example.test"),
             "email 2 should be redacted"
         );
         assert!(
@@ -629,8 +629,8 @@ mod tests {
     #[test]
     fn test_pii_removal_disabled() {
         // When use_pii_removal is false, text should pass through unchanged
-        let text = "louis@screenpi.pe";
+        let text = "person.one@example.test";
         let sanitized_text: Option<String> = Some(text).map(|t| t.to_string());
-        assert_eq!(sanitized_text.as_deref(), Some("louis@screenpi.pe"));
+        assert_eq!(sanitized_text.as_deref(), Some("person.one@example.test"));
     }
 }

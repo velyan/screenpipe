@@ -117,6 +117,8 @@ pub struct AppState {
     /// AX privacy policy.
     pub blocked_apps: Vec<String>,
     pub blocked_title_keywords: Vec<String>,
+    /// Identity hints for outgoing/incoming message direction classification.
+    pub user_identities: Vec<String>,
     /// Main-body distillation settings for synchronous active-window capture.
     pub enable_main_body_distillation: bool,
     pub main_body_distillation_threshold: f32,
@@ -147,6 +149,7 @@ pub struct SCServer {
     pub included_windows: Vec<String>,
     pub blocked_apps: Vec<String>,
     pub blocked_title_keywords: Vec<String>,
+    pub user_identities: Vec<String>,
     pub enable_main_body_distillation: bool,
     pub main_body_distillation_threshold: f32,
     /// Shared hot frame cache — set this before starting the server so AppState uses it.
@@ -186,6 +189,7 @@ impl SCServer {
             blocked_apps: screenpipe_accessibility::tree::default_blocked_apps(),
             blocked_title_keywords: screenpipe_accessibility::tree::default_blocked_title_keywords(
             ),
+            user_identities: Vec::new(),
             enable_main_body_distillation: false,
             main_body_distillation_threshold: 0.60,
             hot_frame_cache: None,
@@ -397,6 +401,7 @@ impl SCServer {
             included_windows: self.included_windows.clone(),
             blocked_apps: self.blocked_apps.clone(),
             blocked_title_keywords: self.blocked_title_keywords.clone(),
+            user_identities: self.user_identities.clone(),
             enable_main_body_distillation: self.enable_main_body_distillation,
             main_body_distillation_threshold: self.main_body_distillation_threshold,
             // Allow up to 3 concurrent ffmpeg extractions. Beyond this, requests
