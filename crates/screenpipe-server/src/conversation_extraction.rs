@@ -14,7 +14,7 @@ const MAX_UI_NOISE_LINES: usize = 48;
 const BROWSER_FALLBACK_TOP_CUTOFF: f32 = 0.09;
 const BROWSER_FALLBACK_BAND_HALF_WIDTH: f32 = 0.24;
 const BROWSER_FALLBACK_MIN_SCORE: f32 = 6.0;
-const GENERIC_FALLBACK_TOP_CUTOFF: f32 = 0.06;
+const GENERIC_FALLBACK_TOP_CUTOFF: f32 = 0.10;
 const GENERIC_FALLBACK_BAND_HALF_WIDTH: f32 = 0.23;
 const GENERIC_FALLBACK_MIN_SCORE: f32 = 6.0;
 
@@ -998,42 +998,16 @@ fn browser_span_score(span: &Span) -> f32 {
     if words <= 0.0 {
         return 0.0;
     }
-    let width_weight = (0.40 + bounds.width).clamp(0.40, 1.40);
+    let width_weight = (0.20 + (bounds.width * bounds.width * 3.0)).clamp(0.20, 2.0);
     words * width_weight
 }
 
-fn infer_browser_fallback_band(spans: &[Span]) -> Option<(f32, f32)> {
-    if spans.is_empty() {
-        return None;
-    }
-
-    const BUCKETS: usize = 20;
-    const WIDTH: f32 = 1.0 / BUCKETS as f32;
-    let mut scores = [0.0f32; BUCKETS];
-
-    for span in spans {
-        let Some(bounds) = span.bounds.as_ref() else {
-            continue;
-        };
-        let center_x = (bounds.left + bounds.width * 0.5).clamp(0.0, 0.999);
-        let idx = ((center_x / WIDTH).floor() as usize).min(BUCKETS - 1);
-        scores[idx] += browser_span_score(span);
-    }
-
-    let (best_idx, best_score) = scores
-        .iter()
-        .copied()
-        .enumerate()
-        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))?;
-    if best_score < BROWSER_FALLBACK_MIN_SCORE {
-        return None;
-    }
-
-    let center = (best_idx as f32 + 0.5) * WIDTH;
-    Some((
-        (center - BROWSER_FALLBACK_BAND_HALF_WIDTH).clamp(0.0, 1.0),
-        (center + BROWSER_FALLBACK_BAND_HALF_WIDTH).clamp(0.0, 1.0),
-    ))
+fn is_main_content_like_for_band(span: &Span) -> bool {
+    let Some(bounds) = span.bounds.as_ref() else {
+        return false;
+    };
+    let words = normalize_key(&span.text).split_whitespace().count();
+    bounds.width >= 0.24 || words >= 5
 }
 
 fn infer_primary_band_for_fallback(
@@ -1048,8 +1022,17 @@ fn infer_primary_band_for_fallback(
     const BUCKETS: usize = 20;
     const WIDTH: f32 = 1.0 / BUCKETS as f32;
     let mut scores = [0.0f32; BUCKETS];
+    let preferred: Vec<&Span> = spans
+        .iter()
+        .filter(|s| is_main_content_like_for_band(s))
+        .collect();
+    let source: Vec<&Span> = if preferred.len() >= 3 {
+        preferred
+    } else {
+        spans.iter().collect()
+    };
 
-    for span in spans {
+    for span in source {
         let Some(bounds) = span.bounds.as_ref() else {
             continue;
         };
@@ -1119,6 +1102,34 @@ fn build_primary_pane_fallback_body(spans: &[Span]) -> Option<String> {
             let span_left = bounds.left;
             let span_right = bounds.left + bounds.width;
             span_right >= left && span_left <= right
+        });
+    }
+
+    // If we clearly have a right/center content pane, drop narrow left-lane rows (sidebar).
+    let right_like_count = candidates
+        .iter()
+        .filter(|span| {
+            span.bounds
+                .as_ref()
+                .map(|b| b.left + b.width * 0.5 >= 0.40)
+                .unwrap_or(false)
+        })
+        .count();
+    let left_like_count = candidates
+        .iter()
+        .filter(|span| {
+            span.bounds
+                .as_ref()
+                .map(|b| b.left + b.width * 0.5 <= 0.28)
+                .unwrap_or(false)
+        })
+        .count();
+    if right_like_count >= 3 && right_like_count >= left_like_count {
+        candidates.retain(|span| {
+            span.bounds
+                .as_ref()
+                .map(|b| (b.left + b.width * 0.5) >= 0.30 || b.width >= 0.45)
+                .unwrap_or(false)
         });
     }
 
@@ -3172,6 +3183,45 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w == "primary_pane_fallback_used"));
+    }
+
+    #[test]
+    fn notion_dense_sidebar_still_prefers_center_page_body() {
+        let ocr_json = r#"[
+            {"text":"Shared","left":"0.06","top":"0.18","width":"0.11","height":"0.03"},
+            {"text":"Startup name - Founder name","left":"0.06","top":"0.23","width":"0.20","height":"0.03"},
+            {"text":"NiceGit - Dan Borthwick","left":"0.06","top":"0.27","width":"0.19","height":"0.03"},
+            {"text":"Paraklete - David Amaechi","left":"0.06","top":"0.31","width":"0.20","height":"0.03"},
+            {"text":"Moya - Vel Yanchina","left":"0.06","top":"0.35","width":"0.18","height":"0.03"},
+            {"text":"Project Pegasus - Jeff Yone","left":"0.06","top":"0.39","width":"0.20","height":"0.03"},
+            {"text":"Moya - Vel Yanchina","left":"0.34","top":"0.36","width":"0.30","height":"0.05"},
+            {"text":"Basic details","left":"0.35","top":"0.47","width":"0.16","height":"0.04"},
+            {"text":"Founder/s name","left":"0.36","top":"0.54","width":"0.15","height":"0.03"},
+            {"text":"Founder/s Linkedin","left":"0.36","top":"0.59","width":"0.17","height":"0.03"},
+            {"text":"Personal assistant for mac os helps you remember what matters and get it done","left":"0.53","top":"0.64","width":"0.38","height":"0.05"},
+            {"text":"Website","left":"0.36","top":"0.73","width":"0.10","height":"0.03"}
+        ]"#;
+        let input = StructuredExtractionInput {
+            captured_at: Utc::now(),
+            app_name: Some("Notion"),
+            window_name: Some("Workspace"),
+            browser_url: None,
+            main_body_text: Some("Shared Startup name Founder"),
+            accessibility_text: Some("Shared Startup name Founder"),
+            accessibility_tree_json: None,
+            ocr_text_json: Some(ocr_json),
+            focused_element: None,
+            identities: &[],
+        };
+
+        let out = extract_structured_messages(&input);
+        assert_ne!(out.content_kind, ContentKind::Conversation);
+        assert_eq!(out.messages.len(), 1);
+        let body = out.messages[0].body.to_lowercase();
+        assert!(body.contains("basic details"));
+        assert!(body.contains("personal assistant for mac os"));
+        assert!(!body.contains("project pegasus"));
+        assert!(!body.contains("paraklete"));
     }
 
     #[test]
