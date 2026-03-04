@@ -2305,6 +2305,34 @@ fn apply_quality_filters(
     out
 }
 
+fn build_fallback_body_from_spans(spans: &[Span]) -> Option<String> {
+    if spans.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for span in spans {
+        let text = normalize_text(&span.text);
+        if text.is_empty() {
+            continue;
+        }
+        let key = normalize_key(&text);
+        if key.is_empty() {
+            continue;
+        }
+        if seen.insert(key) {
+            lines.push(text);
+        }
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join(" "))
+    }
+}
+
 pub fn extract_structured_messages(
     input: &StructuredExtractionInput<'_>,
 ) -> StructuredExtractionResult {
@@ -2510,12 +2538,9 @@ pub fn extract_structured_messages_cancelable(
                     .or(input.accessibility_text)
                     .map(normalize_text)
             })
+            .or_else(|| build_fallback_body_from_spans(&filtered))
             .unwrap_or_default();
-        let should_fallback = (is_conversation_profile || is_browser_shell)
-            && !fallback_body.is_empty()
-            && (reason.as_deref() == Some("non_conversation_window")
-                || reason.as_deref() == Some("insufficient_conversation_signals")
-                || !ax_tree_available);
+        let should_fallback = !fallback_body.is_empty();
 
         if should_fallback {
             if !warnings.iter().any(|w| w == "main_body_fallback_used") {
@@ -2531,6 +2556,14 @@ pub fn extract_structured_messages_cancelable(
             {
                 warnings.push("browser_shell_ocr_fallback_used".to_string());
             }
+            if !is_conversation_profile
+                && !is_browser_shell
+                && !warnings
+                    .iter()
+                    .any(|w| w == "non_conversation_main_body_fallback_used")
+            {
+                warnings.push("non_conversation_main_body_fallback_used".to_string());
+            }
 
             let source = if used_browser_fallback {
                 "ocr"
@@ -2543,7 +2576,7 @@ pub fn extract_structured_messages_cancelable(
             };
 
             return StructuredExtractionResult {
-                content_kind: ContentKind::Conversation,
+                content_kind,
                 messages: vec![StructuredMessage {
                     sequence: 1,
                     direction: MessageDirection::Unknown,
@@ -2715,8 +2748,14 @@ mod tests {
 
         let out = extract_structured_messages(&input);
         assert_ne!(out.content_kind, ContentKind::Conversation);
-        assert!(out.messages.is_empty());
-        assert_eq!(out.meta.status, "skipped_non_conversation");
+        assert_eq!(out.meta.status, "partial");
+        assert_eq!(out.meta.reason.as_deref(), Some("main_body_fallback"));
+        assert_eq!(out.messages.len(), 1);
+        assert!(out
+            .meta
+            .warnings
+            .iter()
+            .any(|w| w == "non_conversation_main_body_fallback_used"));
     }
 
     #[test]
@@ -2727,7 +2766,7 @@ mod tests {
         );
 
         let out = extract_structured_messages(&input);
-        assert_eq!(out.content_kind, ContentKind::Conversation);
+        assert_ne!(out.content_kind, ContentKind::Conversation);
         assert_eq!(out.meta.status, "partial");
         assert_eq!(out.messages.len(), 1);
         assert_eq!(out.messages[0].direction, MessageDirection::Unknown);
@@ -2747,7 +2786,7 @@ mod tests {
         );
 
         let out = extract_structured_messages(&input);
-        assert_eq!(out.content_kind, ContentKind::Conversation);
+        assert_ne!(out.content_kind, ContentKind::Conversation);
         assert_eq!(out.meta.status, "partial");
         assert_eq!(out.meta.reason.as_deref(), Some("main_body_fallback"));
         assert_eq!(out.messages.len(), 1);
@@ -2783,7 +2822,7 @@ mod tests {
         };
 
         let out = extract_structured_messages(&input);
-        assert_eq!(out.content_kind, ContentKind::Conversation);
+        assert_ne!(out.content_kind, ContentKind::Conversation);
         assert_eq!(out.meta.reason.as_deref(), Some("main_body_fallback"));
         assert_eq!(out.messages.len(), 1);
         assert!(out.messages[0].body.contains("A Pitch Deck Masterclass"));
