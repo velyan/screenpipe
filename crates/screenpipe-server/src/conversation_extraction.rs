@@ -14,6 +14,9 @@ const MAX_UI_NOISE_LINES: usize = 48;
 const BROWSER_FALLBACK_TOP_CUTOFF: f32 = 0.09;
 const BROWSER_FALLBACK_BAND_HALF_WIDTH: f32 = 0.24;
 const BROWSER_FALLBACK_MIN_SCORE: f32 = 6.0;
+const GENERIC_FALLBACK_TOP_CUTOFF: f32 = 0.06;
+const GENERIC_FALLBACK_BAND_HALF_WIDTH: f32 = 0.23;
+const GENERIC_FALLBACK_MIN_SCORE: f32 = 6.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -1033,6 +1036,116 @@ fn infer_browser_fallback_band(spans: &[Span]) -> Option<(f32, f32)> {
     ))
 }
 
+fn infer_primary_band_for_fallback(
+    spans: &[Span],
+    min_score: f32,
+    half_width: f32,
+) -> Option<(f32, f32)> {
+    if spans.is_empty() {
+        return None;
+    }
+
+    const BUCKETS: usize = 20;
+    const WIDTH: f32 = 1.0 / BUCKETS as f32;
+    let mut scores = [0.0f32; BUCKETS];
+
+    for span in spans {
+        let Some(bounds) = span.bounds.as_ref() else {
+            continue;
+        };
+        let center_x = (bounds.left + bounds.width * 0.5).clamp(0.0, 0.999);
+        let idx = ((center_x / WIDTH).floor() as usize).min(BUCKETS - 1);
+        scores[idx] += browser_span_score(span);
+    }
+
+    let (best_idx, best_score) = scores
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))?;
+    if best_score < min_score {
+        return None;
+    }
+
+    let center = (best_idx as f32 + 0.5) * WIDTH;
+    Some((
+        (center - half_width).clamp(0.0, 1.0),
+        (center + half_width).clamp(0.0, 1.0),
+    ))
+}
+
+fn build_primary_pane_fallback_body(spans: &[Span]) -> Option<String> {
+    if spans.is_empty() {
+        return None;
+    }
+
+    let mut candidates: Vec<&Span> = spans
+        .iter()
+        .filter(|span| {
+            let Some(bounds) = span.bounds.as_ref() else {
+                return false;
+            };
+            if bounds.top < GENERIC_FALLBACK_TOP_CUTOFF {
+                return false;
+            }
+            if looks_like_ui_noise(&span.text, span.role.as_deref()) {
+                return false;
+            }
+            if looks_like_browser_shell_chrome(&span.text) {
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    let band = infer_primary_band_for_fallback(
+        &candidates
+            .iter()
+            .map(|s| (*s).clone())
+            .collect::<Vec<Span>>(),
+        GENERIC_FALLBACK_MIN_SCORE,
+        GENERIC_FALLBACK_BAND_HALF_WIDTH,
+    );
+
+    if let Some((left, right)) = band {
+        candidates.retain(|span| {
+            let Some(bounds) = span.bounds.as_ref() else {
+                return false;
+            };
+            let span_left = bounds.left;
+            let span_right = bounds.left + bounds.width;
+            span_right >= left && span_left <= right
+        });
+    }
+
+    candidates.sort_by(|a, b| visual_cmp(&a.bounds, &b.bounds));
+    let mut seen = std::collections::HashSet::new();
+    let mut lines = Vec::new();
+    for span in candidates {
+        let text = normalize_text(&span.text);
+        if text.is_empty() {
+            continue;
+        }
+        let key = normalize_key(&text);
+        if key.is_empty() {
+            continue;
+        }
+        if seen.insert(key) {
+            lines.push(text);
+        }
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join(" "))
+    }
+}
+
 fn build_browser_shell_fallback_body(spans: &[Span]) -> Option<String> {
     if spans.is_empty() {
         return None;
@@ -1061,11 +1174,13 @@ fn build_browser_shell_fallback_body(spans: &[Span]) -> Option<String> {
         return None;
     }
 
-    let band = infer_browser_fallback_band(
+    let band = infer_primary_band_for_fallback(
         &candidates
             .iter()
             .map(|s| (*s).clone())
             .collect::<Vec<Span>>(),
+        BROWSER_FALLBACK_MIN_SCORE,
+        BROWSER_FALLBACK_BAND_HALF_WIDTH,
     );
 
     if let Some((left, right)) = band {
@@ -2530,15 +2645,23 @@ pub fn extract_structured_messages_cancelable(
             None
         };
         let used_browser_fallback = browser_fallback_body.is_some();
+        let pane_fallback_body = if is_browser_shell {
+            None
+        } else {
+            build_primary_pane_fallback_body(&filtered)
+                .or_else(|| build_primary_pane_fallback_body(&ocr_spans_for_fallback))
+        };
+        let used_pane_fallback = pane_fallback_body.is_some();
         let fallback_body = browser_fallback_body
             .clone()
+            .or(pane_fallback_body)
+            .or_else(|| build_fallback_body_from_spans(&filtered))
             .or_else(|| {
                 input
                     .main_body_text
                     .or(input.accessibility_text)
                     .map(normalize_text)
             })
-            .or_else(|| build_fallback_body_from_spans(&filtered))
             .unwrap_or_default();
         let should_fallback = !fallback_body.is_empty();
 
@@ -2556,6 +2679,9 @@ pub fn extract_structured_messages_cancelable(
             {
                 warnings.push("browser_shell_ocr_fallback_used".to_string());
             }
+            if used_pane_fallback && !warnings.iter().any(|w| w == "primary_pane_fallback_used") {
+                warnings.push("primary_pane_fallback_used".to_string());
+            }
             if !is_conversation_profile
                 && !is_browser_shell
                 && !warnings
@@ -2566,6 +2692,8 @@ pub fn extract_structured_messages_cancelable(
             }
 
             let source = if used_browser_fallback {
+                "ocr"
+            } else if used_pane_fallback {
                 "ocr"
             } else if ax_tree_available {
                 "ax"
@@ -3005,6 +3133,45 @@ mod tests {
                 .to_lowercase()
                 .contains("absolutely, we can hop on a call")
         }));
+    }
+
+    #[test]
+    fn notion_non_conversation_uses_primary_pane_fallback() {
+        let ocr_json = r#"[
+            {"text":"Search","left":"0.06","top":"0.10","width":"0.12","height":"0.03"},
+            {"text":"Inbox","left":"0.07","top":"0.16","width":"0.10","height":"0.03"},
+            {"text":"Moya - Vel Yanchina","left":"0.36","top":"0.35","width":"0.30","height":"0.05"},
+            {"text":"Basic details","left":"0.37","top":"0.46","width":"0.18","height":"0.04"},
+            {"text":"Founder/s name","left":"0.38","top":"0.54","width":"0.15","height":"0.03"},
+            {"text":"Personal assistant for mac os","left":"0.56","top":"0.65","width":"0.30","height":"0.04"},
+            {"text":"Learn more","left":"0.08","top":"0.91","width":"0.12","height":"0.03"}
+        ]"#;
+        let input = StructuredExtractionInput {
+            captured_at: Utc::now(),
+            app_name: Some("Notion"),
+            window_name: Some("Workspace"),
+            browser_url: None,
+            main_body_text: Some("Search Inbox Learn more"),
+            accessibility_text: Some("Search Inbox Learn more"),
+            accessibility_tree_json: None,
+            ocr_text_json: Some(ocr_json),
+            focused_element: None,
+            identities: &[],
+        };
+
+        let out = extract_structured_messages(&input);
+        assert_ne!(out.content_kind, ContentKind::Conversation);
+        assert_eq!(out.meta.reason.as_deref(), Some("main_body_fallback"));
+        assert_eq!(out.messages.len(), 1);
+        let body = out.messages[0].body.to_lowercase();
+        assert!(body.contains("moya - vel yanchina"));
+        assert!(body.contains("basic details"));
+        assert!(!body.contains("inbox"));
+        assert!(out
+            .meta
+            .warnings
+            .iter()
+            .any(|w| w == "primary_pane_fallback_used"));
     }
 
     #[test]
