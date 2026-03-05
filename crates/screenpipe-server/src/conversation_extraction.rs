@@ -1115,16 +1115,7 @@ fn build_primary_pane_fallback_body(spans: &[Span]) -> Option<String> {
                 .unwrap_or(false)
         })
         .count();
-    let left_like_count = candidates
-        .iter()
-        .filter(|span| {
-            span.bounds
-                .as_ref()
-                .map(|b| b.left + b.width * 0.5 <= 0.28)
-                .unwrap_or(false)
-        })
-        .count();
-    if right_like_count >= 3 && right_like_count >= left_like_count {
+    if right_like_count >= 3 {
         candidates.retain(|span| {
             span.bounds
                 .as_ref()
@@ -1185,6 +1176,36 @@ fn build_browser_shell_fallback_body(spans: &[Span]) -> Option<String> {
         return None;
     }
 
+    // Browser shells frequently include a persistent left rail (tabs/sidebar).
+    // If we can detect both left rail and right/center content, anchor selection
+    // to the right/center pane before band inference so the rail cannot dominate.
+    let right_like_pre = candidates
+        .iter()
+        .filter(|span| {
+            span.bounds
+                .as_ref()
+                .map(|b| b.left + b.width * 0.5 >= 0.38)
+                .unwrap_or(false)
+        })
+        .count();
+    let left_like_pre = candidates
+        .iter()
+        .filter(|span| {
+            span.bounds
+                .as_ref()
+                .map(|b| b.left + b.width * 0.5 <= 0.26)
+                .unwrap_or(false)
+        })
+        .count();
+    if right_like_pre >= 3 && left_like_pre >= 2 && right_like_pre >= left_like_pre {
+        candidates.retain(|span| {
+            span.bounds
+                .as_ref()
+                .map(|b| (b.left + b.width * 0.5) >= 0.30 || b.width >= 0.45)
+                .unwrap_or(false)
+        });
+    }
+
     let band = infer_primary_band_for_fallback(
         &candidates
             .iter()
@@ -1202,6 +1223,33 @@ fn build_browser_shell_fallback_body(spans: &[Span]) -> Option<String> {
             let span_left = bounds.left;
             let span_right = bounds.left + bounds.width;
             span_right >= left && span_left <= right
+        });
+    }
+
+    let right_like_post = candidates
+        .iter()
+        .filter(|span| {
+            span.bounds
+                .as_ref()
+                .map(|b| b.left + b.width * 0.5 >= 0.38)
+                .unwrap_or(false)
+        })
+        .count();
+    let left_like_post = candidates
+        .iter()
+        .filter(|span| {
+            span.bounds
+                .as_ref()
+                .map(|b| b.left + b.width * 0.5 <= 0.26)
+                .unwrap_or(false)
+        })
+        .count();
+    if right_like_post >= 3 && right_like_post >= left_like_post {
+        candidates.retain(|span| {
+            span.bounds
+                .as_ref()
+                .map(|b| (b.left + b.width * 0.5) >= 0.30 || b.width >= 0.45)
+                .unwrap_or(false)
         });
     }
 
@@ -1223,6 +1271,17 @@ fn build_browser_shell_fallback_body(spans: &[Span]) -> Option<String> {
         None
     } else {
         Some(lines.join(" "))
+    }
+}
+
+fn infer_fallback_source_from_spans(spans: &[Span]) -> &'static str {
+    let has_ax = spans.iter().any(|s| s.source == "ax");
+    let has_ocr = spans.iter().any(|s| s.source == "ocr");
+    match (has_ax, has_ocr) {
+        (true, true) => "hybrid",
+        (true, false) => "ax",
+        (false, true) => "ocr",
+        (false, false) => "raw",
     }
 }
 
@@ -2649,31 +2708,52 @@ pub fn extract_structured_messages_cancelable(
                 | AppProfile::SlackDm
         );
         let is_browser_shell = is_browser_shell_app(input.app_name);
-        let browser_fallback_body = if is_browser_shell {
+        let filtered_source = infer_fallback_source_from_spans(&filtered);
+        let ocr_fallback_source = infer_fallback_source_from_spans(&ocr_spans_for_fallback);
+
+        let browser_fallback = if is_browser_shell {
             build_browser_shell_fallback_body(&ocr_spans_for_fallback)
-                .or_else(|| build_browser_shell_fallback_body(&filtered))
+                .map(|body| (body, ocr_fallback_source))
+                .or_else(|| {
+                    build_browser_shell_fallback_body(&filtered)
+                        .map(|body| (body, filtered_source))
+                })
         } else {
             None
         };
-        let used_browser_fallback = browser_fallback_body.is_some();
-        let pane_fallback_body = if is_browser_shell {
+        let used_browser_fallback = browser_fallback.is_some();
+
+        let pane_fallback = if is_browser_shell {
             None
         } else {
             build_primary_pane_fallback_body(&filtered)
-                .or_else(|| build_primary_pane_fallback_body(&ocr_spans_for_fallback))
+                .map(|body| (body, filtered_source))
+                .or_else(|| {
+                    build_primary_pane_fallback_body(&ocr_spans_for_fallback)
+                        .map(|body| (body, ocr_fallback_source))
+                })
         };
-        let used_pane_fallback = pane_fallback_body.is_some();
-        let fallback_body = browser_fallback_body
-            .clone()
-            .or(pane_fallback_body)
-            .or_else(|| build_fallback_body_from_spans(&filtered))
-            .or_else(|| {
-                input
-                    .main_body_text
-                    .or(input.accessibility_text)
-                    .map(normalize_text)
-            })
-            .unwrap_or_default();
+        let used_pane_fallback = pane_fallback.is_some();
+
+        let mut fallback_source: Option<&'static str> = None;
+        let fallback_body = if let Some((body, source)) = browser_fallback {
+            fallback_source = Some(source);
+            body
+        } else if let Some((body, source)) = pane_fallback {
+            fallback_source = Some(source);
+            body
+        } else if let Some(body) = build_fallback_body_from_spans(&filtered) {
+            fallback_source = Some(filtered_source);
+            body
+        } else if let Some(body) = input
+            .main_body_text
+            .or(input.accessibility_text)
+            .map(normalize_text)
+        {
+            body
+        } else {
+            String::new()
+        };
         let should_fallback = !fallback_body.is_empty();
 
         if should_fallback {
@@ -2702,10 +2782,8 @@ pub fn extract_structured_messages_cancelable(
                 warnings.push("non_conversation_main_body_fallback_used".to_string());
             }
 
-            let source = if used_browser_fallback {
-                "ocr"
-            } else if used_pane_fallback {
-                "ocr"
+            let source = if let Some(source) = fallback_source {
+                source
             } else if ax_tree_available {
                 "ax"
             } else if ocr_text_available {
@@ -3151,7 +3229,7 @@ mod tests {
         let ocr_json = r#"[
             {"text":"Search","left":"0.06","top":"0.10","width":"0.12","height":"0.03"},
             {"text":"Inbox","left":"0.07","top":"0.16","width":"0.10","height":"0.03"},
-            {"text":"Moya - Vel Yanchina","left":"0.36","top":"0.35","width":"0.30","height":"0.05"},
+            {"text":"Project - Founder Name","left":"0.36","top":"0.35","width":"0.30","height":"0.05"},
             {"text":"Basic details","left":"0.37","top":"0.46","width":"0.18","height":"0.04"},
             {"text":"Founder/s name","left":"0.38","top":"0.54","width":"0.15","height":"0.03"},
             {"text":"Personal assistant for mac os","left":"0.56","top":"0.65","width":"0.30","height":"0.04"},
@@ -3175,9 +3253,43 @@ mod tests {
         assert_eq!(out.meta.reason.as_deref(), Some("main_body_fallback"));
         assert_eq!(out.messages.len(), 1);
         let body = out.messages[0].body.to_lowercase();
-        assert!(body.contains("moya - vel yanchina"));
+        assert!(body.contains("project - founder name"));
         assert!(body.contains("basic details"));
         assert!(!body.contains("inbox"));
+        assert!(out
+            .meta
+            .warnings
+            .iter()
+            .any(|w| w == "primary_pane_fallback_used"));
+    }
+
+    #[test]
+    fn non_conversation_ax_pane_fallback_reports_ax_source() {
+        let ax_json = r#"[
+            {"role":"AXStaticText","text":"Search","depth":1,"bounds":{"left":0.06,"top":0.10,"width":0.12,"height":0.03}},
+            {"role":"AXStaticText","text":"Inbox","depth":1,"bounds":{"left":0.07,"top":0.16,"width":0.10,"height":0.03}},
+            {"role":"AXStaticText","text":"Project - Founder Profile","depth":1,"bounds":{"left":0.35,"top":0.34,"width":0.30,"height":0.05}},
+            {"role":"AXStaticText","text":"Basic details","depth":1,"bounds":{"left":0.36,"top":0.46,"width":0.18,"height":0.04}},
+            {"role":"AXStaticText","text":"Founder name","depth":1,"bounds":{"left":0.37,"top":0.54,"width":0.14,"height":0.03}}
+        ]"#;
+        let input = StructuredExtractionInput {
+            captured_at: Utc::now(),
+            app_name: Some("Notion"),
+            window_name: Some("Workspace"),
+            browser_url: None,
+            main_body_text: None,
+            accessibility_text: None,
+            accessibility_tree_json: Some(ax_json),
+            ocr_text_json: None,
+            focused_element: None,
+            identities: &[],
+        };
+
+        let out = extract_structured_messages(&input);
+        assert_ne!(out.content_kind, ContentKind::Conversation);
+        assert_eq!(out.meta.reason.as_deref(), Some("main_body_fallback"));
+        assert_eq!(out.messages.len(), 1);
+        assert_eq!(out.messages[0].source, "ax");
         assert!(out
             .meta
             .warnings
@@ -3190,11 +3302,11 @@ mod tests {
         let ocr_json = r#"[
             {"text":"Shared","left":"0.06","top":"0.18","width":"0.11","height":"0.03"},
             {"text":"Startup name - Founder name","left":"0.06","top":"0.23","width":"0.20","height":"0.03"},
-            {"text":"NiceGit - Dan Borthwick","left":"0.06","top":"0.27","width":"0.19","height":"0.03"},
-            {"text":"Paraklete - David Amaechi","left":"0.06","top":"0.31","width":"0.20","height":"0.03"},
-            {"text":"Moya - Vel Yanchina","left":"0.06","top":"0.35","width":"0.18","height":"0.03"},
-            {"text":"Project Pegasus - Jeff Yone","left":"0.06","top":"0.39","width":"0.20","height":"0.03"},
-            {"text":"Moya - Vel Yanchina","left":"0.34","top":"0.36","width":"0.30","height":"0.05"},
+            {"text":"Startup A - Founder One","left":"0.06","top":"0.27","width":"0.19","height":"0.03"},
+            {"text":"Startup B - Founder Two","left":"0.06","top":"0.31","width":"0.20","height":"0.03"},
+            {"text":"Project - Founder Name","left":"0.06","top":"0.35","width":"0.18","height":"0.03"},
+            {"text":"Startup C - Founder Three","left":"0.06","top":"0.39","width":"0.20","height":"0.03"},
+            {"text":"Project - Founder Name","left":"0.34","top":"0.36","width":"0.30","height":"0.05"},
             {"text":"Basic details","left":"0.35","top":"0.47","width":"0.16","height":"0.04"},
             {"text":"Founder/s name","left":"0.36","top":"0.54","width":"0.15","height":"0.03"},
             {"text":"Founder/s Linkedin","left":"0.36","top":"0.59","width":"0.17","height":"0.03"},
@@ -3220,8 +3332,50 @@ mod tests {
         let body = out.messages[0].body.to_lowercase();
         assert!(body.contains("basic details"));
         assert!(body.contains("personal assistant for mac os"));
-        assert!(!body.contains("project pegasus"));
-        assert!(!body.contains("paraklete"));
+        assert!(!body.contains("startup c"));
+        assert!(!body.contains("startup b"));
+    }
+
+    #[test]
+    fn notion_left_heavy_sidebar_still_keeps_center_document_body() {
+        let ocr_json = r#"[
+            {"text":"Search","left":"0.06","top":"0.10","width":"0.12","height":"0.03"},
+            {"text":"Inbox","left":"0.07","top":"0.14","width":"0.10","height":"0.03"},
+            {"text":"Shared","left":"0.06","top":"0.18","width":"0.11","height":"0.03"},
+            {"text":"Startup name - Founder name","left":"0.06","top":"0.22","width":"0.20","height":"0.03"},
+            {"text":"Startup A - Founder One","left":"0.06","top":"0.26","width":"0.19","height":"0.03"},
+            {"text":"Startup B - Founder Two","left":"0.06","top":"0.30","width":"0.20","height":"0.03"},
+            {"text":"Project - Founder Name","left":"0.06","top":"0.34","width":"0.18","height":"0.03"},
+            {"text":"Startup C - Founder Three","left":"0.06","top":"0.38","width":"0.20","height":"0.03"},
+            {"text":"Startup D - Founder Four","left":"0.06","top":"0.42","width":"0.17","height":"0.03"},
+            {"text":"Startup E - Founder Five","left":"0.06","top":"0.46","width":"0.16","height":"0.03"},
+            {"text":"Project - Founder Name","left":"0.36","top":"0.35","width":"0.30","height":"0.05"},
+            {"text":"Basic details","left":"0.37","top":"0.47","width":"0.18","height":"0.04"},
+            {"text":"Founder/s name","left":"0.38","top":"0.54","width":"0.15","height":"0.03"},
+            {"text":"Personal assistant for mac os helps you remember what matters and get it done","left":"0.53","top":"0.64","width":"0.38","height":"0.05"},
+            {"text":"Website","left":"0.38","top":"0.73","width":"0.10","height":"0.03"}
+        ]"#;
+        let input = StructuredExtractionInput {
+            captured_at: Utc::now(),
+            app_name: Some("Notion"),
+            window_name: Some("Workspace"),
+            browser_url: None,
+            main_body_text: Some("Search Inbox Shared"),
+            accessibility_text: Some("Search Inbox Shared"),
+            accessibility_tree_json: None,
+            ocr_text_json: Some(ocr_json),
+            focused_element: None,
+            identities: &[],
+        };
+
+        let out = extract_structured_messages(&input);
+        assert_ne!(out.content_kind, ContentKind::Conversation);
+        assert_eq!(out.messages.len(), 1);
+        let body = out.messages[0].body.to_lowercase();
+        assert!(body.contains("basic details"));
+        assert!(body.contains("personal assistant for mac os"));
+        assert!(!body.contains("startup name - founder name"));
+        assert!(!body.contains("startup c"));
     }
 
     #[test]
