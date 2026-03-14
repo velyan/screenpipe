@@ -4,8 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       sidecar_version:
-        description: "Sidecar version (example: 0.3.158-moya.1)"
-        required: true
+        description: "Optional expected screenpipe version. If set, it must match the built Cargo.toml version."
+        required: false
+        default: ""
       screenpipe_ref:
         description: "Git ref to build (branch, tag, or commit SHA)"
         required: false
@@ -20,11 +21,12 @@ permissions:
   contents: write
 
 jobs:
-  build-macos:
-    runs-on: macos-latest
-    strategy:
-      matrix:
-        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+  resolve-release:
+    runs-on: ubuntu-latest
+    outputs:
+      resolved_ref: ${{ steps.ref.outputs.value }}
+      resolved_sha: ${{ steps.version.outputs.sha }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - name: Resolve ref
         id: ref
@@ -40,6 +42,60 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.ref.outputs.value }}
+
+      - name: Resolve screenpipe version
+        id: version
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ github.event.inputs.sidecar_version }}
+        run: |
+          set -euo pipefail
+
+          VERSION="$(python3 - <<'PY'
+          import re
+
+          in_workspace_package = False
+          version = None
+
+          with open("Cargo.toml", "r", encoding="utf-8") as f:
+              for raw_line in f:
+                  line = raw_line.strip()
+                  if line.startswith("[") and line.endswith("]"):
+                      in_workspace_package = line == "[workspace.package]"
+                      continue
+                  if not in_workspace_package:
+                      continue
+                  match = re.match(r'^version\\s*=\\s*"([^"]+)"$', line)
+                  if match:
+                      version = match.group(1)
+                      break
+
+          if not version:
+              raise SystemExit("failed to resolve workspace.package.version from Cargo.toml")
+
+          print(version)
+          PY
+          )"
+
+          if [[ -n "${EXPECTED_VERSION}" && "${EXPECTED_VERSION}" != "${VERSION}" ]]; then
+            echo "sidecar_version mismatch: expected ${EXPECTED_VERSION}, resolved ${VERSION}" >&2
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build-macos:
+    runs-on: macos-latest
+    needs: resolve-release
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-release.outputs.resolved_ref }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -115,9 +171,54 @@ jobs:
           name: moya-sidecar-${{ matrix.target }}
           path: out/*
 
+  package-universal:
+    runs-on: macos-latest
+    needs: build-macos
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Build universal sidecar payload
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p out
+
+          create_universal_binary() {
+            local name="$1"
+            local arm64_path="artifacts/moya-sidecar-aarch64-apple-darwin/${name}-darwin-arm64"
+            local x64_path="artifacts/moya-sidecar-x86_64-apple-darwin/${name}-darwin-x64"
+            local output_path="out/${name}-darwin-universal"
+
+            if [[ ! -f "${arm64_path}" || ! -f "${x64_path}" ]]; then
+              echo "Missing architecture slices for ${name}" >&2
+              exit 1
+            fi
+
+            lipo -create "${arm64_path}" "${x64_path}" -output "${output_path}"
+            chmod +x "${output_path}"
+            if ! lipo "${output_path}" -verify_arch arm64 x86_64 >/dev/null 2>&1; then
+              echo "Universal merge failed for ${name}: $(lipo -info "${output_path}" 2>/dev/null || file -b "${output_path}")" >&2
+              exit 1
+            fi
+          }
+
+          create_universal_binary screenpipe
+          create_universal_binary ffmpeg
+          create_universal_binary ffprobe
+
+      - name: Upload universal sidecar artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: moya-sidecar-darwin-universal
+          path: out/*
+
   publish-release:
     runs-on: ubuntu-latest
-    needs: build-macos
+    needs: [resolve-release, build-macos, package-universal]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -131,11 +232,11 @@ jobs:
         shell: bash
         env:
           GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_SHA: ${{ github.sha }}
+          SOURCE_COMMIT: ${{ needs.resolve-release.outputs.resolved_sha }}
+          VERSION: ${{ needs.resolve-release.outputs.version }}
         run: |
           set -euo pipefail
 
-          VERSION="${{ github.event.inputs.sidecar_version }}"
           export VERSION
           TAG="moya-sidecar-v${VERSION}"
 
@@ -146,6 +247,9 @@ jobs:
           cp artifacts/moya-sidecar-x86_64-apple-darwin/screenpipe-darwin-x64 release-assets/
           cp artifacts/moya-sidecar-x86_64-apple-darwin/ffmpeg-darwin-x64 release-assets/
           cp artifacts/moya-sidecar-x86_64-apple-darwin/ffprobe-darwin-x64 release-assets/
+          cp artifacts/moya-sidecar-darwin-universal/screenpipe-darwin-universal release-assets/
+          cp artifacts/moya-sidecar-darwin-universal/ffmpeg-darwin-universal release-assets/
+          cp artifacts/moya-sidecar-darwin-universal/ffprobe-darwin-universal release-assets/
 
           python3 - <<'PY'
           import hashlib
@@ -155,7 +259,7 @@ jobs:
 
           version = os.environ["VERSION"]
           repo = os.environ["GITHUB_REPOSITORY"]
-          commit = os.environ["GITHUB_SHA"]
+          commit = os.environ["SOURCE_COMMIT"]
           tag = f"moya-sidecar-v{version}"
           base_url = f"https://github.com/{repo}/releases/download/{tag}"
           root = Path("release-assets")
@@ -183,6 +287,11 @@ jobs:
                       "ffmpeg": entry("ffmpeg-darwin-x64"),
                       "ffprobe": entry("ffprobe-darwin-x64"),
                   },
+                  "darwin-universal": {
+                      "screenpipe": entry("screenpipe-darwin-universal"),
+                      "ffmpeg": entry("ffmpeg-darwin-universal"),
+                      "ffprobe": entry("ffprobe-darwin-universal"),
+                  },
               },
           }
 
@@ -200,9 +309,10 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_COMMIT: ${{ needs.resolve-release.outputs.resolved_sha }}
+          VERSION: ${{ needs.resolve-release.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${{ github.event.inputs.sidecar_version }}"
           TAG="moya-sidecar-v${VERSION}"
           TITLE="Moya Sidecar ${VERSION}"
 
@@ -210,9 +320,9 @@ jobs:
             echo "Release ${TAG} already exists; reusing."
           else
             if [[ "${{ github.event.inputs.prerelease }}" == "true" ]]; then
-              gh release create "${TAG}" --title "${TITLE}" --notes "Moya sidecar release ${VERSION}" --prerelease
+              gh release create "${TAG}" --target "${SOURCE_COMMIT}" --title "${TITLE}" --notes "Moya sidecar release ${VERSION}" --prerelease
             else
-              gh release create "${TAG}" --title "${TITLE}" --notes "Moya sidecar release ${VERSION}"
+              gh release create "${TAG}" --target "${SOURCE_COMMIT}" --title "${TITLE}" --notes "Moya sidecar release ${VERSION}"
             fi
           fi
 
@@ -222,5 +332,8 @@ jobs:
           gh release upload "${TAG}" release-assets/screenpipe-darwin-x64 --clobber
           gh release upload "${TAG}" release-assets/ffmpeg-darwin-x64 --clobber
           gh release upload "${TAG}" release-assets/ffprobe-darwin-x64 --clobber
+          gh release upload "${TAG}" release-assets/screenpipe-darwin-universal --clobber
+          gh release upload "${TAG}" release-assets/ffmpeg-darwin-universal --clobber
+          gh release upload "${TAG}" release-assets/ffprobe-darwin-universal --clobber
           gh release upload "${TAG}" release-assets/moya-sidecar-manifest.json --clobber
           gh release upload "${TAG}" release-assets/moya-sidecar-manifest.sha256 --clobber
