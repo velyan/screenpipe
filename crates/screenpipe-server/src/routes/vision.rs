@@ -20,8 +20,8 @@ use screenpipe_accessibility::tree::{
 use screenpipe_accessibility::{UiCaptureConfig, UiRecorder};
 use screenpipe_db::{ContentType, SearchResult};
 use screenpipe_vision::capture_screenshot_by_window::{
-    capture_all_visible_windows, capture_focused_window, get_frontmost_pid, FocusedWindowTarget,
-    Rect, WindowFilters,
+    capture_all_visible_windows, capture_focused_window, get_frontmost_pid,
+    list_visible_windows_metadata, FocusedWindowTarget, Rect, VisibleWindowMetadata, WindowFilters,
 };
 use screenpipe_vision::monitor::{
     get_monitor_by_id, list_monitors, list_monitors_detailed, MonitorListError, SafeMonitor,
@@ -302,12 +302,9 @@ async fn best_fallback_monitor(
 }
 
 async fn best_fallback_window_across_monitors(
-    tree_walker_config: &TreeWalkerConfig,
+    window_filters: &WindowFilters,
     explicit_monitor_id: Option<u32>,
-) -> Option<(
-    screenpipe_vision::capture_screenshot_by_window::CapturedWindow,
-    u32,
-)> {
+) -> Option<(FocusedWindowTarget, u32)> {
     let monitors: Vec<SafeMonitor> = if let Some(mid) = explicit_monitor_id {
         get_monitor_by_id(mid).await.into_iter().collect()
     } else {
@@ -317,41 +314,50 @@ async fn best_fallback_window_across_monitors(
         return None;
     }
 
-    let window_filters = WindowFilters::new(
-        &tree_walker_config.ignored_windows,
-        &tree_walker_config.included_windows,
-        &[],
-    );
+    let windows = list_visible_windows_metadata(window_filters).ok()?;
+    if windows.is_empty() {
+        return None;
+    }
+
+    let monitor_candidates: Vec<MonitorCandidate> = monitors
+        .iter()
+        .map(|monitor| MonitorCandidate {
+            id: monitor.id(),
+            bounds: Rect {
+                x: monitor.x(),
+                y: monitor.y(),
+                width: monitor.width(),
+                height: monitor.height(),
+            },
+        })
+        .collect();
+
     let frontmost_pid = get_frontmost_pid();
+    select_best_fallback_window_target(&windows, &monitor_candidates, frontmost_pid)
+}
 
-    let mut best_candidate: Option<(
-        screenpipe_vision::capture_screenshot_by_window::CapturedWindow,
-        u32,
-        (u8, u8, u64),
-    )> = None;
+#[derive(Debug, Clone, Copy)]
+struct MonitorCandidate {
+    id: u32,
+    bounds: Rect,
+}
 
-    for monitor in &monitors {
-        let Ok(captured_windows) =
-            capture_all_visible_windows(monitor, &window_filters, false).await
-        else {
-            continue;
-        };
+fn select_best_fallback_window_target(
+    windows: &[VisibleWindowMetadata],
+    monitors: &[MonitorCandidate],
+    frontmost_pid: Option<i32>,
+) -> Option<(FocusedWindowTarget, u32)> {
+    let mut best_candidate: Option<(FocusedWindowTarget, u32, (u8, u8, u64))> = None;
 
-        let monitor_rect = Rect {
-            x: monitor.x(),
-            y: monitor.y(),
-            width: monitor.width(),
-            height: monitor.height(),
-        };
+    for window in windows {
+        let window_bounds = window.bounds();
 
-        for window in captured_windows {
-            let window_rect = Rect {
-                x: window.window_x,
-                y: window.window_y,
-                width: window.window_width,
-                height: window.window_height,
-            };
-            let overlap = window_rect.intersection_area(&monitor_rect);
+        for monitor in monitors {
+            let overlap = window_bounds.intersection_area(&monitor.bounds);
+            if overlap == 0 {
+                continue;
+            }
+
             let score = (
                 u8::from(frontmost_pid == Some(window.process_id)),
                 u8::from(window.is_focused),
@@ -364,12 +370,22 @@ async fn best_fallback_window_across_monitors(
                 .unwrap_or(true);
 
             if should_replace {
-                best_candidate = Some((window, monitor.id(), score));
+                best_candidate = Some((
+                    FocusedWindowTarget {
+                        process_id: window.process_id,
+                        app_name: window.app_name.clone(),
+                        window_name: window.window_name.clone(),
+                        window_id: window.window_id,
+                        bounds: window_bounds,
+                    },
+                    monitor.id,
+                    score,
+                ));
             }
         }
     }
 
-    best_candidate.map(|(window, monitor_id, _)| (window, monitor_id))
+    best_candidate.map(|(target, monitor_id, _)| (target, monitor_id))
 }
 
 async fn resolve_active_window(
@@ -441,7 +457,7 @@ async fn resolve_active_window(
         bounds: target_bounds,
     };
 
-    let captured_window = match capture_focused_window(&target, &window_filters).await {
+    let captured_window = match capture_focused_window(&target, &window_filters) {
         Ok(Some(captured_window)) => captured_window,
         Ok(None) => {
             return Ok(ActiveWindowResolution::Fallback {
@@ -653,6 +669,11 @@ pub(crate) async fn capture_active_window(
     JsonResponse(req): JsonResponse<CaptureActiveWindowRequest>,
 ) -> Result<JsonResponse<ActiveWindowCaptureResponse>, (StatusCode, JsonResponse<Value>)> {
     let tree_walker_config = tree_walker_config_from_state(&state);
+    let window_filters = WindowFilters::new(
+        &tree_walker_config.ignored_windows,
+        &tree_walker_config.included_windows,
+        &[],
+    );
     let resolution = resolve_active_window(&tree_walker_config)
         .await
         .map_err(|e| {
@@ -715,26 +736,88 @@ pub(crate) async fn capture_active_window(
                 ));
             }
 
-            if let Some((window, selected_monitor_id)) =
-                best_fallback_window_across_monitors(&tree_walker_config, monitor_id).await
+            if let Some((target, selected_monitor_id)) =
+                best_fallback_window_across_monitors(&window_filters, monitor_id).await
             {
-                debug!(
-                    "active-window strict=false fallback to window OCR (reason={reason}, monitor={}, app={}, window={})",
-                    selected_monitor_id,
-                    window.app_name,
-                    window.window_name
-                );
+                let fallback_app = target.app_name.clone();
+                let fallback_window = target.window_name.clone();
+                let fallback_window_capture = match capture_focused_window(&target, &window_filters)
+                {
+                    Ok(Some(window)) => Some(window),
+                    Ok(None) => {
+                        debug!(
+                            "active-window strict=false fallback target capture missed (reason={reason}, monitor={}, app={}, window={})",
+                            selected_monitor_id, fallback_app, fallback_window
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        let capture_error = e.to_string();
+                        debug!(
+                            "active-window strict=false fallback target capture error (reason={reason}, monitor={}, app={}, window={}): {}",
+                            selected_monitor_id, fallback_app, fallback_window, capture_error
+                        );
+                        None
+                    }
+                };
 
-                (
-                    window.image,
-                    selected_monitor_id,
-                    None,
-                    Some(window.app_name),
-                    Some(window.window_name),
-                    window.browser_url,
-                    window.is_focused,
-                    PROVENANCE_MONITOR_FALLBACK,
-                )
+                if let Some(window) = fallback_window_capture {
+                    debug!(
+                        "active-window strict=false fallback to window OCR (reason={reason}, monitor={}, app={}, window={})",
+                        selected_monitor_id,
+                        window.app_name,
+                        window.window_name
+                    );
+
+                    (
+                        window.image,
+                        selected_monitor_id,
+                        None,
+                        Some(window.app_name),
+                        Some(window.window_name),
+                        window.browser_url,
+                        window.is_focused,
+                        PROVENANCE_MONITOR_FALLBACK,
+                    )
+                } else {
+                    let monitor = best_fallback_monitor(&tree_walker_config, monitor_id).await;
+
+                    let Some(monitor) = monitor else {
+                        return Err((
+                            StatusCode::CONFLICT,
+                            JsonResponse(json!({
+                                "error": "active_window_unavailable",
+                                "reason": "no_monitors",
+                            })),
+                        ));
+                    };
+
+                    debug!(
+                        "active-window strict=false fallback to monitor screenshot (reason={reason}, monitor={})",
+                        monitor.id()
+                    );
+
+                    let (image, _) = capture_monitor_image(&monitor).await.map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            JsonResponse(json!({
+                                "error": "monitor_fallback_capture_failed",
+                                "message": e.to_string(),
+                            })),
+                        )
+                    })?;
+
+                    (
+                        image,
+                        monitor.id(),
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                        PROVENANCE_MONITOR_FALLBACK,
+                    )
+                }
             } else {
                 let monitor = best_fallback_monitor(&tree_walker_config, monitor_id).await;
 
@@ -895,6 +978,43 @@ pub(crate) async fn latest_active_window(
         ));
     };
 
+    let meta = state
+        .db
+        .get_frame_capture_metadata(frame_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonResponse(json!({
+                    "error": "latest_active_window_lookup_failed",
+                    "message": e.to_string(),
+                })),
+            )
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                JsonResponse(json!({
+                    "error": "frame_not_found",
+                    "frame_id": frame_id,
+                })),
+            )
+        })?;
+
+    let max_age_ms = i64::try_from(query.max_age_ms).unwrap_or(i64::MAX);
+    let age_ms = (Utc::now() - meta.timestamp).num_milliseconds().max(0);
+    if age_ms > max_age_ms {
+        return Err((
+            StatusCode::CONFLICT,
+            JsonResponse(json!({
+                "error": "stale_active_window_capture",
+                "captured_at": meta.timestamp,
+                "age_ms": age_ms,
+                "max_age_ms": query.max_age_ms,
+            })),
+        ));
+    }
+
     let build_opts = StructuredBuildOptions {
         include_structured_messages: true,
         structured_timeout_ms: default_structured_timeout_ms(),
@@ -921,19 +1041,6 @@ pub(crate) async fn latest_active_window(
                 })),
             )
         })?;
-
-    let max_age_ms = i64::try_from(query.max_age_ms).unwrap_or(i64::MAX);
-    if response.age_ms > max_age_ms {
-        return Err((
-            StatusCode::CONFLICT,
-            JsonResponse(json!({
-                "error": "stale_active_window_capture",
-                "captured_at": response.captured_at,
-                "age_ms": response.age_ms,
-                "max_age_ms": query.max_age_ms,
-            })),
-        ));
-    }
 
     Ok(Json(response))
 }
@@ -985,4 +1092,80 @@ pub(crate) async fn active_window_health() -> JsonResponse<ActiveWindowHealthRes
         input_monitoring,
         details,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_best_fallback_window_target_prefers_frontmost_overlap() {
+        let windows = vec![
+            VisibleWindowMetadata {
+                app_name: "Slack".to_string(),
+                window_name: "asks".to_string(),
+                process_id: 42,
+                window_id: Some(7),
+                is_focused: true,
+                window_x: 0,
+                window_y: 0,
+                window_width: 900,
+                window_height: 700,
+            },
+            VisibleWindowMetadata {
+                app_name: "Arc".to_string(),
+                window_name: "docs".to_string(),
+                process_id: 84,
+                window_id: Some(8),
+                is_focused: false,
+                window_x: 0,
+                window_y: 0,
+                window_width: 1200,
+                window_height: 700,
+            },
+        ];
+        let monitors = vec![MonitorCandidate {
+            id: 1,
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                width: 1440,
+                height: 900,
+            },
+        }];
+
+        let (target, monitor_id) =
+            select_best_fallback_window_target(&windows, &monitors, Some(42)).unwrap();
+
+        assert_eq!(monitor_id, 1);
+        assert_eq!(target.app_name, "Slack");
+        assert_eq!(target.window_name, "asks");
+        assert_eq!(target.window_id, Some(7));
+    }
+
+    #[test]
+    fn select_best_fallback_window_target_skips_windows_without_monitor_overlap() {
+        let windows = vec![VisibleWindowMetadata {
+            app_name: "Slack".to_string(),
+            window_name: "asks".to_string(),
+            process_id: 42,
+            window_id: Some(7),
+            is_focused: true,
+            window_x: 2000,
+            window_y: 0,
+            window_width: 800,
+            window_height: 600,
+        }];
+        let monitors = vec![MonitorCandidate {
+            id: 1,
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                width: 1440,
+                height: 900,
+            },
+        }];
+
+        assert!(select_best_fallback_window_target(&windows, &monitors, Some(42)).is_none());
+    }
 }

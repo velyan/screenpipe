@@ -461,27 +461,31 @@ fn parse_ocr_lines(ocr_text_json: Option<&str>) -> Vec<OcrLine> {
 }
 
 fn is_browser_shell_context(input: &DistillationInput<'_>) -> bool {
-    let mut haystack = String::new();
-    if let Some(app) = input.app_name {
-        haystack.push_str(app);
-        haystack.push(' ');
-    }
-    if let Some(window) = input.window_name {
-        haystack.push_str(window);
-        haystack.push(' ');
-    }
-    if let Some(url) = input.browser_url {
-        haystack.push_str(url);
-    }
-    let l = haystack.to_lowercase();
-    l.contains("arc")
-        || l.contains("chrome")
-        || l.contains("safari")
-        || l.contains("firefox")
-        || l.contains("brave")
-        || l.contains("edge")
-        || l.contains("vivaldi")
-        || l.contains("opera")
+    let Some(app_name) = input.app_name else {
+        return false;
+    };
+
+    let normalized = app_name
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect::<String>();
+
+    normalized.split_whitespace().any(|token| {
+        matches!(
+            token,
+            "arc"
+                | "chrome"
+                | "chromium"
+                | "safari"
+                | "firefox"
+                | "brave"
+                | "edge"
+                | "msedge"
+                | "vivaldi"
+                | "opera"
+        )
+    })
 }
 
 fn ocr_line_center_x(line: &OcrLine) -> f32 {
@@ -1504,5 +1508,21 @@ mod tests {
         assert!(out.main_body_text.contains("Lessons for founders"));
         assert!(!out.main_body_text.contains("Sidebar item"));
         assert!(!out.main_body_text.contains("Hide sidebar"));
+    }
+
+    #[test]
+    fn browser_shell_detection_does_not_use_window_title_substrings() {
+        let input = DistillationInput {
+            raw_text: "Project notes for March sprint planning",
+            ocr_text_json: None,
+            app_name: Some("Knowledge Base"),
+            window_name: Some("March planning notes"),
+            browser_url: None,
+            content_hash: Some(131),
+            nodes: None,
+            focused_element: None,
+        };
+
+        assert!(!is_browser_shell_context(&input));
     }
 }

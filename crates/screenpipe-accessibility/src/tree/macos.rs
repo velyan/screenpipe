@@ -225,14 +225,34 @@ impl MacosTreeWalker {
         let system = ax::UiElement::sys_wide();
         let ax_app = match system.focused_app() {
             Ok(app) => app,
-            Err(_) => return Ok(None),
+            Err(e) => {
+                let detail = e.to_string();
+                log_no_snapshot(
+                    "focused_app_unavailable",
+                    SnapshotLogContext::visible(None, None),
+                    Some(&detail),
+                );
+                return Ok(None);
+            }
         };
         let pid = match ax_app.pid() {
             Ok(pid) => pid,
-            Err(_) => return Ok(None),
+            Err(_) => {
+                log_no_snapshot(
+                    "focused_app_pid_unavailable",
+                    SnapshotLogContext::visible(None, None),
+                    None,
+                );
+                return Ok(None);
+            }
         };
         let app = ns::RunningApp::with_pid(pid);
         let Some(app) = app else {
+            log_no_snapshot(
+                "running_app_lookup_failed",
+                SnapshotLogContext::visible(None, None),
+                None,
+            );
             return Ok(None);
         };
 
@@ -249,6 +269,7 @@ impl MacosTreeWalker {
             .iter()
             .any(|pattern| app_lower.contains(&pattern.to_lowercase()))
         {
+            log_no_snapshot("blocked_app_filtered", SnapshotLogContext::redacted(), None);
             return Ok(None);
         }
 
@@ -257,6 +278,7 @@ impl MacosTreeWalker {
             let p = pattern.to_lowercase();
             app_lower.contains(&p)
         }) {
+            log_no_snapshot("ignored_app_filtered", SnapshotLogContext::redacted(), None);
             return Ok(None);
         }
 
@@ -276,10 +298,22 @@ impl MacosTreeWalker {
 
         let window_val = match ax_app.attr_value(ax::attr::focused_window()) {
             Ok(v) => v,
-            Err(_) => return Ok(None),
+            Err(_) => {
+                log_no_snapshot(
+                    "focused_window_unavailable",
+                    SnapshotLogContext::visible(Some(&app_name), None),
+                    None,
+                );
+                return Ok(None);
+            }
         };
 
         if window_val.get_type_id() != ax::UiElement::type_id() {
+            log_no_snapshot(
+                "focused_window_wrong_type",
+                SnapshotLogContext::visible(Some(&app_name), None),
+                Some("AXFocusedWindow was not an AXUiElement"),
+            );
             return Ok(None);
         }
         let window: &ax::UiElement = unsafe { std::mem::transmute(&*window_val) };
@@ -295,6 +329,11 @@ impl MacosTreeWalker {
             .iter()
             .any(|pattern| window_lower.contains(&pattern.to_lowercase()))
         {
+            log_no_snapshot(
+                "blocked_window_title_filtered",
+                SnapshotLogContext::redacted(),
+                None,
+            );
             return Ok(None);
         }
 
@@ -303,6 +342,11 @@ impl MacosTreeWalker {
             let p = pattern.to_lowercase();
             window_lower.contains(&p)
         }) {
+            log_no_snapshot(
+                "ignored_window_filtered",
+                SnapshotLogContext::redacted(),
+                None,
+            );
             return Ok(None);
         }
 
@@ -317,6 +361,7 @@ impl MacosTreeWalker {
                 window_lower.contains(&p)
             });
             if !matches_app && !matches_window {
+                log_no_snapshot("included_window_miss", SnapshotLogContext::redacted(), None);
                 return Ok(None);
             }
         }
@@ -400,6 +445,61 @@ impl MacosTreeWalker {
             max_depth_reached: state.max_depth_reached,
         }))
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotLogVisibility {
+    Visible,
+    Redacted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SnapshotLogContext<'a> {
+    app_name: Option<&'a str>,
+    window_name: Option<&'a str>,
+    visibility: SnapshotLogVisibility,
+}
+
+impl<'a> SnapshotLogContext<'a> {
+    fn visible(app_name: Option<&'a str>, window_name: Option<&'a str>) -> Self {
+        Self {
+            app_name,
+            window_name,
+            visibility: SnapshotLogVisibility::Visible,
+        }
+    }
+
+    fn redacted() -> Self {
+        Self {
+            app_name: None,
+            window_name: None,
+            visibility: SnapshotLogVisibility::Redacted,
+        }
+    }
+
+    fn app_for_log(self) -> &'a str {
+        match self.visibility {
+            SnapshotLogVisibility::Visible => self.app_name.unwrap_or("<unknown>"),
+            SnapshotLogVisibility::Redacted => "<redacted>",
+        }
+    }
+
+    fn window_for_log(self) -> &'a str {
+        match self.visibility {
+            SnapshotLogVisibility::Visible => self.window_name.unwrap_or("<unknown>"),
+            SnapshotLogVisibility::Redacted => "<redacted>",
+        }
+    }
+}
+
+fn log_no_snapshot(reason: &str, context: SnapshotLogContext<'_>, detail: Option<&str>) {
+    debug!(
+        "tree walk: no focused window snapshot (reason={}, app={}, window={}, detail={})",
+        reason,
+        context.app_for_log(),
+        context.window_for_log(),
+        detail.unwrap_or("<none>")
+    );
 }
 
 fn extract_focused_element_context(
@@ -868,6 +968,20 @@ mod tests {
         assert!(!looks_like_url("hello world"));
         assert!(!looks_like_url(".hidden"));
         assert!(!looks_like_url("abc"));
+    }
+
+    #[test]
+    fn test_snapshot_log_context_redacts_sensitive_metadata() {
+        let context = SnapshotLogContext::redacted();
+        assert_eq!(context.app_for_log(), "<redacted>");
+        assert_eq!(context.window_for_log(), "<redacted>");
+    }
+
+    #[test]
+    fn test_snapshot_log_context_preserves_visible_metadata() {
+        let context = SnapshotLogContext::visible(Some("Arc"), Some("Project notes"));
+        assert_eq!(context.app_for_log(), "Arc");
+        assert_eq!(context.window_for_log(), "Project notes");
     }
 
     #[test]

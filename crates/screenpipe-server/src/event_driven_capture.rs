@@ -719,7 +719,6 @@ async fn resolve_focused_window_for_monitor(
         bounds: target_bounds,
     };
     let focused_capture = capture_focused_window(&target, &window_filters)
-        .await
         .map_err(|e| anyhow::anyhow!("focused window capture failed: {}", e))?;
     let Some(captured_window) = focused_capture else {
         debug!(

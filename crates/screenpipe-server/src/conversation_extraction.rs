@@ -5,8 +5,10 @@
 use chrono::{DateTime, Local, LocalResult, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use regex::Regex;
 use screenpipe_accessibility::tree::{AccessibilityTreeNode, FocusedElementContext, NodeBounds};
+use serde::de::{DeserializeSeed, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 const DEFAULT_CONVERSATION_THRESHOLD: f32 = 0.55;
@@ -336,6 +338,12 @@ fn parse_iso_from_label(label: &str, captured_at: DateTime<Utc>) -> Option<Strin
             .map(|(_, rhs)| rhs.trim())
             .filter(|v| !v.is_empty())
             .unwrap_or("");
+        let token = token.trim_start_matches(',').trim();
+        let token = token
+            .strip_prefix("at ")
+            .or_else(|| token.strip_prefix("At "))
+            .unwrap_or(token)
+            .trim();
         if let Some(time) = parse_time_token(token) {
             let ndt = NaiveDateTime::new(day, time);
             if let LocalResult::Single(local_dt) = Local.from_local_datetime(&ndt) {
@@ -752,30 +760,82 @@ fn normalize_ocr_bounds(
     })
 }
 
-fn parse_spans_from_ax(tree_json: Option<&str>) -> Vec<Span> {
-    let Some(raw) = tree_json else {
-        return Vec::new();
-    };
+struct AxSpanSeed<'a> {
+    cancel: Option<&'a AtomicBool>,
+}
 
-    let Ok(nodes) = serde_json::from_str::<Vec<AccessibilityTreeNode>>(raw) else {
-        return Vec::new();
-    };
+struct AxSpanVisitor<'a> {
+    cancel: Option<&'a AtomicBool>,
+}
 
-    nodes
-        .into_iter()
-        .filter_map(|node| {
+impl<'de, 'a> DeserializeSeed<'de> for AxSpanSeed<'a> {
+    type Value = Vec<Span>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(AxSpanVisitor {
+            cancel: self.cancel,
+        })
+    }
+}
+
+impl<'de, 'a> Visitor<'de> for AxSpanVisitor<'a> {
+    type Value = Vec<Span>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a sequence of accessibility tree nodes")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut spans = Vec::new();
+        loop {
+            if is_cancelled(self.cancel) {
+                return Ok(spans);
+            }
+
+            let Some(node) = seq.next_element::<AccessibilityTreeNode>()? else {
+                return Ok(spans);
+            };
+
             let text = normalize_text(&node.text);
             if text.is_empty() {
-                return None;
+                continue;
             }
-            Some(Span {
+            spans.push(Span {
                 text,
                 bounds: node.bounds,
                 source: "ax",
                 role: Some(node.role),
-            })
-        })
-        .collect()
+            });
+        }
+    }
+}
+
+fn parse_spans_from_ax(tree_json: Option<&str>, cancel: Option<&AtomicBool>) -> Vec<Span> {
+    let Some(raw) = tree_json else {
+        return Vec::new();
+    };
+    if is_cancelled(cancel) {
+        return Vec::new();
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    let Ok(spans) = AxSpanSeed { cancel }.deserialize(&mut deserializer) else {
+        return Vec::new();
+    };
+    if is_cancelled(cancel) {
+        return Vec::new();
+    }
+    if deserializer.end().is_err() {
+        return Vec::new();
+    }
+
+    spans
 }
 
 fn parse_spans_from_ocr(ocr_text_json: Option<&str>, cancel: Option<&AtomicBool>) -> Vec<Span> {
@@ -945,6 +1005,20 @@ fn is_near_duplicate_bounds(a: &NodeBounds, b: &NodeBounds) -> bool {
         && (a.top - b.top).abs() <= 0.015
         && (a.width - b.width).abs() <= 0.06
         && (a.height - b.height).abs() <= 0.06
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let haystack_bytes = haystack.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    if haystack_bytes.len() < needle_bytes.len() {
+        return None;
+    }
+    haystack_bytes
+        .windows(needle_bytes.len())
+        .position(|window| window.eq_ignore_ascii_case(needle_bytes))
 }
 
 fn looks_like_browser_shell_chrome(line: &str) -> bool {
@@ -1697,10 +1771,10 @@ fn parse_whatsapp_message_line(
         return None;
     };
 
-    let marker_idx = lower.find(marker)?;
-    let (left, right) = compact.split_at(marker_idx);
+    let marker_idx = find_ascii_case_insensitive(&compact, marker)?;
+    let (left, right_with_marker) = compact.split_at(marker_idx);
+    let right = right_with_marker.get(marker.len()..)?.trim();
     let sender = right
-        .trim_start_matches(marker)
         .split(',')
         .next()
         .map(|v| v.trim().to_string())
@@ -1715,10 +1789,11 @@ fn parse_whatsapp_message_line(
         return None;
     }
 
-    let mut body = payload.clone();
+    let payload_for_timestamp = payload.trim_end_matches(',').trim().to_string();
+    let mut body = payload_for_timestamp.clone();
     let mut timestamp_raw = None;
-    if let Some(ts_sep_idx) = payload.rfind(',') {
-        let (maybe_body, maybe_ts) = payload.split_at(ts_sep_idx);
+    if let Some(ts_sep_idx) = payload_for_timestamp.rfind(',') {
+        let (maybe_body, maybe_ts) = payload_for_timestamp.split_at(ts_sep_idx);
         let ts = maybe_ts.trim_start_matches(',').trim();
         if looks_like_timestamp(ts) {
             timestamp_raw = Some(ts.to_string());
@@ -1726,7 +1801,7 @@ fn parse_whatsapp_message_line(
         }
     }
     if body.is_empty() {
-        body = payload;
+        body = payload_for_timestamp;
     }
     if is_timestamp_only_message(&body) {
         return None;
@@ -2538,7 +2613,7 @@ pub fn extract_structured_messages_cancelable(
         input.accessibility_text,
     );
 
-    let ax_spans = parse_spans_from_ax(input.accessibility_tree_json);
+    let ax_spans = parse_spans_from_ax(input.accessibility_tree_json, cancel);
     let ocr_spans = parse_spans_from_ocr(input.ocr_text_json, cancel);
     let ocr_spans_for_fallback = ocr_spans.clone();
     let ax_tree_available = !ax_spans.is_empty();
@@ -2715,8 +2790,7 @@ pub fn extract_structured_messages_cancelable(
             build_browser_shell_fallback_body(&ocr_spans_for_fallback)
                 .map(|body| (body, ocr_fallback_source))
                 .or_else(|| {
-                    build_browser_shell_fallback_body(&filtered)
-                        .map(|body| (body, filtered_source))
+                    build_browser_shell_fallback_body(&filtered).map(|body| (body, filtered_source))
                 })
         } else {
             None
@@ -3173,6 +3247,13 @@ mod tests {
     }
 
     #[test]
+    fn ax_parser_rejects_trailing_json_data() {
+        let raw = r#"[{"role":"AXStaticText","text":"Hello","depth":0,"bounds":{"left":0.1,"top":0.2,"width":0.3,"height":0.1}}] trailing"#;
+        let spans = parse_spans_from_ax(Some(raw), None);
+        assert!(spans.is_empty());
+    }
+
+    #[test]
     fn whatsapp_policy_parser_splits_bubbles() {
         let input = input_with_text(
             "Your message, hey are you free tomorrow?, 25Februaryat4:59 pm, Sent to Contact A\nmessage, yes let's do it, 25Februaryat5:02 pm, Received from Contact A\nmessage, joining now...., 5:14 pm, Received from Contact A",
@@ -3184,6 +3265,21 @@ mod tests {
         assert!(out.messages.len() >= 3, "expected per-message extraction");
         assert_eq!(out.messages[0].direction, MessageDirection::Outgoing);
         assert_eq!(out.messages[1].direction, MessageDirection::Incoming);
+    }
+
+    #[test]
+    fn parse_iso_handles_today_at_labels() {
+        let parsed = parse_iso_from_label("Today at 8:21 PM", Utc::now());
+        assert!(parsed.is_some());
+    }
+
+    #[test]
+    fn whatsapp_sender_parse_handles_mixed_case_markers() {
+        let line = "message, sounds good, Today at 8:21 PM, Received from Contact B";
+        let parsed = parse_whatsapp_message_line(line, 1, Utc::now()).expect("message parsed");
+        assert_eq!(parsed.direction, MessageDirection::Incoming);
+        assert_eq!(parsed.sender.as_deref(), Some("Contact B"));
+        assert!(parsed.timestamp_iso.is_some());
     }
 
     #[test]

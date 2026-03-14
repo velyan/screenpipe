@@ -215,6 +215,30 @@ pub struct CapturedWindow {
     pub window_height: u32,
 }
 
+#[derive(Debug, Clone)]
+pub struct VisibleWindowMetadata {
+    pub app_name: String,
+    pub window_name: String,
+    pub process_id: i32,
+    pub window_id: Option<u32>,
+    pub is_focused: bool,
+    pub window_x: i32,
+    pub window_y: i32,
+    pub window_width: u32,
+    pub window_height: u32,
+}
+
+impl VisibleWindowMetadata {
+    pub fn bounds(&self) -> Rect {
+        Rect {
+            x: self.window_x,
+            y: self.window_y,
+            width: self.window_width,
+            height: self.window_height,
+        }
+    }
+}
+
 /// Focused input window target resolved by the accessibility walker.
 #[derive(Debug, Clone)]
 pub struct FocusedWindowTarget {
@@ -518,6 +542,177 @@ struct WindowData {
     window_width: u32,
     window_height: u32,
     image_buffer: image::RgbaImage,
+}
+
+#[cfg(target_os = "macos")]
+fn get_all_windows_metadata() -> Result<Vec<VisibleWindowMetadata>, Box<dyn Error>> {
+    if use_sck_rs() {
+        get_all_windows_metadata_sck()
+    } else {
+        get_all_windows_metadata_xcap_macos()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn get_all_windows_metadata_sck() -> Result<Vec<VisibleWindowMetadata>, Box<dyn Error>> {
+    let frontmost_pid = get_frontmost_pid();
+    let windows = SckWindow::all()?;
+    Ok(windows
+        .into_iter()
+        .filter_map(|window| extract_visible_window_metadata_sck(window, frontmost_pid))
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn extract_visible_window_metadata_sck(
+    window: SckWindow,
+    frontmost_pid: Option<i32>,
+) -> Option<VisibleWindowMetadata> {
+    let app_name = match window.app_name() {
+        Ok(name) => name.to_string(),
+        Err(_) => return None,
+    };
+
+    let window_name = match window.title() {
+        Ok(title) => title.to_string(),
+        Err(_) => return None,
+    };
+
+    if window.is_minimized().unwrap_or(false) {
+        return None;
+    }
+
+    let process_id = window
+        .pid()
+        .ok()
+        .and_then(|p| i32::try_from(p).ok())
+        .unwrap_or(-1);
+    let window_id = window.id().ok();
+    let per_window_focus = window.is_focused().unwrap_or(false);
+    let is_focused = resolve_window_focus(frontmost_pid, process_id, per_window_focus);
+
+    Some(VisibleWindowMetadata {
+        app_name,
+        window_name,
+        process_id,
+        window_id,
+        is_focused,
+        window_x: window.x().unwrap_or(0),
+        window_y: window.y().unwrap_or(0),
+        window_width: window.width().unwrap_or(0),
+        window_height: window.height().unwrap_or(0),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn get_all_windows_metadata_xcap_macos() -> Result<Vec<VisibleWindowMetadata>, Box<dyn Error>> {
+    let frontmost_pid = get_frontmost_pid();
+    let windows = XcapWindow::all()?;
+    Ok(windows
+        .into_iter()
+        .filter_map(|window| extract_visible_window_metadata_xcap(window, frontmost_pid))
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn extract_visible_window_metadata_xcap(
+    window: XcapWindow,
+    frontmost_pid: Option<i32>,
+) -> Option<VisibleWindowMetadata> {
+    let app_name = match window.app_name() {
+        Ok(name) => name.to_string(),
+        Err(_) => return None,
+    };
+
+    let window_name = match window.title() {
+        Ok(title) => title.to_string(),
+        Err(_) => return None,
+    };
+
+    if window.is_minimized().unwrap_or(false) {
+        return None;
+    }
+
+    let process_id = window
+        .pid()
+        .ok()
+        .and_then(|p| i32::try_from(p).ok())
+        .unwrap_or(-1);
+    let window_id = window.id().ok();
+    let per_window_focus = window.is_focused().unwrap_or(false);
+    let is_focused = resolve_window_focus(frontmost_pid, process_id, per_window_focus);
+
+    Some(VisibleWindowMetadata {
+        app_name,
+        window_name,
+        process_id,
+        window_id,
+        is_focused,
+        window_x: window.x().unwrap_or(0),
+        window_y: window.y().unwrap_or(0),
+        window_width: window.width().unwrap_or(0),
+        window_height: window.height().unwrap_or(0),
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn get_all_windows_metadata() -> Result<Vec<VisibleWindowMetadata>, Box<dyn Error>> {
+    let frontmost_pid = get_frontmost_pid();
+    let windows = Window::all()?;
+    Ok(windows
+        .into_iter()
+        .filter_map(|window| extract_visible_window_metadata_xcap_non_macos(window, frontmost_pid))
+        .collect())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn extract_visible_window_metadata_xcap_non_macos(
+    window: Window,
+    frontmost_pid: Option<i32>,
+) -> Option<VisibleWindowMetadata> {
+    let mut app_name = match window.app_name() {
+        Ok(name) => name.to_string(),
+        Err(_) => return None,
+    };
+
+    #[cfg(target_os = "windows")]
+    if app_name.is_empty() {
+        if let Some(pid) = window.pid().ok() {
+            if let Some(exe_name) = get_process_exe_name(pid as u32) {
+                app_name = exe_name;
+            }
+        }
+    }
+
+    let window_name = match window.title() {
+        Ok(title) => title.to_string(),
+        Err(_) => return None,
+    };
+
+    if window.is_minimized().unwrap_or(false) {
+        return None;
+    }
+
+    let process_id = window
+        .pid()
+        .ok()
+        .and_then(|p| i32::try_from(p).ok())
+        .unwrap_or(-1);
+    let window_id = window.id().ok();
+    let per_window_focus = window.is_focused().unwrap_or(false);
+    let is_focused = resolve_window_focus(frontmost_pid, process_id, per_window_focus);
+
+    Some(VisibleWindowMetadata {
+        app_name,
+        window_name,
+        process_id,
+        window_id,
+        is_focused,
+        window_x: window.x().unwrap_or(0),
+        window_y: window.y().unwrap_or(0),
+        window_width: window.width().unwrap_or(0),
+        window_height: window.height().unwrap_or(0),
+    })
 }
 
 /// Query the frontmost application PID once, so all windows in a capture cycle
@@ -1190,7 +1385,7 @@ fn focused_window_blocked_by_privacy(
 
 /// Capture only the focused input window resolved by the accessibility walker.
 /// Returns `None` when no matching valid window could be captured.
-pub async fn capture_focused_window(
+pub fn capture_focused_window(
     target: &FocusedWindowTarget,
     window_filters: &WindowFilters,
 ) -> Result<Option<CapturedWindow>, Box<dyn Error>> {
@@ -1828,6 +2023,18 @@ pub async fn capture_all_visible_windows(
     }
 
     Ok(all_captured_images)
+}
+
+pub fn list_visible_windows_metadata(
+    window_filters: &WindowFilters,
+) -> Result<Vec<VisibleWindowMetadata>, Box<dyn Error>> {
+    let windows = get_all_windows_metadata()?;
+    Ok(windows
+        .into_iter()
+        .filter(|window| {
+            is_valid_capture_target(&window.app_name, &window.window_name, window_filters)
+        })
+        .collect())
 }
 
 #[cfg(test)]
