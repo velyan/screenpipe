@@ -115,9 +115,54 @@ jobs:
           name: moya-sidecar-${{ matrix.target }}
           path: out/*
 
+  package-universal:
+    runs-on: macos-latest
+    needs: build-macos
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Build universal sidecar payload
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p out
+
+          create_universal_binary() {
+            local name="$1"
+            local arm64_path="artifacts/moya-sidecar-aarch64-apple-darwin/${name}-darwin-arm64"
+            local x64_path="artifacts/moya-sidecar-x86_64-apple-darwin/${name}-darwin-x64"
+            local output_path="out/${name}-darwin-universal"
+
+            if [[ ! -f "${arm64_path}" || ! -f "${x64_path}" ]]; then
+              echo "Missing architecture slices for ${name}" >&2
+              exit 1
+            fi
+
+            lipo -create "${arm64_path}" "${x64_path}" -output "${output_path}"
+            chmod +x "${output_path}"
+            if ! lipo "${output_path}" -verify_arch arm64 x86_64 >/dev/null 2>&1; then
+              echo "Universal merge failed for ${name}: $(lipo -info "${output_path}" 2>/dev/null || file -b "${output_path}")" >&2
+              exit 1
+            fi
+          }
+
+          create_universal_binary screenpipe
+          create_universal_binary ffmpeg
+          create_universal_binary ffprobe
+
+      - name: Upload universal sidecar artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: moya-sidecar-darwin-universal
+          path: out/*
+
   publish-release:
     runs-on: ubuntu-latest
-    needs: build-macos
+    needs: [build-macos, package-universal]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -146,6 +191,9 @@ jobs:
           cp artifacts/moya-sidecar-x86_64-apple-darwin/screenpipe-darwin-x64 release-assets/
           cp artifacts/moya-sidecar-x86_64-apple-darwin/ffmpeg-darwin-x64 release-assets/
           cp artifacts/moya-sidecar-x86_64-apple-darwin/ffprobe-darwin-x64 release-assets/
+          cp artifacts/moya-sidecar-darwin-universal/screenpipe-darwin-universal release-assets/
+          cp artifacts/moya-sidecar-darwin-universal/ffmpeg-darwin-universal release-assets/
+          cp artifacts/moya-sidecar-darwin-universal/ffprobe-darwin-universal release-assets/
 
           python3 - <<'PY'
           import hashlib
@@ -182,6 +230,11 @@ jobs:
                       "screenpipe": entry("screenpipe-darwin-x64"),
                       "ffmpeg": entry("ffmpeg-darwin-x64"),
                       "ffprobe": entry("ffprobe-darwin-x64"),
+                  },
+                  "darwin-universal": {
+                      "screenpipe": entry("screenpipe-darwin-universal"),
+                      "ffmpeg": entry("ffmpeg-darwin-universal"),
+                      "ffprobe": entry("ffprobe-darwin-universal"),
                   },
               },
           }
@@ -222,5 +275,8 @@ jobs:
           gh release upload "${TAG}" release-assets/screenpipe-darwin-x64 --clobber
           gh release upload "${TAG}" release-assets/ffmpeg-darwin-x64 --clobber
           gh release upload "${TAG}" release-assets/ffprobe-darwin-x64 --clobber
+          gh release upload "${TAG}" release-assets/screenpipe-darwin-universal --clobber
+          gh release upload "${TAG}" release-assets/ffmpeg-darwin-universal --clobber
+          gh release upload "${TAG}" release-assets/ffprobe-darwin-universal --clobber
           gh release upload "${TAG}" release-assets/moya-sidecar-manifest.json --clobber
           gh release upload "${TAG}" release-assets/moya-sidecar-manifest.sha256 --clobber
