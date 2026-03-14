@@ -65,7 +65,7 @@ jobs:
                       continue
                   if not in_workspace_package:
                       continue
-                  match = re.match(r'^version\\s*=\\s*"([^"]+)"$', line)
+                  match = re.match(r'^version\s*=\s*"([^"]+)"$', line)
                   if match:
                       version = match.group(1)
                       break
