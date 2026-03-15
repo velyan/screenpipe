@@ -23,6 +23,10 @@ use std::time::Instant;
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
+use crate::main_body_distillation::{
+    distill_main_body_text, DistillationConfig, DistillationInput,
+};
+
 /// Limits concurrent OCR tasks to avoid CPU spikes when multiple monitors
 /// trigger capture simultaneously.
 static OCR_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
@@ -43,7 +47,11 @@ pub struct CaptureContext<'a> {
     pub browser_url: Option<&'a str>,
     pub focused: bool,
     pub capture_trigger: &'a str,
+    pub capture_provenance: Option<&'a str>,
+    pub force_ocr: bool,
     pub use_pii_removal: bool,
+    pub enable_main_body_distillation: bool,
+    pub main_body_distillation_threshold: f32,
 }
 
 /// Result of a paired capture operation.
@@ -133,7 +141,7 @@ pub async fn paired_capture(
             .unwrap_or(false);
 
     // Run OCR when: no a11y text, app prefers OCR, OR a11y text is thin (hybrid)
-    let (ocr_text, ocr_text_json) = if !has_accessibility_text || a11y_is_thin {
+    let (ocr_text, ocr_text_json) = if ctx.force_ocr || !has_accessibility_text || a11y_is_thin {
         // Windows native OCR is async, so call it directly (not inside spawn_blocking)
         #[cfg(target_os = "windows")]
         {
@@ -246,6 +254,48 @@ pub async fn paired_capture(
     } else {
         ocr_text_json.clone()
     };
+    let focused_accessibility_json = tree_snapshot
+        .and_then(|snap| snap.focused_element.clone())
+        .map(|mut focused| {
+            if ctx.use_pii_removal {
+                focused.name = focused.name.map(|value| remove_pii(&value));
+                focused.input_text = focused.input_text.map(|value| remove_pii(&value));
+                focused.selected_text = focused.selected_text.map(|value| remove_pii(&value));
+            }
+            focused
+        })
+        .and_then(|focused| serde_json::to_string(&focused).ok());
+    let distillation = if ctx.capture_provenance.is_some() && sanitized_text.is_some() {
+        let text = sanitized_text.as_ref().expect("checked is_some above");
+        Some(
+            distill_main_body_text(
+                DistillationInput {
+                    raw_text: text,
+                    ocr_text_json: Some(sanitized_ocr_json.as_str()),
+                    app_name: ctx.app_name,
+                    window_name: ctx.window_name,
+                    browser_url: ctx.browser_url,
+                    content_hash,
+                    nodes: tree_snapshot.map(|snapshot| snapshot.nodes.as_slice()),
+                    focused_element: tree_snapshot
+                        .and_then(|snapshot| snapshot.focused_element.as_ref()),
+                },
+                &DistillationConfig {
+                    enabled: ctx.enable_main_body_distillation,
+                    min_confidence: ctx.main_body_distillation_threshold,
+                },
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let main_body_text = distillation
+        .as_ref()
+        .map(|result| result.main_body_text.as_str());
+    let main_body_meta_json = distillation
+        .as_ref()
+        .map(|result| result.metadata.to_json_string());
 
     // Insert snapshot frame + OCR text positions in a single transaction.
     let ocr_engine_name = if cfg!(target_os = "macos") {
@@ -285,10 +335,25 @@ pub async fn paired_capture(
         )
         .await?;
 
+    if let Some(capture_provenance) = ctx.capture_provenance {
+        ctx.db
+            .upsert_active_window_compat(
+                frame_id,
+                capture_provenance,
+                focused_accessibility_json.as_deref(),
+                main_body_text,
+                main_body_meta_json.as_deref(),
+            )
+            .await?;
+    }
+
     let duration_ms = start.elapsed().as_millis() as u64;
     debug!(
-        "paired_capture: frame_id={}, trigger={}, text_source={:?}, total={duration_ms}ms",
-        frame_id, ctx.capture_trigger, text_source
+        "paired_capture: frame_id={}, trigger={}, provenance={}, text_source={:?}, total={duration_ms}ms",
+        frame_id,
+        ctx.capture_trigger,
+        ctx.capture_provenance.unwrap_or("none"),
+        text_source
     );
 
     Ok(PairedCaptureResult {
@@ -506,7 +571,11 @@ mod tests {
             browser_url: None,
             focused: true,
             capture_trigger: "click",
+            capture_provenance: Some("focused_window"),
+            force_ocr: false,
             use_pii_removal: false,
+            enable_main_body_distillation: false,
+            main_body_distillation_threshold: 0.60,
         };
 
         let result = paired_capture(&ctx, None).await.unwrap();
@@ -539,12 +608,19 @@ mod tests {
             browser_url: Some("https://example.com"),
             focused: true,
             capture_trigger: "app_switch",
+            capture_provenance: Some("focused_window"),
+            force_ocr: false,
             use_pii_removal: false,
+            enable_main_body_distillation: false,
+            main_body_distillation_threshold: 0.60,
         };
 
         let snap = TreeSnapshot {
             app_name: "Safari".to_string(),
             window_name: "Example Page".to_string(),
+            window_id: None,
+            process_id: None,
+            window_bounds: None,
             text_content: "Hello World - Example Page".to_string(),
             nodes: vec![AccessibilityTreeNode {
                 role: "AXStaticText".to_string(),
@@ -552,6 +628,7 @@ mod tests {
                 depth: 0,
                 bounds: None,
             }],
+            focused_element: None,
             browser_url: Some("https://example.com".to_string()),
             timestamp: now,
             node_count: 1,
@@ -594,15 +671,23 @@ mod tests {
             browser_url: None,
             focused: true,
             capture_trigger: "idle",
+            capture_provenance: Some("focused_window"),
+            force_ocr: false,
             use_pii_removal: false,
+            enable_main_body_distillation: false,
+            main_body_distillation_threshold: 0.60,
         };
 
         // Empty accessibility text should be treated as no text
         let snap = TreeSnapshot {
             app_name: "TestApp".to_string(),
             window_name: String::new(),
+            window_id: None,
+            process_id: None,
+            window_bounds: None,
             text_content: String::new(),
             nodes: vec![],
+            focused_element: None,
             browser_url: None,
             timestamp: now,
             node_count: 0,
@@ -713,8 +798,12 @@ mod tests {
         TreeSnapshot {
             app_name: "Test".to_string(),
             window_name: "Test Window".to_string(),
+            window_id: None,
+            process_id: None,
+            window_bounds: None,
             text_content: text,
             nodes,
+            focused_element: None,
             browser_url: None,
             timestamp: Utc::now(),
             node_count: 0,

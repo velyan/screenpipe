@@ -17,7 +17,7 @@
 
 use super::{
     AccessibilityTreeNode, NodeBounds, SkipReason, TreeSnapshot, TreeWalkResult, TreeWalkerConfig,
-    TreeWalkerPlatform, TruncationReason,
+    TreeWalkerPlatform, TruncationReason, WindowBounds,
 };
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -858,7 +858,7 @@ impl TreeWalkerPlatform for LinuxTreeWalker {
         let conn = unsafe { self.ensure_init()? };
 
         // Find the focused window
-        let (app_name, window_title, window_ref, _pid) = match find_focused_window(conn) {
+        let (app_name, window_title, window_ref, pid) = match find_focused_window(conn) {
             Some(result) => result,
             None => return Ok(TreeWalkResult::NotFound),
         };
@@ -871,6 +871,24 @@ impl TreeWalkerPlatform for LinuxTreeWalker {
 
         let app_lower = app_name.to_lowercase();
         let window_lower = window_title.to_lowercase();
+
+        if self
+            .config
+            .blocked_apps
+            .iter()
+            .any(|pattern| app_lower.contains(&pattern.to_lowercase()))
+        {
+            return Ok(TreeWalkResult::Skipped(SkipReason::ExcludedApp));
+        }
+
+        if self
+            .config
+            .blocked_title_keywords
+            .iter()
+            .any(|pattern| window_lower.contains(&pattern.to_lowercase()))
+        {
+            return Ok(TreeWalkResult::Skipped(SkipReason::ExcludedApp));
+        }
 
         // Apply user-configured ignored windows
         if self.config.ignored_windows.iter().any(|pattern| {
@@ -901,6 +919,17 @@ impl TreeWalkerPlatform for LinuxTreeWalker {
                 state.window_h = wh as f64;
             }
         }
+
+        let window_bounds = if state.window_w > 0.0 && state.window_h > 0.0 {
+            Some(WindowBounds {
+                x: state.window_x,
+                y: state.window_y,
+                width: state.window_w,
+                height: state.window_h,
+            })
+        } else {
+            None
+        };
 
         // Walk the accessibility tree
         walk_accessible(conn, &window_ref, 0, &mut state);
@@ -942,8 +971,12 @@ impl TreeWalkerPlatform for LinuxTreeWalker {
         Ok(TreeWalkResult::Found(TreeSnapshot {
             app_name,
             window_name: window_title,
+            window_id: None,
+            process_id: Some(pid),
+            window_bounds,
             text_content,
             nodes: state.nodes,
+            focused_element: None,
             browser_url,
             timestamp: Utc::now(),
             node_count: state.node_count,

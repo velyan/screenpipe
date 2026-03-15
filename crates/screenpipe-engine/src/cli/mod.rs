@@ -236,6 +236,22 @@ pub struct RecordArgs {
     #[arg(long, default_value_t = true)]
     pub use_pii_removal: bool,
 
+    /// Enable Apple Intelligence main-body text distillation (opt-in).
+    #[arg(
+        long,
+        default_value_t = false,
+        env = "SCREENPIPE_ENABLE_MAIN_BODY_DISTILLATION"
+    )]
+    pub enable_main_body_distillation: bool,
+
+    /// Minimum confidence required to accept distilled text.
+    #[arg(
+        long,
+        default_value_t = 0.60,
+        env = "SCREENPIPE_MAIN_BODY_DISTILLATION_THRESHOLD"
+    )]
+    pub main_body_distillation_threshold: f32,
+
     /// Filter music-dominant audio before transcription (reduces Spotify/YouTube music noise)
     #[arg(long, default_value_t = false)]
     pub filter_music: bool,
@@ -252,9 +268,26 @@ pub struct RecordArgs {
     #[arg(long)]
     pub included_windows: Vec<String>,
 
+    /// App-name substrings to block from accessibility capture (privacy policy).
+    #[arg(long)]
+    pub blocked_apps: Vec<String>,
+
+    /// Window-title substrings to block from accessibility capture (privacy policy).
+    #[arg(long)]
+    pub blocked_title_keywords: Vec<String>,
+
     /// URLs to ignore for browser privacy filtering
     #[arg(long)]
     pub ignored_urls: Vec<String>,
+
+    /// Identity hints for outgoing/incoming direction classification.
+    /// Format: kind:value (email:me@example.com, name:My Name, handle:@me)
+    #[arg(
+        long = "user-identity",
+        env = "SCREENPIPE_USER_IDENTITIES",
+        value_delimiter = ','
+    )]
+    pub user_identity: Vec<String>,
 
     /// Deepgram API Key for audio transcription
     #[arg(long = "deepgram-api-key")]
@@ -275,6 +308,14 @@ pub struct RecordArgs {
     /// Video quality preset: low, balanced, high, max
     #[arg(long, default_value = "balanced")]
     pub video_quality: String,
+
+    /// Enable input event capture (keyboard, mouse, clipboard)
+    #[arg(long, default_value_t = false)]
+    pub enable_input_capture: bool,
+
+    /// Enable accessibility text capture (AX tree walker)
+    #[arg(long, default_value_t = false)]
+    pub enable_accessibility: bool,
 
     /// Enable cloud sync
     #[arg(long, default_value_t = false)]
@@ -311,9 +352,9 @@ impl RecordArgs {
     /// Create UI recorder configuration from record arguments
     pub fn to_ui_recorder_config(&self) -> crate::ui_recorder::UiRecorderConfig {
         crate::ui_recorder::UiRecorderConfig {
-            enabled: true,
-            enable_tree_walker: true,
-            record_input_events: true,
+            enabled: self.enable_input_capture || self.enable_accessibility,
+            enable_tree_walker: self.enable_accessibility,
+            record_input_events: self.enable_input_capture,
             excluded_windows: self.ignored_windows.clone(),
             ignored_windows: self.ignored_windows.clone(),
             included_windows: self.included_windows.clone(),
@@ -334,9 +375,11 @@ impl RecordArgs {
             disable_audio: self.disable_audio,
             disable_vision: self.disable_vision,
             use_pii_removal: self.use_pii_removal,
+            enable_main_body_distillation: self.enable_main_body_distillation,
+            main_body_distillation_threshold: self.main_body_distillation_threshold,
             filter_music: self.filter_music,
-            enable_input_capture: true,
-            enable_accessibility: true,
+            enable_input_capture: self.enable_input_capture,
+            enable_accessibility: self.enable_accessibility,
             audio_transcription_engine: self.audio_transcription_engine.into(),
             transcription_mode: self.transcription_mode.into(),
             audio_devices: self.audio_device,
@@ -345,8 +388,19 @@ impl RecordArgs {
             use_all_monitors: self.use_all_monitors,
             ignored_windows: self.ignored_windows,
             included_windows: self.included_windows,
+            blocked_apps: if self.blocked_apps.is_empty() {
+                screenpipe_a11y::tree::default_blocked_apps()
+            } else {
+                self.blocked_apps
+            },
+            blocked_title_keywords: if self.blocked_title_keywords.is_empty() {
+                screenpipe_a11y::tree::default_blocked_title_keywords()
+            } else {
+                self.blocked_title_keywords
+            },
             ignored_urls: self.ignored_urls,
             languages,
+            user_identities: self.user_identity,
             deepgram_api_key: self.deepgram_api_key,
             user_id: None,
             user_name: None,

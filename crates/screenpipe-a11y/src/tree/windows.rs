@@ -8,8 +8,8 @@
 //! the focused window's tree and extract all visible text — matching macOS behavior.
 
 use super::{
-    AccessibilityTreeNode, NodeBounds, SkipReason, TreeSnapshot, TreeWalkResult, TreeWalkerConfig,
-    TreeWalkerPlatform,
+    AccessibilityTreeNode, FocusedElementContext, NodeBounds, SkipReason, TreeSnapshot,
+    TreeWalkResult, TreeWalkerConfig, TreeWalkerPlatform, WindowBounds,
 };
 use crate::events::AccessibilityNode;
 use crate::platform::windows_uia::UiaContext;
@@ -26,7 +26,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+    GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
 };
 
 /// Excluded apps — password managers and security tools (matches macOS list).
@@ -183,9 +183,10 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
         let app_name = crate::platform::windows::get_process_name(pid)
             .unwrap_or_else(|| "Unknown".to_string());
 
-        // Skip excluded apps
         let app_lower = app_name.to_lowercase();
-        if EXCLUDED_APPS.iter().any(|ex| app_lower.contains(ex)) {
+        if matches_any_pattern_case_insensitive(&app_name, &self.config.blocked_apps)
+            || EXCLUDED_APPS.iter().any(|ex| app_lower.contains(ex))
+        {
             return Ok(TreeWalkResult::Skipped(SkipReason::ExcludedApp));
         }
 
@@ -194,6 +195,25 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
             let mut buf = [0u16; 512];
             let len = GetWindowTextW(hwnd, &mut buf);
             String::from_utf16_lossy(&buf[..len as usize])
+        };
+        let window_bounds = {
+            let mut rect = RECT::default();
+            if unsafe { GetWindowRect(hwnd, &mut rect).is_ok() } {
+                let width = (rect.right - rect.left).max(0) as f64;
+                let height = (rect.bottom - rect.top).max(0) as f64;
+                if width > 0.0 && height > 0.0 {
+                    Some(WindowBounds {
+                        x: rect.left as f64,
+                        y: rect.top as f64,
+                        width,
+                        height,
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         };
 
         // Skip incognito / private browsing windows (localized title check)
@@ -204,6 +224,9 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
 
         // Apply user-configured ignored windows (check app name and window title)
         let window_lower = window_name.to_lowercase();
+        if matches_any_pattern_case_insensitive(&window_name, &self.config.blocked_title_keywords) {
+            return Ok(TreeWalkResult::Skipped(SkipReason::ExcludedApp));
+        }
         if self.config.ignored_windows.iter().any(|pattern| {
             let p = pattern.to_lowercase();
             app_lower.contains(&p) || window_lower.contains(&p)
@@ -232,6 +255,7 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
             Some(tree) => tree,
             None => return Ok(TreeWalkResult::NotFound),
         };
+        let focused_element = extract_focused_element_context(&root);
 
         // Get monitor dimensions for normalizing element bounds to 0-1 coords
         let monitor_rect = get_monitor_rect(hwnd);
@@ -281,8 +305,12 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
         Ok(TreeWalkResult::Found(TreeSnapshot {
             app_name,
             window_name,
+            window_id: None,
+            process_id: Some(pid),
+            window_bounds,
             text_content: text_buffer,
             nodes,
+            focused_element,
             browser_url,
             timestamp: Utc::now(),
             node_count,
@@ -355,6 +383,49 @@ fn normalize_bounds(
         width: width as f32,
         height: height as f32,
     })
+}
+
+fn extract_focused_element_context(root: &AccessibilityNode) -> Option<FocusedElementContext> {
+    let node = find_focused_node(root)?;
+    let name = node
+        .name
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let input_text = node
+        .value
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    Some(FocusedElementContext {
+        role: node.control_type.clone(),
+        name,
+        input_text,
+        selected_text: None,
+        bounds: None,
+    })
+}
+
+fn matches_any_pattern_case_insensitive(haystack: &str, patterns: &[String]) -> bool {
+    let haystack_lower = haystack.to_lowercase();
+    patterns
+        .iter()
+        .any(|pattern| haystack_lower.contains(&pattern.to_lowercase()))
+}
+
+fn find_focused_node(node: &AccessibilityNode) -> Option<&AccessibilityNode> {
+    if node.is_focused == Some(true) {
+        return Some(node);
+    }
+
+    for child in &node.children {
+        if let Some(found) = find_focused_node(child) {
+            return Some(found);
+        }
+    }
+
+    None
 }
 
 /// Recursively extract text from the accessibility tree.

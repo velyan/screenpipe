@@ -32,6 +32,8 @@ pub struct RecordingConfig {
     pub filter_music: bool,
     pub enable_input_capture: bool,
     pub enable_accessibility: bool,
+    pub enable_main_body_distillation: bool,
+    pub main_body_distillation_threshold: f32,
 
     // Engines (typed, not strings)
     pub audio_transcription_engine: AudioTranscriptionEngine,
@@ -46,10 +48,13 @@ pub struct RecordingConfig {
     // Filters
     pub ignored_windows: Vec<String>,
     pub included_windows: Vec<String>,
+    pub blocked_apps: Vec<String>,
+    pub blocked_title_keywords: Vec<String>,
     pub ignored_urls: Vec<String>,
     /// Automatically detect and skip incognito / private browsing windows.
     pub ignore_incognito_windows: bool,
     pub languages: Vec<Language>,
+    pub user_identities: Vec<String>,
 
     // Cloud/auth
     pub deepgram_api_key: Option<String>,

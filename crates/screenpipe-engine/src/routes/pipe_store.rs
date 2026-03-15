@@ -17,8 +17,7 @@ use crate::pipes_api::SharedPipeManager;
 
 /// Base URL for the screenpipe registry API.
 fn api_base_url() -> String {
-    std::env::var("SCREENPIPE_API_BASE_URL")
-        .unwrap_or_else(|_| "https://screenpi.pe".to_string())
+    std::env::var("SCREENPIPE_API_BASE_URL").unwrap_or_else(|_| "https://screenpi.pe".to_string())
 }
 
 /// Extract the Bearer token from the Authorization header.
@@ -196,9 +195,7 @@ pub async fn pipe_store_install(
                 .and_then(|v| v.as_str())
             {
                 Some(md) => md.to_string(),
-                None => {
-                    return Json(json!({ "error": "pipe not found or missing source_md" }))
-                }
+                None => return Json(json!({ "error": "pipe not found or missing source_md" })),
             }
         }
     };

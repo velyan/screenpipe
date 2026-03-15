@@ -29,10 +29,10 @@ use futures::future::try_join_all;
 use crate::{
     text_similarity::is_similar_transcription, AudioChunksResponse, AudioDevice, AudioEntry,
     AudioResult, AudioResultRaw, ContentType, DeviceType, Element, ElementRow, ElementSource,
-    FrameData, FrameRow, FrameRowLight, FrameWindowData, InsertUiEvent, MeetingRecord, MemoryRecord, OCREntry,
-    OCRResult, OCRResultRaw, OcrEngine, OcrTextBlock, Order, SearchMatch, SearchMatchGroup,
-    SearchResult, Speaker, TagContentType, TextBounds, TextPosition, TimeSeriesChunk, UiContent,
-    UiEventRecord, UiEventRow, VideoMetadata,
+    FrameData, FrameRow, FrameRowLight, FrameWindowData, InsertUiEvent, MeetingRecord,
+    MemoryRecord, OCREntry, OCRResult, OCRResultRaw, OcrEngine, OcrTextBlock, Order, SearchMatch,
+    SearchMatchGroup, SearchResult, Speaker, TagContentType, TextBounds, TextPosition,
+    TimeSeriesChunk, UiContent, UiEventRecord, UiEventRow, VideoMetadata,
 };
 
 /// Time window (in seconds) to check for similar transcriptions across devices.
@@ -42,6 +42,26 @@ const DEDUP_TIME_WINDOW_SECS: i64 = 45;
 /// Similarity threshold for cross-device deduplication (0.0 to 1.0).
 /// Higher = stricter matching, lower = more aggressive deduplication.
 const DEDUP_SIMILARITY_THRESHOLD: f64 = 0.85;
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FrameCaptureMetadata {
+    pub timestamp: DateTime<Utc>,
+    pub snapshot_path: Option<String>,
+    pub app_name: Option<String>,
+    pub window_name: Option<String>,
+    pub browser_url: Option<String>,
+    pub focused: Option<bool>,
+    pub text_source: Option<String>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ActiveWindowCompatRow {
+    pub frame_id: i64,
+    pub capture_provenance: String,
+    pub focused_accessibility_json: Option<String>,
+    pub main_body_text: Option<String>,
+    pub main_body_meta_json: Option<String>,
+}
 
 pub struct DeleteTimeRangeResult {
     pub frames_deleted: u64,
@@ -387,7 +407,8 @@ impl DatabaseManager {
         let mut last_error = None;
         for attempt in 1..=max_retries {
             let mut conn =
-                match tokio::time::timeout(Duration::from_secs(3), self.write_pool.acquire()).await {
+                match tokio::time::timeout(Duration::from_secs(3), self.write_pool.acquire()).await
+                {
                     Ok(Ok(conn)) => conn,
                     Ok(Err(e)) => return Err(e),
                     Err(_) => return Err(sqlx::Error::PoolTimedOut),
@@ -538,12 +559,11 @@ impl DatabaseManager {
 
     /// Check whether an audio chunk row exists.
     pub async fn audio_chunk_exists(&self, chunk_id: i64) -> Result<bool, sqlx::Error> {
-        let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM audio_chunks WHERE id = ?1)",
-        )
-        .bind(chunk_id)
-        .fetch_one(&self.pool)
-        .await?;
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM audio_chunks WHERE id = ?1)")
+                .bind(chunk_id)
+                .fetch_one(&self.pool)
+                .await?;
         Ok(exists)
     }
 
@@ -1822,7 +1842,11 @@ impl DatabaseManager {
 
         for (idx, window) in windows.iter().enumerate() {
             // Compute full_text for FTS indexing
-            let full_text = if window.text.is_empty() { None } else { Some(window.text.as_str()) };
+            let full_text = if window.text.is_empty() {
+                None
+            } else {
+                Some(window.text.as_str())
+            };
 
             // Insert frame
             let frame_id = sqlx::query(
@@ -1941,7 +1965,11 @@ impl DatabaseManager {
 
             for (idx, window) in windows.iter().enumerate() {
                 // Compute full_text for FTS indexing
-                let full_text = if window.text.is_empty() { None } else { Some(window.text.as_str()) };
+                let full_text = if window.text.is_empty() {
+                    None
+                } else {
+                    Some(window.text.as_str())
+                };
 
                 let frame_id = sqlx::query(
                     "INSERT INTO frames (video_chunk_id, offset_index, timestamp, name, browser_url, app_name, window_name, focused, device_name, full_text) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -2208,14 +2236,18 @@ impl DatabaseManager {
                 SearchResult::Audio(audio) => audio.timestamp,
                 SearchResult::UI(ui) => ui.timestamp,
                 SearchResult::Input(input) => input.timestamp,
-                SearchResult::Memory(m) => m.created_at.parse::<DateTime<Utc>>().unwrap_or_default(),
+                SearchResult::Memory(m) => {
+                    m.created_at.parse::<DateTime<Utc>>().unwrap_or_default()
+                }
             };
             let timestamp_b = match b {
                 SearchResult::OCR(ocr) => ocr.timestamp,
                 SearchResult::Audio(audio) => audio.timestamp,
                 SearchResult::UI(ui) => ui.timestamp,
                 SearchResult::Input(input) => input.timestamp,
-                SearchResult::Memory(m) => m.created_at.parse::<DateTime<Utc>>().unwrap_or_default(),
+                SearchResult::Memory(m) => {
+                    m.created_at.parse::<DateTime<Utc>>().unwrap_or_default()
+                }
             };
             timestamp_b.cmp(&timestamp_a)
         });
@@ -2602,6 +2634,62 @@ impl DatabaseManager {
         .flatten())
     }
 
+    /// Persist compatibility metadata for active-window capture routes.
+    pub async fn upsert_active_window_compat(
+        &self,
+        frame_id: i64,
+        capture_provenance: &str,
+        focused_accessibility_json: Option<&str>,
+        main_body_text: Option<&str>,
+        main_body_meta_json: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+        sqlx::query(
+            r#"
+            INSERT INTO active_window_compat (
+                frame_id,
+                capture_provenance,
+                focused_accessibility_json,
+                main_body_text,
+                main_body_meta_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(frame_id) DO UPDATE SET
+                capture_provenance = excluded.capture_provenance,
+                focused_accessibility_json = excluded.focused_accessibility_json,
+                main_body_text = excluded.main_body_text,
+                main_body_meta_json = excluded.main_body_meta_json
+            "#,
+        )
+        .bind(frame_id)
+        .bind(capture_provenance)
+        .bind(focused_accessibility_json)
+        .bind(main_body_text)
+        .bind(main_body_meta_json)
+        .execute(&mut **tx.conn())
+        .await?;
+        tx.commit().await
+    }
+
+    /// Return the newest frame ID recorded for an active-window provenance.
+    pub async fn get_latest_active_window_frame_id(
+        &self,
+        capture_provenance: &str,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query_scalar::<_, i64>(
+            r#"
+            SELECT awc.frame_id
+            FROM active_window_compat awc
+            INNER JOIN frames f ON f.id = awc.frame_id
+            WHERE awc.capture_provenance = ?1
+            ORDER BY f.timestamp DESC, awc.frame_id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(capture_provenance)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     /// Get frame IDs within a time range. Lightweight query for video export.
     pub async fn get_frame_ids_in_range(
         &self,
@@ -2686,6 +2774,45 @@ impl DatabaseManager {
         Ok(result.flatten())
     }
 
+    /// Get raw OCR text and OCR text_json for a frame.
+    pub async fn get_frame_ocr_data(
+        &self,
+        frame_id: i64,
+    ) -> Result<(Option<String>, Option<String>), sqlx::Error> {
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT text, text_json FROM ocr_text WHERE frame_id = ?1 LIMIT 1",
+        )
+        .bind(frame_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.unwrap_or((None, None)))
+    }
+
+    /// Get snapshot metadata needed to rebuild active-window compatibility responses.
+    pub async fn get_frame_capture_metadata(
+        &self,
+        frame_id: i64,
+    ) -> Result<Option<FrameCaptureMetadata>, sqlx::Error> {
+        sqlx::query_as::<_, FrameCaptureMetadata>(
+            r#"
+            SELECT
+                timestamp,
+                snapshot_path,
+                app_name,
+                window_name,
+                browser_url,
+                focused,
+                text_source
+            FROM frames
+            WHERE id = ?1
+            "#,
+        )
+        .bind(frame_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     /// Get accessibility data for a frame (accessibility_text, accessibility_tree_json).
     /// Used by the /frames/:frame_id/context endpoint for copy-all and URL extraction.
     pub async fn get_frame_accessibility_data(
@@ -2694,6 +2821,47 @@ impl DatabaseManager {
     ) -> Result<(Option<String>, Option<String>), sqlx::Error> {
         let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
             "SELECT accessibility_text, accessibility_tree_json FROM frames WHERE id = ?1",
+        )
+        .bind(frame_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.unwrap_or((None, None)))
+    }
+
+    pub async fn get_active_window_compat(
+        &self,
+        frame_id: i64,
+    ) -> Result<Option<ActiveWindowCompatRow>, sqlx::Error> {
+        sqlx::query_as::<_, ActiveWindowCompatRow>(
+            r#"
+            SELECT
+                frame_id,
+                capture_provenance,
+                focused_accessibility_json,
+                main_body_text,
+                main_body_meta_json
+            FROM active_window_compat
+            WHERE frame_id = ?1
+            "#,
+        )
+        .bind(frame_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
+    /// Get distilled main-body data for a frame from the compatibility store.
+    pub async fn get_frame_main_body_data(
+        &self,
+        frame_id: i64,
+    ) -> Result<(Option<String>, Option<String>), sqlx::Error> {
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            r#"
+            SELECT main_body_text, main_body_meta_json
+            FROM active_window_compat
+            WHERE frame_id = ?1
+            LIMIT 1
+            "#,
         )
         .bind(frame_id)
         .fetch_optional(&self.pool)
@@ -2777,8 +2945,7 @@ impl DatabaseManager {
                     speaker_name,
                 ));
 
-                let (frames_count, audio_count) =
-                    tokio::try_join!(frames_future, audio_future)?;
+                let (frames_count, audio_count) = tokio::try_join!(frames_future, audio_future)?;
                 return Ok(frames_count + audio_count);
             } else {
                 let frames_count = frames_future.await?;
@@ -2955,11 +3122,7 @@ impl DatabaseManager {
         let count: i64 = match content_type {
             ContentType::OCR | ContentType::Accessibility => {
                 sqlx::query_scalar(&sql)
-                    .bind(if has_fts {
-                        fts_query
-                    } else {
-                        "*".to_owned()
-                    })
+                    .bind(if has_fts { fts_query } else { "*".to_owned() })
                     .bind(start_time)
                     .bind(end_time)
                     .bind(min_length.map(|l| l as i64))
@@ -5818,9 +5981,8 @@ LIMIT ? OFFSET ?
         let merged_start: Option<String> = row.try_get("ms")?;
         let merged_end: Option<String> = row.try_get("me")?;
         // Update the survivor row
-        let update_sql = format!(
-            "UPDATE meetings SET meeting_start = ?1, meeting_end = ?2 WHERE id = ?3"
-        );
+        let update_sql =
+            format!("UPDATE meetings SET meeting_start = ?1, meeting_end = ?2 WHERE id = ?3");
         sqlx::query(&update_sql)
             .bind(&merged_start)
             .bind(&merged_end)
@@ -5950,10 +6112,7 @@ LIMIT ? OFFSET ?
             sets.push("source_context = ?5");
         }
 
-        let sql = format!(
-            "UPDATE memories SET {} WHERE id = ?6",
-            sets.join(", ")
-        );
+        let sql = format!("UPDATE memories SET {} WHERE id = ?6", sets.join(", "));
 
         sqlx::query(&sql)
             .bind(&now)
@@ -6095,7 +6254,6 @@ LIMIT ? OFFSET ?
             .fetch_one(&self.pool)
             .await
     }
-
 }
 
 pub fn find_matching_positions(blocks: &[OcrTextBlock], query: &str) -> Vec<TextPosition> {
@@ -6180,7 +6338,9 @@ pub fn find_matching_a11y_positions(tree_json: &str, query: &str) -> Vec<TextPos
     matches.sort_by(|a, b| {
         let area_a = a.bounds.width * a.bounds.height;
         let area_b = b.bounds.width * b.bounds.height;
-        area_b.partial_cmp(&area_a).unwrap_or(std::cmp::Ordering::Equal)
+        area_b
+            .partial_cmp(&area_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
     matches.dedup_by(|a, b| a.text == b.text);
 

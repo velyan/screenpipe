@@ -8,7 +8,10 @@ pub mod text_similarity;
 mod types;
 mod video_db;
 
-pub use db::{find_matching_a11y_positions, parse_all_text_positions, DatabaseManager, DeleteTimeRangeResult};
+pub use db::{
+    find_matching_a11y_positions, parse_all_text_positions, ActiveWindowCompatRow, DatabaseManager,
+    DeleteTimeRangeResult, FrameCaptureMetadata,
+};
 pub use migration_worker::{
     create_migration_worker, MigrationCommand, MigrationConfig, MigrationResponse, MigrationStatus,
     MigrationWorker,

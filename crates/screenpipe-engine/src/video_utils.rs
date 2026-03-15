@@ -1042,6 +1042,23 @@ mod pii_redaction_tests {
         output.into_inner()
     }
 
+    fn create_checkerboard_test_jpeg() -> Vec<u8> {
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_fn(100, 100, |x, y| {
+            let tile = ((x / 5) + (y / 5)) % 2;
+            if tile == 0 {
+                Rgb([0, 0, 0])
+            } else {
+                Rgb([255, 255, 255])
+            }
+        });
+        let dynamic_img = DynamicImage::ImageRgb8(img);
+
+        let mut output = Cursor::new(Vec::new());
+        let mut encoder = JpegEncoder::new_with_quality(&mut output, 85);
+        encoder.encode_image(&dynamic_img).unwrap();
+        output.into_inner()
+    }
+
     #[test]
     fn test_redact_frame_pii_empty_regions() {
         let image_data = create_test_jpeg();
@@ -1053,7 +1070,7 @@ mod pii_redaction_tests {
 
     #[test]
     fn test_redact_frame_pii_single_region() {
-        let image_data = create_test_jpeg();
+        let image_data = create_checkerboard_test_jpeg();
         let regions = vec![PiiRegion {
             x: 10,
             y: 10,
@@ -1063,10 +1080,22 @@ mod pii_redaction_tests {
         }];
 
         let result = redact_frame_pii(&image_data, &regions).unwrap();
-        // Result should be different from original (blurred)
-        assert_ne!(result, image_data);
-        // Should still be a valid image
-        assert!(image::load_from_memory(&result).is_ok());
+        let original = image::load_from_memory(&image_data).unwrap().to_rgba8();
+        let redacted = image::load_from_memory(&result).unwrap().to_rgba8();
+
+        let mut changed_pixels = 0;
+        for y in 10..30 {
+            for x in 10..40 {
+                if original.get_pixel(x, y) != redacted.get_pixel(x, y) {
+                    changed_pixels += 1;
+                }
+            }
+        }
+
+        assert!(
+            changed_pixels > 0,
+            "redaction should alter pixels inside the target region"
+        );
     }
 
     #[test]

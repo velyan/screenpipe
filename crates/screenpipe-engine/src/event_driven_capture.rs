@@ -729,7 +729,11 @@ async fn do_capture(
         browser_url: browser_url_owned.as_deref(),
         focused: true, // event-driven captures are always for the focused window
         capture_trigger: trigger.as_str(),
+        capture_provenance: None,
+        force_ocr: false,
         use_pii_removal,
+        enable_main_body_distillation: false,
+        main_body_distillation_threshold: 0.60,
     };
 
     let result = paired_capture(&ctx, tree_snapshot.as_ref()).await?;

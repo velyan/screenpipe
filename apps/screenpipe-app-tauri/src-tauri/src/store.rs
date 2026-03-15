@@ -674,6 +674,8 @@ impl SettingsStore {
             disable_vision: self.disable_vision,
             use_pii_removal: self.use_pii_removal,
             filter_music: self.filter_music,
+            enable_main_body_distillation: false,
+            main_body_distillation_threshold: 0.60,
             enable_input_capture: true, // always enabled, setting removed from UI
             enable_accessibility: true, // always enabled, setting removed from UI
             audio_transcription_engine: audio_engine_str
@@ -689,6 +691,8 @@ impl SettingsStore {
             use_all_monitors: self.use_all_monitors,
             ignored_windows: self.ignored_windows.clone(),
             included_windows: self.included_windows.clone(),
+            blocked_apps: screenpipe_a11y::tree::default_blocked_apps(),
+            blocked_title_keywords: screenpipe_a11y::tree::default_blocked_title_keywords(),
             ignored_urls: self.ignored_urls.clone(),
             ignore_incognito_windows: self.ignore_incognito_windows,
             languages: self
@@ -697,6 +701,7 @@ impl SettingsStore {
                 .filter(|s| s != &"default")
                 .filter_map(|s| s.parse().ok())
                 .collect(),
+            user_identities: vec![],
             deepgram_api_key: if self.deepgram_api_key.is_empty()
                 || self.deepgram_api_key == "default"
             {
@@ -980,4 +985,3 @@ impl PipeSuggestionsSettingsStore {
         store.save().map_err(|e| e.to_string())
     }
 }
-

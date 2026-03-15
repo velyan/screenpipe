@@ -50,6 +50,7 @@ use crate::{
             search_speakers_handler, undo_speaker_reassign_handler, update_speaker_handler,
         },
         streaming::{handle_video_export_post, handle_video_export_ws, stream_frames_handler},
+        vision_compat::{active_window_health, capture_active_window, latest_active_window},
         websocket::{ws_events_handler, ws_health_handler, ws_metrics_handler},
     },
     sync_api::{self, SyncState},
@@ -143,6 +144,17 @@ pub struct AppState {
     pub vision_metrics: Arc<screenpipe_screen::PipelineMetrics>,
     /// Audio pipeline metrics (shared across all devices)
     pub audio_metrics: Arc<screenpipe_audio::metrics::AudioPipelineMetrics>,
+    /// Window filters used by active-window capture endpoints.
+    pub ignored_windows: Vec<String>,
+    pub included_windows: Vec<String>,
+    /// AX privacy policy.
+    pub blocked_apps: Vec<String>,
+    pub blocked_title_keywords: Vec<String>,
+    /// Identity hints for outgoing/incoming message direction classification.
+    pub user_identities: Vec<String>,
+    /// Main-body distillation settings for synchronous active-window capture.
+    pub enable_main_body_distillation: bool,
+    pub main_body_distillation_threshold: f32,
     /// Limits concurrent ffmpeg frame extractions to prevent CPU thrashing
     /// when many thumbnails are requested in parallel (e.g., search results).
     pub frame_extraction_semaphore: Arc<tokio::sync::Semaphore>,
@@ -173,6 +185,13 @@ pub struct SCServer {
     pipe_manager: Option<crate::pipes_api::SharedPipeManager>,
     pub vision_metrics: Arc<screenpipe_screen::PipelineMetrics>,
     pub audio_metrics: Arc<screenpipe_audio::metrics::AudioPipelineMetrics>,
+    pub ignored_windows: Vec<String>,
+    pub included_windows: Vec<String>,
+    pub blocked_apps: Vec<String>,
+    pub blocked_title_keywords: Vec<String>,
+    pub user_identities: Vec<String>,
+    pub enable_main_body_distillation: bool,
+    pub main_body_distillation_threshold: f32,
     /// Shared hot frame cache — set this before starting the server so AppState uses it.
     pub hot_frame_cache: Option<Arc<HotFrameCache>>,
     /// Power manager handle — set this before starting to enable /power endpoints.
@@ -210,6 +229,13 @@ impl SCServer {
             pipe_manager: None,
             vision_metrics: Arc::new(screenpipe_screen::PipelineMetrics::new()),
             audio_metrics,
+            ignored_windows: Vec::new(),
+            included_windows: Vec::new(),
+            blocked_apps: screenpipe_a11y::tree::default_blocked_apps(),
+            blocked_title_keywords: screenpipe_a11y::tree::default_blocked_title_keywords(),
+            user_identities: Vec::new(),
+            enable_main_body_distillation: false,
+            main_body_distillation_threshold: 0.60,
             hot_frame_cache: None,
             power_manager: None,
             pipe_permissions: Arc::new(DashMap::new()),
@@ -433,6 +459,13 @@ impl SCServer {
             pipe_manager: self.pipe_manager.clone(),
             vision_metrics: self.vision_metrics.clone(),
             audio_metrics: self.audio_metrics.clone(),
+            ignored_windows: self.ignored_windows.clone(),
+            included_windows: self.included_windows.clone(),
+            blocked_apps: self.blocked_apps.clone(),
+            blocked_title_keywords: self.blocked_title_keywords.clone(),
+            user_identities: self.user_identities.clone(),
+            enable_main_body_distillation: self.enable_main_body_distillation,
+            main_body_distillation_threshold: self.main_body_distillation_threshold,
             // Allow up to 3 concurrent ffmpeg extractions. Beyond this, requests
             // queue rather than thrashing CPU with 15+ parallel ffmpeg processes
             // (typical when search results load all thumbnails at once).
@@ -471,6 +504,9 @@ impl SCServer {
             .get("/frames/:frame_id/metadata", get_frame_metadata)
             .get("/frames/next-valid", get_next_valid_frame)
             .get("/health", health_check)
+            .post("/vision/capture-active-window", capture_active_window)
+            .get("/vision/latest-active-window", latest_active_window)
+            .get("/vision/active-window/health", active_window_health)
             .post("/raw_sql", execute_raw_sql)
             .post("/add", add_to_database)
             .get("/speakers/unnamed", get_unnamed_speakers_handler)

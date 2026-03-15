@@ -365,8 +365,14 @@ async fn main() -> anyhow::Result<()> {
                     map.insert("use_pii_removal".into(), json!(record_args.use_pii_removal));
                     map.insert("disable_vision".into(), json!(record_args.disable_vision));
                     map.insert("vad_engine".into(), json!("Silero"));
-                    map.insert("enable_input_capture".into(), json!(true));
-                    map.insert("enable_accessibility".into(), json!(true));
+                    map.insert(
+                        "enable_input_capture".into(),
+                        json!(record_args.enable_input_capture),
+                    );
+                    map.insert(
+                        "enable_accessibility".into(),
+                        json!(record_args.enable_accessibility),
+                    );
                     map.insert("enable_sync".into(), json!(record_args.enable_sync));
                     map.insert(
                         "sync_interval_secs".into(),
@@ -685,6 +691,13 @@ async fn main() -> anyhow::Result<()> {
     );
     server.vision_metrics = vision_metrics;
     server.audio_metrics = audio_manager.metrics.clone();
+    server.ignored_windows = config.ignored_windows.clone();
+    server.included_windows = config.included_windows.clone();
+    server.blocked_apps = config.blocked_apps.clone();
+    server.blocked_title_keywords = config.blocked_title_keywords.clone();
+    server.user_identities = config.user_identities.clone();
+    server.enable_main_body_distillation = config.enable_main_body_distillation;
+    server.main_body_distillation_threshold = config.main_body_distillation_threshold;
     server.hot_frame_cache = Some(hot_frame_cache);
     server.power_manager = Some(power_manager);
     server.manual_meeting = Some(manual_meeting.clone());
@@ -1013,9 +1026,9 @@ async fn main() -> anyhow::Result<()> {
         .map(|detector| start_meeting_watcher(detector.clone()));
 
     // Persist meeting state transitions to DB (smart mode only)
-    let _meeting_persister_handle = meeting_detector
-        .as_ref()
-        .map(|detector| start_meeting_persister(detector.clone(), db.clone(), manual_meeting.clone()));
+    let _meeting_persister_handle = meeting_detector.as_ref().map(|detector| {
+        start_meeting_persister(detector.clone(), db.clone(), manual_meeting.clone())
+    });
 
     // Bridge calendar events from event bus into meeting detector
     let _calendar_bridge_handle = meeting_detector

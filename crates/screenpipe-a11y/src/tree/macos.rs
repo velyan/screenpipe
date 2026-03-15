@@ -5,8 +5,8 @@
 //! macOS accessibility tree walker using cidre AX APIs.
 
 use super::{
-    AccessibilityTreeNode, SkipReason, TreeSnapshot, TreeWalkResult, TreeWalkerConfig,
-    TreeWalkerPlatform,
+    AccessibilityTreeNode, FocusedElementContext, SkipReason, TreeSnapshot, TreeWalkResult,
+    TreeWalkerConfig, TreeWalkerPlatform, WindowBounds,
 };
 use anyhow::Result;
 use chrono::Utc;
@@ -210,19 +210,13 @@ impl MacosTreeWalker {
             .map(|s| s.to_string())
             .unwrap_or_default();
 
-        // Skip excluded apps (password managers, etc.)
         let app_lower = app_name.to_lowercase();
-        const EXCLUDED_APPS: &[&str] = &[
-            "1password",
-            "bitwarden",
-            "lastpass",
-            "dashlane",
-            "keepassxc",
-            "keychain access",
-            "screenpipe",
-            "loginwindow",
-        ];
-        if EXCLUDED_APPS.iter().any(|ex| app_lower.contains(ex)) {
+        if self
+            .config
+            .blocked_apps
+            .iter()
+            .any(|pattern| app_lower.contains(&pattern.to_lowercase()))
+        {
             return Ok(TreeWalkResult::Skipped(SkipReason::ExcludedApp));
         }
 
@@ -259,6 +253,7 @@ impl MacosTreeWalker {
         let window: &ax::UiElement = unsafe { std::mem::transmute(&*window_val) };
 
         let window_name = get_string_attr(window, ax::attr::title()).unwrap_or_default();
+        let window_id = get_u32_attr_by_name(window, "AXWindowNumber");
 
         // Skip incognito / private browsing windows.  Uses the full detector
         // which checks AppleScript window properties for Chromium browsers
@@ -271,8 +266,17 @@ impl MacosTreeWalker {
             return Ok(TreeWalkResult::Skipped(SkipReason::Incognito));
         }
 
-        // Apply user-configured ignored windows (also check window title)
         let window_lower = window_name.to_lowercase();
+        if self
+            .config
+            .blocked_title_keywords
+            .iter()
+            .any(|pattern| window_lower.contains(&pattern.to_lowercase()))
+        {
+            return Ok(TreeWalkResult::Skipped(SkipReason::ExcludedApp));
+        }
+
+        // Apply user-configured ignored windows (also check window title)
         if self.config.ignored_windows.iter().any(|pattern| {
             let p = pattern.to_lowercase();
             window_lower.contains(&p)
@@ -297,14 +301,22 @@ impl MacosTreeWalker {
 
         // 3. Read window frame for normalizing element bounds to 0-1 coords
         let mut state = WalkState::new(&self.config, start);
+        let mut window_bounds = None;
         if let Some((wx, wy, ww, wh)) = get_element_frame(window) {
             if ww > 0.0 && wh > 0.0 {
                 state.window_x = wx;
                 state.window_y = wy;
                 state.window_w = ww;
                 state.window_h = wh;
+                window_bounds = Some(WindowBounds {
+                    x: wx,
+                    y: wy,
+                    width: ww,
+                    height: wh,
+                });
             }
         }
+        let focused_element = extract_focused_element_context(window_bounds.as_ref());
 
         // Walk the accessibility tree
         walk_element(window, 0, &mut state);
@@ -349,8 +361,12 @@ impl MacosTreeWalker {
         Ok(TreeWalkResult::Found(TreeSnapshot {
             app_name,
             window_name,
+            window_id,
+            process_id: u32::try_from(pid).ok(),
+            window_bounds,
             text_content,
             nodes: state.nodes,
+            focused_element,
             browser_url,
             timestamp: Utc::now(),
             node_count: state.node_count,
@@ -629,6 +645,15 @@ fn get_element_frame(elem: &ax::UiElement) -> Option<(f64, f64, f64, f64)> {
     Some((pos.0, pos.1, size.0, size.1))
 }
 
+fn get_u32_attr_by_name(elem: &ax::UiElement, name: &str) -> Option<u32> {
+    let attr_name = cf::String::from_str(name);
+    let attr = ax::Attr::with_string(&attr_name);
+    elem.attr_value(&attr)
+        .ok()
+        .and_then(|value| value.try_as_number().and_then(|number| number.to_i64()))
+        .and_then(|raw| u32::try_from(raw).ok())
+}
+
 /// Normalize an element's screen-absolute frame to 0-1 coordinates.
 ///
 /// Prefers **monitor-relative** normalization (matching the full-screen capture image).
@@ -673,6 +698,68 @@ fn normalize_bounds(
         top: top.clamp(0.0, 1.0),
         width: width.min(1.0 - left.max(0.0)),
         height: height.min(1.0 - top.max(0.0)),
+    })
+}
+
+fn normalize_bounds_for_window(
+    elem_x: f64,
+    elem_y: f64,
+    elem_w: f64,
+    elem_h: f64,
+    window: &WindowBounds,
+) -> Option<super::NodeBounds> {
+    if window.width <= 0.0 || window.height <= 0.0 || elem_w <= 0.0 || elem_h <= 0.0 {
+        return None;
+    }
+
+    let left = ((elem_x - window.x) / window.width) as f32;
+    let top = ((elem_y - window.y) / window.height) as f32;
+    let width = (elem_w / window.width) as f32;
+    let height = (elem_h / window.height) as f32;
+
+    if left < -0.1 || top < -0.1 || width <= 0.0 || height <= 0.0 || left > 1.1 || top > 1.1 {
+        return None;
+    }
+
+    Some(super::NodeBounds {
+        left: left.clamp(0.0, 1.0),
+        top: top.clamp(0.0, 1.0),
+        width: width.min(1.0 - left.max(0.0)),
+        height: height.min(1.0 - top.max(0.0)),
+    })
+}
+
+fn extract_focused_element_context(
+    window_bounds: Option<&WindowBounds>,
+) -> Option<FocusedElementContext> {
+    let system = ax::UiElement::sys_wide();
+    let focused = system.attr_value(ax::attr::focused_ui_element()).ok()?;
+    if focused.get_type_id() != ax::UiElement::type_id() {
+        return None;
+    }
+    let elem: &ax::UiElement = unsafe { std::mem::transmute(&*focused) };
+
+    let role = elem.role().ok().map(|r| r.to_string())?;
+    let name = get_string_attr(elem, ax::attr::title())
+        .or_else(|| get_string_attr(elem, ax::attr::desc()))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let input_text = get_string_attr(elem, ax::attr::value())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let selected_text = get_string_attr(elem, ax::attr::selected_text())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let bounds = get_element_frame(elem).and_then(|(x, y, w, h)| {
+        window_bounds.and_then(|wb| normalize_bounds_for_window(x, y, w, h, wb))
+    });
+
+    Some(FocusedElementContext {
+        role,
+        name,
+        input_text,
+        selected_text,
+        bounds,
     })
 }
 
