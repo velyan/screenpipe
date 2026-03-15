@@ -4,28 +4,21 @@
 import { useState, useRef, useMemo, useCallback, useEffect } from "react";
 import { AudioData, StreamTimeSeriesResponse, TimeRange } from "@/components/rewind/timeline";
 import { Button } from "@/components/ui/button";
-import { GripHorizontal, X, Copy, Check, BotMessageSquare, Sparkles, MoreVertical, RefreshCw, Loader2 } from "lucide-react";
+import { GripHorizontal, X, Copy, Check, BotMessageSquare, Sparkles, MoreVertical, RefreshCw, UserCheck } from "lucide-react";
 import {
 	DropdownMenu,
 	DropdownMenuContent,
 	DropdownMenuItem,
 	DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import {
-	Dialog,
-	DialogContent,
-	DialogHeader,
-	DialogTitle,
-	DialogFooter,
-} from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { useToast } from "@/components/ui/use-toast";
 import { showChatWithPrefill } from "@/lib/chat-utils";
+import { toast } from "@/components/ui/use-toast";
 import {
 	ConversationBubble,
 	TimeGapDivider,
 	ParticipantsSummary,
 } from "@/components/conversation-bubble";
+import { SpeakerAssignPopover } from "@/components/speaker-assign-popover";
 import { cn } from "@/lib/utils";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Meeting, deduplicateAudioItems } from "@/lib/hooks/use-meetings";
@@ -113,6 +106,8 @@ export function AudioTranscript({
 	const activeMeetingId = activeMeeting?.id;
 	useEffect(() => {
 		setMeetingPageSize(MEETING_PAGE_SIZE);
+		setSelectionMode(false);
+		setSelectedChunks(new Set());
 	}, [activeMeetingId]);
 
 	const [position, setPosition] = useState(() => ({
@@ -142,6 +137,10 @@ export function AudioTranscript({
 		Map<number, string>
 	>(new Map());
 
+	// Selection mode for bulk speaker reassign
+	const [selectionMode, setSelectionMode] = useState(false);
+	const [selectedChunks, setSelectedChunks] = useState<Set<number>>(new Set());
+
 	const handleRetranscribed = useCallback(
 		(audioChunkId: number, newText: string) => {
 			setTranscriptionOverrides((prev) => {
@@ -152,6 +151,23 @@ export function AudioTranscript({
 		},
 		[]
 	);
+
+	const toggleChunkSelection = useCallback((chunkId: number) => {
+		setSelectedChunks((prev) => {
+			const next = new Set(prev);
+			if (next.has(chunkId)) {
+				next.delete(chunkId);
+			} else {
+				next.add(chunkId);
+			}
+			return next;
+		});
+	}, []);
+
+	const exitSelectionMode = useCallback(() => {
+		setSelectionMode(false);
+		setSelectedChunks(new Set());
+	}, []);
 
 	const handleSpeakerAssigned = useCallback(
 		(audioChunkId: number, newSpeakerId: number, newSpeakerName: string) => {
@@ -266,7 +282,7 @@ export function AudioTranscript({
 
 		// Compute participants and first chunk by speaker (for header assign popovers)
 		const participantMap = new Map<number, { name: string; duration: number }>();
-		const firstChunkBySpeaker = new Map<number, { audioChunkId: number; audioFilePath: string }>();
+		const firstChunkBySpeaker = new Map<number | string, { audioChunkId: number; audioFilePath: string }>();
 		dedupedAudio.forEach((audio) => {
 			const { speakerId, speakerName } = getSpeakerInfo(audio);
 			const id = speakerId ?? -1;
@@ -371,7 +387,7 @@ export function AudioTranscript({
 		const totalDuration = participants.reduce((sum, p) => sum + p.duration, 0);
 
 		// Build first chunk by speaker for header assign popovers
-		const firstChunkBySpeaker = new Map<number, { audioChunkId: number; audioFilePath: string }>();
+		const firstChunkBySpeaker = new Map<number | string, { audioChunkId: number; audioFilePath: string }>();
 		dedupedAudio.forEach((audio) => {
 			const { speakerId } = getSpeakerInfo(audio);
 			const id = speakerId ?? -1;
@@ -391,6 +407,38 @@ export function AudioTranscript({
 		return { items, participants, timeRange, totalDuration, firstChunkBySpeaker };
 	}, [activeMeeting, getSpeakerInfo]);
 
+	const handleBulkAssignToSelected = useCallback(
+		(firstChunkNewSpeakerId: number, firstChunkNewSpeakerName: string) => {
+			const chunks = Array.from(selectedChunks);
+			for (const chunkId of chunks) {
+				setSpeakerOverrides((prev) => {
+					const next = new Map(prev);
+					next.set(chunkId, { speakerId: firstChunkNewSpeakerId, speakerName: firstChunkNewSpeakerName });
+					return next;
+				});
+			}
+
+			// Fire API calls for all selected chunks (first was handled by popover, rest fire-and-forget)
+			const data = activeMeeting ? meetingConversationData : conversationData;
+			for (const chunkId of chunks) {
+				const audio = data.items.find((item) => item.audio.audio_chunk_id === chunkId)?.audio;
+				if (!audio) continue;
+				fetch("http://localhost:3030/speakers/reassign", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({
+						audio_chunk_id: chunkId,
+						new_speaker_name: firstChunkNewSpeakerName,
+						propagate_similar: false,
+					}),
+				}).catch((err) => console.error("bulk reassign error:", err));
+			}
+
+			exitSelectionMode();
+		},
+		[selectedChunks, activeMeeting, meetingConversationData, conversationData, exitSelectionMode]
+	);
+
 	// Copy full transcript to clipboard (nearby or meeting depending on active tab)
 	const handleCopyTranscript = useCallback(() => {
 		const data = !!activeMeeting ? meetingConversationData : conversationData;
@@ -409,73 +457,29 @@ export function AudioTranscript({
 		});
 	}, [activeMeeting, meetingConversationData, conversationData, getSpeakerInfo]);
 
-	// Retranscribe: re-run STT on all audio in the current view
-	const [isRetranscribing, setIsRetranscribing] = useState(false);
-	const [showRetranscribeDialog, setShowRetranscribeDialog] = useState(false);
-	const [retranscribePrompt, setRetranscribePrompt] = useState("");
-	const { toast } = useToast();
-
+	// Retranscribe: open AI chat with a retranscribe prompt
 	const handleRetranscribe = useCallback(async () => {
-		if (isRetranscribing) return; // prevent double-submit
 		const data = !!activeMeeting ? meetingConversationData : conversationData;
 		if (!data.items.length) return;
 
-		setShowRetranscribeDialog(false);
-		setIsRetranscribing(true);
+		const timeRange = data.timeRange
+			? `from ${data.timeRange.start.toISOString()} to ${data.timeRange.end.toISOString()}`
+			: "";
 
-		try {
-			// Collect unique audio_chunk_ids from visible items (avoids timestamp mismatch)
-			const chunkIds = [...new Set(data.items.map((item) => item.audio.audio_chunk_id))];
-			const body: Record<string, unknown> = {
-				audio_chunk_ids: chunkIds,
-			};
-			if (retranscribePrompt.trim()) {
-				body.prompt = retranscribePrompt.trim();
-			}
-
-			console.log("[retranscribe] request:", chunkIds.length, "chunks");
-
-			const res = await fetch("http://localhost:3030/audio/retranscribe", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify(body),
-			});
-
-			if (!res.ok) {
-				const err = await res.json().catch(() => ({}));
-				throw new Error(err.error || `failed (${res.status})`);
-			}
-
-			const result = await res.json();
-			console.log("[retranscribe] response:", JSON.stringify(result));
-
-			// Apply all new transcriptions as overrides
-			const transcriptions = result.transcriptions ?? [];
-			for (const t of transcriptions) {
-				handleRetranscribed(t.audio_chunk_id, t.new_text);
-			}
-
-			const count = result.chunks_processed ?? 0;
-			toast({
-				title: "retranscribed",
-				description: `${count} chunk${count !== 1 ? "s" : ""} updated`,
-			});
-		} catch (e: any) {
-			console.error("[retranscribe] error:", e);
-			toast({
-				title: "retranscribe failed",
-				description: e.message,
-				variant: "destructive",
-			});
-		} finally {
-			setIsRetranscribing(false);
-			setRetranscribePrompt("");
-		}
-	}, [activeMeeting, meetingConversationData, conversationData, retranscribePrompt, isRetranscribing, handleRetranscribed, toast]);
+		await showChatWithPrefill({
+			context: "",
+			prompt: `can you retranscribe the audio ${timeRange}?`,
+			autoSend: true,
+			source: "retranscribe-button",
+		});
+	}, [activeMeeting, meetingConversationData, conversationData]);
 
 	const handleSendToChat = useCallback(async () => {
 		const data = !!activeMeeting ? meetingConversationData : conversationData;
-		if (!data.items.length) return;
+		if (!data.items.length) {
+			toast({ title: "no transcript data to send", variant: "destructive" });
+			return;
+		}
 
 		const lines = data.items.map((item) => {
 			const { speakerName } = getSpeakerInfo(item.audio);
@@ -532,49 +536,36 @@ export function AudioTranscript({
 		const { data, hasMeeting, isOngoing, canSummarize } = summarizeInfo;
 		if (!canSummarize) return;
 
-		// Build transcript lines, skip empty transcriptions
-		const lines = data.items
-			.filter((item) => item.audio.transcription && item.audio.transcription.trim().length > 0)
-			.map((item) => {
-				const { speakerName } = getSpeakerInfo(item.audio);
-				const time = item.audio.timestamp.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-				const name = speakerName || (item.audio.is_input ? "me" : "speaker");
-				return `[${time}] ${name}: ${item.audio.transcription}`;
-			});
+		const timeRange = data.timeRange;
+		if (!timeRange) return;
 
-		// Truncate very long transcripts (cap at 500 lines)
-		const MAX_LINES = 500;
-		let truncated = false;
-		let transcriptLines = lines;
-		if (lines.length > MAX_LINES) {
-			transcriptLines = lines.slice(-MAX_LINES);
-			truncated = true;
-		}
+		const startUtc = timeRange.start.toISOString();
+		const endUtc = timeRange.end.toISOString();
+		const startLocal = timeRange.start.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+		const endLocal = timeRange.end.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
-		const timeRange = data.timeRange
-			? `${data.timeRange.start.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} – ${data.timeRange.end.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
-			: "";
+		const speakers = data.participants
+			.map((p) => p.name || `speaker-${p.id}`)
+			.join(", ");
 
-		const label = hasMeeting
-			? `meeting transcript (${timeRange})`
-			: `nearby audio transcript (${timeRange})`;
+		const label = hasMeeting ? "meeting" : "audio";
+		const ongoingNote = isOngoing ? " (still in progress)" : "";
 
-		const truncationNote = truncated
-			? `\n\n(note: transcript was truncated to the most recent ${MAX_LINES} segments out of ${lines.length} total)`
-			: "";
-
-		const ongoingNote = isOngoing ? " (meeting still in progress)" : "";
-
-		const context = `here is my ${label}${ongoingNote}:\n\n${transcriptLines.join("\n")}${truncationNote}`;
+		const context = [
+			`${label} from ${startLocal} to ${endLocal}${ongoingNote}`,
+			speakers ? `participants: ${speakers}` : "",
+			`segments: ${data.items.length}`,
+			`use screenpipe search API with content_type=audio, start_time=${startUtc}, end_time=${endUtc} to fetch the transcript`,
+		].filter(Boolean).join("\n");
 
 		const meetingPipe = templatePipes.find((p) => p.name === "meeting-summary");
 		const fallbackPrompt = isOngoing
-			? "summarize this meeting so far with key takeaways and action items identified to this point"
-			: "summarize this meeting with key takeaways and action items";
+			? `query the audio transcriptions from ${startLocal} to ${endLocal} and summarize this meeting so far with key takeaways and action items`
+			: `query the audio transcriptions from ${startLocal} to ${endLocal} and summarize this meeting with key takeaways and action items`;
 		const prompt = meetingPipe?.prompt || fallbackPrompt;
 
 		await showChatWithPrefill({ context, prompt, autoSend: true });
-	}, [summarizeInfo, getSpeakerInfo, templatePipes]);
+	}, [summarizeInfo, templatePipes]);
 
 	const isVisible = useMemo(() => {
 		return conversationData.items.length > 0 || activeMeeting != null;
@@ -710,24 +701,27 @@ export function AudioTranscript({
 								<TooltipTrigger asChild>
 									<DropdownMenuTrigger asChild>
 										<Button variant="ghost" size="sm" className="h-6 w-6 p-0">
-											{isRetranscribing ? (
-												<Loader2 className="h-3 w-3 animate-spin" />
-											) : (
-												<MoreVertical className="h-3 w-3" />
-											)}
+											<MoreVertical className="h-3 w-3" />
 										</Button>
 									</DropdownMenuTrigger>
 								</TooltipTrigger>
-								<TooltipContent side="bottom"><p>{isRetranscribing ? "retranscribing..." : "more"}</p></TooltipContent>
+								<TooltipContent side="bottom"><p>more</p></TooltipContent>
 							</Tooltip>
 							<DropdownMenuContent align="end" className="w-44">
 								<DropdownMenuItem
-									onClick={() => setShowRetranscribeDialog(true)}
-									disabled={isRetranscribing}
+									onClick={handleRetranscribe}
 									className="text-xs gap-2"
 								>
 									<RefreshCw className="h-3 w-3" />
 									retranscribe
+								</DropdownMenuItem>
+								<DropdownMenuItem
+									onClick={() => setSelectionMode(true)}
+									disabled={selectionMode}
+									className="text-xs gap-2"
+								>
+									<UserCheck className="h-3 w-3" />
+									select &amp; reassign
 								</DropdownMenuItem>
 							</DropdownMenuContent>
 						</DropdownMenu>
@@ -779,15 +773,7 @@ export function AudioTranscript({
 					WebkitOverflowScrolling: "touch",
 				}}
 			>
-				{/* Retranscribing banner */}
-				{isRetranscribing && (
-					<div className="flex items-center gap-2 px-3 py-2 border-b border-border bg-muted/50 text-xs text-muted-foreground">
-						<Loader2 className="h-3 w-3 animate-spin shrink-0" />
-						<span>retranscribing audio — this may take a moment...</span>
-					</div>
-				)}
-
-				{activeMeeting ? (
+					{activeMeeting ? (
 					// Full meeting transcript view
 					<div className="p-3 pb-14 space-y-0">
 						{meetingConversationData.items.length === 0 ? (
@@ -867,6 +853,9 @@ export function AudioTranscript({
 																	)
 															: undefined
 													}
+													selectionMode={selectionMode}
+													isSelected={selectedChunks.has(item.audio.audio_chunk_id)}
+													onToggleSelect={() => toggleChunkSelection(item.audio.audio_chunk_id)}
 												/>
 											</div>
 										);
@@ -913,6 +902,9 @@ export function AudioTranscript({
 													newName
 												)
 											}
+											selectionMode={selectionMode}
+											isSelected={selectedChunks.has(item.audio.audio_chunk_id)}
+											onToggleSelect={() => toggleChunkSelection(item.audio.audio_chunk_id)}
 										/>
 									</div>
 								);
@@ -921,6 +913,52 @@ export function AudioTranscript({
 					</div>
 				)}
 			</div>
+
+			{/* Floating selection bar */}
+			{selectionMode && (
+				<div className="absolute bottom-5 left-3 right-3 flex items-center justify-between gap-2 px-3 py-2 bg-popover border border-border text-xs z-10">
+					{selectedChunks.size > 0 ? (
+						<>
+							<span className="text-muted-foreground shrink-0">
+								{selectedChunks.size} selected
+							</span>
+							{(() => {
+								const firstChunkId = Array.from(selectedChunks)[0];
+								const data = activeMeeting ? meetingConversationData : conversationData;
+								const firstAudio = data.items.find(
+									(item) => item.audio.audio_chunk_id === firstChunkId
+								)?.audio;
+								if (!firstAudio) return null;
+								return (
+									<SpeakerAssignPopover
+										audioChunkId={firstChunkId}
+										speakerId={firstAudio.speaker_id}
+										speakerName={firstAudio.speaker_name}
+										audioFilePath={firstAudio.audio_file_path}
+										onAssigned={(newId, newName) =>
+											handleBulkAssignToSelected(newId, newName)
+										}
+									>
+										<span className="px-2 py-1 border border-border hover:bg-accent cursor-pointer transition-colors duration-150">
+											assign to...
+										</span>
+									</SpeakerAssignPopover>
+								);
+							})()}
+						</>
+					) : (
+						<span className="text-muted-foreground">click bubbles to select</span>
+					)}
+					<Button
+						variant="ghost"
+						size="sm"
+						className="h-6 px-2 text-xs shrink-0"
+						onClick={exitSelectionMode}
+					>
+						cancel
+					</Button>
+				</div>
+			)}
 
 			{/* Resize handle */}
 			<div
@@ -933,54 +971,6 @@ export function AudioTranscript({
 				}}
 			/>
 
-			{/* Retranscribe dialog */}
-			<Dialog open={showRetranscribeDialog} onOpenChange={setShowRetranscribeDialog}>
-				<DialogContent className="sm:max-w-md">
-					<DialogHeader>
-						<DialogTitle className="text-sm">retranscribe audio</DialogTitle>
-					</DialogHeader>
-					<div className="space-y-3">
-						{(() => {
-							const data = !!activeMeeting ? meetingConversationData : conversationData;
-							const chunkCount = new Set(data.items.map((item) => item.audio.audio_chunk_id)).size;
-							return (
-								<p className="text-xs text-muted-foreground">
-									re-run speech-to-text on {chunkCount} audio chunk{chunkCount !== 1 ? "s" : ""}.
-									optionally provide a prompt to guide transcription (e.g. speaker names, technical terms).
-								</p>
-							);
-						})()}
-						<Input
-							placeholder="optional prompt (e.g. 'speakers: marc, ben. topic: AI startups')"
-							value={retranscribePrompt}
-							onChange={(e) => setRetranscribePrompt(e.target.value)}
-							onKeyDown={(e) => {
-								if (e.key === "Enter") handleRetranscribe();
-							}}
-							className="text-xs"
-							autoFocus
-						/>
-					</div>
-					<DialogFooter>
-						<Button
-							variant="outline"
-							size="sm"
-							className="text-xs"
-							onClick={() => setShowRetranscribeDialog(false)}
-						>
-							cancel
-						</Button>
-						<Button
-							size="sm"
-							className="text-xs gap-1.5"
-							onClick={handleRetranscribe}
-						>
-							<RefreshCw className="h-3 w-3" />
-							retranscribe
-						</Button>
-					</DialogFooter>
-				</DialogContent>
-			</Dialog>
 		</div>
 	) : null;
 }

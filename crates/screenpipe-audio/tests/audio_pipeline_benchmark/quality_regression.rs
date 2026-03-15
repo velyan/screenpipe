@@ -29,15 +29,13 @@ async fn whisper_hallucination_on_silence() {
     println!("\n--- Whisper Hallucination: Pure Silence ---");
 
     let engine = Arc::new(AudioTranscriptionEngine::WhisperLargeV3TurboQuantized);
-    let model_path = download_whisper_model(engine.clone()).expect("failed to download model");
-    let context_params =
-        create_whisper_context_parameters(engine.clone()).expect("failed to create params");
-    let whisper_context =
-        WhisperContext::new_with_params(&model_path.to_string_lossy(), context_params)
-            .expect("failed to load model");
-    let mut whisper_state = whisper_context
-        .create_state()
-        .expect("failed to create state");
+    let transcription_engine =
+        TranscriptionEngine::new(engine.clone(), None, None, vec![Language::English], vec![])
+            .await
+            .expect("failed to create transcription engine");
+    let mut session = transcription_engine
+        .create_session()
+        .expect("failed to create session");
 
     // 30 seconds of pure silence at 16kHz
     let silence = vec![0.0f32; SAMPLE_RATE as usize * 30];
@@ -69,15 +67,13 @@ async fn whisper_hallucination_on_noise() {
     println!("\n--- Whisper Hallucination: White Noise ---");
 
     let engine = Arc::new(AudioTranscriptionEngine::WhisperLargeV3TurboQuantized);
-    let model_path = download_whisper_model(engine.clone()).expect("failed to download model");
-    let context_params =
-        create_whisper_context_parameters(engine.clone()).expect("failed to create params");
-    let whisper_context =
-        WhisperContext::new_with_params(&model_path.to_string_lossy(), context_params)
-            .expect("failed to load model");
-    let mut whisper_state = whisper_context
-        .create_state()
-        .expect("failed to create state");
+    let transcription_engine =
+        TranscriptionEngine::new(engine.clone(), None, None, vec![Language::English], vec![])
+            .await
+            .expect("failed to create transcription engine");
+    let mut session = transcription_engine
+        .create_session()
+        .expect("failed to create session");
 
     // 30 seconds of white noise at 0.1 amplitude
     let noise = audio_fixtures::white_noise(0.1, 30.0);
@@ -107,15 +103,13 @@ async fn whisper_hallucination_on_ambient() {
     println!("\n--- Whisper Hallucination: Low Ambient Noise ---");
 
     let engine = Arc::new(AudioTranscriptionEngine::WhisperLargeV3TurboQuantized);
-    let model_path = download_whisper_model(engine.clone()).expect("failed to download model");
-    let context_params =
-        create_whisper_context_parameters(engine.clone()).expect("failed to create params");
-    let whisper_context =
-        WhisperContext::new_with_params(&model_path.to_string_lossy(), context_params)
-            .expect("failed to load model");
-    let mut whisper_state = whisper_context
-        .create_state()
-        .expect("failed to create state");
+    let transcription_engine =
+        TranscriptionEngine::new(engine.clone(), None, None, vec![Language::English], vec![])
+            .await
+            .expect("failed to create transcription engine");
+    let mut session = transcription_engine
+        .create_session()
+        .expect("failed to create session");
 
     // 30s of very low noise at 0.01 amplitude (typical quiet room)
     let ambient = audio_fixtures::white_noise(0.01, 30.0);
@@ -153,15 +147,13 @@ async fn whisper_real_speech_still_works() {
     };
 
     let engine = Arc::new(AudioTranscriptionEngine::WhisperLargeV3TurboQuantized);
-    let model_path = download_whisper_model(engine.clone()).expect("failed to download model");
-    let context_params =
-        create_whisper_context_parameters(engine.clone()).expect("failed to create params");
-    let whisper_context =
-        WhisperContext::new_with_params(&model_path.to_string_lossy(), context_params)
-            .expect("failed to load model");
-    let mut whisper_state = whisper_context
-        .create_state()
-        .expect("failed to create state");
+    let transcription_engine =
+        TranscriptionEngine::new(engine.clone(), None, None, vec![Language::English], vec![])
+            .await
+            .expect("failed to create transcription engine");
+    let mut session = transcription_engine
+        .create_session()
+        .expect("failed to create session");
 
     // Load first scenario with speech
     let dataset_path = std::path::Path::new(&dataset_dir);

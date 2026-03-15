@@ -136741,7 +136741,7 @@
       "frame_id": 13258,
       "browser_url": "https://mail.google.com/mail/u/3/#inbox/FMfcgzQfBZlSLWGBMzdVcbKwGHNQtNfp",
       "app_name": "Arc",
-      "text": "https://discord.gg/dU9EBuw7Uq, contact us at louis@mediar.ai, or",
+      "text": "https://discord.gg/screenpipe, contact us at louis@mediar.ai, or",
       "confidence": 1,
       "bounds": {
         "left": 0.45349,
@@ -136750,7 +136750,7 @@
         "height": 0.02336
       },
       "ground_truth_urls": [
-        "https://discord.gg/dU9EBuw7Uq"
+        "https://discord.gg/screenpipe"
       ]
     },
     {

@@ -9,8 +9,8 @@ mod types;
 mod video_db;
 
 pub use db::{
-    parse_all_text_positions, DatabaseManager, DeleteTimeRangeResult, FrameCaptureMetadata,
-    TextDistillationCacheRow,
+    find_matching_a11y_positions, parse_all_text_positions, ActiveWindowCompatRow, DatabaseManager,
+    DeleteTimeRangeResult, FrameCaptureMetadata,
 };
 pub use migration_worker::{
     create_migration_worker, MigrationCommand, MigrationConfig, MigrationResponse, MigrationStatus,

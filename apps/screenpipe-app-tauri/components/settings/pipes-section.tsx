@@ -11,6 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import {
   Play,
+  Sparkles,
   Square,
   Trash2,
   ChevronDown,
@@ -23,15 +24,25 @@ import {
   Users,
   MoreHorizontal,
   Plus,
+  Search,
+  Share2,
+  Link,
 } from "lucide-react";
 import { Textarea } from "@/components/ui/textarea";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { homeDir, join } from "@tauri-apps/api/path";
 import { revealItemInDir, openUrl } from "@tauri-apps/plugin-opener";
-import { emit } from "@tauri-apps/api/event";
-import { showChatWithPrefill } from "@/lib/chat-utils";
+import { emit, once } from "@tauri-apps/api/event";
+import { ChatPrefillData } from "@/lib/chat-utils";
 import { commands } from "@/lib/utils/tauri";
 import { cn } from "@/lib/utils";
 import {
@@ -45,6 +56,7 @@ import { useSettings } from "@/lib/hooks/use-settings";
 import { AIPresetsSelector } from "@/components/rewind/ai-presets-selector";
 import { useTeam } from "@/lib/hooks/use-team";
 import { useToast } from "@/components/ui/use-toast";
+import { HelpTooltip } from "@/components/ui/help-tooltip";
 import { UpgradeDialog } from "@/components/upgrade-dialog";
 import posthog from "posthog-js";
 
@@ -105,11 +117,11 @@ curl "http://localhost:3030/search?limit=20&content_type=all&start_time=<ISO8601
 
 ## after creating the file
 
-IMPORTANT: always use "bunx screenpipe@latest" (not "bunx screenpipe" or "screenpipe") to ensure the latest CLI version:
+IMPORTANT: always use "bun x screenpipe@latest" (not "bun x screenpipe" or "screenpipe") to ensure the latest CLI version:
 
-install: bunx screenpipe@latest pipe install ~/.screenpipe/pipes/my-pipe
-enable:  bunx screenpipe@latest pipe enable my-pipe
-test:    bunx screenpipe@latest pipe run my-pipe
+install: bun x screenpipe@latest pipe install ~/.screenpipe/pipes/my-pipe
+enable:  bun x screenpipe@latest pipe enable my-pipe
+test:    bun x screenpipe@latest pipe run my-pipe
 
 ## important formatting rules
 
@@ -118,6 +130,48 @@ the pipe.md file MUST start with --- on the very first line (YAML front-matter).
 ## task
 
 create the pipe.md file, install it, and enable it. here is what the user wants:`;
+
+function navigateHomeAndPrefill(data: ChatPrefillData): void {
+  // Store prefill data before navigating — the page will reload so
+  // any code after location change won't execute.
+  sessionStorage.setItem("pendingChatPrefill", JSON.stringify(data));
+  const url = new URL(window.location.href);
+  url.searchParams.set("section", "home");
+  window.location.href = url.toString();
+}
+
+function buildOptimizePrompt(pipeName: string): string {
+  const sessionDir = `~/.pi/agent/sessions/`;
+  return `i need help optimizing my screenpipe pipe "${pipeName}".
+
+## your task
+
+1. first, ask me: what do i expect this pipe to produce? what's the ideal output?
+2. then read the pipe prompt: ~/.screenpipe/pipes/${pipeName}/pipe.md
+3. check the last few execution logs by querying the screenpipe API: GET http://localhost:3030/pipes/${pipeName}/executions?limit=5
+4. look at the pi agent session files in ${sessionDir} for the full conversation history (tool calls, reasoning, errors)
+5. based on all of this, suggest specific improvements to the pipe.md prompt
+
+## optimization guidelines
+
+follow these prompt engineering best practices (from anthropic's guide):
+- be specific and explicit about expected output format
+- give the agent clear step-by-step instructions
+- include examples of good output
+- add error handling: "if the API returns empty results, try content_type=accessibility instead of ocr"
+- add validation: "before writing the file, verify you have at least 3 activity entries"
+- avoid ambiguity: specify exact file paths, exact API parameters, exact output structure
+
+## common issues to check for
+
+- pipe queries content_type=ocr but user have mostly accessibility (try accessibility instead)
+- pipe doesn't specify output file path explicitly (agent guesses wrong location)
+- pipe prompt is too vague for small/local models (needs more explicit steps)
+- schedule is too frequent (burning credits on empty time ranges)
+- no error handling for empty API responses (agent exits successfully with no output)
+
+after analyzing, show me the improved pipe.md and explain what you changed and why.`;
+}
 
 function parsePipeError(stderr: string): {
   type: "daily_limit" | "credits_exhausted" | "rate_limit" | "unknown";
@@ -168,7 +222,17 @@ interface PipeConfig {
   model: string;
   provider?: string;
   preset?: string;
-  config: Record<string, unknown>;
+  history?: boolean;
+  connections?: string[];
+  // serde(flatten) merges extra YAML fields into this level at runtime
+  [key: string]: unknown;
+}
+
+interface AvailableConnection {
+  id: string;
+  name: string;
+  icon: string;
+  connected: boolean;
 }
 
 interface PipeStatus {
@@ -393,16 +457,16 @@ function statusBadgeVariant(status: string): "default" | "secondary" | "destruct
 function errorTypeBadge(errorType: string | null) {
   if (!errorType) return null;
   const colors: Record<string, string> = {
-    rate_limited: "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200",
-    timeout: "bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200",
-    timed_out: "bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200",
-    auth_failed: "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200",
-    network: "bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200",
-    crash: "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200",
-    interrupted: "bg-gray-100 text-gray-800 dark:bg-gray-900 dark:text-gray-200",
-    cancelled: "bg-gray-100 text-gray-800 dark:bg-gray-900 dark:text-gray-200",
+    rate_limited: "bg-muted text-muted-foreground",
+    timeout: "bg-muted text-muted-foreground",
+    timed_out: "bg-muted text-muted-foreground",
+    auth_failed: "bg-foreground text-background",
+    network: "bg-muted text-muted-foreground",
+    crash: "bg-foreground text-background",
+    interrupted: "bg-muted text-muted-foreground",
+    cancelled: "bg-muted text-muted-foreground",
   };
-  const cls = colors[errorType] || "bg-gray-100 text-gray-800";
+  const cls = colors[errorType] || "bg-muted text-muted-foreground";
   return (
     <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium ${cls}`}>
       {errorType.replace("_", " ")}
@@ -413,6 +477,7 @@ function errorTypeBadge(errorType: string | null) {
 export function PipesSection() {
   const [pipes, setPipes] = useState<PipeStatus[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const expandedRef = useRef<string | null>(null);
   const [logs, setLogs] = useState<PipeRunLog[]>([]);
   const [executions, setExecutions] = useState<PipeExecution[]>([]);
   // Per-pipe recent executions (always fetched for all pipes)
@@ -423,6 +488,7 @@ export function PipesSection() {
   const [showUpgrade, setShowUpgrade] = useState(false);
   const [promptDrafts, setPromptDrafts] = useState<Record<string, string>>({});
   const [saveStatus, setSaveStatus] = useState<Record<string, "saving" | "saved" | "error">>({});
+  const [saveErrors, setSaveErrors] = useState<Record<string, string>>({});
   const [refreshing, setRefreshing] = useState(false);
   const debounceTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const pendingSaves = useRef<Record<string, string>>({});
@@ -433,27 +499,69 @@ export function PipesSection() {
   const { toast } = useToast();
   const isTeamAdmin = !!team.team && team.role === "admin";
   const [sharingPipe, setSharingPipe] = useState<string | null>(null);
-  const [pipeFilter, setPipeFilter] = useState<"all" | "personal" | "team">("all");
+  const [sharingPublic, setSharingPublic] = useState<string | null>(null);
+  const [pipeFilter, setPipeFilter] = useState<"all" | "personal" | "team">(() => {
+    if (typeof window !== "undefined") {
+      return (localStorage.getItem("pipes-pipe-filter") as "all" | "personal" | "team") || "all";
+    }
+    return "all";
+  });
+  const [searchQuery, setSearchQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState<"all" | "running" | "enabled" | "failed" | "scheduled" | "manual">(() => {
+    if (typeof window !== "undefined") {
+      return (localStorage.getItem("pipes-status-filter") as "all" | "running" | "enabled" | "failed" | "scheduled" | "manual") || "all";
+    }
+    return "all";
+  });
+  const [availableConnections, setAvailableConnections] = useState<AvailableConnection[]>([]);
   const sharedPipeNames = new Set(
     team.configs
       .filter((c) => c.config_type === "pipe" && c.scope === "team")
       .map((c) => c.key)
   );
 
+  const isManualPipe = (p: PipeStatus) =>
+    !p.config.schedule || p.config.schedule === "manual";
+  const isScheduledPipe = (p: PipeStatus) =>
+    !!p.config.schedule && p.config.schedule !== "manual";
+
   const filteredPipes = pipes
     .filter((p) => {
-      if (pipeFilter === "all") return true;
-      if (pipeFilter === "team") return sharedPipeNames.has(p.config.name);
-      return !sharedPipeNames.has(p.config.name); // personal
+      // Team/personal filter
+      if (pipeFilter === "team" && !sharedPipeNames.has(p.config.name)) return false;
+      if (pipeFilter === "personal" && sharedPipeNames.has(p.config.name)) return false;
+
+      // Search filter
+      if (searchQuery) {
+        const q = searchQuery.toLowerCase();
+        if (!p.config.name.toLowerCase().includes(q)) return false;
+      }
+
+      // Status filter
+      if (statusFilter === "running" && !p.is_running) return false;
+      if (statusFilter === "enabled" && !p.config.enabled) return false;
+      if (statusFilter === "failed" && p.last_success !== false) return false;
+      if (statusFilter === "scheduled" && !isScheduledPipe(p)) return false;
+      if (statusFilter === "manual" && !isManualPipe(p)) return false;
+
+      return true;
     })
     .sort((a, b) => {
-      // Enabled first
+      // Running first, then enabled, then rest
+      if (a.is_running !== b.is_running) return a.is_running ? -1 : 1;
       if (a.config.enabled !== b.config.enabled) return a.config.enabled ? -1 : 1;
       // Then by last run time (most recent first)
       const aTime = a.last_run ? new Date(a.last_run).getTime() : 0;
       const bTime = b.last_run ? new Date(b.last_run).getTime() : 0;
       return bTime - aTime;
     });
+
+  // Counts for filter chips
+  const runningCount = pipes.filter((p) => p.is_running).length;
+  const enabledCount = pipes.filter((p) => p.config.enabled).length;
+  const failedCount = pipes.filter((p) => p.last_success === false).length;
+  const scheduledCount = pipes.filter((p) => isScheduledPipe(p)).length;
+  const manualCount = pipes.filter((p) => isManualPipe(p)).length;
 
   const sharePipeToTeam = async (pipe: PipeStatus) => {
     setSharingPipe(pipe.config.name);
@@ -474,6 +582,31 @@ export function PipesSection() {
     }
   };
 
+  const sharePipePublic = async (pipe: PipeStatus) => {
+    setSharingPublic(pipe.config.name);
+    try {
+      const res = await fetch("https://screenpi.pe/api/pipes/share", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          raw_content: pipe.raw_content,
+          name: pipe.config.name,
+          author_id: settings.user?.id || null,
+          author_email: settings.user?.email || null,
+        }),
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      await commands.copyTextToClipboard(data.url);
+      posthog.capture("pipe_shared_public", { pipe_name: pipe.config.name, pipe_id: data.id });
+      toast({ title: "link copied!", description: data.url });
+    } catch (err: any) {
+      toast({ title: "failed to share pipe", description: err.message, variant: "destructive" });
+    } finally {
+      setSharingPublic(null);
+    }
+  };
+
   const fetchPipes = useCallback(async () => {
     try {
       const res = await fetch("http://localhost:3030/pipes?include_executions=true");
@@ -486,7 +619,20 @@ export function PipesSection() {
         fetched.push(pipe);
         results[pipe.config.name] = recent_executions || [];
       }
-      setPipes(fetched);
+      // Preserve optimistic UI for pipes with in-flight config saves
+      const pendingNames = Object.keys(pendingConfigSaves.current);
+      if (pendingNames.length > 0) {
+        setPipes((prev) => {
+          const prevByName = new Map(prev.map((p) => [p.config.name, p]));
+          return fetched.map((p) =>
+            pendingNames.includes(p.config.name) && prevByName.has(p.config.name)
+              ? prevByName.get(p.config.name)!
+              : p
+          );
+        });
+      } else {
+        setPipes(fetched);
+      }
       setPipeExecutions(results);
       // Clear drafts that match the server content (already saved)
       setPromptDrafts((prev) => {
@@ -507,8 +653,21 @@ export function PipesSection() {
     }
   }, []);
 
+  const fetchConnections = useCallback(async () => {
+    try {
+      const res = await fetch("http://localhost:3030/connections");
+      const data = await res.json();
+      if (data.data) {
+        setAvailableConnections(
+          data.data.map((c: any) => ({ id: c.id, name: c.name, icon: c.icon, connected: c.connected }))
+        );
+      }
+    } catch { /* server may not be running */ }
+  }, []);
+
   const trackedPipesView = useRef(false);
   useEffect(() => {
+    fetchConnections();
     fetchPipes().then(() => {
       if (!trackedPipesView.current) {
         trackedPipesView.current = true;
@@ -533,11 +692,39 @@ export function PipesSection() {
       const res = await fetch("http://localhost:3030/pipes?include_executions=true");
       const data = await res.json();
       const rawItems: Array<PipeStatus & { recent_executions?: PipeExecution[] }> = data.data || [];
+      const fetched: PipeStatus[] = [];
       const results: Record<string, PipeExecution[]> = {};
       for (const item of rawItems) {
-        results[item.config.name] = item.recent_executions || [];
+        const { recent_executions, ...pipe } = item;
+        fetched.push(pipe);
+        results[item.config.name] = recent_executions || [];
       }
       setPipeExecutions(results);
+      // Also sync pipe status (is_running) to keep summary consistent
+      const pendingNames = Object.keys(pendingConfigSaves.current);
+      if (pendingNames.length > 0) {
+        setPipes((prev) => {
+          const prevByName = new Map(prev.map((p) => [p.config.name, p]));
+          return fetched.map((p) =>
+            pendingNames.includes(p.config.name) && prevByName.has(p.config.name)
+              ? prevByName.get(p.config.name)!
+              : p
+          );
+        });
+      } else {
+        setPipes(fetched);
+      }
+      // Refresh execution history for the currently expanded pipe
+      const exp = expandedRef.current;
+      if (exp) {
+        try {
+          const execRes = await fetch(`http://localhost:3030/pipes/${exp}/executions?limit=20`);
+          const execData = await execRes.json();
+          setExecutions(execData.data || []);
+        } catch {
+          // non-fatal
+        }
+      }
     } catch {
       // ignore — next poll will retry
     }
@@ -661,8 +848,10 @@ export function PipesSection() {
   const toggleExpand = (name: string) => {
     if (expanded === name) {
       setExpanded(null);
+      expandedRef.current = null;
     } else {
       setExpanded(name);
+      expandedRef.current = name;
       fetchLogs(name);
       fetchExecutions(name);
     }
@@ -670,6 +859,7 @@ export function PipesSection() {
 
   const savePipeContent = useCallback(async (name: string, content: string) => {
     setSaveStatus((prev) => ({ ...prev, [name]: "saving" }));
+    setSaveErrors((prev) => { const next = { ...prev }; delete next[name]; return next; });
     try {
       const res = await fetch(`http://localhost:3030/pipes/${name}/config`, {
         method: "POST",
@@ -682,8 +872,9 @@ export function PipesSection() {
       setSaveStatus((prev) => ({ ...prev, [name]: "saved" }));
       // Don't clear draft or refetch — the 10s poll will sync.
       setTimeout(() => setSaveStatus((prev) => { const next = { ...prev }; delete next[name]; return next; }), 2000);
-    } catch (e) {
+    } catch (e: any) {
       console.error("pipe save failed:", e);
+      setSaveErrors((prev) => ({ ...prev, [name]: e?.message || "unknown error" }));
       setSaveStatus((prev) => ({ ...prev, [name]: "error" }));
     }
   }, []);
@@ -768,19 +959,9 @@ export function PipesSection() {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <div>
-          <h3 className="text-lg font-medium">Pipes</h3>
+          <h3 className="text-lg font-medium">My Pipes</h3>
           <p className="text-sm text-muted-foreground">
             scheduled agents that run on your screen data
-            {" · "}
-            <a
-              href="https://screenpi.pe/pipes"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 underline underline-offset-2 hover:text-foreground transition-colors"
-            >
-              pipe store
-              <ExternalLink className="h-3 w-3" />
-            </a>
             {" · "}
             <a
               href="https://docs.screenpi.pe/pipes"
@@ -796,15 +977,54 @@ export function PipesSection() {
         <div className="flex items-center gap-2">
           <Button variant="outline" size="sm" disabled={refreshing} onClick={async () => {
             setRefreshing(true);
-            await fetchPipes();
+            await Promise.all([
+              fetchPipes(),
+              new Promise((r) => setTimeout(r, 2000)),
+            ]);
             setRefreshing(false);
           }}>
-            <RefreshCw className={`h-4 w-4 ${refreshing ? "animate-spin" : ""}`} />
+            {refreshing ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />}
           </Button>
           <Button variant="outline" size="sm" onClick={openPipesFolder}>
             <FolderOpen className="h-4 w-4 mr-1" />
             open folder
           </Button>
+        </div>
+      </div>
+
+      {/* Search + filter chips */}
+      <div className="space-y-2">
+        <div className="relative">
+          <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+          <Input
+            placeholder="search pipes..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            className="pl-8 h-8 text-sm"
+          />
+        </div>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          {([
+            { key: "all", label: "All", count: pipes.length },
+            { key: "running", label: "Running", count: runningCount },
+            { key: "enabled", label: "Enabled", count: enabledCount },
+            { key: "failed", label: "Failed", count: failedCount },
+            { key: "scheduled", label: "Scheduled", count: scheduledCount },
+            { key: "manual", label: "Manual", count: manualCount },
+          ] as const).map(({ key, label, count }) => (
+            <button
+              key={key}
+              onClick={() => { setStatusFilter(key); localStorage.setItem("pipes-status-filter", key); }}
+              className={cn(
+                "px-2.5 py-1 rounded-full text-xs transition-colors",
+                statusFilter === key
+                  ? "bg-foreground text-background font-medium"
+                  : "bg-muted text-muted-foreground hover:text-foreground"
+              )}
+            >
+              {label} {count > 0 && <span className="ml-0.5">{count}</span>}
+            </button>
+          ))}
         </div>
       </div>
 
@@ -819,7 +1039,7 @@ export function PipesSection() {
             return (
               <button
                 key={tab}
-                onClick={() => setPipeFilter(tab)}
+                onClick={() => { setPipeFilter(tab); localStorage.setItem("pipes-pipe-filter", tab); }}
                 className={cn(
                   "pb-2 text-sm transition-colors duration-150 border-b-2 -mb-px",
                   pipeFilter === tab
@@ -837,7 +1057,9 @@ export function PipesSection() {
       {filteredPipes.length === 0 ? (
         <Card>
           <CardContent className="py-8 text-center text-muted-foreground">
-            {pipeFilter === "all" ? (
+            {searchQuery || statusFilter !== "all" ? (
+              <p>no pipes match your filters</p>
+            ) : pipeFilter === "all" ? (
               <>
                 <p>no pipes installed</p>
                 <p className="text-sm mt-2">
@@ -948,6 +1170,23 @@ export function PipesSection() {
                     }
                   />
 
+                  {/* Optimize with AI */}
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 shrink-0"
+                    title="optimize with ai"
+                    onClick={() => {
+                      navigateHomeAndPrefill({
+                        context: "the user wants to optimize their pipe",
+                        prompt: buildOptimizePrompt(pipe.config.name),
+                        autoSend: true,
+                      });
+                    }}
+                  >
+                    <Sparkles className="h-3.5 w-3.5" />
+                  </Button>
+
                   {/* Overflow menu */}
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
@@ -956,6 +1195,17 @@ export function PipesSection() {
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
+                      <DropdownMenuItem
+                        disabled={sharingPublic === pipe.config.name}
+                        onClick={() => sharePipePublic(pipe)}
+                      >
+                        {sharingPublic === pipe.config.name ? (
+                          <Loader2 className="h-3.5 w-3.5 mr-2 animate-spin" />
+                        ) : (
+                          <Link className="h-3.5 w-3.5 mr-2" />
+                        )}
+                        copy share link
+                      </DropdownMenuItem>
                       {isTeamAdmin && (
                         <>
                           <DropdownMenuItem
@@ -969,9 +1219,9 @@ export function PipesSection() {
                             )}
                             {sharedPipeNames.has(pipe.config.name) ? "update team copy" : "share to team"}
                           </DropdownMenuItem>
-                          <DropdownMenuSeparator />
                         </>
                       )}
+                      <DropdownMenuSeparator />
                       <DropdownMenuItem
                         className="text-destructive"
                         onClick={() => deletePipe(pipe.config.name)}
@@ -1022,7 +1272,7 @@ export function PipesSection() {
                     </span>
                     <span className="text-muted-foreground/50">·</span>
                     {exec.status === "completed" ? (
-                      <span className="text-green-600 dark:text-green-400">ok</span>
+                      <span className="text-foreground">ok</span>
                     ) : exec.status === "running" ? (
                       <span className="flex items-center gap-1">
                         <Loader2 className="h-2.5 w-2.5 animate-spin" />
@@ -1052,9 +1302,9 @@ export function PipesSection() {
                         </button>
                       </span>
                     ) : exec.status === "failed" ? (
-                      <span className="text-red-600 dark:text-red-400">failed</span>
+                      <span className="text-foreground font-medium">failed</span>
                     ) : exec.status === "timed_out" ? (
-                      <span className="text-orange-600 dark:text-orange-400">timeout</span>
+                      <span className="text-muted-foreground">timeout</span>
                     ) : (
                       <span>{exec.status}</span>
                     )}
@@ -1067,7 +1317,7 @@ export function PipesSection() {
                     {exec.error_type && (
                       <>
                         <span className="text-muted-foreground/50">·</span>
-                        <span className="text-red-600/70 dark:text-red-400/70">
+                        <span className="text-muted-foreground">
                           {exec.error_type.replace("_", " ")}
                         </span>
                       </>
@@ -1124,6 +1374,206 @@ export function PipesSection() {
                     </div>
 
                     <div>
+                      <Label className="text-xs">schedule</Label>
+                      <Select
+                        value={pipe.config.schedule || "manual"}
+                        onValueChange={(value) => {
+                          const pipeName = pipe.config.name;
+                          setPipes((prev) =>
+                            prev.map((p) =>
+                              p.config.name === pipeName
+                                ? { ...p, config: { ...p.config, schedule: value } }
+                                : p
+                            )
+                          );
+                          const savePromise = fetch(`http://localhost:3030/pipes/${pipeName}/config`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ schedule: value }),
+                          }).then(() => {
+                            delete pendingConfigSaves.current[pipeName];
+                            fetchPipes();
+                          }).catch(() => {
+                            delete pendingConfigSaves.current[pipeName];
+                          });
+                          pendingConfigSaves.current[pipeName] = savePromise;
+                        }}
+                      >
+                        <SelectTrigger className="mt-1 h-8 text-xs">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {(() => {
+                            const presets = [
+                              { value: "manual", label: "manual" },
+                              { value: "every 5m", label: "every 5 minutes" },
+                              { value: "every 15m", label: "every 15 minutes" },
+                              { value: "every 30m", label: "every 30 minutes" },
+                              { value: "every 1h", label: "every hour" },
+                              { value: "every 3h", label: "every 3 hours" },
+                              { value: "every day at 9am", label: "every morning (9 AM)" },
+                              { value: "every day at 12pm", label: "every noon (12 PM)" },
+                              { value: "every day at 6pm", label: "every evening (6 PM)" },
+                              { value: "every monday at 9am", label: "every monday (9 AM)" },
+                            ];
+                            const current = pipe.config.schedule || "manual";
+                            const isCustom = !presets.some((p) => p.value === current);
+                            return (
+                              <>
+                                {isCustom && (
+                                  <SelectItem value={current}>{current} (custom)</SelectItem>
+                                )}
+                                {presets.map((p) => (
+                                  <SelectItem key={p.value} value={p.value}>{p.label}</SelectItem>
+                                ))}
+                              </>
+                            );
+                          })()}
+                        </SelectContent>
+                      </Select>
+                      <p className="text-[11px] text-muted-foreground mt-1">
+                        how often this pipe runs automatically
+                      </p>
+                    </div>
+
+                    <div className="flex items-center gap-3">
+                      <div className="flex items-center gap-1.5">
+                        <Label className="text-xs">history</Label>
+                        <HelpTooltip text="when enabled, the pipe remembers previous conversations across runs. useful for pipes that need context from past executions." />
+                      </div>
+                      <Switch
+                        checked={!!pipe.config.history}
+                        onCheckedChange={(checked) => {
+                          const pipeName = pipe.config.name;
+                          setPipes((prev) =>
+                            prev.map((p) =>
+                              p.config.name === pipeName
+                                ? { ...p, config: { ...p.config, history: checked } }
+                                : p
+                            )
+                          );
+                          const savePromise = fetch(`http://localhost:3030/pipes/${pipeName}/config`, {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({ history: checked }),
+                          }).then(() => {
+                            delete pendingConfigSaves.current[pipeName];
+                            fetchPipes();
+                          }).catch(() => {
+                            delete pendingConfigSaves.current[pipeName];
+                          });
+                          pendingConfigSaves.current[pipeName] = savePromise;
+                        }}
+                      />
+                    </div>
+
+                    <div>
+                      <div className="flex items-center gap-1.5">
+                        <Label className="text-xs">connections</Label>
+                        <HelpTooltip text="connections this pipe can use. the ai will query the connections api at runtime to get credentials." />
+                      </div>
+                      <div className="flex flex-wrap gap-1.5 mt-1">
+                        {(pipe.config.connections || []).map((connId) => {
+                          const conn = availableConnections.find((c) => c.id === connId);
+                          const isConnected = conn?.connected ?? false;
+                          return (
+                            <Badge
+                              key={connId}
+                              variant={isConnected ? "default" : "outline"}
+                              className={cn("text-[10px] gap-1 pr-1", !isConnected && "border-destructive/50")}
+                            >
+                              {isConnected ? (
+                                <span>{conn?.name || connId}</span>
+                              ) : (
+                                <button
+                                  className="text-destructive hover:underline"
+                                  onClick={() => {
+                                    sessionStorage.setItem("openConnection", connId);
+                                    const url = new URL(window.location.href);
+                                    url.searchParams.set("section", "connections");
+                                    window.location.href = url.toString();
+                                  }}
+                                >
+                                  {conn?.name || connId} — setup →
+                                </button>
+                              )}
+                              <button
+                                className="ml-0.5 hover:text-destructive"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  const pipeName = pipe.config.name;
+                                  const updated = (pipe.config.connections || []).filter(
+                                    (c) => c !== connId
+                                  );
+                                  setPipes((prev) =>
+                                    prev.map((p) =>
+                                      p.config.name === pipeName
+                                        ? { ...p, config: { ...p.config, connections: updated } }
+                                        : p
+                                    )
+                                  );
+                                  fetch(`http://localhost:3030/pipes/${pipeName}/config`, {
+                                    method: "POST",
+                                    headers: { "Content-Type": "application/json" },
+                                    body: JSON.stringify({ connections: updated }),
+                                  }).then(() => fetchPipes());
+                                }}
+                              >
+                                ×
+                              </button>
+                            </Badge>
+                          );
+                        })}
+                        <DropdownMenu modal={false}>
+                          <DropdownMenuTrigger asChild>
+                            <Button variant="outline" size="sm" className="h-5 text-[10px] px-1.5 gap-0.5">
+                              <Plus className="h-3 w-3" /> add
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="start">
+                            {availableConnections
+                              .filter((c) => !(pipe.config.connections || []).includes(c.id))
+                              .map((conn) => (
+                                <DropdownMenuItem
+                                  key={conn.id}
+                                  onClick={() => {
+                                    const pipeName = pipe.config.name;
+                                    const updated = [...(pipe.config.connections || []), conn.id];
+                                    setPipes((prev) =>
+                                      prev.map((p) =>
+                                        p.config.name === pipeName
+                                          ? { ...p, config: { ...p.config, connections: updated } }
+                                          : p
+                                      )
+                                    );
+                                    fetch(`http://localhost:3030/pipes/${pipeName}/config`, {
+                                      method: "POST",
+                                      headers: { "Content-Type": "application/json" },
+                                      body: JSON.stringify({ connections: updated }),
+                                    }).then(() => fetchPipes());
+                                  }}
+                                >
+                                  <span className="text-xs">{conn.name}</span>
+                                  {conn.connected ? (
+                                    <span className="ml-auto text-[10px] text-green-500">●</span>
+                                  ) : (
+                                    <span className="ml-auto text-[10px] text-muted-foreground">○</span>
+                                  )}
+                                </DropdownMenuItem>
+                              ))}
+                            {availableConnections.filter(
+                              (c) => !(pipe.config.connections || []).includes(c.id)
+                            ).length === 0 && (
+                              <DropdownMenuItem disabled>
+                                <span className="text-xs text-muted-foreground">all connections added</span>
+                              </DropdownMenuItem>
+                            )}
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </div>
+                    </div>
+
+                    <div>
                       <div className="flex items-center gap-2">
                         <Label className="text-xs">pipe.md</Label>
                         {saveStatus[pipe.config.name] === "saving" && (
@@ -1137,7 +1587,9 @@ export function PipesSection() {
                           </span>
                         )}
                         {saveStatus[pipe.config.name] === "error" && (
-                          <span className="text-[11px] text-destructive">save failed</span>
+                          <span className="text-[11px] text-destructive" title={saveErrors[pipe.config.name]}>
+                            save failed: {saveErrors[pipe.config.name] || "unknown error"}
+                          </span>
                         )}
                         {promptDrafts[pipe.config.name] !== undefined && !saveStatus[pipe.config.name] && (
                           <span className="text-[11px] text-muted-foreground">unsaved</span>
@@ -1147,6 +1599,9 @@ export function PipesSection() {
                         value={promptDrafts[pipe.config.name] ?? pipe.raw_content}
                         onChange={(e) => handlePipeEdit(pipe.config.name, e.target.value)}
                         className="text-xs font-mono h-64 mt-1"
+                        autoCorrect="off"
+                        autoCapitalize="off"
+                        spellCheck={false}
                       />
                     </div>
 
@@ -1266,7 +1721,7 @@ export function PipesSection() {
           if (!value) return;
           input.value = "";
 
-          await showChatWithPrefill({
+          navigateHomeAndPrefill({
             context: PIPE_CREATION_PROMPT,
             prompt: value,
             autoSend: true,
@@ -1288,6 +1743,7 @@ export function PipesSection() {
         reason="daily_limit"
         source="pipes"
       />
+
     </div>
   );
 }

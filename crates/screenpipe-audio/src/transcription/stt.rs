@@ -15,7 +15,7 @@ use crate::transcription::openai_compatible::batch::transcribe_with_openai_compa
 use crate::transcription::whisper::batch::process_with_whisper;
 use crate::transcription::VocabularyEntry;
 use crate::utils::audio::resample;
-use crate::utils::ffmpeg::{get_new_file_path, write_audio_to_file};
+use crate::utils::ffmpeg::{get_new_file_path_with_timestamp, write_audio_to_file};
 use crate::vad::VadEngine;
 use anyhow::Result;
 use reqwest::Client;
@@ -145,37 +145,78 @@ pub async fn stt(
     vocabulary: &[VocabularyEntry],
     alternate_stt: Option<AlternateSttEngine>,
 ) -> Result<String> {
-    let transcription: Result<String> =
-        if *audio_transcription_engine == AudioTranscriptionEngine::Disabled {
-            Ok(String::new())
-        } else if audio_transcription_engine == AudioTranscriptionEngine::Deepgram.into() {
-            // Deepgram implementation
-            let api_key = deepgram_api_key.unwrap_or_default();
+    let transcription: Result<String> = if *audio_transcription_engine
+        == AudioTranscriptionEngine::Disabled
+    {
+        Ok(String::new())
+    } else if audio_transcription_engine == AudioTranscriptionEngine::Deepgram.into() {
+        // Deepgram implementation
+        let api_key = deepgram_api_key.unwrap_or_default();
 
-            match transcribe_with_deepgram(
-                &api_key,
-                audio,
-                device,
-                sample_rate,
-                languages.clone(),
-                vocabulary,
-            )
-            .await
-            {
-                Ok(transcription) => Ok(transcription),
-                Err(e) => {
-                    error!(
-                        "device: {}, deepgram transcription failed, falling back to Whisper: {:?}",
+        match transcribe_with_deepgram(
+            &api_key,
+            audio,
+            device,
+            sample_rate,
+            languages.clone(),
+            vocabulary,
+        )
+        .await
+        {
+            Ok(transcription) => Ok(transcription),
+            Err(e) => {
+                error!(
+                    "device: {}, deepgram transcription failed, falling back to Whisper: {:?}",
+                    device, e
+                );
+                // Fallback to Whisper
+                process_with_whisper(audio, languages.clone(), whisper_state, vocabulary).await
+            }
+        }
+    } else if *audio_transcription_engine == AudioTranscriptionEngine::Qwen3Asr {
+        // Qwen3-ASR via alternate STT engine (audiopipe)
+        if let Some(ref engine) = alternate_stt {
+            let mut engine = engine
+                .lock()
+                .map_err(|e| anyhow::anyhow!("stt model lock: {}", e))?;
+            engine.transcribe(audio, sample_rate)
+        } else {
+            Err(anyhow::anyhow!("qwen3-asr model not initialized"))
+        }
+    } else if audio_transcription_engine == AudioTranscriptionEngine::OpenAICompatible.into() {
+        // OpenAI Compatible implementation
+        let mut config = openai_compatible_config.unwrap_or_default();
+        let client = config.get_or_create_client();
+
+        // Collect vocabulary words for the prompt/context field
+        let vocab_words: Vec<String> = vocabulary.iter().map(|v| v.word.clone()).collect();
+        match transcribe_with_openai_compatible(
+            Some(client),
+            &config.endpoint,
+            config.api_key.as_deref(),
+            &config.model,
+            audio,
+            device,
+            sample_rate,
+            languages.clone(),
+            &vocab_words,
+        )
+        .await
+        {
+            Ok(transcription) => Ok(transcription),
+            Err(e) => {
+                error!(
+                        "device: {}, openai compatible transcription failed, falling back to Whisper: {:?}",
                         device, e
                     );
-                    // Fallback to Whisper
-                    process_with_whisper(audio, languages.clone(), whisper_state, vocabulary).await
-                }
+                // Fallback to Whisper
+                process_with_whisper(audio, languages.clone(), whisper_state, vocabulary).await
             }
-        } else {
-            // Existing Whisper implementation
-            process_with_whisper(audio, languages, whisper_state, vocabulary).await
-        };
+        }
+    } else {
+        // Existing Whisper implementation
+        process_with_whisper(audio, languages, whisper_state, vocabulary).await
+    };
 
     // Post-processing: apply vocabulary replacements
     match transcription {
@@ -209,10 +250,9 @@ pub async fn process_audio_input(
     pre_written_path: Option<String>,
     filter_music: bool,
 ) -> Result<()> {
-    // NOTE: capture_timestamp is set when audio enters the channel, but smart mode
-    // deferral can delay processing by 20+ minutes. The DB now uses Utc::now() at
-    // insert time instead, so this timestamp is only used for TranscriptionResult
-    // metadata (not for DB storage).
+    // capture_timestamp is set when audio enters the channel. Used for both
+    // file naming and DB storage so audio appears at the correct timeline position,
+    // even when smart mode defers processing by 20+ minutes.
     let timestamp = audio.capture_timestamp;
 
     let audio_data = if audio.sample_rate != SAMPLE_RATE {
@@ -254,7 +294,9 @@ pub async fn process_audio_input(
     let file_path = if let Some(path) = pre_written_path {
         path
     } else {
-        let new_file_path = get_new_file_path(&audio.device.to_string(), output_path);
+        let capture_dt = chrono::DateTime::from_timestamp(timestamp as i64, 0);
+        let new_file_path =
+            get_new_file_path_with_timestamp(&audio.device.to_string(), output_path, capture_dt);
         if let Err(e) = write_audio_to_file(
             &audio.data.to_vec(),
             audio.sample_rate,

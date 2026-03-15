@@ -12,6 +12,33 @@ use serde_json::{json, Value};
 use specta::Type;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use tokio::sync::oneshot;
+
+/// Read lines from a byte stream using lossy UTF-8 conversion.
+/// Unlike `BufReader::lines()`, this never fails on invalid UTF-8 —
+/// invalid bytes are replaced with U+FFFD instead of crashing the reader.
+fn read_lines_lossy(reader: &mut BufReader<impl std::io::Read>) -> Option<String> {
+    let mut buf = Vec::new();
+    match reader.read_until(b'\n', &mut buf) {
+        Ok(0) => None, // EOF
+        Ok(_) => {
+            // Strip trailing newline
+            if buf.last() == Some(&b'\n') {
+                buf.pop();
+                if buf.last() == Some(&b'\r') {
+                    buf.pop();
+                }
+            }
+            Some(String::from_utf8_lossy(&buf).into_owned())
+        }
+        Err(e) => {
+            error!("I/O error reading pi output: {}", e);
+            None
+        }
+    }
+}
+#[cfg(windows)]
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,8 +53,9 @@ static PI_INSTALL_DONE: AtomicBool = AtomicBool::new(false);
 
 /// On Windows, `.cmd` files cannot be spawned directly with `Command::new()` since
 /// Rust 1.77+ (CVE-2024-24576 fix). We must use `cmd.exe /C` to run them.
-/// `.exe` shims (from `bun add -g`) are native executables — run them directly.
-/// Only wrap non-exe paths (e.g. JS files) with bun.
+/// For `.exe` bun shims: resolve the JS entrypoint and run via `bun <cli.js>`
+/// so bun is always the explicit runtime (the shim's own bun-lookup can fall
+/// back to Node.js if bun isn't at the expected location).
 #[cfg(windows)]
 fn build_command_for_path(path: &str) -> Command {
     if path.ends_with(".cmd") || path.ends_with(".bat") {
@@ -35,7 +63,22 @@ fn build_command_for_path(path: &str) -> Command {
         cmd.args(["/C", path]);
         cmd
     } else if path.ends_with(".exe") {
-        Command::new(path)
+        // Bun global-install .exe shims need bun.exe to run the JS, but their
+        // internal bun-resolution can fail (falling back to Node.js) when the app
+        // is installed in a non-standard directory.  Resolve the actual JS
+        // entrypoint and run it with our known-good bun, just like Unix does.
+        if let Some(bun) = find_bun_executable() {
+            if let Some(js) = resolve_bun_global_entrypoint(path) {
+                info!("Resolved bun shim {} → JS entrypoint {}", path, js);
+                let mut cmd = Command::new(bun);
+                cmd.arg(js);
+                return cmd;
+            }
+            // Not a bun shim or resolution failed — run .exe directly
+            Command::new(path)
+        } else {
+            Command::new(path)
+        }
     } else if let Some(bun) = find_bun_executable() {
         let mut cmd = Command::new(bun);
         cmd.arg(path);
@@ -58,7 +101,105 @@ fn build_command_for_path(path: &str) -> Command {
     }
 }
 
-const PI_PACKAGE: &str = "@mariozechner/pi-coding-agent@0.51.1";
+/// Given a bun global-install `.exe` shim path (e.g. `~/.bun/bin/pi.exe`),
+/// resolve the actual JS entrypoint by reading the package.json `bin` field
+/// from bun's global `node_modules`.
+/// Returns `None` if the path isn't a bun shim or resolution fails.
+#[cfg(windows)]
+fn resolve_bun_global_entrypoint(exe_path: &str) -> Option<String> {
+    let exe = Path::new(exe_path);
+    let stem = exe.file_stem()?.to_str()?; // "pi"
+
+    // Only resolve for known bun global dirs
+    let parent = exe.parent()?.to_str().unwrap_or_default();
+    let is_bun_dir = parent.ends_with(".bun\\bin")
+        || parent.ends_with(".bun/bin")
+        || parent.ends_with("bun\\bin")
+        || parent.ends_with("bun/bin");
+    if !is_bun_dir {
+        return None;
+    }
+
+    // Bun global modules live at ~/.bun/install/global/node_modules/
+    let home = dirs::home_dir()?;
+    let global_nm = home
+        .join(".bun")
+        .join("install")
+        .join("global")
+        .join("node_modules");
+    if !global_nm.exists() {
+        debug!(
+            "Bun global node_modules not found at {}",
+            global_nm.display()
+        );
+        return None;
+    }
+
+    // Walk top-level packages (including scoped @org/pkg) looking for a matching bin entry
+    for entry in std::fs::read_dir(&global_nm).ok()? {
+        let entry = entry.ok()?;
+        let pkg_path = entry.path();
+
+        // Handle scoped packages (@org/pkg)
+        if pkg_path.file_name()?.to_str()?.starts_with('@') {
+            for sub in std::fs::read_dir(&pkg_path).ok()?.flatten() {
+                if let Some(js) = check_package_bin(sub.path(), stem) {
+                    return Some(js);
+                }
+            }
+        } else if let Some(js) = check_package_bin(pkg_path, stem) {
+            return Some(js);
+        }
+    }
+
+    debug!(
+        "No package with bin '{}' found in {}",
+        stem,
+        global_nm.display()
+    );
+    None
+}
+
+/// Check if a package directory has a `bin` entry matching `bin_name`,
+/// and return the resolved absolute path to the JS file.
+#[cfg(windows)]
+fn check_package_bin(pkg_dir: std::path::PathBuf, bin_name: &str) -> Option<String> {
+    let pkg_json = pkg_dir.join("package.json");
+    if !pkg_json.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&pkg_json).ok()?;
+    let parsed: Value = serde_json::from_str(&content).ok()?;
+
+    // bin can be a string (single binary) or an object { name: path }
+    let bin_val = parsed.get("bin")?;
+    let relative = if let Some(obj) = bin_val.as_object() {
+        obj.get(bin_name)?.as_str()?.to_string()
+    } else if let Some(s) = bin_val.as_str() {
+        // Single-bin package — name must match package name
+        let pkg_name = parsed.get("name")?.as_str()?;
+        if pkg_name.ends_with(bin_name) || pkg_name == bin_name {
+            s.to_string()
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    let js_path = pkg_dir.join(&relative);
+    if js_path.exists() {
+        Some(js_path.to_string_lossy().to_string())
+    } else {
+        debug!(
+            "bin entry points to {} but file doesn't exist",
+            js_path.display()
+        );
+        None
+    }
+}
+
+const PI_PACKAGE: &str = "@mariozechner/pi-coding-agent@0.57.1";
 const SCREENPIPE_API_URL: &str = "https://api.screenpi.pe/v1";
 
 /// Pool of Pi sessions — each session_id gets its own PiManager/process.
@@ -106,9 +247,9 @@ pub struct PiCheckResult {
 }
 
 /// RPC Response from Pi
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
-struct RpcResponse {
+pub(crate) struct RpcResponse {
     #[serde(rename = "type")]
     response_type: String,
     success: Option<bool>,
@@ -117,6 +258,10 @@ struct RpcResponse {
     command: Option<String>,
     id: Option<String>,
 }
+
+/// Pending response channels keyed by request ID.
+/// Shared between PiManager (sender side) and the stdout reader thread (resolver side).
+type PendingResponses = Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<RpcResponse>>>>;
 
 #[allow(dead_code)]
 pub struct PiManager {
@@ -129,6 +274,8 @@ pub struct PiManager {
     last_activity: std::time::Instant,
     /// Guard: ensures only one `pi_terminated` event is emitted per session.
     terminated_emitted: Arc<AtomicBool>,
+    /// Channels waiting for RPC responses, keyed by request ID.
+    pending_responses: PendingResponses,
 }
 
 impl PiManager {
@@ -141,6 +288,7 @@ impl PiManager {
             app_handle,
             last_activity: std::time::Instant::now(),
             terminated_emitted: Arc::new(AtomicBool::new(false)),
+            pending_responses: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -199,24 +347,52 @@ impl PiManager {
         }
         self.stdin = None;
         self.project_dir = None;
+        // Drop all pending response channels so waiting callers get an error
+        self.pending_responses.lock().unwrap().clear();
     }
 
     pub fn is_running(&mut self) -> bool {
         self.check_alive()
     }
 
-    /// Send a command to Pi via stdin pipe and return response
+    /// Send a command to Pi via stdin (fire-and-forget).
+    /// Use this for commands like `prompt` where the result streams via events.
     pub fn send_command(&mut self, command: Value) -> Result<(), String> {
-        // Verify process is actually alive before writing
+        self.send_command_inner(command).map(|_| ())
+    }
+
+    /// Send a command and wait for the Pi process to respond.
+    /// Use this for commands like `abort` and `new_session` that must complete
+    /// before the next command can be sent safely.
+    pub fn send_command_and_wait(
+        &mut self,
+        command: Value,
+        timeout: std::time::Duration,
+    ) -> Result<oneshot::Receiver<RpcResponse>, String> {
+        let req_id = self.send_command_inner(command)?;
+        let (tx, rx) = oneshot::channel();
+        self.pending_responses
+            .lock()
+            .unwrap()
+            .insert(req_id, tx);
+        // Caller awaits `rx` with a timeout
+        let _ = timeout; // timeout is applied by the caller via tokio::time::timeout
+        Ok(rx)
+    }
+
+    /// Shared implementation: stamps the command with an ID, writes to stdin.
+    fn send_command_inner(&mut self, command: Value) -> Result<String, String> {
         if !self.check_alive() {
             return Err("Pi process has died".to_string());
         }
 
         self.last_activity = std::time::Instant::now();
         self.request_id += 1;
+        let req_id = format!("req_{}", self.request_id);
+
         let mut cmd = command;
         if let Some(obj) = cmd.as_object_mut() {
-            obj.insert("id".to_string(), json!(format!("req_{}", self.request_id)));
+            obj.insert("id".to_string(), json!(&req_id));
         }
 
         let cmd_str = serde_json::to_string(&cmd).map_err(|e| e.to_string())?;
@@ -230,8 +406,8 @@ impl PiManager {
         let stdin = self.stdin.as_mut().ok_or("Pi not running")?;
 
         info!(
-            "Sending to Pi (req_{}): type={}, child_pid={:?}, bytes={}",
-            self.request_id,
+            "Sending to Pi ({}): type={}, child_pid={:?}, bytes={}",
+            req_id,
             cmd_type,
             child_pid,
             cmd_str.len() + 1
@@ -242,9 +418,9 @@ impl PiManager {
         stdin
             .flush()
             .map_err(|e| format!("Failed to flush Pi stdin: {}", e))?;
-        info!("Sent to Pi (req_{}): flushed ok", self.request_id);
+        info!("Sent to Pi ({}): flushed ok", req_id);
 
-        Ok(())
+        Ok(req_id)
     }
 }
 
@@ -281,7 +457,82 @@ fn parse_where_output(stdout: &str) -> Option<String> {
 }
 
 /// Find pi executable
+/// Returns the screenpipe-managed pi install directory (`~/.screenpipe/pi-agent/`).
+fn pi_local_install_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".screenpipe").join("pi-agent"))
+}
+
+/// Seed the pi-agent package.json with overrides to fix dependency resolution.
+/// `hosted-git-info` requires `lru-cache@^10`, but bun on Windows can hoist
+/// an ESM-only lru-cache@7.x that breaks CJS `require()`.
+/// Writing overrides before `bun add` ensures the correct version is used.
+fn seed_pi_package_json(install_dir: &std::path::Path) {
+    let pkg_path = install_dir.join("package.json");
+    // Only seed if package.json doesn't exist yet — don't overwrite user/bun changes
+    if pkg_path.exists() {
+        // If it exists, check if overrides are already present
+        if let Ok(contents) = std::fs::read_to_string(&pkg_path) {
+            if !contents.contains("overrides") {
+                // Merge overrides into existing package.json
+                if let Ok(mut pkg) = serde_json::from_str::<serde_json::Value>(&contents) {
+                    pkg.as_object_mut().map(|obj| {
+                        obj.insert(
+                            "overrides".to_string(),
+                            json!({
+                                "hosted-git-info": {
+                                    "lru-cache": "^10.0.0"
+                                }
+                            }),
+                        );
+                    });
+                    if let Ok(new_contents) = serde_json::to_string_pretty(&pkg) {
+                        let _ = std::fs::write(&pkg_path, new_contents);
+                        info!("Added lru-cache overrides to existing pi-agent package.json");
+                    }
+                }
+            }
+        }
+        return;
+    }
+    let pkg_json = json!({
+        "overrides": {
+            "hosted-git-info": {
+                "lru-cache": "^10.0.0"
+            }
+        }
+    });
+    match std::fs::write(
+        &pkg_path,
+        serde_json::to_string_pretty(&pkg_json).unwrap_or_default(),
+    ) {
+        Ok(_) => info!("Seeded pi-agent package.json with lru-cache overrides"),
+        Err(e) => warn!("Failed to seed pi-agent package.json: {}", e),
+    }
+}
+
+/// Find the JS entrypoint for the locally-installed pi package.
+fn find_local_pi_entrypoint() -> Option<String> {
+    let dir = pi_local_install_dir()?;
+    let cli_js = dir
+        .join("node_modules")
+        .join("@mariozechner")
+        .join("pi-coding-agent")
+        .join("dist")
+        .join("cli.js");
+    if cli_js.exists() {
+        Some(cli_js.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
 fn find_pi_executable() -> Option<String> {
+    // 1. Check screenpipe-managed local install first (preferred — we control the deps)
+    if let Some(js) = find_local_pi_entrypoint() {
+        return Some(js);
+    }
+
+    // 2. Fallback to global install locations
     let home = dirs::home_dir()
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_default();
@@ -343,53 +594,12 @@ fn find_pi_executable() -> Option<String> {
     None
 }
 
-/// Ensure the screenpipe skills exist in the project's .pi/skills directory
+/// Ensure the screenpipe skills exist in the project's .pi/skills directory.
+/// Delegates to screenpipe-core's canonical implementation.
 fn ensure_screenpipe_skill(project_dir: &str) -> Result<(), String> {
-    let skills: &[(&str, &str)] = &[
-        (
-            "screenpipe-search",
-            include_str!("../assets/skills/screenpipe-search/SKILL.md"),
-        ),
-        (
-            "screenpipe-pipe-creator",
-            include_str!("../assets/skills/screenpipe-pipe-creator/SKILL.md"),
-        ),
-        (
-            "screenpipe-media",
-            include_str!("../assets/skills/screenpipe-media/SKILL.md"),
-        ),
-        (
-            "screenpipe-retranscribe",
-            include_str!("../assets/skills/screenpipe-retranscribe/SKILL.md"),
-        ),
-        (
-            "screenpipe-analytics",
-            include_str!("../assets/skills/screenpipe-analytics/SKILL.md"),
-        ),
-        (
-            "screenpipe-elements",
-            include_str!("../assets/skills/screenpipe-elements/SKILL.md"),
-        ),
-    ];
-
-    for (name, content) in skills {
-        let skill_dir = std::path::Path::new(project_dir)
-            .join(".pi")
-            .join("skills")
-            .join(name);
-        let skill_path = skill_dir.join("SKILL.md");
-
-        // Always overwrite to keep skill up-to-date with app version
-        std::fs::create_dir_all(&skill_dir)
-            .map_err(|e| format!("Failed to create skill dir for {}: {}", name, e))?;
-
-        std::fs::write(&skill_path, content)
-            .map_err(|e| format!("Failed to write {} skill: {}", name, e))?;
-
-        debug!("Screenpipe {} skill installed at {:?}", name, skill_path);
-    }
-
-    Ok(())
+    use screenpipe_core::agents::pi::PiExecutor;
+    PiExecutor::ensure_screenpipe_skill(std::path::Path::new(project_dir))
+        .map_err(|e| format!("Failed to install screenpipe skills: {}", e))
 }
 
 /// Ensure the web-search extension exists in the project's .pi/extensions directory
@@ -501,6 +711,7 @@ fn ensure_pi_config(
             "openai" => "openai-byok",
             "openai-chatgpt" => "openai-chatgpt",
             "native-ollama" => "ollama",
+            "anthropic" => "anthropic-byok",
             "custom" => "custom",
             _ => "", // screenpipe-cloud already added above
         };
@@ -509,7 +720,9 @@ fn ensure_pi_config(
             let base_url = if config.provider == "native-ollama" && config.url.is_empty() {
                 "http://localhost:11434/v1".to_string()
             } else if config.provider == "openai-chatgpt" {
-                "https://api.openai.com/v1".to_string()
+                "https://chatgpt.com/backend-api".to_string()
+            } else if config.provider == "anthropic" && config.url.is_empty() {
+                "https://api.anthropic.com".to_string()
             } else {
                 config.url.clone()
             };
@@ -520,12 +733,15 @@ fn ensure_pi_config(
                 "native-ollama" => "ollama".to_string(), // Ollama ignores API key but Pi requires one
                 "openai" => "OPENAI_API_KEY".to_string(), // Pi will read from env
                 "openai-chatgpt" => "OPENAI_CHATGPT_TOKEN".to_string(), // OAuth token from env
+                "anthropic" => "ANTHROPIC_API_KEY".to_string(), // Pi will read from env
                 "custom" => "CUSTOM_API_KEY".to_string(), // Pi will read from env
                 _ => "".to_string(),
             };
 
             let wire_api = if config.provider == "openai-chatgpt" {
                 "openai-codex-responses"
+            } else if config.provider == "anthropic" {
+                "anthropic-messages"
             } else {
                 "openai-completions"
             };
@@ -775,7 +991,7 @@ pub async fn pi_start_inner(
     std::fs::create_dir_all(&project_dir)
         .map_err(|e| format!("Failed to create project directory: {}", e))?;
 
-    // Ensure screenpipe-search skill exists in project
+    // Ensure screenpipe skills exist in project
     ensure_screenpipe_skill(&project_dir)?;
 
     // Install web-search extension only for screenpipe-cloud presets
@@ -791,6 +1007,7 @@ pub async fn pi_start_inner(
                 "openai" => "openai-byok",
                 "openai-chatgpt" => "openai-chatgpt",
                 "native-ollama" => "ollama",
+                "anthropic" => "anthropic-byok",
                 "custom" => "custom",
                 "screenpipe-cloud" | "pi" | _ => "screenpipe",
             };
@@ -864,7 +1081,7 @@ pub async fn pi_start_inner(
                 .ok_or_else(|| {
                     let bun_found = find_bun_executable().is_some();
                     if bun_found {
-                        format!("Pi not found after install attempt. Install manually with: bun add -g {}", PI_PACKAGE)
+                        format!("Pi not found after install attempt. Try restarting the app or delete ~/.screenpipe/pi-agent and restart.")
                     } else {
                         format!("Pi not found: bun is not installed. Screenpipe needs bun to run the AI assistant. Expected bundled bun next to the app executable.")
                     }
@@ -898,6 +1115,39 @@ pub async fn pi_start_inner(
             let current_path = std::env::var("PATH").unwrap_or_default();
             let sep = if cfg!(windows) { ";" } else { ":" };
             let new_path = format!("{}{}{}", bun_dir.display(), sep, current_path);
+
+            // On Windows, ensure bash is available for Pi's bash tool.
+            // Downloads PortableGit on first use if no bash is found (~50MB, one-time).
+            #[cfg(windows)]
+            let new_path = {
+                let mut path = new_path;
+                let bash_result = tokio::task::spawn_blocking(ensure_bash_available)
+                    .await
+                    .unwrap_or_else(|e| {
+                        warn!("bash setup task panicked (non-fatal): {:?}", e);
+                        None
+                    });
+                match bash_result {
+                    Some(bash_dir) => {
+                        // Also add the usr/bin dir which has common unix utils (grep, cat, etc.)
+                        let usr_bin = Path::new(&bash_dir)
+                            .parent() // git-portable/
+                            .map(|p| p.join("usr").join("bin"));
+                        path = format!("{}{}{}", bash_dir, sep, path);
+                        if let Some(ref ub) = usr_bin {
+                            if ub.exists() {
+                                path = format!("{}{}{}", ub.display(), sep, path);
+                            }
+                        }
+                        info!("Injected bash dir into PATH for pi: {}", bash_dir);
+                    }
+                    None => {
+                        warn!("bash not available — Pi's bash tool may fail on Windows");
+                    }
+                }
+                path
+            };
+
             cmd.env("PATH", new_path);
             debug!("Injected bun dir into PATH for pi: {}", bun_dir.display());
         }
@@ -920,7 +1170,7 @@ pub async fn pi_start_inner(
     }
 
     // Bun 1.3+ fixed the readline pipe bug (bun 1.2 needed a PTY workaround).
-    // The bundled bun is 1.3.7, so piped stdin works correctly.
+    // The bundled bun is 1.3.10, so piped stdin works correctly.
     // PTY canonical mode has a ~1024-byte line limit on macOS which silently
     // drops large JSON commands (prompts are 2500+ bytes), so pipe is required.
     cmd.stdin(Stdio::piped());
@@ -944,9 +1194,14 @@ pub async fn pi_start_inner(
         // ChatGPT OAuth: inject token from stored OAuth file (no api_key in config)
         if config.provider == "openai-chatgpt" {
             match crate::chatgpt_oauth::get_valid_token().await {
-                Ok(token) => { cmd.env("OPENAI_CHATGPT_TOKEN", token); }
+                Ok(token) => {
+                    cmd.env("OPENAI_CHATGPT_TOKEN", token);
+                }
                 Err(e) => {
-                    return Err(format!("ChatGPT OAuth token unavailable: {}. Please sign in again.", e));
+                    return Err(format!(
+                        "ChatGPT OAuth token unavailable: {}. Please sign in again.",
+                        e
+                    ));
                 }
             }
         }
@@ -957,6 +1212,9 @@ pub async fn pi_start_inner(
                 match config.provider.as_str() {
                     "openai" => {
                         cmd.env("OPENAI_API_KEY", api_key);
+                    }
+                    "anthropic" => {
+                        cmd.env("ANTHROPIC_API_KEY", api_key);
                     }
                     "custom" => {
                         cmd.env("CUSTOM_API_KEY", api_key);
@@ -992,6 +1250,7 @@ pub async fn pi_start_inner(
 
     // Update manager for this session
     let terminated_emitted = Arc::new(AtomicBool::new(false));
+    let pending_responses: PendingResponses;
     if let Some(m) = pool.sessions.get_mut(&sid) {
         m.child = Some(child);
         m.stdin = Some(stdin);
@@ -999,6 +1258,9 @@ pub async fn pi_start_inner(
         m.last_activity = std::time::Instant::now();
         // Fresh flag for this session — old reader threads keep their own Arc
         m.terminated_emitted = terminated_emitted.clone();
+        pending_responses = m.pending_responses.clone();
+    } else {
+        pending_responses = Arc::new(std::sync::Mutex::new(HashMap::new()));
     }
 
     // Snapshot the state BEFORE dropping the lock, so we don't hold it during I/O
@@ -1020,61 +1282,64 @@ pub async fn pi_start_inner(
     let app_handle = app.clone();
     let terminated_guard = terminated_emitted.clone();
     let sid_clone = sid.clone();
+    let pending_for_reader = pending_responses.clone();
     std::thread::spawn(move || {
-        let reader = BufReader::new(stdout);
+        let mut reader = BufReader::new(stdout);
         info!(
             "Pi stdout reader started (pid: {}, session: {})",
             pid, sid_clone
         );
         let mut line_count = 0u64;
         let mut ready_signalled = false;
-        for line in reader.lines() {
-            match line {
-                Ok(line) => {
-                    line_count += 1;
-                    let event_type = serde_json::from_str::<Value>(&line).ok().and_then(|v| {
-                        v.get("type")
-                            .and_then(|t| t.as_str())
-                            .map(|s| s.to_string())
-                    });
-                    debug!(
-                        "Pi stdout #{} (pid {}, session {}): type={}",
-                        line_count,
-                        pid,
-                        sid_clone,
-                        event_type.as_deref().unwrap_or("non-json")
-                    );
+        while let Some(line) = read_lines_lossy(&mut reader) {
+            line_count += 1;
+            let parsed = serde_json::from_str::<Value>(&line).ok();
+            let event_type = parsed.as_ref().and_then(|v| {
+                v.get("type")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
+            });
+            debug!(
+                "Pi stdout #{} (pid {}, session {}): type={}",
+                line_count,
+                pid,
+                sid_clone,
+                event_type.as_deref().unwrap_or("non-json")
+            );
 
-                    // Signal readiness on first successful JSON line
-                    if !ready_signalled {
-                        if serde_json::from_str::<Value>(&line).is_ok() {
-                            ready_notify_reader.notify_one();
-                            ready_signalled = true;
-                        }
-                    }
+            // Signal readiness on first successful JSON line
+            if !ready_signalled && parsed.is_some() {
+                ready_notify_reader.notify_one();
+                ready_signalled = true;
+            }
 
-                    // Try to parse as JSON and emit event tagged with sessionId
-                    match serde_json::from_str::<Value>(&line) {
-                        Ok(event) => {
-                            let tagged = json!({ "sessionId": sid_clone, "event": event });
-                            if let Err(e) = app_handle.emit("pi_event", &tagged) {
-                                error!("Failed to emit pi_event: {}", e);
+            match parsed {
+                Some(event) => {
+                    // Route RPC responses to waiting callers
+                    if event_type.as_deref() == Some("response") {
+                        if let Some(id) = event.get("id").and_then(|v| v.as_str()) {
+                            let mut pending = pending_for_reader.lock().unwrap();
+                            if let Some(tx) = pending.remove(id) {
+                                if let Ok(rpc) = serde_json::from_value::<RpcResponse>(event.clone()) {
+                                    let _ = tx.send(rpc);
+                                }
                             }
                         }
-                        Err(e) => {
-                            let end = line.len().min(100);
-                            let end = line.floor_char_boundary(end);
-                            warn!("Pi stdout not JSON: {} (line: {})", e, &line[..end]);
-                        }
                     }
-                    if let Err(e) = app_handle.emit("pi_output", &line) {
-                        error!("Failed to emit pi_output: {}", e);
+                    // Always emit as Tauri event too (frontend may need response events)
+                    let tagged = json!({ "sessionId": sid_clone, "event": event });
+                    if let Err(e) = app_handle.emit("pi_event", &tagged) {
+                        error!("Failed to emit pi_event: {}", e);
                     }
                 }
-                Err(e) => {
-                    error!("Error reading pi stdout: {}", e);
-                    break;
+                None => {
+                    let end = line.len().min(100);
+                    let end = line.floor_char_boundary(end);
+                    warn!("Pi stdout not JSON: (line: {})", &line[..end]);
                 }
+            }
+            if let Err(e) = app_handle.emit("pi_output", &line) {
+                error!("Failed to emit pi_output: {}", e);
             }
         }
         info!(
@@ -1101,37 +1366,28 @@ pub async fn pi_start_inner(
         let app_handle = app.clone();
         let sid_stderr = sid.clone();
         std::thread::spawn(move || {
-            let reader = BufReader::new(stderr);
+            let mut reader = BufReader::new(stderr);
             info!("Pi stderr reader started (session: {})", sid_stderr);
-            for line in reader.lines() {
-                match line {
-                    Ok(line) => {
-                        // Try to parse as JSON RPC event and forward like stdout
-                        if let Ok(event) = serde_json::from_str::<Value>(&line) {
-                            let event_type =
-                                event.get("type").and_then(|t| t.as_str()).unwrap_or("?");
-                            debug!(
-                                "Pi stderr JSON (session {}): type={}",
-                                sid_stderr, event_type
-                            );
-                            let tagged = json!({ "sessionId": sid_stderr, "event": event });
-                            if let Err(e) = app_handle.emit("pi_event", &tagged) {
-                                error!("Failed to emit pi_event from stderr: {}", e);
-                            }
-                            if let Err(e) = app_handle.emit("pi_output", &line) {
-                                error!("Failed to emit pi_output from stderr: {}", e);
-                            }
-                        } else {
-                            // Not JSON — log as warn so Pi startup errors are visible
-                            warn!("Pi stderr: {}", &line[..line.len().min(500)]);
-                        }
-                        let _ = app_handle.emit("pi_log", &line);
+            while let Some(line) = read_lines_lossy(&mut reader) {
+                // Try to parse as JSON RPC event and forward like stdout
+                if let Ok(event) = serde_json::from_str::<Value>(&line) {
+                    let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+                    debug!(
+                        "Pi stderr JSON (session {}): type={}",
+                        sid_stderr, event_type
+                    );
+                    let tagged = json!({ "sessionId": sid_stderr, "event": event });
+                    if let Err(e) = app_handle.emit("pi_event", &tagged) {
+                        error!("Failed to emit pi_event from stderr: {}", e);
                     }
-                    Err(e) => {
-                        error!("Error reading pi stderr: {}", e);
-                        break;
+                    if let Err(e) = app_handle.emit("pi_output", &line) {
+                        error!("Failed to emit pi_output from stderr: {}", e);
                     }
+                } else {
+                    // Not JSON — log as warn so Pi startup errors are visible
+                    warn!("Pi stderr: {}", &line[..line.len().min(500)]);
                 }
+                let _ = app_handle.emit("pi_log", &line);
             }
             info!("Pi stderr reader ended (session: {})", sid_stderr);
         });
@@ -1214,22 +1470,25 @@ pub async fn pi_prompt(
     m.send_command(cmd)
 }
 
-/// Abort current Pi operation
+/// Abort current Pi operation. Waits for the Pi SDK to confirm the abort completed.
 #[tauri::command]
 #[specta::specta]
 pub async fn pi_abort(state: State<'_, PiState>, session_id: Option<String>) -> Result<(), String> {
     let sid = session_id.unwrap_or_else(|| "chat".to_string());
-    let mut pool = state.0.lock().await;
-    let m = pool.sessions.get_mut(&sid).ok_or("Pi not initialized")?;
-
-    if !m.is_running() {
-        return Err("Pi is not running".to_string());
-    }
-
-    m.send_command(json!({"type": "abort"}))
+    let rx = {
+        let mut pool = state.0.lock().await;
+        let m = pool.sessions.get_mut(&sid).ok_or("Pi not initialized")?;
+        if !m.is_running() {
+            return Err("Pi is not running".to_string());
+        }
+        m.send_command_and_wait(json!({"type": "abort"}), RPC_RESPONSE_TIMEOUT)?
+    };
+    // Await outside the lock so other commands aren't blocked
+    await_rpc_response(rx, "abort").await
 }
 
-/// Start a new Pi session (clears conversation history)
+/// Start a new Pi session (clears conversation history).
+/// Waits for the Pi SDK to finish aborting any in-flight work and resetting state.
 #[tauri::command]
 #[specta::specta]
 pub async fn pi_new_session(
@@ -1237,14 +1496,43 @@ pub async fn pi_new_session(
     session_id: Option<String>,
 ) -> Result<(), String> {
     let sid = session_id.unwrap_or_else(|| "chat".to_string());
-    let mut pool = state.0.lock().await;
-    let m = pool.sessions.get_mut(&sid).ok_or("Pi not initialized")?;
+    let rx = {
+        let mut pool = state.0.lock().await;
+        let m = pool.sessions.get_mut(&sid).ok_or("Pi not initialized")?;
+        if !m.is_running() {
+            return Err("Pi is not running".to_string());
+        }
+        m.send_command_and_wait(json!({"type": "new_session"}), RPC_RESPONSE_TIMEOUT)?
+    };
+    await_rpc_response(rx, "new_session").await
+}
 
-    if !m.is_running() {
-        return Err("Pi is not running".to_string());
+/// Timeout for RPC responses that must complete before the next command.
+const RPC_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Await an RPC response with a timeout. Returns Ok(()) on success or the error from Pi.
+async fn await_rpc_response(
+    rx: oneshot::Receiver<RpcResponse>,
+    command_name: &str,
+) -> Result<(), String> {
+    match tokio::time::timeout(RPC_RESPONSE_TIMEOUT, rx).await {
+        Ok(Ok(resp)) => {
+            if resp.success == Some(true) {
+                Ok(())
+            } else {
+                Err(resp.error.unwrap_or_else(|| format!("{} failed", command_name)))
+            }
+        }
+        Ok(Err(_)) => {
+            // Channel dropped — process likely died
+            Err(format!("Pi process died while waiting for {} response", command_name))
+        }
+        Err(_) => {
+            warn!("Timed out waiting for Pi {} response", command_name);
+            // Don't error — the command was sent, Pi may still process it
+            Ok(())
+        }
     }
-
-    m.send_command(json!({"type": "new_session"}))
 }
 
 /// Check if pi is available
@@ -1304,10 +1592,18 @@ pub async fn pi_install(app: AppHandle) -> Result<(), String> {
 
     let bun = find_bun_executable().ok_or("Could not find bun. Install from https://bun.sh")?;
 
+    let install_dir =
+        pi_local_install_dir().ok_or("Cannot determine home directory for Pi install")?;
+    std::fs::create_dir_all(&install_dir)
+        .map_err(|e| format!("Failed to create Pi install dir: {}", e))?;
+
     let app_handle = app.clone();
     std::thread::spawn(move || {
+        // Seed package.json with overrides to fix lru-cache resolution on Windows
+        seed_pi_package_json(&install_dir);
+
         let mut cmd = std::process::Command::new(&bun);
-        cmd.args(["add", "-g", PI_PACKAGE]);
+        cmd.current_dir(&install_dir).args(["add", PI_PACKAGE]);
 
         // On Windows, prevent console window from appearing
         #[cfg(windows)]
@@ -1396,13 +1692,352 @@ fn find_bun_executable() -> Option<String> {
     result
 }
 
+/// Find a bash executable on Windows. Returns None on non-Windows platforms
+/// (where bash is always available). Checks:
+/// 1. Our bundled PortableGit in %LOCALAPPDATA%\screenpipe\git-portable\
+/// 2. Standard Git for Windows install
+/// 3. bash.exe on PATH (Git Bash, MSYS2, WSL, etc.)
+#[cfg(windows)]
+fn find_bash_executable() -> Option<String> {
+    // 1. Bundled PortableGit in screenpipe's data directory
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        let bundled = PathBuf::from(&local_app_data)
+            .join("screenpipe")
+            .join("git-portable")
+            .join("bin")
+            .join("bash.exe");
+        if bundled.exists() {
+            info!("Found bundled bash at: {}", bundled.display());
+            return Some(bundled.to_string_lossy().to_string());
+        }
+    }
+
+    // 2. Standard Git for Windows locations
+    let standard_paths = [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+    ];
+    for p in &standard_paths {
+        if Path::new(p).exists() {
+            info!("Found system bash at: {}", p);
+            return Some(p.to_string());
+        }
+    }
+
+    // 3. Try `where bash` on PATH
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        if let Ok(output) = std::process::Command::new("where")
+            .arg("bash")
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Some(line) = stdout.lines().next() {
+                    let path = line.trim().to_string();
+                    if !path.is_empty() && Path::new(&path).exists() {
+                        info!("Found bash on PATH: {}", path);
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+
+    debug!("No bash executable found on Windows");
+    None
+}
+
+/// Download and extract PortableGit to provide bash on Windows.
+/// This is a blocking function — call from a background thread.
+/// Returns Ok(path_to_bash_exe) on success.
+#[cfg(windows)]
+fn download_portable_git() -> Result<String, String> {
+    let local_app_data =
+        std::env::var("LOCALAPPDATA").map_err(|_| "LOCALAPPDATA env var not set".to_string())?;
+    let screenpipe_dir = PathBuf::from(&local_app_data).join("screenpipe");
+    let git_dir = screenpipe_dir.join("git-portable");
+    let bash_path = git_dir.join("bin").join("bash.exe");
+
+    // Already downloaded
+    if bash_path.exists() {
+        info!("PortableGit already present at {}", git_dir.display());
+        return Ok(bash_path.to_string_lossy().to_string());
+    }
+
+    // Pinned version for reproducibility
+    const PORTABLE_GIT_VERSION: &str = "2.47.1";
+    const PORTABLE_GIT_URL: &str = "https://github.com/git-for-windows/git/releases/download/v2.47.1.windows.1/PortableGit-2.47.1-64-bit.7z.exe";
+    const PORTABLE_GIT_SHA256: &str =
+        "4f3f21f4effcb659566883ee1ed3ae403e5b3d7a0699cee455f6cd765e1ac39c";
+
+    info!(
+        "Downloading PortableGit {} for bash support...",
+        PORTABLE_GIT_VERSION
+    );
+
+    // Create parent directories
+    std::fs::create_dir_all(&screenpipe_dir)
+        .map_err(|e| format!("Failed to create screenpipe data dir: {}", e))?;
+
+    // Download to temp file
+    let temp_file = std::env::temp_dir().join(format!(
+        "PortableGit-{}-64-bit.7z.exe",
+        PORTABLE_GIT_VERSION
+    ));
+
+    // Use bun or curl to download (bun is always available since we bundle it)
+    let download_result = if let Some(bun) = find_bun_executable() {
+        let script = format!(
+            r#"const r = await fetch("{}"); if (!r.ok) throw new Error(r.statusText); const b = await r.arrayBuffer(); require("fs").writeFileSync("{}", Buffer.from(b));"#,
+            PORTABLE_GIT_URL,
+            temp_file.to_string_lossy().replace('\\', "\\\\")
+        );
+        let mut cmd = std::process::Command::new(&bun);
+        cmd.args(["--eval", &script]);
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        cmd.output()
+    } else {
+        // Fallback: try curl.exe (ships with Windows 10+)
+        let mut cmd = std::process::Command::new("curl.exe");
+        cmd.args(["-fSL", "-o", &temp_file.to_string_lossy(), PORTABLE_GIT_URL]);
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        cmd.output()
+    };
+
+    match download_result {
+        Ok(output) if output.status.success() => {
+            info!("PortableGit downloaded to {}", temp_file.display());
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let _ = std::fs::remove_file(&temp_file);
+            return Err(format!("PortableGit download failed: {}", stderr));
+        }
+        Err(e) => {
+            return Err(format!("Failed to run download command: {}", e));
+        }
+    }
+
+    // Verify SHA256 using certutil (built into Windows)
+    let digest = {
+        let mut cmd = std::process::Command::new("certutil");
+        cmd.args(["-hashfile", &temp_file.to_string_lossy(), "SHA256"]);
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        match cmd.output() {
+            Ok(output) if output.status.success() => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // certutil output: line 0 = header, line 1 = hex hash, line 2 = status
+                stdout
+                    .lines()
+                    .nth(1)
+                    .map(|l| l.trim().replace(' ', "").to_lowercase())
+                    .unwrap_or_default()
+            }
+            _ => {
+                warn!("Could not verify SHA256 (certutil failed), proceeding with caution");
+                String::new()
+            }
+        }
+    };
+
+    if !digest.is_empty() && digest != PORTABLE_GIT_SHA256 {
+        let _ = std::fs::remove_file(&temp_file);
+        return Err(format!(
+            "SHA256 mismatch: expected {}, got {}. Download may be corrupted.",
+            PORTABLE_GIT_SHA256, digest
+        ));
+    }
+    if !digest.is_empty() {
+        info!("SHA256 verified: {}", digest);
+    }
+
+    // Extract: PortableGit .7z.exe is a self-extracting archive.
+    // Run it with -o<dir> -y to extract silently.
+    info!("Extracting PortableGit to {}...", git_dir.display());
+
+    // Extract to a temp directory first (atomic: rename on success)
+    let extract_temp = screenpipe_dir.join("git-portable-extracting");
+    let _ = std::fs::remove_dir_all(&extract_temp);
+
+    {
+        let mut cmd = std::process::Command::new(&temp_file);
+        cmd.args([
+            &format!("-o{}", extract_temp.to_string_lossy()),
+            "-y",
+            "-gm2",
+        ]);
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        match cmd.output() {
+            Ok(output) if output.status.success() => {
+                info!("PortableGit extracted successfully");
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let _ = std::fs::remove_dir_all(&extract_temp);
+                let _ = std::fs::remove_file(&temp_file);
+                return Err(format!("PortableGit extraction failed: {}", stderr));
+            }
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&extract_temp);
+                let _ = std::fs::remove_file(&temp_file);
+                return Err(format!("Failed to run PortableGit extractor: {}", e));
+            }
+        }
+    }
+
+    // Verify extraction produced bash.exe
+    let extracted_bash = extract_temp.join("bin").join("bash.exe");
+    if !extracted_bash.exists() {
+        let _ = std::fs::remove_dir_all(&extract_temp);
+        let _ = std::fs::remove_file(&temp_file);
+        return Err("Extraction completed but bash.exe not found in expected location".to_string());
+    }
+
+    // Run post-install.bat if present (required by PortableGit)
+    let post_install = extract_temp.join("post-install.bat");
+    if post_install.exists() {
+        info!("Running PortableGit post-install.bat...");
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.args(["/C", &post_install.to_string_lossy()])
+            .current_dir(&extract_temp);
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        match cmd.output() {
+            Ok(output) if output.status.success() => {
+                info!("post-install.bat completed successfully");
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                warn!("post-install.bat returned non-zero (non-fatal): {}", stderr);
+            }
+            Err(e) => {
+                warn!("Failed to run post-install.bat (non-fatal): {}", e);
+            }
+        }
+    }
+
+    // Atomic rename: move extracted dir to final location
+    let _ = std::fs::remove_dir_all(&git_dir);
+    std::fs::rename(&extract_temp, &git_dir).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&extract_temp);
+        format!(
+            "Failed to move extracted PortableGit to final location: {}",
+            e
+        )
+    })?;
+
+    // Clean up temp download
+    let _ = std::fs::remove_file(&temp_file);
+
+    let final_bash = git_dir.join("bin").join("bash.exe");
+    info!(
+        "PortableGit setup complete. bash at: {}",
+        final_bash.display()
+    );
+    Ok(final_bash.to_string_lossy().to_string())
+}
+
+/// Ensure bash is available on Windows. If not found, downloads PortableGit.
+/// Safe to call — never crashes, only logs warnings on failure.
+/// Returns the bash bin directory (for PATH injection) or None.
+#[cfg(windows)]
+fn ensure_bash_available() -> Option<String> {
+    if let Some(bash_path) = find_bash_executable() {
+        return Path::new(&bash_path)
+            .parent()
+            .map(|d| d.to_string_lossy().to_string());
+    }
+
+    info!("No bash found on Windows, attempting to download PortableGit...");
+    match download_portable_git() {
+        Ok(bash_path) => {
+            info!("PortableGit installed, bash available at: {}", bash_path);
+            Path::new(&bash_path)
+                .parent()
+                .map(|d| d.to_string_lossy().to_string())
+        }
+        Err(e) => {
+            warn!(
+                "Failed to set up bash for Windows (AI chat may not work correctly): {}. \
+                 Install Git for Windows from https://git-scm.com/download/win to fix this.",
+                e
+            );
+            None
+        }
+    }
+}
+
 /// Background Pi installation — call once from app setup.
+/// Installs pi into `~/.screenpipe/pi-agent/` (local install, not global)
+/// so we fully control the dependency tree and avoid version conflicts.
 /// Runs on a dedicated thread, never panics, never blocks the caller.
 /// Sets `PI_INSTALL_DONE` when finished so `pi_start` can wait for it.
 pub fn ensure_pi_installed_background() {
-    // If Pi is already installed, mark done immediately
-    if find_pi_executable().is_some() {
-        debug!("Pi already installed, skipping background install");
+    // If Pi is already installed locally, check if it needs the lru-cache fix.
+    if find_local_pi_entrypoint().is_some() {
+        if let Some(install_dir) = pi_local_install_dir() {
+            let pkg_path = install_dir.join("package.json");
+            let needs_fix = pkg_path.exists()
+                && std::fs::read_to_string(&pkg_path)
+                    .map(|c| !c.contains("overrides"))
+                    .unwrap_or(false);
+            if needs_fix {
+                info!("Pi installed but missing lru-cache overrides — patching and reinstalling");
+                seed_pi_package_json(&install_dir);
+                // Delete bun.lock so bun resolves deps with new overrides
+                let _ = std::fs::remove_file(install_dir.join("bun.lock"));
+                let _ = std::fs::remove_file(install_dir.join("bun.lockb"));
+                // Trigger reinstall in background (don't block)
+                if let Some(bun) = find_bun_executable() {
+                    let _ = std::thread::Builder::new()
+                        .name("pi-lru-fix".to_string())
+                        .spawn(move || {
+                            let mut cmd = std::process::Command::new(&bun);
+                            cmd.current_dir(&install_dir).args(["install"]);
+                            #[cfg(windows)]
+                            {
+                                use std::os::windows::process::CommandExt;
+                                const CREATE_NO_WINDOW: u32 = 0x08000000;
+                                cmd.creation_flags(CREATE_NO_WINDOW);
+                            }
+                            match cmd.output() {
+                                Ok(output) if output.status.success() => {
+                                    info!("Pi lru-cache fix: reinstall successful");
+                                }
+                                Ok(output) => {
+                                    let stderr = String::from_utf8_lossy(&output.stderr);
+                                    warn!("Pi lru-cache fix: reinstall failed: {}", stderr);
+                                }
+                                Err(e) => warn!("Pi lru-cache fix: bun error: {}", e),
+                            }
+                        });
+                }
+            } else {
+                debug!("Pi already installed locally, skipping background install");
+            }
+        }
         PI_INSTALL_DONE.store(true, Ordering::SeqCst);
         return;
     }
@@ -1419,10 +2054,27 @@ pub fn ensure_pi_installed_background() {
                     }
                 };
 
-                info!("Pi not found — installing via bun in background");
+                let install_dir = match pi_local_install_dir() {
+                    Some(d) => d,
+                    None => {
+                        warn!("Cannot determine home directory for Pi install");
+                        return;
+                    }
+                };
+
+                if let Err(e) = std::fs::create_dir_all(&install_dir) {
+                    warn!("Failed to create Pi install dir {}: {}", install_dir.display(), e);
+                    return;
+                }
+
+                info!("Pi not found — installing into {} via bun", install_dir.display());
+
+                // Seed package.json with overrides to fix lru-cache resolution on Windows
+                seed_pi_package_json(&install_dir);
 
                 let mut cmd = std::process::Command::new(&bun);
-                cmd.args(["add", "-g", PI_PACKAGE]);
+                cmd.current_dir(&install_dir)
+                    .args(["add", PI_PACKAGE]);
 
                 #[cfg(windows)]
                 {
@@ -1433,7 +2085,7 @@ pub fn ensure_pi_installed_background() {
 
                 match cmd.output() {
                     Ok(output) if output.status.success() => {
-                        info!("Pi installed successfully in background");
+                        info!("Pi installed successfully into {}", install_dir.display());
                     }
                     Ok(output) => {
                         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1822,5 +2474,132 @@ mod tests {
     #[test]
     fn test_ready_timeout_constant() {
         assert_eq!(super::PI_READY_TIMEOUT.as_secs(), 2);
+    }
+
+    // -- read_lines_lossy unit tests --
+
+    /// Valid UTF-8 line is returned as-is
+    #[test]
+    fn test_read_lines_lossy_valid_utf8() {
+        let data = b"hello world\n";
+        let mut reader = BufReader::new(&data[..]);
+        assert_eq!(
+            super::read_lines_lossy(&mut reader),
+            Some("hello world".into())
+        );
+        assert_eq!(super::read_lines_lossy(&mut reader), None); // EOF
+    }
+
+    /// Multiple lines are read sequentially
+    #[test]
+    fn test_read_lines_lossy_multiple_lines() {
+        let data = b"line one\nline two\nline three\n";
+        let mut reader = BufReader::new(&data[..]);
+        assert_eq!(
+            super::read_lines_lossy(&mut reader),
+            Some("line one".into())
+        );
+        assert_eq!(
+            super::read_lines_lossy(&mut reader),
+            Some("line two".into())
+        );
+        assert_eq!(
+            super::read_lines_lossy(&mut reader),
+            Some("line three".into())
+        );
+        assert_eq!(super::read_lines_lossy(&mut reader), None);
+    }
+
+    /// Invalid UTF-8 bytes are replaced with U+FFFD instead of erroring
+    #[test]
+    fn test_read_lines_lossy_invalid_utf8() {
+        // 0xFF 0xFE are not valid UTF-8
+        let data: &[u8] = &[b'h', b'i', 0xFF, 0xFE, b'\n'];
+        let mut reader = BufReader::new(data);
+        let line = super::read_lines_lossy(&mut reader).unwrap();
+        assert!(
+            line.contains('\u{FFFD}'),
+            "should contain replacement char, got: {}",
+            line
+        );
+        assert!(line.starts_with("hi"), "should preserve valid prefix");
+    }
+
+    /// CRLF line endings are stripped
+    #[test]
+    fn test_read_lines_lossy_crlf() {
+        let data = b"windows line\r\n";
+        let mut reader = BufReader::new(&data[..]);
+        assert_eq!(
+            super::read_lines_lossy(&mut reader),
+            Some("windows line".into())
+        );
+    }
+
+    /// Last line without trailing newline is still returned
+    #[test]
+    fn test_read_lines_lossy_no_trailing_newline() {
+        let data = b"no newline at end";
+        let mut reader = BufReader::new(&data[..]);
+        assert_eq!(
+            super::read_lines_lossy(&mut reader),
+            Some("no newline at end".into())
+        );
+        assert_eq!(super::read_lines_lossy(&mut reader), None);
+    }
+
+    /// Empty input returns None immediately
+    #[test]
+    fn test_read_lines_lossy_empty() {
+        let data: &[u8] = b"";
+        let mut reader = BufReader::new(data);
+        assert_eq!(super::read_lines_lossy(&mut reader), None);
+    }
+
+    /// Empty line (just a newline) returns empty string
+    #[test]
+    fn test_read_lines_lossy_empty_line() {
+        let data = b"\n";
+        let mut reader = BufReader::new(&data[..]);
+        assert_eq!(super::read_lines_lossy(&mut reader), Some("".into()));
+        assert_eq!(super::read_lines_lossy(&mut reader), None);
+    }
+
+    /// Large JSON line (simulating Pi's big outputs) is read completely
+    #[test]
+    fn test_read_lines_lossy_large_json() {
+        let big_value = "x".repeat(100_000);
+        let json_line = format!("{{\"type\":\"data\",\"content\":\"{}\"}}\n", big_value);
+        let mut reader = BufReader::new(json_line.as_bytes());
+        let line = super::read_lines_lossy(&mut reader).unwrap();
+        assert_eq!(line.len(), json_line.len() - 1); // minus the \n
+                                                     // Verify it's valid JSON
+        assert!(serde_json::from_str::<Value>(&line).is_ok());
+    }
+
+    /// Mixed valid and invalid UTF-8 lines — valid lines unaffected
+    #[test]
+    fn test_read_lines_lossy_mixed_valid_invalid() {
+        let mut data: Vec<u8> = Vec::new();
+        data.extend_from_slice(b"{\"type\":\"ok\"}\n");
+        data.extend_from_slice(&[0x80, 0x81, b'\n']); // invalid UTF-8 line
+        data.extend_from_slice(b"{\"type\":\"still_ok\"}\n");
+
+        let mut reader = BufReader::new(&data[..]);
+
+        // First line: valid JSON
+        let line1 = super::read_lines_lossy(&mut reader).unwrap();
+        assert!(serde_json::from_str::<Value>(&line1).is_ok());
+
+        // Second line: lossy conversion, not valid JSON but reader survives
+        let line2 = super::read_lines_lossy(&mut reader).unwrap();
+        assert!(line2.contains('\u{FFFD}'));
+
+        // Third line: valid JSON — reader recovered
+        let line3 = super::read_lines_lossy(&mut reader).unwrap();
+        let v: Value = serde_json::from_str(&line3).unwrap();
+        assert_eq!(v["type"], "still_ok");
+
+        assert_eq!(super::read_lines_lossy(&mut reader), None);
     }
 }

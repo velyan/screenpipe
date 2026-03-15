@@ -184,6 +184,8 @@ pub struct SettingsStore {
     pub show_chat_shortcut: String,
     #[serde(rename = "searchShortcut")]
     pub search_shortcut: String,
+    #[serde(rename = "lockVaultShortcut", default)]
+    pub lock_vault_shortcut: String,
     #[serde(rename = "realtimeAudioTranscriptionEngine")]
     pub realtime_audio_transcription_engine: String,
     #[serde(rename = "disableVision")]
@@ -231,6 +233,16 @@ pub struct SettingsStore {
     #[serde(rename = "videoQuality", default = "default_video_quality")]
     pub video_quality: String,
 
+    /// When true, the chat window stays above all other windows (default: true).
+    #[serde(rename = "chatAlwaysOnTop", default = "default_true")]
+    pub chat_always_on_top: bool,
+
+    /// Automatically detect and skip incognito / private browsing windows.
+    /// Uses localized title matching (20+ languages) and on macOS, native
+    /// AppleScript detection for Chromium browsers.
+    #[serde(rename = "ignoreIncognitoWindows", default = "default_true")]
+    pub ignore_incognito_windows: bool,
+
     /// Catch-all for fields added by the frontend (e.g. chatHistory, deviceId)
     /// that the Rust struct doesn't know about. Without this, `save()` would
     /// serialize only known fields and silently wipe frontend-only data.
@@ -276,6 +288,8 @@ pub enum AIProviderType {
     ScreenpipeCloud,
     #[serde(rename = "pi", alias = "opencode")]
     Pi,
+    #[serde(rename = "anthropic")]
+    Anthropic,
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -533,8 +547,14 @@ impl Default for SettingsStore {
             stop_recording_shortcut: "Alt+Shift+X".to_string(),
             #[cfg(not(target_os = "windows"))]
             stop_recording_shortcut: "Super+Ctrl+X".to_string(),
-            start_audio_shortcut: "".to_string(),
-            stop_audio_shortcut: "".to_string(),
+            #[cfg(target_os = "windows")]
+            start_audio_shortcut: "Alt+Shift+A".to_string(),
+            #[cfg(not(target_os = "windows"))]
+            start_audio_shortcut: "Super+Ctrl+A".to_string(),
+            #[cfg(target_os = "windows")]
+            stop_audio_shortcut: "Alt+Shift+Z".to_string(),
+            #[cfg(not(target_os = "windows"))]
+            stop_audio_shortcut: "Super+Ctrl+Z".to_string(),
             #[cfg(target_os = "windows")]
             show_chat_shortcut: "Alt+L".to_string(),
             #[cfg(not(target_os = "windows"))]
@@ -543,6 +563,10 @@ impl Default for SettingsStore {
             search_shortcut: "Alt+K".to_string(),
             #[cfg(not(target_os = "windows"))]
             search_shortcut: "Control+Super+K".to_string(),
+            #[cfg(target_os = "windows")]
+            lock_vault_shortcut: "Ctrl+Shift+L".to_string(),
+            #[cfg(not(target_os = "windows"))]
+            lock_vault_shortcut: "Super+Shift+L".to_string(),
             realtime_audio_transcription_engine: "deepgram".to_string(),
             disable_vision: false,
             disable_ocr: false,
@@ -559,6 +583,8 @@ impl Default for SettingsStore {
             overlay_mode: "window".to_string(),
             show_overlay_in_screen_recording: false,
             video_quality: "balanced".to_string(),
+            chat_always_on_top: true,
+            ignore_incognito_windows: true,
             extra: std::collections::HashMap::new(),
         }
     }
@@ -587,6 +613,7 @@ impl SettingsStore {
                 "screenpipe-cloud",
                 "opencode",
                 "pi",
+                "anthropic",
             ];
             if let Some(presets) = obj.get_mut("aiPresets") {
                 if let Some(arr) = presets.as_array_mut() {
@@ -597,10 +624,10 @@ impl SettingsStore {
                                     "unknown AI provider '{}' in preset, falling back to 'custom'",
                                     provider
                                 );
-                                preset
-                                    .as_object_mut()
-                                    .unwrap()
-                                    .insert("provider".to_string(), Value::String("custom".to_string()));
+                                preset.as_object_mut().unwrap().insert(
+                                    "provider".to_string(),
+                                    Value::String("custom".to_string()),
+                                );
                             }
                         }
                     }
@@ -634,18 +661,19 @@ impl SettingsStore {
     pub fn to_recording_config(
         &self,
         data_dir: std::path::PathBuf,
-    ) -> screenpipe_server::RecordingConfig {
+    ) -> screenpipe_engine::RecordingConfig {
         use screenpipe_audio::audio_manager::builder::TranscriptionMode;
         use screenpipe_audio::core::engine::AudioTranscriptionEngine;
         let audio_engine_str = self.resolve_audio_engine();
 
-        screenpipe_server::RecordingConfig {
+        screenpipe_engine::RecordingConfig {
             audio_chunk_duration: self.audio_chunk_duration as u64,
             port: self.port,
             data_dir,
             disable_audio: self.disable_audio,
             disable_vision: self.disable_vision,
             use_pii_removal: self.use_pii_removal,
+            filter_music: self.filter_music,
             enable_main_body_distillation: false,
             main_body_distillation_threshold: 0.60,
             enable_input_capture: true, // always enabled, setting removed from UI
@@ -663,16 +691,17 @@ impl SettingsStore {
             use_all_monitors: self.use_all_monitors,
             ignored_windows: self.ignored_windows.clone(),
             included_windows: self.included_windows.clone(),
-            blocked_apps: screenpipe_accessibility::tree::default_blocked_apps(),
-            blocked_title_keywords: screenpipe_accessibility::tree::default_blocked_title_keywords(),
-            user_identities: vec![],
+            blocked_apps: screenpipe_a11y::tree::default_blocked_apps(),
+            blocked_title_keywords: screenpipe_a11y::tree::default_blocked_title_keywords(),
             ignored_urls: self.ignored_urls.clone(),
+            ignore_incognito_windows: self.ignore_incognito_windows,
             languages: self
                 .languages
                 .iter()
                 .filter(|s| s != &"default")
                 .filter_map(|s| s.parse().ok())
                 .collect(),
+            user_identities: vec![],
             deepgram_api_key: if self.deepgram_api_key.is_empty()
                 || self.deepgram_api_key == "default"
             {
@@ -720,6 +749,16 @@ impl SettingsStore {
                     .ok()
                 })
                 .unwrap_or_default(),
+            batch_max_duration_secs: self
+                .extra
+                .get("batchMaxDurationSecs")
+                .and_then(|v| v.as_u64())
+                .filter(|&v| v > 0),
+            power_mode: self
+                .extra
+                .get("powerMode")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
         }
     }
 
@@ -803,22 +842,6 @@ pub fn init_onboarding_store(app: &AppHandle) -> Result<OnboardingStore, String>
     Ok(onboarding)
 }
 
-// ─── Reminders Settings ─────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RemindersSettingsStore {
-    pub enabled: bool,
-    #[serde(default)]
-    pub custom_prompt: String,
-    /// When true, only audio/transcript data is used (no screen OCR).
-    #[serde(default = "reminders_audio_only_default")]
-    pub audio_only: bool,
-}
-
-fn reminders_audio_only_default() -> bool {
-    true
-}
-
 // ─── Cloud Sync Settings ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -830,6 +853,7 @@ pub struct CloudSyncSettingsStore {
 }
 
 impl CloudSyncSettingsStore {
+    #[allow(dead_code)]
     pub fn get(app: &AppHandle) -> Result<Option<Self>, String> {
         let store = get_store(app, None).map_err(|e| e.to_string())?;
         if store.is_empty() {
@@ -916,13 +940,39 @@ impl IcsCalendarSettingsStore {
     }
 }
 
-impl RemindersSettingsStore {
+// ─── Pipe Suggestions Settings ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipeSuggestionsSettingsStore {
+    pub enabled: bool,
+    #[serde(default = "default_pipe_suggestion_frequency")]
+    pub frequency_hours: u32,
+    #[serde(default)]
+    pub last_shown_at: Option<String>,
+}
+
+fn default_pipe_suggestion_frequency() -> u32 {
+    24
+}
+
+impl Default for PipeSuggestionsSettingsStore {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            frequency_hours: 24,
+            last_shown_at: None,
+        }
+    }
+}
+
+impl PipeSuggestionsSettingsStore {
     pub fn get(app: &AppHandle) -> Result<Option<Self>, String> {
         let store = get_store(app, None).map_err(|e| e.to_string())?;
         if store.is_empty() {
             return Ok(None);
         }
-        let settings = serde_json::from_value(store.get("reminders").unwrap_or(Value::Null));
+        let settings =
+            serde_json::from_value(store.get("pipe_suggestions").unwrap_or(Value::Null));
         match settings {
             Ok(settings) => Ok(settings),
             Err(_) => Ok(None),
@@ -931,7 +981,7 @@ impl RemindersSettingsStore {
 
     pub fn save(&self, app: &AppHandle) -> Result<(), String> {
         let store = get_store(app, None).map_err(|e| e.to_string())?;
-        store.set("reminders", json!(self));
+        store.set("pipe_suggestions", json!(self));
         store.save().map_err(|e| e.to_string())
     }
 }

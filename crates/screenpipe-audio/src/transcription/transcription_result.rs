@@ -7,7 +7,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use screenpipe_core::pii_removal::remove_pii;
 use screenpipe_db::{DatabaseManager, Speaker};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::core::engine::AudioTranscriptionEngine;
 
@@ -120,37 +120,55 @@ pub async fn process_transcription_result(
     // if smart mode deferred transcription by 20 minutes.
     let capture_ts: Option<DateTime<Utc>> = DateTime::from_timestamp(result.timestamp as i64, 0);
 
-    match db
-        .insert_audio_chunk_and_transcription(
-            &result.path,
-            &transcription,
-            0,
-            &transcription_engine,
-            &screenpipe_db::AudioDevice {
-                name: result.input.device.name.clone(),
-                device_type: match result.input.device.device_type {
-                    crate::core::device::DeviceType::Input => screenpipe_db::DeviceType::Input,
-                    crate::core::device::DeviceType::Output => screenpipe_db::DeviceType::Output,
+    // Retry DB insertion with backoff to survive transient pool saturation.
+    // Without this, transcribed audio is silently dropped from the timeline.
+    for retry in 0..3u32 {
+        match db
+            .insert_audio_chunk_and_transcription(
+                &result.path,
+                &transcription,
+                0,
+                &transcription_engine,
+                &screenpipe_db::AudioDevice {
+                    name: result.input.device.name.clone(),
+                    device_type: match result.input.device.device_type {
+                        crate::core::device::DeviceType::Input => screenpipe_db::DeviceType::Input,
+                        crate::core::device::DeviceType::Output => {
+                            screenpipe_db::DeviceType::Output
+                        }
+                    },
                 },
-            },
-            Some(speaker.id),
-            Some(result.start_time),
-            Some(result.end_time),
-            capture_ts,
-        )
-        .await
-    {
-        Ok(audio_chunk_id) => {
-            debug!(
-                "Inserted audio chunk+transcription for device {} using {}",
-                result.input.device, transcription_engine
-            );
-            chunk_id = Some(audio_chunk_id);
+                Some(speaker.id),
+                Some(result.start_time),
+                Some(result.end_time),
+                capture_ts,
+            )
+            .await
+        {
+            Ok(audio_chunk_id) => {
+                debug!(
+                    "Inserted audio chunk+transcription for device {} using {}",
+                    result.input.device, transcription_engine
+                );
+                chunk_id = Some(audio_chunk_id);
+                break;
+            }
+            Err(e) => {
+                if retry < 2 {
+                    warn!(
+                        "Failed to insert audio chunk+transcription for device {} (attempt {}/3): {}, retrying...",
+                        result.input.device, retry + 1, e
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(500 * (retry as u64 + 1)))
+                        .await;
+                } else {
+                    error!(
+                        "Failed to insert audio chunk+transcription for device {} after 3 retries: {}",
+                        result.input.device, e
+                    );
+                }
+            }
         }
-        Err(e) => error!(
-            "Failed to insert audio chunk+transcription for device {}: {}",
-            result.input.device, e
-        ),
     }
     Ok(chunk_id.map(|id| AudioInsertResult {
         audio_chunk_id: id,
@@ -158,12 +176,21 @@ pub async fn process_transcription_result(
     }))
 }
 
-async fn get_or_create_speaker_from_embedding(
+pub async fn get_or_create_speaker_from_embedding(
     db: &DatabaseManager,
     embedding: &[f32],
 ) -> Result<Speaker, anyhow::Error> {
     let speaker = db.get_speaker_from_embedding(embedding).await?;
     if let Some(speaker) = speaker {
+        debug!(
+            "matched speaker id={} name={:?}",
+            speaker.id,
+            if speaker.name.is_empty() {
+                "unnamed"
+            } else {
+                &speaker.name
+            }
+        );
         // Improve cluster over time: update centroid and store diverse embeddings
         if let Err(e) = db.update_speaker_centroid(speaker.id, embedding).await {
             debug!("failed to update speaker centroid: {}", e);
@@ -173,6 +200,7 @@ async fn get_or_create_speaker_from_embedding(
         }
         Ok(speaker)
     } else {
+        // insert_speaker logs the creation at info level
         let speaker = db.insert_speaker(embedding).await?;
         Ok(speaker)
     }

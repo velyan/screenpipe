@@ -261,7 +261,7 @@ impl UpdatesManager {
                 item.set_text("Downloading latest version of screenpipe")?;
             }
 
-            if let Some(tray) = self.app.tray_by_id("screenpipe_main") {
+            {
                 let theme = dark_light::detect().unwrap_or(Mode::Dark);
                 let icon_path = if theme == Mode::Light {
                     "assets/screenpipe-logo-tray-updates-black.png"
@@ -274,9 +274,19 @@ impl UpdatesManager {
                     .path()
                     .resolve(icon_path, tauri::path::BaseDirectory::Resource)?;
 
-                if let Ok(image) = tauri::image::Image::from_path(path) {
-                    crate::safe_icon::safe_set_icon_as_template(&tray, image)?;
-                }
+                let image = tauri::image::Image::from_path(path)?;
+
+                // TrayIcon must be accessed/dropped on the main thread
+                let app_clone = self.app.clone();
+                let _ = self.app.run_on_main_thread(move || {
+                    crate::window::with_autorelease_pool(|| {
+                        if let Some(tray) = app_clone.tray_by_id("screenpipe_main") {
+                            if let Err(e) = crate::safe_icon::safe_set_icon_as_template(&tray, image) {
+                                error!("failed to set tray update icon: {}", e);
+                            }
+                        }
+                    });
+                });
             }
 
             // Download and install on all platforms
@@ -427,8 +437,18 @@ impl UpdatesManager {
                     "auto-update enabled, restarting to apply update v{}",
                     update.version
                 );
-                // Give user time to read the notification
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                // Emit event so the frontend can display a countdown/warning
+                let _ = self.app.emit(
+                    "update-restarting",
+                    serde_json::json!({
+                        "version": update.version,
+                        "delay_secs": 30,
+                    }),
+                );
+                // Give user 30 seconds to finish what they're doing before restarting.
+                // Previous 5-second delay was too aggressive and interrupted fullscreen
+                // apps (games, presentations) without adequate warning.
+                tokio::time::sleep(Duration::from_secs(30)).await;
                 if let Err(err) =
                     stop_screenpipe(self.app.state::<RecordingState>(), self.app.clone()).await
                 {

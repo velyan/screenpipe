@@ -112,7 +112,7 @@ async fn do_refresh_token(refresh_token: &str) -> Result<OAuthTokens, String> {
             "grant_type": "refresh_token",
             "client_id": CLIENT_ID,
             "refresh_token": refresh_token,
-            "scope": "openid profile email",
+            "scope": "openid profile email offline_access",
         }))
         .send()
         .await

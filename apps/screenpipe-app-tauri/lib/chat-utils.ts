@@ -6,7 +6,7 @@
 // Shared chat utilities - mention parsing, shortcut formatting, app suggestions
 // ============================================================================
 
-import { emit, once } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { commands } from "@/lib/utils/tauri";
 
 // ============================================================================
@@ -31,17 +31,25 @@ export interface ChatPrefillData {
  */
 export async function showChatWithPrefill(data: ChatPrefillData): Promise<void> {
   await commands.showWindow("Chat");
-  // Wait for the chat component to signal readiness
+  // Wait for the chat component to signal readiness.
+  // Use `listen` (not `once`) so we don't miss events that fire before the
+  // listener is registered — we unlisten manually after the first event.
   await new Promise<void>((resolve) => {
-    const timeout = setTimeout(resolve, 5000);
-    once("chat-ready", () => {
+    let resolved = false;
+    const done = () => {
+      if (resolved) return;
+      resolved = true;
       clearTimeout(timeout);
+      unlistenPromise.then((fn) => fn());
       resolve();
-    });
-    // Ping in case chat is already mounted (won't re-emit "chat-ready" on its own)
-    emit("chat-ping", {});
+    };
+    const timeout = setTimeout(done, 5000);
+    const unlistenPromise = listen("chat-ready", done);
+    // Ping in case chat is already mounted (won't re-emit "chat-ready" on its own).
+    // Small delay to ensure the listen call above has registered first.
+    setTimeout(() => emit("chat-ping", {}), 50);
   });
-  await emit("chat-prefill", data);
+  await emit("chat-prefill", { ...data, targetWindow: "chat" });
 }
 
 // ============================================================================
@@ -118,7 +126,7 @@ interface TimeRange {
 export interface ParsedMentions {
   cleanedInput: string;
   timeRanges: TimeRange[];
-  contentType: "all" | "ocr" | "audio" | "input" | "accessibility" | null;
+  contentType: "all" | "ocr" | "audio" | "input" | "accessibility" | "screen" | null;
   appName: string | null;
   usedSelection: boolean;
   speakerName: string | null;
@@ -163,7 +171,7 @@ export function parseMentions(input: string, options?: ParseMentionsOptions): Pa
   const now = new Date();
   const timeRanges: TimeRange[] = [];
   let cleanedInput = input;
-  let contentType: "all" | "ocr" | "audio" | "input" | "accessibility" | null = null;
+  let contentType: "all" | "ocr" | "audio" | "input" | "accessibility" | "screen" | null = null;
   let appName: string | null = null;
   let usedSelection = false;
   let speakerName: string | null = null;
@@ -246,10 +254,11 @@ export function parseMentions(input: string, options?: ParseMentionsOptions): Pa
     cleanedInput = cleanedInput.replace(audioPattern, "").trim();
   }
 
-  // @screen or @ocr or @vision - screen text only
+  // @screen or @ocr or @vision - screen text only (accessibility + OCR)
+  // Maps to "screen" which the frontend translates into searching both modalities
   const screenPattern = /@(screen|ocr|vision)\b/gi;
   if (screenPattern.test(cleanedInput)) {
-    contentType = "ocr";
+    contentType = "screen";
     cleanedInput = cleanedInput.replace(screenPattern, "").trim();
   }
 

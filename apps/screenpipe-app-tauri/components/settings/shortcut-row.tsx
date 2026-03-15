@@ -98,6 +98,7 @@ const ShortcutRow = ({
     startAudioShortcut: string;
     stopAudioShortcut: string;
     showChatShortcut: string;
+    lockVaultShortcut?: string;
   }) => {
     console.log("syncing shortcuts:", {
       showShortcut: updatedShortcuts.showScreenpipeShortcut,
@@ -134,6 +135,7 @@ const ShortcutRow = ({
         stopAudioShortcut: settings.stopAudioShortcut,
         showChatShortcut: settings.showChatShortcut,
         searchShortcut: settings.searchShortcut,
+        lockVaultShortcut: settings.lockVaultShortcut || "",
       };
       const conflict = Object.entries(allShortcuts).find(
         ([key, value]) =>
@@ -156,16 +158,16 @@ const ShortcutRow = ({
         description: `${shortcut.replace(/_/g, " ")} enabled`,
       });
 
-      // Remove from disabled shortcuts if it exists
-      updateSettings({
-        disabledShortcuts: settings.disabledShortcuts.filter(
-          (s) => s !== shortcut
-        ),
-      });
-
+      // Remove from disabled shortcuts and set the key value in a single update
+      // to avoid race condition (both updates do read-modify-write)
       switch (type) {
         case "global":
-          updateSettings({ [shortcut]: keys });
+          await updateSettings({
+            disabledShortcuts: settings.disabledShortcuts.filter(
+              (s) => s !== shortcut
+            ),
+            [shortcut]: keys,
+          });
           // Build updated shortcuts with the NEW value for the changed shortcut
           const updatedShortcuts = {
             showScreenpipeShortcut: shortcut === "showScreenpipeShortcut" ? keys : settings.showScreenpipeShortcut,
@@ -174,6 +176,7 @@ const ShortcutRow = ({
             startAudioShortcut: shortcut === "startAudioShortcut" ? keys : settings.startAudioShortcut,
             stopAudioShortcut: shortcut === "stopAudioShortcut" ? keys : settings.stopAudioShortcut,
             showChatShortcut: shortcut === "showChatShortcut" ? keys : settings.showChatShortcut,
+            lockVaultShortcut: shortcut === "lockVaultShortcut" ? keys : (settings.lockVaultShortcut || ""),
           };
           await syncShortcuts(updatedShortcuts);
 
@@ -218,6 +221,7 @@ const ShortcutRow = ({
       startAudioShortcut: settings.startAudioShortcut,
       stopAudioShortcut: settings.stopAudioShortcut,
       showChatShortcut: settings.showChatShortcut,
+      lockVaultShortcut: settings.lockVaultShortcut || "",
     });
   };
 
@@ -243,17 +247,23 @@ const ShortcutRow = ({
       </div>
       <div className="flex items-center gap-4">
         <button
-          onClick={() => setIsRecording(true)}
+          onClick={() => {
+            if (getShortcutState() === ShortcutState.DISABLED) return;
+            setIsRecording(true);
+          }}
           className={cn(
             "relative min-w-[140px] rounded-md border px-3 py-2 text-sm",
             "bg-muted/50 hover:bg-muted/70 transition-colors",
             "focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-ring",
             isRecording && "border-primary",
-            !value && "text-muted-foreground"
+            (!value || getShortcutState() === ShortcutState.DISABLED) && "text-muted-foreground",
+            getShortcutState() === ShortcutState.DISABLED && "opacity-50 cursor-not-allowed"
           )}
         >
           {isRecording ? (
             <span className="animate-pulse">recording...</span>
+          ) : getShortcutState() === ShortcutState.DISABLED ? (
+            <span>Disabled</span>
           ) : (
             <span className="flex items-center justify-between gap-2">
               {currentKeys.map((key, i) => (
@@ -276,6 +286,7 @@ const ShortcutRow = ({
           checked={getShortcutState() === ShortcutState.ENABLED}
           disabled={getShortcutState() === ShortcutState.UNASSIGNED}
           onCheckedChange={async (checked) => {
+            if (isRecording) setIsRecording(false);
             if (checked && value) {
               console.log("re-enabling shortcut", value);
               await handleEnableShortcut(value);

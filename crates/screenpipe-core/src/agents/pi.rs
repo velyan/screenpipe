@@ -13,7 +13,7 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, warn};
 
-const PI_PACKAGE: &str = "@mariozechner/pi-coding-agent@0.53.0";
+const PI_PACKAGE: &str = "@mariozechner/pi-coding-agent@0.57.1";
 pub const SCREENPIPE_API_URL: &str = "https://api.screenpi.pe/v1";
 
 /// Returns the screenpipe cloud models array as a serde_json::Value.
@@ -56,6 +56,24 @@ pub fn screenpipe_cloud_models() -> serde_json::Value {
             "cost": {"input": 0.8, "output": 4, "cacheRead": 0.08, "cacheWrite": 1},
             "contextWindow": 200000,
             "maxTokens": 64000
+        },
+        {
+            "id": "gemini-3-flash",
+            "name": "Gemini 3 Flash",
+            "reasoning": false,
+            "input": ["text", "image"],
+            "cost": {"input": 0.10, "output": 0.40, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 1000000,
+            "maxTokens": 65536
+        },
+        {
+            "id": "gemini-3.1-pro",
+            "name": "Gemini 3.1 Pro",
+            "reasoning": true,
+            "input": ["text", "image"],
+            "cost": {"input": 1.25, "output": 10.00, "cacheRead": 0, "cacheWrite": 0},
+            "contextWindow": 1000000,
+            "maxTokens": 65536
         }
     ])
 }
@@ -80,17 +98,39 @@ impl PiExecutor {
     pub fn ensure_screenpipe_skill(project_dir: &Path) -> Result<()> {
         let skills: &[(&str, &str)] = &[
             (
-                "screenpipe-search",
-                include_str!("../../assets/skills/screenpipe-search/SKILL.md"),
+                "screenpipe-api",
+                include_str!("../../assets/skills/screenpipe-api/SKILL.md"),
             ),
             (
-                "screenpipe-media",
-                include_str!("../../assets/skills/screenpipe-media/SKILL.md"),
+                "screenpipe-cli",
+                include_str!("../../assets/skills/screenpipe-cli/SKILL.md"),
             ),
         ];
 
+        // Clean up deprecated skills from the 8→2 consolidation.
+        // Only removes known old names so user-created skills are preserved.
+        let deprecated = [
+            "screenpipe-analytics",
+            "screenpipe-connections",
+            "screenpipe-elements",
+            "screenpipe-media",
+            "screenpipe-pipe-creator",
+            "screenpipe-pipes",
+            "screenpipe-retranscribe",
+            "screenpipe-search",
+            "screenpipe-qa",
+        ];
+        let skills_root = project_dir.join(".pi").join("skills");
+        for old in &deprecated {
+            let old_dir = skills_root.join(old);
+            if old_dir.exists() {
+                let _ = std::fs::remove_dir_all(&old_dir);
+                debug!("removed deprecated skill dir {:?}", old_dir);
+            }
+        }
+
         for (name, content) in skills {
-            let skill_dir = project_dir.join(".pi").join("skills").join(name);
+            let skill_dir = skills_root.join(name);
             let skill_path = skill_dir.join("SKILL.md");
 
             std::fs::create_dir_all(&skill_dir)?;
@@ -98,6 +138,99 @@ impl PiExecutor {
             debug!("{} skill installed at {:?}", name, skill_path);
         }
 
+        Ok(())
+    }
+
+    /// Install or remove the screenpipe-permissions extension based on config.
+    /// Only installed when the pipe has data permission restrictions.
+    pub fn ensure_permissions_extension(
+        project_dir: &Path,
+        config: &crate::pipes::PipeConfig,
+    ) -> Result<()> {
+        use crate::pipes::permissions::PipePermissions;
+        let perms = PipePermissions::from_config(config);
+        let ext_dir = project_dir.join(".pi").join("extensions");
+        let ext_path = ext_dir.join("screenpipe-permissions.ts");
+
+        if perms.has_any_restrictions() {
+            std::fs::create_dir_all(&ext_dir)?;
+            let ext_content = include_str!("../../assets/extensions/screenpipe-permissions.ts");
+            std::fs::write(&ext_path, ext_content)?;
+            debug!(
+                "screenpipe-permissions extension installed at {:?}",
+                ext_path
+            );
+        } else if ext_path.exists() {
+            std::fs::remove_file(&ext_path)?;
+            info!("screenpipe-permissions extension removed (no restrictions configured)");
+        }
+
+        Ok(())
+    }
+
+    /// Conditionally install skills based on pipe permissions.
+    /// Skills that teach endpoints the pipe can't access are skipped.
+    pub fn ensure_screenpipe_skill_filtered(
+        project_dir: &Path,
+        config: &crate::pipes::PipeConfig,
+    ) -> Result<()> {
+        use crate::pipes::permissions::PipePermissions;
+        let perms = PipePermissions::from_config(config);
+
+        let all_skills: &[(&str, &str, Box<dyn Fn(&PipePermissions) -> bool>)] = &[
+            (
+                "screenpipe-api",
+                include_str!("../../assets/skills/screenpipe-api/SKILL.md"),
+                Box::new(|_| true), // always installed — unified API skill
+            ),
+            (
+                "screenpipe-cli",
+                include_str!("../../assets/skills/screenpipe-cli/SKILL.md"),
+                Box::new(|_| true), // always installed — pipe & connection management
+            ),
+        ];
+
+        for (name, content, should_install) in all_skills {
+            let skill_dir = project_dir.join(".pi").join("skills").join(name);
+            let skill_path = skill_dir.join("SKILL.md");
+
+            if should_install(&perms) {
+                std::fs::create_dir_all(&skill_dir)?;
+                std::fs::write(&skill_path, content)?;
+                debug!("{} skill installed at {:?}", name, skill_path);
+            } else if skill_path.exists() {
+                std::fs::remove_file(&skill_path)?;
+                info!("{} skill removed (denied by pipe permissions)", name);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Auto-detect whether to use filtered or unfiltered skill installation.
+    /// If PipeManager already wrote `.screenpipe-permissions.json`, use filtered.
+    /// Otherwise install all skills (CLI / direct executor usage).
+    pub fn ensure_screenpipe_skill_auto(project_dir: &Path) -> Result<()> {
+        let perms_path = project_dir.join(".screenpipe-permissions.json");
+        if perms_path.exists() {
+            // PipeManager already handled filtered installation — skip
+            // to avoid overwriting with unfiltered skills.
+            debug!("permissions file found, skipping unfiltered skill install");
+            Ok(())
+        } else {
+            Self::ensure_screenpipe_skill(project_dir)
+        }
+    }
+
+    /// Install the context-pruning extension that truncates large tool results
+    /// to prevent unbounded context growth in --continue sessions.
+    pub fn ensure_context_pruning_extension(project_dir: &Path) -> Result<()> {
+        let ext_dir = project_dir.join(".pi").join("extensions");
+        std::fs::create_dir_all(&ext_dir)?;
+        let ext_content = include_str!("../../assets/extensions/context-pruning.ts");
+        let ext_path = ext_dir.join("context-pruning.ts");
+        std::fs::write(&ext_path, ext_content)?;
+        debug!("context-pruning extension installed at {:?}", ext_path);
         Ok(())
     }
 
@@ -207,14 +340,21 @@ impl PiExecutor {
                     ),
                     "openai-chatgpt" => (
                         "openai-chatgpt",
-                        "https://api.openai.com/v1",
+                        "https://chatgpt.com/backend-api",
                         "OPENAI_CHATGPT_TOKEN",
+                    ),
+                    "anthropic" => (
+                        "anthropic-byok",
+                        provider_url.unwrap_or("https://api.anthropic.com"),
+                        "ANTHROPIC_API_KEY",
                     ),
                     other => (other, provider_url.unwrap_or(""), "CUSTOM_API_KEY"),
                 };
 
                 let wire_api = if prov == "openai-chatgpt" {
                     "openai-codex-responses"
+                } else if prov == "anthropic" {
+                    "anthropic-messages"
                 } else {
                     "openai-completions"
                 };
@@ -329,11 +469,16 @@ impl PiExecutor {
         resolved_provider: &str,
         provider_api_key: Option<&str>,
         pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
+        continue_session: bool,
     ) -> Result<AgentOutput> {
         let mut cmd = build_async_command(pi_path);
         cmd.current_dir(working_dir);
         // Flags MUST come before -p on Windows (see spawn_pi_streaming comment)
-        cmd.arg("--no-session");
+        if continue_session {
+            cmd.arg("--continue");
+        } else {
+            cmd.arg("--no-session");
+        }
         cmd.arg("--provider").arg(resolved_provider);
         cmd.arg("--model").arg(model);
         cmd.arg("-p").arg(prompt);
@@ -352,6 +497,9 @@ impl PiExecutor {
                     }
                     "openai-chatgpt" => {
                         cmd.env("OPENAI_CHATGPT_TOKEN", key);
+                    }
+                    "anthropic" | "anthropic-byok" => {
+                        cmd.env("ANTHROPIC_API_KEY", key);
                     }
                     "custom" => {
                         cmd.env("CUSTOM_API_KEY", key);
@@ -420,6 +568,7 @@ impl PiExecutor {
         provider_api_key: Option<&str>,
         pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
         line_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        continue_session: bool,
     ) -> Result<AgentOutput> {
         let mut cmd = build_async_command(pi_path);
         cmd.current_dir(working_dir);
@@ -427,7 +576,11 @@ impl PiExecutor {
         // as a single string, and the long prompt text can break arg parsing
         // if flags come after it.
         cmd.arg("--mode").arg("json");
-        cmd.arg("--no-session");
+        if continue_session {
+            cmd.arg("--continue");
+        } else {
+            cmd.arg("--no-session");
+        }
         cmd.arg("--provider").arg(resolved_provider);
         cmd.arg("--model").arg(model);
         cmd.arg("-p").arg(prompt);
@@ -444,6 +597,9 @@ impl PiExecutor {
                     }
                     "openai-chatgpt" => {
                         cmd.env("OPENAI_CHATGPT_TOKEN", key);
+                    }
+                    "anthropic" | "anthropic-byok" => {
+                        cmd.env("ANTHROPIC_API_KEY", key);
                     }
                     "custom" => {
                         cmd.env("CUSTOM_API_KEY", key);
@@ -584,6 +740,7 @@ impl AgentExecutor for PiExecutor {
         provider_url: Option<&str>,
         provider_api_key: Option<&str>,
         pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
+        continue_session: bool,
     ) -> Result<AgentOutput> {
         Self::ensure_pi_config(
             self.user_token.as_deref(),
@@ -592,7 +749,8 @@ impl AgentExecutor for PiExecutor {
             Some(model),
             provider_url,
         )?;
-        Self::ensure_screenpipe_skill(working_dir)?;
+        // Use filtered skills if permissions are configured, unfiltered otherwise
+        Self::ensure_screenpipe_skill_auto(working_dir)?;
 
         // Provider resolution:
         // 1. Explicit provider from pipe frontmatter → use it
@@ -600,9 +758,13 @@ impl AgentExecutor for PiExecutor {
         let resolved_provider = provider.unwrap_or("screenpipe").to_string();
 
         Self::ensure_web_search_extension(working_dir, Some(&resolved_provider))?;
+        Self::ensure_context_pruning_extension(working_dir)?;
 
-        let pi_path = find_pi_executable()
-            .ok_or_else(|| anyhow!("pi not found. install with: bun add -g {}", PI_PACKAGE))?;
+        let pi_path = find_pi_executable().ok_or_else(|| {
+            anyhow!(
+                "pi not found. try restarting the app or delete ~/.screenpipe/pi-agent and restart"
+            )
+        })?;
         let resolved_model = Self::resolve_model(model, &resolved_provider);
 
         info!(
@@ -619,6 +781,7 @@ impl AgentExecutor for PiExecutor {
                 &resolved_provider,
                 provider_api_key,
                 pid_tx,
+                continue_session,
             )
             .await?;
 
@@ -648,6 +811,7 @@ impl AgentExecutor for PiExecutor {
                     &resolved_provider,
                     provider_api_key,
                     None,
+                    continue_session,
                 )
                 .await;
         }
@@ -665,6 +829,7 @@ impl AgentExecutor for PiExecutor {
         provider_api_key: Option<&str>,
         pid_tx: Option<tokio::sync::oneshot::Sender<u32>>,
         line_tx: tokio::sync::mpsc::UnboundedSender<String>,
+        continue_session: bool,
     ) -> Result<AgentOutput> {
         let resolved_provider = provider.unwrap_or("screenpipe").to_string();
         let resolved_model = Self::resolve_model(model, &resolved_provider);
@@ -676,11 +841,16 @@ impl AgentExecutor for PiExecutor {
             Some(&resolved_model),
             provider_url,
         )?;
-        Self::ensure_screenpipe_skill(working_dir)?;
+        // Use filtered skills if permissions are configured, unfiltered otherwise
+        Self::ensure_screenpipe_skill_auto(working_dir)?;
         Self::ensure_web_search_extension(working_dir, Some(&resolved_provider))?;
+        Self::ensure_context_pruning_extension(working_dir)?;
 
-        let pi_path = find_pi_executable()
-            .ok_or_else(|| anyhow!("pi not found. install with: bun add -g {}", PI_PACKAGE))?;
+        let pi_path = find_pi_executable().ok_or_else(|| {
+            anyhow!(
+                "pi not found. try restarting the app or delete ~/.screenpipe/pi-agent and restart"
+            )
+        })?;
 
         info!(
             "pipe streaming using provider: {}, model: {}",
@@ -697,6 +867,7 @@ impl AgentExecutor for PiExecutor {
                 provider_api_key,
                 pid_tx,
                 line_tx.clone(),
+                continue_session,
             )
             .await?;
 
@@ -726,6 +897,7 @@ impl AgentExecutor for PiExecutor {
                     provider_api_key,
                     None,
                     line_tx,
+                    continue_session,
                 )
                 .await;
         }
@@ -743,17 +915,31 @@ impl AgentExecutor for PiExecutor {
 
     async fn ensure_installed(&self) -> Result<()> {
         if find_pi_executable().is_some() {
-            debug!("pi already installed");
-            return Ok(());
+            // Check if local install matches expected version; upgrade if stale
+            if !is_local_pi_version_current() {
+                info!("pi version mismatch — upgrading to {}", PI_PACKAGE);
+                // Fall through to install
+            } else {
+                debug!("pi already installed");
+                return Ok(());
+            }
         }
 
         let bun = find_bun_executable()
             .ok_or_else(|| anyhow!("bun not found — install from https://bun.sh"))?;
 
-        info!("installing pi via bun …");
+        let install_dir = pi_local_install_dir()
+            .ok_or_else(|| anyhow!("cannot determine home directory for Pi install"))?;
+
+        std::fs::create_dir_all(&install_dir)?;
+
+        info!("installing pi into {} via bun …", install_dir.display());
+
+        // Seed package.json with overrides to fix lru-cache resolution on Windows
+        seed_pi_package_json(&install_dir);
 
         let mut cmd = std::process::Command::new(&bun);
-        cmd.args(["add", "-g", PI_PACKAGE]);
+        cmd.current_dir(&install_dir).args(["add", PI_PACKAGE]);
 
         #[cfg(windows)]
         {
@@ -764,7 +950,7 @@ impl AgentExecutor for PiExecutor {
 
         let output = cmd.output()?;
         if output.status.success() {
-            info!("pi installed successfully");
+            info!("pi installed successfully into {}", install_dir.display());
             Ok(())
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -822,7 +1008,113 @@ pub fn find_bun_executable() -> Option<String> {
     paths.into_iter().find(|p| std::path::Path::new(p).exists())
 }
 
+/// Returns the screenpipe-managed pi install directory (`~/.screenpipe/pi-agent/`).
+fn pi_local_install_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".screenpipe").join("pi-agent"))
+}
+
+/// Check whether the locally-installed Pi version matches `PI_PACKAGE`.
+fn is_local_pi_version_current() -> bool {
+    let dir = match pi_local_install_dir() {
+        Some(d) => d,
+        None => return false,
+    };
+    let pkg_json = dir
+        .join("node_modules")
+        .join("@mariozechner")
+        .join("pi-coding-agent")
+        .join("package.json");
+    let contents = match std::fs::read_to_string(&pkg_json) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&contents) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let installed = match parsed.get("version").and_then(|v| v.as_str()) {
+        Some(v) => v,
+        None => return false,
+    };
+    // PI_PACKAGE is "@mariozechner/pi-coding-agent@0.57.1" — extract version after last '@'
+    let expected = PI_PACKAGE.rsplit('@').next().unwrap_or("");
+    if installed != expected {
+        info!(
+            "local pi version {} differs from expected {}",
+            installed, expected
+        );
+        return false;
+    }
+    true
+}
+
+/// Seed the pi-agent package.json with overrides to fix dependency resolution.
+/// `hosted-git-info` requires `lru-cache@^10`, but bun on Windows can hoist
+/// an ESM-only lru-cache@7.x that breaks CJS `require()`.
+fn seed_pi_package_json(install_dir: &Path) {
+    let pkg_path = install_dir.join("package.json");
+    if pkg_path.exists() {
+        if let Ok(contents) = std::fs::read_to_string(&pkg_path) {
+            if !contents.contains("overrides") {
+                if let Ok(mut pkg) = serde_json::from_str::<serde_json::Value>(&contents) {
+                    if let Some(obj) = pkg.as_object_mut() {
+                        obj.insert(
+                            "overrides".to_string(),
+                            json!({
+                                "hosted-git-info": {
+                                    "lru-cache": "^10.0.0"
+                                }
+                            }),
+                        );
+                    }
+                    if let Ok(new_contents) = serde_json::to_string_pretty(&pkg) {
+                        let _ = std::fs::write(&pkg_path, new_contents);
+                        info!("Added lru-cache overrides to existing pi-agent package.json");
+                    }
+                }
+            }
+        }
+        return;
+    }
+    let pkg_json = json!({
+        "overrides": {
+            "hosted-git-info": {
+                "lru-cache": "^10.0.0"
+            }
+        }
+    });
+    match std::fs::write(
+        &pkg_path,
+        serde_json::to_string_pretty(&pkg_json).unwrap_or_default(),
+    ) {
+        Ok(_) => info!("Seeded pi-agent package.json with lru-cache overrides"),
+        Err(e) => warn!("Failed to seed pi-agent package.json: {}", e),
+    }
+}
+
+/// Find the JS entrypoint for the locally-installed pi package.
+fn find_local_pi_entrypoint() -> Option<String> {
+    let dir = pi_local_install_dir()?;
+    let cli_js = dir
+        .join("node_modules")
+        .join("@mariozechner")
+        .join("pi-coding-agent")
+        .join("dist")
+        .join("cli.js");
+    if cli_js.exists() {
+        Some(cli_js.to_string_lossy().to_string())
+    } else {
+        None
+    }
+}
+
 pub fn find_pi_executable() -> Option<String> {
+    // 1. Check screenpipe-managed local install first (preferred — we control the deps)
+    if let Some(js) = find_local_pi_entrypoint() {
+        return Some(js);
+    }
+
+    // 2. Fallback to global install locations
     let home = dirs::home_dir()
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_default();
@@ -937,6 +1229,18 @@ fn build_async_command(path: &str) -> tokio::process::Command {
             let mut c = tokio::process::Command::new("cmd.exe");
             c.args(["/C", path]);
             c
+        } else if path.ends_with(".js") {
+            // Local install returns a .js entrypoint — run with bun
+            if let Some(bun) = find_bun_executable() {
+                let mut c = tokio::process::Command::new(&bun);
+                c.arg(path);
+                debug!("running pi JS entrypoint via bun: {} {}", bun, path);
+                c
+            } else {
+                let mut c = tokio::process::Command::new("node");
+                c.arg(path);
+                c
+            }
         } else {
             tokio::process::Command::new(path)
         };

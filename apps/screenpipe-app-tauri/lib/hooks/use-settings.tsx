@@ -13,6 +13,7 @@ export type AIProviderType =
 	| "native-ollama"
 	| "openai"
 	| "openai-chatgpt"
+	| "anthropic"
 	| "custom"
 	| "embedded"
 	| "pi";
@@ -47,6 +48,10 @@ export type AIPreset = {
 	  }
 	| {
 			provider: "screenpipe-cloud";
+	  }
+	| {
+			provider: "anthropic";
+			apiKey: string;
 	  }
 	| {
 			provider: "custom";
@@ -92,6 +97,7 @@ export type Settings = SettingsStore & {
 	chatHistory?: ChatHistoryStore;
 	ignoredUrls?: string[];
 	searchShortcut?: string;
+	lockVaultShortcut?: string;
 	/** When true, audio devices follow system default and auto-switch on changes */
 	useSystemDefaultAudio?: boolean;
 	adaptiveFps?: boolean;
@@ -125,6 +131,14 @@ export type Settings = SettingsStore & {
 	openaiCompatibleModel?: string;
 	/** Filter music-dominant audio before transcription (reduces Spotify/YouTube music noise) */
 	filterMusic?: boolean;
+	/** Maximum batch transcription duration in seconds (0 = engine default: Deepgram 3600s, Whisper 600s) */
+	batchMaxDurationSecs?: number;
+	/** Show periodic notifications suggesting pipe ideas based on user's data (default: true) */
+	pipeSuggestionsEnabled?: boolean;
+	/** Hours between pipe suggestion notifications (default: 24) */
+	pipeSuggestionFrequencyHours?: number;
+	/** User's power mode preference — persisted so it survives app restarts */
+	powerMode?: "auto" | "performance" | "battery_saver";
 }
 
 export function getEffectiveFilters(settings: Settings) {
@@ -184,8 +198,8 @@ const DEFAULT_PI_PRESET: AIPreset = {
 	id: "pi-agent",
 	provider: "pi",
 	url: "",
-	model: "claude-haiku-4-5",
-	maxContextChars: 200000,
+	model: "gemini-3.1-pro",
+	maxContextChars: 1000000,
 	defaultPreset: true,
 	prompt: "",
 };
@@ -252,10 +266,11 @@ let DEFAULT_SETTINGS: Settings = {
 			showScreenpipeShortcut: "Control+Super+S",
 			startRecordingShortcut: "Super+Alt+U",
 			stopRecordingShortcut: "Super+Alt+X",
-			startAudioShortcut: "",
-			stopAudioShortcut: "",
+			startAudioShortcut: "Control+Super+A",
+			stopAudioShortcut: "Control+Super+Z",
 			showChatShortcut: "Control+Super+L",
 			searchShortcut: "Control+Super+K",
+			lockVaultShortcut: "Super+Shift+L",
 			realtimeAudioTranscriptionEngine: "deepgram",
 			disableVision: false,
 			disableOcr: false,
@@ -282,13 +297,16 @@ export function createDefaultSettingsObject(): Settings {
 	try {
 		const p = platform();
 		DEFAULT_SETTINGS.platform = p;
-		DEFAULT_SETTINGS.disabledShortcuts = DEFAULT_IGNORED_WINDOWS_IN_ALL_OS;
-		DEFAULT_SETTINGS.disabledShortcuts.push(...(DEFAULT_IGNORED_WINDOWS_PER_OS[p] ?? []));
+		DEFAULT_SETTINGS.ignoredWindows = [...DEFAULT_IGNORED_WINDOWS_IN_ALL_OS];
+		DEFAULT_SETTINGS.ignoredWindows.push(...(DEFAULT_IGNORED_WINDOWS_PER_OS[p] ?? []));
 		DEFAULT_SETTINGS.ocrEngine = p === "macos" ? "apple-native" : p === "windows" ? "windows-native" : "tesseract";
 		DEFAULT_SETTINGS.fps = p === "macos" ? 0.5 : 1;
 		DEFAULT_SETTINGS.showScreenpipeShortcut = p === "windows" ? "Alt+S" : "Control+Super+S";
 		DEFAULT_SETTINGS.showChatShortcut = p === "windows" ? "Alt+L" : "Control+Super+L";
 		DEFAULT_SETTINGS.searchShortcut = p === "windows" ? "Alt+K" : "Control+Super+K";
+		DEFAULT_SETTINGS.startAudioShortcut = p === "windows" ? "Alt+Shift+A" : "Control+Super+A";
+		DEFAULT_SETTINGS.stopAudioShortcut = p === "windows" ? "Alt+Shift+Z" : "Control+Super+Z";
+		DEFAULT_SETTINGS.lockVaultShortcut = p === "windows" ? "Ctrl+Shift+L" : "Super+Shift+L";
 
 		if (p === "windows") {
 			DEFAULT_SETTINGS.enableAccessibility = true;
@@ -391,6 +409,18 @@ function createSettingsStore() {
 		if (!settings.showChatShortcut || settings.showChatShortcut.trim() === "") {
 			const p = platform();
 			settings.showChatShortcut = p === "windows" ? "Alt+L" : "Control+Super+L";
+			needsUpdate = true;
+		}
+
+		// Migration: Fill empty audio shortcuts with platform defaults
+		if (!settings.startAudioShortcut || settings.startAudioShortcut.trim() === "") {
+			const p = platform();
+			settings.startAudioShortcut = p === "windows" ? "Alt+Shift+A" : "Control+Super+A";
+			needsUpdate = true;
+		}
+		if (!settings.stopAudioShortcut || settings.stopAudioShortcut.trim() === "") {
+			const p = platform();
+			settings.stopAudioShortcut = p === "windows" ? "Alt+Shift+Z" : "Control+Super+Z";
 			needsUpdate = true;
 		}
 

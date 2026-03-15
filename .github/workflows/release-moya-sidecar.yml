@@ -118,7 +118,7 @@ jobs:
             export CFLAGS="-mcpu=apple-m1 -U__ARM_FEATURE_MATMUL_INT8"
             export CXXFLAGS="-mcpu=apple-m1 -U__ARM_FEATURE_MATMUL_INT8"
           fi
-          cargo build -p screenpipe-server --bin screenpipe --release --features metal --target "${{ matrix.target }}"
+          cargo build -p screenpipe-engine --bin screenpipe --release --features metal --target "${{ matrix.target }}"
 
       - name: Prepare sidecar payload
         shell: bash

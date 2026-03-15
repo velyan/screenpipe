@@ -62,6 +62,8 @@ pub enum SearchResult {
     UI(UiContent),
     /// User input actions (clicks, keystrokes, clipboard)
     Input(UiEventRecord),
+    /// Persistent memory
+    Memory(MemoryRecord),
 }
 
 #[derive(FromRow, Debug)]
@@ -76,7 +78,6 @@ pub struct Frame {
 pub struct OCRResultRaw {
     pub frame_id: i64,
     pub ocr_text: String,
-    pub raw_ocr_text: Option<String>,
     pub text_json: String,
     pub frame_name: String,
     pub timestamp: DateTime<Utc>,
@@ -88,7 +89,6 @@ pub struct OCRResultRaw {
     pub tags: Option<String>,
     pub browser_url: Option<String>,
     pub focused: Option<bool>,
-    pub capture_provenance: Option<String>,
     pub device_name: String,
 }
 
@@ -97,8 +97,6 @@ pub struct OCRResult {
     pub frame_id: i64,
     pub frame_name: String,
     pub ocr_text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub raw_text: Option<String>,
     pub text_json: String,
     pub timestamp: DateTime<Utc>,
     pub file_path: String,
@@ -109,7 +107,6 @@ pub struct OCRResult {
     pub tags: Vec<String>,
     pub browser_url: Option<String>,
     pub focused: Option<bool>,
-    pub capture_provenance: Option<String>,
     pub device_name: String,
 }
 
@@ -120,6 +117,7 @@ pub struct OCRResult {
 /// - `audio` - Transcribed speech
 /// - `input` - User actions (clicks, keystrokes, clipboard)
 /// - `accessibility` - Accessibility tree text
+/// - `memory` - Persistent facts, preferences, decisions
 #[derive(OaSchema, Debug, Deserialize, PartialEq, Default, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum ContentType {
@@ -134,6 +132,8 @@ pub enum ContentType {
     Input,
     /// Accessibility tree text
     Accessibility,
+    /// Persistent memories: facts, preferences, decisions, insights
+    Memory,
 }
 
 #[derive(FromRow)]
@@ -157,6 +157,19 @@ pub struct Speaker {
     pub id: i64,
     pub name: String,
     pub metadata: String,
+}
+
+/// A persistent memory: fact, preference, decision, or insight.
+#[derive(OaSchema, Debug, Serialize, Deserialize, FromRow, Clone)]
+pub struct MemoryRecord {
+    pub id: i64,
+    pub content: String,
+    pub source: String,
+    pub source_context: Option<String>,
+    pub tags: Option<String>,
+    pub importance: f64,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(OaSchema, Debug, Serialize, Deserialize, FromRow, Clone)]
@@ -231,6 +244,7 @@ pub struct FrameData {
     pub timestamp: DateTime<Utc>,
     pub offset_index: i64,
     pub fps: f64,
+    pub machine_id: Option<String>,
     pub ocr_entries: Vec<OCREntry>,
     pub audio_entries: Vec<AudioEntry>,
 }
@@ -299,7 +313,8 @@ pub struct AudioChunksResponse {
     pub timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct OcrTextBlock {
     pub block_num: String,
     pub conf: String,
@@ -361,6 +376,8 @@ pub struct FrameRow {
     pub window_name: String,
     pub ocr_text: String,
     pub text_json: String,
+    /// Accessibility tree JSON — used as fallback for bounding boxes when OCR text_json is empty
+    pub accessibility_tree_json: Option<String>,
 }
 
 /// Lightweight frame row for grouped search — skips text/text_json columns.
@@ -759,6 +776,10 @@ mod tests {
         assert_eq!(
             ContentType::Accessibility,
             serde_json::from_str(r#""accessibility""#).unwrap()
+        );
+        assert_eq!(
+            ContentType::Memory,
+            serde_json::from_str(r#""memory""#).unwrap()
         );
     }
 }

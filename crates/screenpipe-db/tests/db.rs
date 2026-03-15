@@ -460,13 +460,13 @@ mod tests {
                 .await
                 .unwrap();
         println!("Raw frames in DB: {:?}", raw_frames);
-        // Check if OCR text is properly indexed in FTS
+        // Check if frames are properly indexed in FTS (ocr_text_fts was dropped)
         let ocr_fts_data: Vec<(i64, String)> =
-            sqlx::query_as("SELECT rowid, text FROM ocr_text_fts")
+            sqlx::query_as("SELECT id, full_text FROM frames_fts")
                 .fetch_all(&db.pool)
                 .await
                 .unwrap();
-        println!("OCR FTS data: {:?}", ocr_fts_data);
+        println!("Frames FTS data (full_text): {:?}", ocr_fts_data);
 
         // check if frames_fts is properly indexed
         let frame_fts_data: Vec<(i64, String, String, String, bool)> = sqlx::query_as(
@@ -506,14 +506,14 @@ mod tests {
 
         // After inserting both audio transcriptions, let's check all audio entries
         let all_audio = db
-            .search_audio("", 100, 0, None, None, None, None, None, None)
+            .search_audio("", 100, 0, None, None, None, None, None, None, None, None)
             .await
             .unwrap();
         println!("All audio entries: {:?}", all_audio);
 
         // Then try specific search
         let audio_results = db
-            .search_audio("2", 100, 0, None, None, None, None, None, None)
+            .search_audio("2", 100, 0, None, None, None, None, None, None, None, None)
             .await
             .unwrap();
         println!("Audio results for '2': {:?}", audio_results);
@@ -1339,131 +1339,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_insert_and_search_ui_monitoring() {
-        let db = setup_test_db().await;
-
-        // Insert UI monitoring data
-        sqlx::query(
-            r#"
-            INSERT INTO ui_monitoring (
-                text_output,
-                timestamp,
-                app,
-                window,
-                initial_traversal_at
-            ) VALUES (?, ?, ?, ?, ?)
-            "#,
-        )
-        .bind("Hello from UI monitoring")
-        .bind(Utc::now())
-        .bind("test_app")
-        .bind("test_window")
-        .bind(Utc::now())
-        .execute(&db.pool)
-        .await
-        .unwrap();
-
-        // Test search with app name filter
-        let results = db
-            .search(
-                "Hello",
-                ContentType::Accessibility,
-                100,
-                0,
-                None,
-                None,
-                Some("test_app"),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        if let SearchResult::UI(ui_result) = &results[0] {
-            assert_eq!(ui_result.text, "Hello from UI monitoring");
-            assert_eq!(ui_result.app_name, "test_app");
-            assert_eq!(ui_result.window_name, "test_window");
-        } else {
-            panic!("Expected UI result");
-        }
-
-        // Test search with window name filter
-        let results = db
-            .search(
-                "Hello",
-                ContentType::Accessibility,
-                100,
-                0,
-                None,
-                None,
-                None,
-                Some("test_window"),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 1);
-
-        // Test search with no matches
-        let results = db
-            .search(
-                "nonexistent",
-                ContentType::Accessibility,
-                100,
-                0,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 0);
-
-        // Test search with empty query (should return all UI entries)
-        let results = db
-            .search(
-                "",
-                ContentType::Accessibility,
-                100,
-                0,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 1);
-    }
-
-    #[tokio::test]
     async fn test_count_search_results_all_content_types() {
         let db = setup_test_db().await;
 
@@ -1512,23 +1387,21 @@ mod tests {
         .await
         .unwrap();
 
-        // Insert UI monitoring data
+        // Insert accessibility data (replaces legacy ui_monitoring table)
         sqlx::query(
             r#"
-            INSERT INTO ui_monitoring (
-                text_output,
+            INSERT INTO accessibility (
+                text_content,
                 timestamp,
-                app,
-                window,
-                initial_traversal_at
-            ) VALUES (?, ?, ?, ?, ?)
+                app_name,
+                window_name
+            ) VALUES (?, ?, ?, ?)
             "#,
         )
         .bind("Hello from UI")
         .bind(Utc::now())
         .bind("test_app")
         .bind("test_window")
-        .bind(Utc::now())
         .execute(&db.pool)
         .await
         .unwrap();
@@ -1552,7 +1425,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(count, 3, "Should count OCR, Audio, and UI results");
+        assert_eq!(
+            count, 3,
+            "Should count OCR, Audio, and Accessibility results"
+        );
 
         // Test count with specific app filter
         let count = db
@@ -1573,7 +1449,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(count, 1, "Should only count UI result with app filter");
+        assert_eq!(
+            count, 1,
+            "Should count accessibility result with app filter"
+        );
 
         // Test count with non-matching query
         let count = db
@@ -1639,17 +1518,10 @@ mod tests {
         }
     }
 
-    /// Manually index accessibility rows into FTS for tests.
-    /// The background FTS indexer doesn't run in tests, so we do it inline.
-    async fn index_accessibility_fts(db: &DatabaseManager) {
-        sqlx::query(
-            "INSERT OR IGNORE INTO accessibility_fts(rowid, text_content, app_name, window_name) \
-             SELECT id, text_content, COALESCE(app_name, ''), COALESCE(window_name, '') \
-             FROM accessibility WHERE text_content IS NOT NULL AND text_content != ''",
-        )
-        .execute(&db.pool)
-        .await
-        .unwrap();
+    /// No-op: accessibility and accessibility_fts tables were dropped by migration.
+    /// Kept as a stub so existing call sites don't need to be removed.
+    async fn index_accessibility_fts(_db: &DatabaseManager) {
+        // Tables dropped — nothing to index.
     }
 
     // =========================================================================

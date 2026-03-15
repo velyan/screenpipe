@@ -1,6 +1,6 @@
 import { Env, UserTier } from '../types';
 import { createSuccessResponse, createErrorResponse, addCorsHeaders } from '../utils/cors';
-import { TIER_CONFIG, isModelAllowed } from '../services/usage-tracker';
+import { getTierConfig, isModelAllowed } from '../services/usage-tracker';
 import { listAnthropicModels } from '../providers/anthropic-proxy';
 
 /**
@@ -20,8 +20,8 @@ export async function handleModelListing(env: Env, tier: UserTier = 'subscribed'
     ]);
 
     const geminiModels = [
-      { id: 'gemini-3-pro-preview', name: 'Gemini 3 Pro', provider: 'google' },
-      { id: 'gemini-3-flash-preview', name: 'Gemini 3 Flash', provider: 'google' },
+      { id: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro', provider: 'google' },
+      { id: 'gemini-3-flash', name: 'Gemini 3 Flash', provider: 'google' },
       { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash', provider: 'google' },
     ];
 
@@ -36,7 +36,7 @@ export async function handleModelListing(env: Env, tier: UserTier = 'subscribed'
 
     // Filter models based on tier
     if (tier !== 'subscribed') {
-      const allowedModels = TIER_CONFIG[tier].allowedModels;
+      const allowedModels = getTierConfig(env)[tier].allowedModels;
       models = models.filter(model =>
         allowedModels.some(allowed =>
           model.id.toLowerCase().includes(allowed.toLowerCase()) ||
@@ -56,7 +56,7 @@ export async function handleModelListing(env: Env, tier: UserTier = 'subscribed'
       data: models,
       models: models, // Also include as 'models' for backwards compatibility
       tier,
-      tier_limits: TIER_CONFIG[tier],
+      tier_limits: getTierConfig(env)[tier],
     }));
   } catch (error) {
     console.error('Error fetching models:', error);

@@ -10,6 +10,7 @@ type PlaybackSpeed = 1 | 1.5 | 2;
 const SPEED_CYCLE: PlaybackSpeed[] = [1, 1.5, 2];
 const PRELOAD_AHEAD_MS = 60_000; // preload audio 60s ahead
 const PRELOAD_BEHIND_MS = 5_000; // also preload 5s behind to cover current position
+const MAX_CACHED_SEGMENTS = 20; // evict oldest segments beyond this limit
 
 interface AudioSegment {
   filePath: string;
@@ -138,14 +139,16 @@ export function useAudioPlayback({
   const mutedDevicesRef = useRef<Set<string>>(new Set());
   mutedDevicesRef.current = mutedDevices;
 
-  // Check if there's audio nearby the current position (within 60s window)
+  // Check if there's audio nearby the current position (within 120s window)
+  // Uses a wider index scan (±200) so sparse event-driven frames don't miss
+  // nearby audio that the subtitle bar would show.
   const hasAudioNearby = (() => {
     if (frames.length === 0) return false;
     const curr = frames[currentIndex];
     if (!curr) return false;
     const currTime = new Date(curr.timestamp).getTime();
-    const windowMs = 60_000;
-    for (let i = Math.max(0, currentIndex - 30); i < Math.min(frames.length, currentIndex + 30); i++) {
+    const windowMs = 120_000;
+    for (let i = Math.max(0, currentIndex - 200); i < Math.min(frames.length, currentIndex + 200); i++) {
       const f = frames[i];
       if (!f) continue;
       const ft = new Date(f.timestamp).getTime();
@@ -154,6 +157,29 @@ export function useAudioPlayback({
     }
     return false;
   })();
+
+  /** Evict oldest non-playing segments when cache exceeds limit. */
+  const evictOldSegments = useCallback(() => {
+    const segments = segmentsRef.current;
+    if (segments.size <= MAX_CACHED_SEGMENTS) return;
+    // Evict non-playing segments furthest from current playback position
+    const toEvict: string[] = [];
+    for (const [path, seg] of segments) {
+      if (seg.playing) continue;
+      toEvict.push(path);
+    }
+    // Keep the most recent MAX_CACHED_SEGMENTS entries (Map preserves insertion order)
+    const evictCount = segments.size - MAX_CACHED_SEGMENTS;
+    for (let i = 0; i < Math.min(evictCount, toEvict.length); i++) {
+      const seg = segments.get(toEvict[i]);
+      if (seg) {
+        try { seg.audioElement.pause(); } catch { /* ignore */ }
+        seg.audioElement.src = "";
+        URL.revokeObjectURL(seg.blobUrl);
+        segments.delete(toEvict[i]);
+      }
+    }
+  }, []);
 
   /** Load an audio file into an HTMLAudioElement with blob URL. */
   const loadAudioSegment = useCallback(
@@ -213,13 +239,16 @@ export function useAudioPlayback({
           "recordingStart:", new Date(recordingStartMs).toISOString(),
           "duration:", actualDuration.toFixed(1) + "s",
         );
+
+        // Evict old segments to cap memory usage
+        evictOldSegments();
       } catch (err) {
         console.warn("[audio-playback] Failed to load audio segment:", filePath, err);
       } finally {
         loadingPathsRef.current.delete(filePath);
       }
     },
-    [],
+    [evictOldSegments],
   );
 
   /** Preload audio segments near the current playback position. */

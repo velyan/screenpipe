@@ -4,6 +4,9 @@ import { useEffect, useState, useRef, useCallback, useMemo } from "react";
 import { Search, X, Loader2, Clock, MessageSquare, User, ArrowLeft, Mic, Volume2, Hash, Tag, Monitor, Keyboard, ClipboardCopy, AppWindow } from "lucide-react";
 import { useKeywordSearchStore, SearchMatch, UiEventResult } from "@/lib/hooks/use-keyword-search-store";
 import { useSearchHighlight } from "@/lib/hooks/use-search-highlight";
+import { useSearchFocus } from "./hooks/use-search-focus";
+import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { useDebounce } from "@/lib/hooks/use-debounce";
 import { format, isToday, isYesterday } from "date-fns";
 import { cn } from "@/lib/utils";
@@ -37,8 +40,10 @@ interface TaggedFrame {
 interface SearchModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onNavigateToTimestamp: (timestamp: string) => void;
+  onNavigateToTimestamp: (timestamp: string, frameId?: number, searchTerms?: string[], searchResultsJson?: string, searchQuery?: string) => void;
   embedded?: boolean;
+  /** When true, this is rendered in its own Tauri window (no backdrop, always open) */
+  standalone?: boolean;
 }
 
 // stopwords to filter out from suggestions — keep this minimal so real
@@ -221,10 +226,19 @@ function useSuggestions(isOpen: boolean) {
   return { suggestions, isLoading };
 }
 
-// Frame thumbnail component with loading state
+// Frame thumbnail component with loading state and retry logic
 const FrameThumbnail = ({ frameId, alt }: { frameId: number; alt: string }) => {
   const [isLoading, setIsLoading] = useState(true);
   const [hasError, setHasError] = useState(false);
+  const [src, setSrc] = useState(`http://localhost:3030/frames/${frameId}`);
+  const retryCount = useRef(0);
+
+  useEffect(() => {
+    setSrc(`http://localhost:3030/frames/${frameId}`);
+    setIsLoading(true);
+    setHasError(false);
+    retryCount.current = 0;
+  }, [frameId]);
 
   return (
     <div className="aspect-video bg-muted relative overflow-hidden">
@@ -240,17 +254,26 @@ const FrameThumbnail = ({ frameId, alt }: { frameId: number; alt: string }) => {
       ) : (
         // eslint-disable-next-line @next/next/no-img-element
         <img
-          src={`http://localhost:3030/frames/${frameId}`}
+          src={src}
           alt={alt}
           className={cn(
-            "w-full h-full object-cover transition-opacity",
+            "w-full h-full object-cover transition-opacity select-none",
             isLoading ? "opacity-0" : "opacity-100"
           )}
           loading="lazy"
+          draggable={false}
+          data-lm-disable="true"
           onLoad={() => setIsLoading(false)}
           onError={() => {
-            setIsLoading(false);
-            setHasError(true);
+            if (retryCount.current < 3) {
+              retryCount.current += 1;
+              setTimeout(() => {
+                setSrc(`http://localhost:3030/frames/${frameId}?retry=${retryCount.current}`);
+              }, 1000 * retryCount.current);
+            } else {
+              setIsLoading(false);
+              setHasError(true);
+            }
           }}
         />
       )}
@@ -267,12 +290,113 @@ function formatRelativeTime(timestamp: string): string {
   return format(date, "MMM d") + " " + time;
 }
 
-export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded = false }: SearchModalProps) {
+/** Compact keyboard/clipboard result item — shows 1 line by default, expands on click */
+function UiEventItem({ evt, onNavigate }: { evt: UiEventResult; onNavigate: () => void }) {
+  const [expanded, setExpanded] = useState(false);
+  const EvtIcon = evt.event_type === "clipboard" ? ClipboardCopy
+    : evt.event_type === "app_switch" ? AppWindow
+    : Keyboard;
+
+  return (
+    <div
+      className="cursor-pointer border border-border rounded p-2 hover:border-foreground/50 transition-colors"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div
+          className="flex items-start gap-2 min-w-0 flex-1"
+          onClick={(e) => { e.stopPropagation(); setExpanded(!expanded); }}
+        >
+          <EvtIcon className="w-3.5 h-3.5 text-muted-foreground mt-0.5 flex-shrink-0" />
+          <div className="min-w-0">
+            <p className={cn("text-xs text-foreground", !expanded && "line-clamp-1")}>
+              {evt.text_content}
+            </p>
+            {(evt.app_name || evt.window_title) && (
+              <p className="text-[11px] text-muted-foreground mt-0.5 truncate">
+                {[evt.app_name, evt.window_title].filter(Boolean).join(" — ")}
+              </p>
+            )}
+          </div>
+        </div>
+        <span
+          className="text-[11px] text-muted-foreground font-mono flex-shrink-0 hover:text-foreground hover:underline"
+          onClick={onNavigate}
+          title="Go to timestamp"
+        >
+          {formatRelativeTime(evt.timestamp)}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded = false, standalone = false }: SearchModalProps) {
   const [query, setQuery] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
+  const { inputRef, inputElRef, focusInput } = useSearchFocus(isOpen);
   const gridRef = useRef<HTMLDivElement>(null);
+
+  // Programmatically scroll via native-scroll events (macOS).
+  // WKWebView in settings WebviewWindow doesn't dispatch JS wheel events,
+  // so CSS overflow can't scroll from trackpad. The Rust side swizzles
+  // WKWebView.scrollWheel: and emits "native-scroll" Tauri events instead.
+  // We find the scrollable element under the cursor and apply the delta.
+  useEffect(() => {
+    if (!isOpen || !embedded) return;
+
+    // Track cursor position for hit-testing
+    let mouseX = 0, mouseY = 0;
+    const onMove = (e: MouseEvent) => { mouseX = e.clientX; mouseY = e.clientY; };
+    document.addEventListener("mousemove", onMove);
+
+    const unlisten = listen<{ deltaX: number; deltaY: number; ctrlKey: boolean; metaKey: boolean }>(
+      "native-scroll",
+      (event) => {
+        const { deltaX, deltaY } = event.payload;
+        // Find element under cursor and walk up to nearest scrollable container
+        const target = document.elementFromPoint(mouseX, mouseY);
+        if (!target) return;
+
+        let el: HTMLElement | null = target as HTMLElement;
+        let scrolledY = false;
+        let scrolledX = false;
+
+        while (el) {
+          const style = window.getComputedStyle(el);
+          const overflowY = style.overflowY;
+          const overflowX = style.overflowX;
+
+          // Vertical scroll
+          if (!scrolledY && Math.abs(deltaY) > 0 && (overflowY === "auto" || overflowY === "scroll") && el.scrollHeight > el.clientHeight) {
+            el.scrollTop -= deltaY;
+            scrolledY = true;
+          }
+
+          // Horizontal scroll (trackpad horizontal swipe or shift+scroll)
+          if (!scrolledX && Math.abs(deltaX) > 0 && (overflowX === "auto" || overflowX === "scroll") && el.scrollWidth > el.clientWidth) {
+            el.scrollLeft -= deltaX;
+            scrolledX = true;
+          }
+
+          if (scrolledY && scrolledX) break;
+          el = el.parentElement;
+        }
+
+        // Fallback: vertical scroll the grid if nothing else caught it
+        if (!scrolledY && Math.abs(deltaY) > 0 && gridRef.current) {
+          gridRef.current.scrollTop -= deltaY;
+        }
+      },
+    );
+    return () => {
+      document.removeEventListener("mousemove", onMove);
+      unlisten.then((f) => f());
+    };
+  }, [isOpen, embedded]);
+
+  // Bump to force search effect re-run (fixes stale debouncedQuery after modal reopen)
+  const [searchEpoch, setSearchEpoch] = useState(0);
 
   // Speaker search state
   const [speakerResults, setSpeakerResults] = useState<SpeakerResult[]>([]);
@@ -282,7 +406,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
   const [speakerTranscriptions, setSpeakerTranscriptions] = useState<AudioTranscription[]>([]);
   const [isLoadingTranscriptions, setIsLoadingTranscriptions] = useState(false);
   const [selectedTranscriptionIndex, setSelectedTranscriptionIndex] = useState(0);
-  const [transcriptionFrames, setTranscriptionFrames] = useState<Map<string, number>>(new Map());
+  const [transcriptionFrames, setTranscriptionFrames] = useState<Map<string, { frame_id: number; app_name: string }>>(new Map());
 
   // Tag search state
   const [tagResults, setTagResults] = useState<TaggedFrame[]>([]);
@@ -295,8 +419,13 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
   type ContentFilter = "all" | "screen" | "input";
   const [contentFilter, setContentFilter] = useState<ContentFilter>("all");
 
-  // App filter
+  // App filter (for screen results and speaker drill-down)
   const [appFilter, setAppFilter] = useState<string | null>(null);
+  const [speakerAppFilter, setSpeakerAppFilter] = useState<string | null>(null);
+  const [domainFilter, setDomainFilter] = useState<string | null>(null);
+  // Time filter — stores the date string (YYYY-MM-DD) from a time range chip
+  const [timeFilter, setTimeFilter] = useState<string | null>(null);
+  const [speakerTimeFilter, setSpeakerTimeFilter] = useState<string | null>(null);
 
   // Pagination
   const [ocrOffset, setOcrOffset] = useState(0);
@@ -309,7 +438,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
   const OCR_PAGE_SIZE = 24;
   const TRANSCRIPTION_PAGE_SIZE = 30;
 
-  const debouncedQuery = useDebounce(query, 200);
+  const debouncedQuery = useDebounce(query, 400);
   const { suggestions, isLoading: suggestionsLoading } = useSuggestions(isOpen);
 
   const {
@@ -320,27 +449,221 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
     isSearching,
     searchKeywords,
     resetSearch,
+    setCurrentResultIndex,
   } = useKeywordSearchStore();
 
-  // Compute app distribution from results and filter
-  const appCounts = useMemo(() => {
+  // --- Facet state (loaded async, independent of paginated results) ---
+  const [facetApps, setFacetApps] = useState<[string, number][]>([]);
+  const [facetDomains, setFacetDomains] = useState<[string, number][]>([]);
+  const [facetTimeRanges, setFacetTimeRanges] = useState<{ label: string; dateKey: string; timestamp: string; count: number }[]>([]);
+  const [facetsLoading, setFacetsLoading] = useState(false);
+
+  // Build time range labels from raw rows
+  const buildTimeRanges = useCallback((rows: { dateKey: string; timestamp: string; count: number }[]) => {
+    // Re-bucket by local date since SQL DATE() operates on UTC strings.
+    // Multiple UTC dates can map to the same local date, so merge counts.
+    const buckets = new Map<string, { label: string; dateKey: string; timestamp: string; count: number }>();
+    for (const r of rows) {
+      const d = new Date(r.timestamp);
+      const localDateKey = format(d, "yyyy-MM-dd");
+      const existing = buckets.get(localDateKey);
+      if (existing) {
+        existing.count += r.count;
+      } else {
+        let label: string;
+        if (isToday(d)) {
+          label = format(d, "h a");
+        } else if (isYesterday(d)) {
+          label = "yesterday " + format(d, "h a");
+        } else {
+          label = format(d, "MMM d");
+        }
+        buckets.set(localDateKey, { label, dateKey: localDateKey, timestamp: r.timestamp, count: r.count });
+      }
+    }
+    return [...buckets.values()]
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+      .slice(0, 10);
+  }, []);
+
+  // Async facet loading — fires a lightweight SQL aggregation query
+  useEffect(() => {
+    const q = debouncedQuery.trim();
+    if (!q || q.length < 3 || q.startsWith("#") || q.startsWith("@")) {
+      setFacetApps([]);
+      setFacetDomains([]);
+      setFacetTimeRanges([]);
+      setFacetsLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setFacetsLoading(true);
+    let pending = 3;
+    const onFacetDone = () => { pending--; if (pending === 0 && !cancelled) setFacetsLoading(false); };
+    const escaped = q.replace(/"/g, '""');
+    const ftsQuery = q.split(/\s+/).map(w => `"${w.replace(/"/g, '""')}"`).join(" OR ");
+
+    // Fire all three facet queries in parallel
+    const fetchFacet = async (sql: string) => {
+      const resp = await fetch("http://localhost:3030/raw_sql", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: sql }),
+        signal: AbortSignal.timeout(5000),
+      });
+      return resp.ok ? resp.json() : [];
+    };
+
+    // App facet (single frames_fts query)
+    fetchFacet(
+      `SELECT app_name as app, COUNT(*) as cnt
+       FROM frames_fts
+       WHERE frames_fts MATCH '${escaped}'
+       AND app_name != ''
+       GROUP BY app_name ORDER BY cnt DESC LIMIT 15`
+    ).then((rows: { app: string; cnt: number }[]) => {
+      if (!cancelled) setFacetApps(rows.map(r => [r.app, r.cnt]));
+    }).catch(() => {}).finally(onFacetDone);
+
+    // Domain facet (frames_fts joined with frames for browser_url)
+    // Note: FTS5 tables cannot be aliased, must use full table name in MATCH
+    fetchFacet(
+      `SELECT f.browser_url as url, COUNT(*) as cnt
+       FROM frames_fts
+       JOIN frames f ON f.id = frames_fts.id
+       WHERE frames_fts MATCH '${escaped}'
+       AND f.browser_url IS NOT NULL AND f.browser_url != ''
+       GROUP BY f.browser_url ORDER BY cnt DESC LIMIT 200`
+    ).then((rows: { url: string; cnt: number }[]) => {
+      if (cancelled) return;
+      // Aggregate by domain
+      const domainMap = new Map<string, number>();
+      for (const r of rows) {
+        try {
+          const domain = new URL(r.url).hostname.replace(/^www\./, "");
+          if (domain) domainMap.set(domain, (domainMap.get(domain) || 0) + r.cnt);
+        } catch { /* skip */ }
+      }
+      setFacetDomains([...domainMap.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8));
+    }).catch(() => {}).finally(onFacetDone);
+
+    // Time facet — bucket by date (frames_fts)
+    fetchFacet(
+      `SELECT DATE(f.timestamp) as d, MIN(f.timestamp) as ts, COUNT(*) as cnt
+       FROM frames_fts
+       JOIN frames f ON f.id = frames_fts.id
+       WHERE frames_fts MATCH '${escaped}'
+       GROUP BY DATE(f.timestamp)
+       ORDER BY d DESC LIMIT 30`
+    ).then((rows: { d: string; ts: string; cnt: number }[]) => {
+      if (cancelled) return;
+      setFacetTimeRanges(buildTimeRanges(rows.map(r => ({ dateKey: r.d, timestamp: r.ts, count: r.cnt }))));
+    }).catch(() => {}).finally(onFacetDone);
+
+    return () => { cancelled = true; setFacetsLoading(false); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedQuery, buildTimeRanges, searchEpoch]);
+
+  // Speaker time ranges (from loaded transcriptions — these are small enough)
+  const speakerTimeRanges = useMemo(() => {
+    if (speakerTranscriptions.length === 0) return [];
+    const buckets = new Map<string, { label: string; dateKey: string; timestamp: string; count: number }>();
+    for (const t of speakerTranscriptions) {
+      const d = new Date(t.timestamp);
+      if (isNaN(d.getTime())) continue;
+      const key = `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+      if (!buckets.has(key)) {
+        const dateKey = format(d, "yyyy-MM-dd");
+        let label: string;
+        if (isToday(d)) label = format(d, "h a");
+        else if (isYesterday(d)) label = "yesterday " + format(d, "h a");
+        else label = format(d, "MMM d");
+        buckets.set(key, { label, dateKey, timestamp: t.timestamp, count: 1 });
+      } else {
+        buckets.get(key)!.count++;
+      }
+    }
+    return [...buckets.values()]
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+      .slice(0, 10);
+  }, [speakerTranscriptions]);
+
+  const domainCounts = facetDomains;
+  const timeRanges = facetTimeRanges;
+
+  // Compute app distribution from speaker transcription frames
+  const speakerAppCounts = useMemo(() => {
     const counts = new Map<string, number>();
-    for (const r of searchResults) {
+    for (const [, info] of transcriptionFrames) {
+      if (info.app_name) {
+        counts.set(info.app_name, (counts.get(info.app_name) || 0) + 1);
+      }
+    }
+    return [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  }, [transcriptionFrames]);
+
+  // Filter speaker transcriptions by app and time
+  const filteredSpeakerTranscriptions = useMemo(() => {
+    let items = speakerTranscriptions;
+    if (speakerAppFilter) items = items.filter(t => {
+      const info = transcriptionFrames.get(t.timestamp);
+      return info?.app_name === speakerAppFilter;
+    });
+    if (speakerTimeFilter) items = items.filter(t => t.timestamp.startsWith(speakerTimeFilter));
+    return items;
+  }, [speakerTranscriptions, speakerAppFilter, speakerTimeFilter, transcriptionFrames]);
+
+  const matchesTimeFilter = useCallback((timestamp: string) => {
+    if (!timeFilter) return true;
+    // Compare in local time — timeFilter is a local date like "2026-02-28"
+    const d = new Date(timestamp);
+    const localDate = format(d, "yyyy-MM-dd");
+    return localDate === timeFilter;
+  }, [timeFilter]);
+
+  // Derive app chips from time-filtered results so they stay consistent
+  // when a date chip is active. Uses actual search result app_names to
+  // guarantee the client-side filter (r.app_name === appFilter) matches.
+  // Use facet data (aggregated over ALL matches) when available,
+  // fall back to client-side counts from loaded results when facets haven't loaded yet
+  const appCounts = useMemo(() => {
+    if (facetApps.length > 0 && !timeFilter) return facetApps;
+    const source = timeFilter
+      ? searchResults.filter(r => matchesTimeFilter(r.timestamp))
+      : searchResults;
+    const counts = new Map<string, number>();
+    for (const r of source) {
       counts.set(r.app_name, (counts.get(r.app_name) || 0) + 1);
     }
-    return [...counts.entries()]
-      .sort((a, b) => b[1] - a[1]);
-  }, [searchResults]);
+    return [...counts.entries()].sort((a, b) => b[1] - a[1]);
+  }, [facetApps, searchResults, timeFilter, matchesTimeFilter]);
 
   const filteredResults = useMemo(() => {
-    if (!appFilter) return searchResults;
-    return searchResults.filter(r => r.app_name === appFilter);
-  }, [searchResults, appFilter]);
+    let results = searchResults;
+    if (appFilter) results = results.filter(r => r.app_name === appFilter);
+    if (domainFilter) results = results.filter(r => {
+      try { return new URL(r.url).hostname.replace(/^www\./, "") === domainFilter; } catch { return false; }
+    });
+    if (timeFilter) results = results.filter(r => matchesTimeFilter(r.timestamp));
+    return results;
+  }, [searchResults, appFilter, domainFilter, timeFilter, matchesTimeFilter]);
+
+  // Keep a ref so keyboard handler reads current value without re-mounting the effect
+  const filteredResultsRef = useRef(filteredResults);
+  filteredResultsRef.current = filteredResults;
+  const filteredSpeakerTranscriptionsRef = useRef(filteredSpeakerTranscriptions);
+  filteredSpeakerTranscriptionsRef.current = filteredSpeakerTranscriptions;
 
   const filteredGroups = useMemo(() => {
-    if (!appFilter) return searchGroups;
-    return searchGroups.filter(g => g.representative.app_name === appFilter);
-  }, [searchGroups, appFilter]);
+    let groups = searchGroups;
+    if (appFilter) groups = groups.filter(g => g.representative.app_name === appFilter);
+    if (domainFilter) groups = groups.filter(g => {
+      try { return new URL(g.representative.url).hostname.replace(/^www\./, "") === domainFilter; } catch { return false; }
+    });
+    if (timeFilter) groups = groups.filter(g => matchesTimeFilter(g.representative.timestamp));
+    return groups;
+  }, [searchGroups, appFilter, domainFilter]);
 
   // Tokenize query for thumbnail highlights (split on spaces, filter empty)
   const queryTokens = useMemo(() => {
@@ -350,14 +673,17 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
 
   const { setHighlight, clear: clearHighlight } = useSearchHighlight();
 
-  // Focus input when modal opens
+  // Reset state when modal opens (focus is handled by useSearchFocus)
   useEffect(() => {
     if (isOpen) {
       setSelectedIndex(0);
       setQuery("");
       resetSearch();
+      setSearchEpoch(e => e + 1);
       clearHighlight();
       setAppFilter(null);
+      setDomainFilter(null);
+      setTimeFilter(null);
       setContentFilter("all");
       setSpeakerResults([]);
       setTagResults([]);
@@ -369,43 +695,28 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
       setHasMoreOcr(true);
       setTranscriptionOffset(0);
       setHasMoreTranscriptions(true);
-
-      // Focus after next frame. The panel is made key window on show,
-      // but the global shortcut path also calls show_main_window first.
-      // A small delay handles the case where make_key_window is still
-      // propagating through the window server.
-      const rafId = requestAnimationFrame(() => {
-        inputRef.current?.focus();
-      });
-      const timer = setTimeout(() => {
-        inputRef.current?.focus();
-      }, 80);
-
-      return () => {
-        cancelAnimationFrame(rafId);
-        clearTimeout(timer);
-      };
     }
   }, [isOpen, resetSearch]);
 
   // Perform search when query changes
   useEffect(() => {
-    if (!debouncedQuery.trim()) {
+    const q = debouncedQuery.trim();
+    if (!q || q.startsWith("#") || q.startsWith("@")) {
       resetSearch();
       setSpeakerResults([]);
       setTagResults([]);
       setAppFilter(null);
+      setDomainFilter(null);
+      setTimeFilter(null);
       return;
     }
 
-    // Skip keyword search for # and @ queries (handled by dedicated effects)
-    if (debouncedQuery.startsWith("#") || debouncedQuery.startsWith("@")) {
-      resetSearch();
-      setSpeakerResults([]);
-      return;
-    }
+    // Require at least 3 chars to avoid wasteful FTS queries while typing
+    if (q.length < 3) return;
 
     setAppFilter(null);
+    setDomainFilter(null);
+    setTimeFilter(null);
     setContentFilter("all");
     setTagResults([]);
     setOcrOffset(0);
@@ -414,7 +725,8 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
       limit: OCR_PAGE_SIZE,
       offset: 0,
     });
-  }, [debouncedQuery, searchKeywords, resetSearch]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedQuery, searchKeywords, resetSearch, searchEpoch]);
 
   // Search tags when query starts with #
   useEffect(() => {
@@ -579,7 +891,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
           const uniqueTimestamps = [...new Set(items.map(i => i.timestamp).filter(Boolean))];
           if (uniqueTimestamps.length > 0 && !cancelled) {
             try {
-              const map = new Map<string, number>();
+              const map = new Map<string, { frame_id: number; app_name: string }>();
               // Batch fetch: find closest frame within ±30s for each timestamp
               const promises = uniqueTimestamps.map(async (ts) => {
                 const d = new Date(ts);
@@ -590,13 +902,13 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({
-                    query: `SELECT id as frame_id FROM frames WHERE timestamp >= '${lo}' AND timestamp <= '${hi}' ORDER BY ABS(julianday(timestamp) - julianday('${escaped}')) LIMIT 1`,
+                    query: `SELECT id as frame_id, app_name FROM frames WHERE timestamp >= '${lo}' AND timestamp <= '${hi}' ORDER BY ABS(julianday(timestamp) - julianday('${escaped}')) LIMIT 1`,
                   }),
                   signal: AbortSignal.timeout(3000),
                 });
                 if (resp.ok) {
-                  const rows: { frame_id: number }[] = await resp.json();
-                  if (rows.length > 0) map.set(ts, rows[0].frame_id);
+                  const rows: { frame_id: number; app_name: string }[] = await resp.json();
+                  if (rows.length > 0) map.set(ts, { frame_id: rows[0].frame_id, app_name: rows[0].app_name || "" });
                 }
               });
               await Promise.all(promises);
@@ -634,12 +946,13 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
   const handleBackFromSpeaker = useCallback(() => {
     setSelectedSpeaker(null);
     setSpeakerTranscriptions([]);
+    setSpeakerAppFilter(null);
+    setSpeakerTimeFilter(null);
     setSelectedTranscriptionIndex(0);
     setTranscriptionOffset(0);
     setHasMoreTranscriptions(true);
-    // Re-focus the input
-    requestAnimationFrame(() => inputRef.current?.focus());
-  }, []);
+    requestAnimationFrame(() => focusInput());
+  }, [focusInput]);
 
   // Load more OCR results
   const loadMoreOcr = useCallback(() => {
@@ -647,18 +960,30 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
     setIsLoadingMore(true);
     const newOffset = ocrOffset + OCR_PAGE_SIZE;
     setOcrOffset(newOffset);
-    searchKeywords(debouncedQuery, {
+    const opts: { limit: number; offset: number; start_time?: Date; end_time?: Date } = {
       limit: OCR_PAGE_SIZE,
       offset: newOffset,
-    }).finally(() => setIsLoadingMore(false));
-  }, [isLoadingMore, hasMoreOcr, debouncedQuery, ocrOffset, searchKeywords]);
+    };
+    if (timeFilter) {
+      opts.start_time = new Date(timeFilter + "T00:00:00");
+      opts.end_time = new Date(timeFilter + "T23:59:59.999");
+    }
+    searchKeywords(debouncedQuery, opts).finally(() => setIsLoadingMore(false));
+  }, [isLoadingMore, hasMoreOcr, debouncedQuery, ocrOffset, searchKeywords, timeFilter]);
 
-  // Track if we got fewer results than page size (= no more pages)
+  // Track if we got fewer results than page size (= no more pages).
+  // The server may filter results after fetching (e.g. app_name filter),
+  // so we only stop when we get zero new results — not just fewer than PAGE_SIZE.
+  const prevResultsLengthRef = useRef(0);
   useEffect(() => {
-    if (searchResults.length > 0 && searchResults.length < (ocrOffset + OCR_PAGE_SIZE)) {
+    const prevLen = prevResultsLengthRef.current;
+    const curLen = searchResults.length;
+    prevResultsLengthRef.current = curLen;
+    // After a load-more, if no new results were added, we've exhausted all pages
+    if (ocrOffset > 0 && curLen === prevLen && !isSearching) {
       setHasMoreOcr(false);
     }
-  }, [searchResults.length, ocrOffset]);
+  }, [searchResults.length, ocrOffset, isSearching]);
 
   // Load more speaker transcriptions
   const loadMoreTranscriptions = useCallback(async () => {
@@ -717,19 +1042,24 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
     if (queryTokens.length > 0) {
       setHighlight(queryTokens, result.frame_id);
     }
-    onNavigateToTimestamp(result.timestamp);
+    // Track which result was selected so timeline arrow keys can cycle from here
+    const idx = searchResults.findIndex((r) => r.frame_id === result.frame_id);
+    if (idx >= 0) setCurrentResultIndex(idx);
+    const resultsJson = JSON.stringify(searchResults);
+    onNavigateToTimestamp(result.timestamp, result.frame_id, queryTokens, resultsJson, query);
     onClose();
-  }, [onNavigateToTimestamp, onClose, queryTokens, setHighlight]);
+  }, [onNavigateToTimestamp, onClose, queryTokens, setHighlight, searchResults, query, setCurrentResultIndex]);
 
-  // Keyboard navigation — skip arrow key capture when input is focused (let cursor move)
+  // Keyboard navigation — uses refs for data arrays to avoid re-mounting when results change
   useEffect(() => {
     if (!isOpen) return;
 
     const handleKeyDown = (e: KeyboardEvent) => {
-      const inputFocused = document.activeElement === inputRef.current;
+      const inputFocused = document.activeElement === inputElRef.current;
 
       // Speaker drill-down mode
       if (selectedSpeaker) {
+        const transcriptions = filteredSpeakerTranscriptionsRef.current;
         switch (e.key) {
           case "Escape":
             e.preventDefault();
@@ -737,7 +1067,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
             break;
           case "ArrowDown":
             e.preventDefault();
-            setSelectedTranscriptionIndex(i => Math.min(i + 1, speakerTranscriptions.length - 1));
+            setSelectedTranscriptionIndex(i => Math.min(i + 1, transcriptions.length - 1));
             break;
           case "ArrowUp":
             e.preventDefault();
@@ -745,10 +1075,13 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
             break;
           case "Enter":
             e.preventDefault();
-            if (speakerTranscriptions[selectedTranscriptionIndex]?.timestamp) {
-              onNavigateToTimestamp(speakerTranscriptions[selectedTranscriptionIndex].timestamp);
-              onClose();
-            }
+            setSelectedTranscriptionIndex(i => {
+              if (transcriptions[i]?.timestamp) {
+                onNavigateToTimestamp(transcriptions[i].timestamp);
+                onClose();
+              }
+              return i;
+            });
             break;
         }
         return;
@@ -756,10 +1089,11 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
 
       // When input is focused, let left/right arrows move the cursor
       if (inputFocused && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
-        return; // Don't capture — let the input handle it
+        return;
       }
 
-      const cols = 3; // Grid columns
+      const cols = 3;
+      const results = filteredResultsRef.current;
 
       switch (e.key) {
         case "Escape":
@@ -767,7 +1101,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
           break;
         case "ArrowRight":
           e.preventDefault();
-          setSelectedIndex(i => Math.min(i + 1, filteredResults.length - 1));
+          setSelectedIndex(i => Math.min(i + 1, results.length - 1));
           break;
         case "ArrowLeft":
           e.preventDefault();
@@ -775,7 +1109,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
           break;
         case "ArrowDown":
           e.preventDefault();
-          setSelectedIndex(i => Math.min(i + cols, filteredResults.length - 1));
+          setSelectedIndex(i => Math.min(i + cols, results.length - 1));
           break;
         case "ArrowUp":
           e.preventDefault();
@@ -784,44 +1118,55 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
         case "Enter":
           e.preventDefault();
           if (e.metaKey || e.ctrlKey) {
-            // Cmd+Enter = send to AI
             handleSendToAI();
-          } else if (filteredResults[selectedIndex]) {
-            // Enter = navigate to timestamp
-            handleSelectResult(filteredResults[selectedIndex]);
+          } else {
+            setSelectedIndex(i => {
+              const r = filteredResultsRef.current[i];
+              if (r) handleSelectResult(r);
+              return i;
+            });
           }
           break;
       }
     };
 
     window.addEventListener("keydown", handleKeyDown);
-    // Also listen on document capture phase as safety net —
-    // if a focus trap or overlay swallows the window-level event,
-    // this still fires and prevents the modal from getting stuck
     const captureEscape = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        onClose();
-      }
+      if (e.key === "Escape") onClose();
     };
     document.addEventListener("keydown", captureEscape, true);
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
       document.removeEventListener("keydown", captureEscape, true);
     };
-  }, [isOpen, filteredResults, selectedIndex, selectedSpeaker, speakerTranscriptions, selectedTranscriptionIndex, onClose, onNavigateToTimestamp, handleSelectResult, handleSendToAI, handleBackFromSpeaker]);
+  }, [isOpen, selectedSpeaker, onClose, onNavigateToTimestamp, handleSelectResult, handleSendToAI, handleBackFromSpeaker]);
 
-  // Scroll selected item into view
+  // Scroll selected item into view (only on arrow-key navigation, not on new page load)
+  const prevSelectedIndex = useRef(selectedIndex);
   useEffect(() => {
-    if (gridRef.current && filteredResults.length > 0) {
+    if (prevSelectedIndex.current !== selectedIndex && gridRef.current && filteredResults.length > 0) {
       const selectedEl = gridRef.current.querySelector(`[data-index="${selectedIndex}"]`);
       selectedEl?.scrollIntoView({ block: "nearest" });
     }
+    prevSelectedIndex.current = selectedIndex;
   }, [selectedIndex, filteredResults.length]);
+
+  // Standalone: resize Tauri window based on content state.
+  // DOM measurement fails because the small window viewport constrains layout.
+  const hasAnyResults = searchResults.length > 0 || speakerResults.length > 0 || tagResults.length > 0 || uiEventResults.length > 0;
+  const hasVisibleContent = hasAnyResults || (debouncedQuery && debouncedQuery.trim().length >= 2) || isSearching || isSearchingSpeakers || isSearchingTags || isSearchingUiEvents;
+  // input ~52px; footer ~28px; results up to ~380px
+  const standaloneTargetH = hasVisibleContent ? 580 : 80;
+
+  useEffect(() => {
+    if (!standalone || !isOpen) return;
+    invoke("resize_search_window", { width: 680, height: standaloneTargetH }).catch(() => {});
+  }, [standalone, isOpen, standaloneTargetH]);
 
   if (!isOpen) return null;
 
   const hasResults = searchResults.length > 0 || speakerResults.length > 0 || tagResults.length > 0 || uiEventResults.length > 0;
-  const showEmpty = !isSearching && !isSearchingSpeakers && !isSearchingTags && !isSearchingUiEvents && debouncedQuery && !hasResults && !selectedSpeaker && !isTagSearch && !isPeopleSearch;
+  const showEmpty = !isSearching && !isSearchingSpeakers && !isSearchingTags && !isSearchingUiEvents && debouncedQuery && debouncedQuery.trim().length >= 3 && !hasResults && !selectedSpeaker && !isTagSearch && !isPeopleSearch;
   const activeIndex = hoveredIndex ?? selectedIndex;
 
   const renderResults = () => (
@@ -853,10 +1198,82 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
             </div>
           )}
 
-          {speakerTranscriptions.length > 0 && (
+          {/* App filter chips for speaker transcriptions */}
+          {speakerAppCounts.length > 1 && (
+            <div className="flex gap-1.5 mb-2 overflow-x-auto scrollbar-hide pb-0.5">
+              <button
+                onClick={() => { setSpeakerAppFilter(null); setSelectedTranscriptionIndex(0); }}
+                className={cn(
+                  "px-2.5 py-1 text-[11px] rounded-full border transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0",
+                  !speakerAppFilter
+                    ? "bg-foreground text-background border-foreground"
+                    : "border-border text-muted-foreground hover:border-foreground/40"
+                )}
+              >
+                all ({speakerTranscriptions.length})
+              </button>
+              {speakerAppCounts.map(([app, count]) => (
+                <button
+                  key={app}
+                  onClick={() => { setSpeakerAppFilter(speakerAppFilter === app ? null : app); setSelectedTranscriptionIndex(0); }}
+                  className={cn(
+                    "px-2.5 py-1 text-[11px] rounded-full border transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0",
+                    speakerAppFilter === app
+                      ? "bg-foreground text-background border-foreground"
+                      : "border-border text-muted-foreground hover:border-foreground/40"
+                  )}
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={`http://localhost:11435/app-icon?name=${encodeURIComponent(app)}`}
+                    className="w-4 h-4 rounded-sm object-contain"
+                    alt=""
+                    onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                  />
+                  {app} ({count})
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Time range filter chips for speaker transcriptions */}
+          {speakerTimeRanges.length > 1 && (
+            <div className="flex gap-1.5 mb-3 overflow-x-auto scrollbar-hide pb-0.5">
+              <button
+                onClick={() => { setSpeakerTimeFilter(null); setSelectedTranscriptionIndex(0); }}
+                className={cn(
+                  "px-2.5 py-1 text-[11px] rounded-full border transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0",
+                  !speakerTimeFilter
+                    ? "bg-foreground text-background border-foreground"
+                    : "border-border text-muted-foreground hover:border-foreground/40"
+                )}
+              >
+                <Clock className="w-3 h-3" />
+                all dates
+              </button>
+              {speakerTimeRanges.map((range) => (
+                <button
+                  key={range.dateKey}
+                  onClick={() => { setSpeakerTimeFilter(speakerTimeFilter === range.dateKey ? null : range.dateKey); setSelectedTranscriptionIndex(0); }}
+                  className={cn(
+                    "px-2.5 py-1 text-[11px] rounded-full border transition-colors flex items-center gap-1 whitespace-nowrap shrink-0",
+                    speakerTimeFilter === range.dateKey
+                      ? "bg-foreground text-background border-foreground"
+                      : "border-border text-muted-foreground hover:border-foreground/40"
+                  )}
+                >
+                  <Clock className="w-3 h-3" />
+                  {range.label} ({range.count})
+                </button>
+              ))}
+            </div>
+          )}
+
+          {filteredSpeakerTranscriptions.length > 0 && (
             <div className="grid grid-cols-3 gap-3">
-              {speakerTranscriptions.map((t, index) => {
-                const frameId = transcriptionFrames.get(t.timestamp);
+              {filteredSpeakerTranscriptions.map((t, index) => {
+                const frameInfo = transcriptionFrames.get(t.timestamp);
+                const frameId = frameInfo?.frame_id;
                 return (
                   <div
                     key={`${t.timestamp}-${index}`}
@@ -962,7 +1379,8 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                 <div
                   key={frame.frame_id}
                   onClick={() => {
-                    onNavigateToTimestamp(frame.timestamp);
+                    const resultsJson = JSON.stringify(searchResults);
+                    onNavigateToTimestamp(frame.timestamp, frame.frame_id, queryTokens, resultsJson, query);
                     if (!embedded) onClose();
                   }}
                   className="cursor-pointer rounded overflow-hidden border border-border hover:border-foreground/50 transition-all duration-150"
@@ -1033,19 +1451,33 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
             </div>
           )}
 
-          {/* Loading skeleton */}
-          {!isTagSearch && !isPeopleSearch && (isSearching || isSearchingUiEvents) && searchResults.length === 0 && uiEventResults.length === 0 && speakerResults.length === 0 && (
-            <div className="grid grid-cols-3 gap-3">
-              {Array.from({ length: 6 }).map((_, i) => (
-                <div key={i} className="bg-muted animate-pulse rounded overflow-hidden">
-                  <div className="aspect-video" />
-                  <div className="p-2 space-y-1">
-                    <div className="h-3 bg-muted-foreground/20 rounded w-16" />
-                    <div className="h-2 bg-muted-foreground/20 rounded w-24" />
+          {/* Loading skeleton — filter chips + thumbnail grid */}
+          {!isTagSearch && !isPeopleSearch && (isSearching || facetsLoading) && searchResults.length === 0 && uiEventResults.length === 0 && speakerResults.length === 0 && (
+            <>
+              {/* Skeleton filter chips */}
+              <div className="flex gap-1.5 mb-2 overflow-hidden">
+                {Array.from({ length: 5 }).map((_, i) => (
+                  <div key={i} className="h-6 bg-muted animate-pulse rounded-full shrink-0" style={{ width: `${60 + i * 12}px` }} />
+                ))}
+              </div>
+              <div className="flex gap-1.5 mb-3 overflow-hidden">
+                {Array.from({ length: 4 }).map((_, i) => (
+                  <div key={i} className="h-6 bg-muted animate-pulse rounded-full shrink-0" style={{ width: `${50 + i * 15}px` }} />
+                ))}
+              </div>
+              {/* Skeleton thumbnail grid */}
+              <div className="grid grid-cols-3 gap-3">
+                {Array.from({ length: 6 }).map((_, i) => (
+                  <div key={i} className="bg-muted animate-pulse rounded overflow-hidden">
+                    <div className="aspect-video" />
+                    <div className="p-2 space-y-1">
+                      <div className="h-3 bg-muted-foreground/20 rounded w-16" />
+                      <div className="h-2 bg-muted-foreground/20 rounded w-24" />
+                    </div>
                   </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            </>
           )}
 
           {/* People section */}
@@ -1099,6 +1531,57 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
             </div>
           )}
 
+          {/* Screen results skeleton — keyword search still in flight but UI events already loaded */}
+          {isSearching && searchResults.length === 0 && contentFilter !== "input" && uiEventResults.length > 0 && (
+            <div className="mb-4">
+              <p className="text-xs text-muted-foreground mb-2 flex items-center gap-1.5">
+                <Monitor className="w-3 h-3" />
+                screen
+              </p>
+              <div className="grid grid-cols-3 gap-3">
+                {Array.from({ length: 6 }).map((_, i) => (
+                  <div key={i} className="bg-muted animate-pulse rounded overflow-hidden">
+                    <div className="aspect-video" />
+                    <div className="p-2 space-y-1">
+                      <div className="h-3 bg-muted-foreground/20 rounded w-16" />
+                      <div className="h-2 bg-muted-foreground/20 rounded w-24" />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* UI event results — shown above screen results so infinite scroll doesn't push them away */}
+          {uiEventResults.length > 0 && contentFilter !== "screen" && (
+            <div className={cn(contentFilter === "all" && "mb-4")}>
+              <p className="text-xs text-muted-foreground mb-2 flex items-center gap-1.5">
+                <Keyboard className="w-3 h-3" />
+                keyboard & clipboard
+              </p>
+              <div className="flex flex-col gap-2">
+                {(contentFilter === "all" ? uiEventResults.slice(0, 5) : uiEventResults).map((evt) => (
+                  <UiEventItem
+                    key={evt.id}
+                    evt={evt}
+                    onNavigate={() => {
+                      onNavigateToTimestamp(evt.timestamp);
+                      if (!embedded) onClose();
+                    }}
+                  />
+                ))}
+              </div>
+              {contentFilter === "all" && uiEventResults.length > 5 && (
+                <button
+                  onClick={() => setContentFilter("input")}
+                  className="mt-2 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
+                >
+                  show all {uiEventResults.length} results
+                </button>
+              )}
+            </div>
+          )}
+
           {/* Screen results grid */}
           {searchResults.length > 0 && contentFilter !== "input" && (
             <>
@@ -1111,11 +1594,11 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
 
               {/* App filter chips */}
               {appCounts.length > 1 && (
-                <div className="flex gap-1.5 mb-3 flex-wrap">
+                <div className="flex gap-1.5 mb-2 overflow-x-auto scrollbar-hide pb-0.5">
                   <button
                     onClick={() => { setAppFilter(null); setSelectedIndex(0); }}
                     className={cn(
-                      "px-2.5 py-1 text-[11px] rounded-full border transition-colors flex items-center gap-1.5",
+                      "px-2.5 py-1 text-[11px] rounded-full border transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0",
                       !appFilter
                         ? "bg-foreground text-background border-foreground"
                         : "border-border text-muted-foreground hover:border-foreground/40"
@@ -1126,9 +1609,9 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                   {appCounts.map(([app, count]) => (
                     <button
                       key={app}
-                      onClick={() => { setAppFilter(appFilter === app ? null : app); setSelectedIndex(0); }}
+                      onClick={() => { const newApp = appFilter === app ? null : app; setAppFilter(newApp); if (newApp) setDomainFilter(null); setSelectedIndex(0); }}
                       className={cn(
-                        "px-2.5 py-1 text-[11px] rounded-full border transition-colors flex items-center gap-1.5",
+                        "px-2.5 py-1 text-[11px] rounded-full border transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0",
                         appFilter === app
                           ? "bg-foreground text-background border-foreground"
                           : "border-border text-muted-foreground hover:border-foreground/40"
@@ -1142,6 +1625,91 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                         onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
                       />
                       {app} ({count})
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* Domain filter chips — hide when a non-browser app is selected
+                  (non-browser apps don't have URLs so domain chips are irrelevant) */}
+              {domainCounts.length > 1 && (!appFilter || filteredResults.some(r => r.url)) && (
+                <div className="flex gap-1.5 mb-2 overflow-x-auto scrollbar-hide pb-0.5">
+                  <button
+                    onClick={() => { setDomainFilter(null); setSelectedIndex(0); }}
+                    className={cn(
+                      "px-2.5 py-1 text-[11px] rounded-full border transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0",
+                      !domainFilter
+                        ? "bg-foreground text-background border-foreground"
+                        : "border-border text-muted-foreground hover:border-foreground/40"
+                    )}
+                  >
+                    all sites
+                  </button>
+                  {domainCounts.map(([domain, count]) => (
+                    <button
+                      key={domain}
+                      onClick={() => { setDomainFilter(domainFilter === domain ? null : domain); setSelectedIndex(0); }}
+                      className={cn(
+                        "px-2.5 py-1 text-[11px] rounded-full border transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0",
+                        domainFilter === domain
+                          ? "bg-foreground text-background border-foreground"
+                          : "border-border text-muted-foreground hover:border-foreground/40"
+                      )}
+                    >
+                      {domain} ({count})
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {/* Time range filter chips */}
+              {timeRanges.length > 1 && (
+                <div className="flex gap-1.5 mb-3 overflow-x-auto scrollbar-hide pb-0.5">
+                  <button
+                    onClick={() => {
+                      setTimeFilter(null);
+                      setSelectedIndex(0);
+                      setOcrOffset(0);
+                      setHasMoreOcr(true);
+                      searchKeywords(debouncedQuery, { limit: OCR_PAGE_SIZE, offset: 0 });
+                    }}
+                    className={cn(
+                      "px-2.5 py-1 text-[11px] rounded-full border transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0",
+                      !timeFilter
+                        ? "bg-foreground text-background border-foreground"
+                        : "border-border text-muted-foreground hover:border-foreground/40"
+                    )}
+                  >
+                    <Clock className="w-3 h-3" />
+                    all dates
+                  </button>
+                  {timeRanges.map((range) => (
+                    <button
+                      key={range.dateKey}
+                      onClick={() => {
+                        const newFilter = timeFilter === range.dateKey ? null : range.dateKey;
+                        setTimeFilter(newFilter);
+                        setSelectedIndex(0);
+                        // Re-query backend with date range for proper pagination
+                        setOcrOffset(0);
+                        setHasMoreOcr(true);
+                        if (newFilter) {
+                          const start = new Date(newFilter + "T00:00:00");
+                          const end = new Date(newFilter + "T23:59:59.999");
+                          searchKeywords(debouncedQuery, { limit: OCR_PAGE_SIZE, offset: 0, start_time: start, end_time: end });
+                        } else {
+                          searchKeywords(debouncedQuery, { limit: OCR_PAGE_SIZE, offset: 0 });
+                        }
+                      }}
+                      className={cn(
+                        "px-2.5 py-1 text-[11px] rounded-full border transition-colors flex items-center gap-1 whitespace-nowrap shrink-0",
+                        timeFilter === range.dateKey
+                          ? "bg-foreground text-background border-foreground"
+                          : "border-border text-muted-foreground hover:border-foreground/40"
+                      )}
+                    >
+                      <Clock className="w-3 h-3" />
+                      {range.label} ({range.count})
                     </button>
                   ))}
                 </div>
@@ -1215,7 +1783,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
               </div>
 
               {/* Load more indicator */}
-              {(isLoadingMore || (hasMoreOcr && searchResults.length >= OCR_PAGE_SIZE)) && (
+              {(isLoadingMore || (hasMoreOcr && filteredResults.length > 0)) && (
                 <div className="flex justify-center py-4">
                   {isLoadingMore ? (
                     <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
@@ -1227,59 +1795,6 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
             </>
           )}
 
-          {/* UI event results */}
-          {uiEventResults.length > 0 && contentFilter !== "screen" && (
-            <div className={cn(contentFilter === "all" && searchResults.length > 0 && "mt-6")}>
-              <p className="text-xs text-muted-foreground mb-2 flex items-center gap-1.5">
-                <Keyboard className="w-3 h-3" />
-                keyboard & clipboard
-              </p>
-              <div className="flex flex-col gap-2">
-                {(contentFilter === "all" ? uiEventResults.slice(0, 5) : uiEventResults).map((evt) => {
-                  const EvtIcon = evt.event_type === "clipboard" ? ClipboardCopy
-                    : evt.event_type === "app_switch" ? AppWindow
-                    : Keyboard;
-                  return (
-                    <div
-                      key={evt.id}
-                      onClick={() => {
-                        onNavigateToTimestamp(evt.timestamp);
-                        if (!embedded) onClose();
-                      }}
-                      className="cursor-pointer border border-border rounded p-3 hover:border-foreground/50 transition-colors"
-                    >
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="flex items-start gap-2 min-w-0">
-                          <EvtIcon className="w-3.5 h-3.5 text-muted-foreground mt-0.5 flex-shrink-0" />
-                          <div className="min-w-0">
-                            <p className="text-xs text-foreground line-clamp-2">
-                              {evt.text_content}
-                            </p>
-                            {(evt.app_name || evt.window_title) && (
-                              <p className="text-[11px] text-muted-foreground mt-0.5 truncate">
-                                {[evt.app_name, evt.window_title].filter(Boolean).join(" — ")}
-                              </p>
-                            )}
-                          </div>
-                        </div>
-                        <span className="text-[11px] text-muted-foreground font-mono flex-shrink-0">
-                          {formatRelativeTime(evt.timestamp)}
-                        </span>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-              {contentFilter === "all" && uiEventResults.length > 5 && (
-                <button
-                  onClick={() => setContentFilter("input")}
-                  className="mt-2 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
-                >
-                  show all {uiEventResults.length} results
-                </button>
-              )}
-            </div>
-          )}
 
           {/* Suggestions when no query */}
           {!debouncedQuery && !isSearching && (
@@ -1319,12 +1834,21 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
     </>
   );
 
-  if (embedded) {
+  if (standalone || embedded) {
+    const hasContent = hasResults || (debouncedQuery && debouncedQuery.trim().length >= 2) || isSearching || isSearchingSpeakers || isSearchingTags || isSearchingUiEvents;
     return (
-      <div className="flex flex-col h-full bg-card">
-        {/* Search Input */}
-        <div className="flex items-center gap-3 px-4 py-3 border-b border-border">
-          <Search className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+      <div className={cn(
+        "flex flex-col bg-card/95 backdrop-blur-xl",
+        standalone ? "rounded-xl border border-border/50 shadow-2xl overflow-hidden" : "h-full",
+      )}>
+        {/* Search Input — Raycast-style large input */}
+        <div className={cn(
+          "flex items-center gap-3 px-5 border-b border-border/50",
+          standalone ? "py-3.5" : "py-3 px-4",
+        )}
+        data-tauri-drag-region={standalone ? true : undefined}
+        >
+          <Search className="w-4.5 h-4.5 text-muted-foreground flex-shrink-0" />
           <input
             ref={inputRef}
             type="text"
@@ -1339,13 +1863,15 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                 setHasMoreTranscriptions(true);
               }
             }}
-            placeholder="Search your memory... (# tags, @ people)"
-            className="flex-1 bg-transparent text-foreground placeholder:text-muted-foreground text-sm outline-none"
+            placeholder="search your memory... (# tags, @ people)"
+            className={cn(
+              "flex-1 bg-transparent text-foreground placeholder:text-muted-foreground/60 outline-none",
+              standalone ? "text-base" : "text-sm",
+            )}
             autoComplete="off"
             autoCorrect="off"
             autoCapitalize="off"
             spellCheck={false}
-            autoFocus
           />
           {(isSearching || isSearchingTags) && <Loader2 className="w-4 h-4 text-muted-foreground animate-spin" />}
           {query && (
@@ -1353,22 +1879,38 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
               onClick={() => setQuery("")}
               className="p-1 hover:bg-muted rounded"
             >
-              <X className="w-3 h-3 text-muted-foreground" />
+              <X className="w-3.5 h-3.5 text-muted-foreground" />
             </button>
           )}
         </div>
 
-        {/* Results area — fills remaining space */}
-        <div
-          ref={gridRef}
-          className="flex-1 min-h-0 overflow-y-auto p-4 overscroll-contain touch-pan-y"
-          onScroll={handleScroll}
-        >
-          {renderResults()}
-        </div>
+        {/* Results area — only shown when there's content */}
+        {hasContent && (
+          <div
+            ref={gridRef}
+            className={cn(
+              "flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y",
+              standalone ? "p-3 max-h-[500px] scrollbar-hide" : "p-4",
+            )}
+            onWheel={(e) => {
+              e.stopPropagation();
+              const target = e.currentTarget;
+              const isAtTop = target.scrollTop === 0 && e.deltaY < 0;
+              const isAtBottom = target.scrollTop + target.clientHeight >= target.scrollHeight && e.deltaY > 0;
+              if (isAtTop || isAtBottom) e.preventDefault();
+            }}
+            onTouchMove={(e) => e.stopPropagation()}
+            onScroll={handleScroll}
+          >
+            {renderResults()}
+          </div>
+        )}
 
-        {/* Footer */}
-        <div className="px-4 py-2 border-t border-border bg-muted/30 flex items-center justify-between text-[10px] text-muted-foreground font-mono">
+        {/* Footer — compact keyboard hints */}
+        <div className={cn(
+          "px-4 py-1.5 border-t border-border/50 flex items-center justify-between text-[10px] text-muted-foreground/70 font-mono",
+          standalone ? "bg-muted/20" : "bg-muted/30 py-2",
+        )}>
           <div className="flex items-center gap-4">
             {selectedSpeaker ? (
               <>
@@ -1381,13 +1923,13 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                 <span>←→↑↓ navigate</span>
                 <span>⏎ go to timeline</span>
                 <span className="flex items-center gap-1">
-                  <MessageSquare className="w-3 h-3" />
+                  <MessageSquare className="w-2.5 h-2.5" />
                   ⌘⏎ ask AI
                 </span>
               </>
             )}
           </div>
-          <span>esc {selectedSpeaker ? "back" : "close"}</span>
+          <span>esc close</span>
         </div>
       </div>
     );
@@ -1398,20 +1940,14 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
       role="dialog"
       aria-modal="true"
       className="fixed inset-0 z-50 flex items-start justify-center pt-[10vh] isolate"
-      onWheel={(e) => {
-        e.stopPropagation();
-        e.preventDefault();
-      }}
+      onWheel={(e) => e.stopPropagation()}
       onTouchMove={(e) => e.stopPropagation()}
     >
       {/* Backdrop - captures all pointer events to prevent interaction with timeline */}
       <div
         className="absolute inset-0 bg-black/60 backdrop-blur-sm"
         onClick={onClose}
-        onWheel={(e) => {
-          e.stopPropagation();
-          e.preventDefault();
-        }}
+        onWheel={(e) => e.stopPropagation()}
         onTouchMove={(e) => e.stopPropagation()}
       />
 
@@ -1441,7 +1977,6 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
             autoCorrect="off"
             autoCapitalize="off"
             spellCheck={false}
-            autoFocus
           />
           {(isSearching || isSearchingTags) && <Loader2 className="w-4 h-4 text-muted-foreground animate-spin" />}
           {query && (

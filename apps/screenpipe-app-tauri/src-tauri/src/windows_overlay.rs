@@ -15,7 +15,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 /// Extended window styles for overlay behavior
-/// Note: Removed WS_EX_NOACTIVATE so window can receive keyboard focus for shortcuts
+/// WS_EX_TOOLWINDOW hides the overlay from the taskbar and Alt+Tab — the Home
+/// window is the persistent taskbar presence instead.
+/// WS_EX_NOACTIVATE removed so window can receive keyboard focus.
 const OVERLAY_EX_STYLE: i32 = (WS_EX_LAYERED.0 | WS_EX_TOOLWINDOW.0) as i32;
 const CLICK_THROUGH_STYLE: i32 = WS_EX_TRANSPARENT.0 as i32;
 
@@ -215,7 +217,10 @@ pub fn bring_to_front_and_activate(window: &WebviewWindow) -> Result<(), String>
         let result = SetWindowPos(
             hwnd,
             HWND_TOPMOST,
-            0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
             SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE,
         );
 

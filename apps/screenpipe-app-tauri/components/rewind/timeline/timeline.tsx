@@ -4,9 +4,10 @@
 import { StreamTimeSeriesResponse, TimeRange } from "@/components/rewind/timeline";
 import { useTimelineSelection } from "@/lib/hooks/use-timeline-selection";
 import { getStore, type ChatConversation } from "@/lib/hooks/use-settings";
-import { isAfter, subDays, format } from "date-fns";
+import { isAfter, subDays, addDays, startOfDay, format } from "date-fns";
 import { motion } from "framer-motion";
-import { ZoomIn, ZoomOut, Mic, Monitor, AppWindow, Globe, Hash } from "lucide-react";
+import { ZoomIn, ZoomOut, Mic, Monitor, AppWindow, Globe, Hash, RotateCcw, Phone, PanelBottomClose, PanelBottomOpen } from "lucide-react";
+import type { Meeting } from "@/lib/hooks/use-meetings";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import posthog from "posthog-js";
@@ -132,6 +133,14 @@ interface TimelineSliderProps {
 	onSpeakerChange?: (speaker: string) => void;
 	selectedTag?: string; // "all" or a tag name
 	onTagChange?: (tag: string) => void;
+	meetings?: Meeting[]; // Detected meetings for call filter
+	selectedMeeting?: string; // "all" or a meeting id
+	onMeetingChange?: (meetingId: string) => void;
+	onRefresh?: () => void;
+	/** Ref attached to the filter column — used for Live Text click guard */
+	filtersRef?: React.MutableRefObject<HTMLDivElement | null>;
+	/** Ref attached to the scrubber area — used for Live Text click guard */
+	scrubberRef?: React.MutableRefObject<HTMLDivElement | null>;
 }
 
 interface AppGroup {
@@ -282,10 +291,18 @@ export const TimelineSlider = ({
 	onSpeakerChange,
 	selectedTag = "all",
 	onTagChange,
+	meetings = [],
+	selectedMeeting = "all",
+	onMeetingChange,
+	onRefresh,
+	filtersRef,
+	scrubberRef,
 }: TimelineSliderProps) => {
 	const containerRef = useRef<HTMLDivElement>(null);
 	const observerTargetRef = useRef<HTMLDivElement>(null);
+	const forwardObserverTargetRef = useRef<HTMLDivElement>(null);
 	const lastFetchRef = useRef<Date | null>(null);
+	const lastForwardFetchRef = useRef<Date | null>(null);
 
 	const [hoveredTimestamp, setHoveredTimestamp] = useState<string | null>(null);
 	const [hoveredRect, setHoveredRect] = useState<{ x: number; y: number } | null>(null);
@@ -384,6 +401,7 @@ export const TimelineSlider = ({
 
 	// Filter dot tooltip state (portal-based to escape overflow clipping)
 	const [hoveredFilterDot, setHoveredFilterDot] = useState<{ name: string; x: number; y: number } | null>(null);
+	const [filtersCollapsed, setFiltersCollapsed] = useState(false);
 	// Which filter section is expanded (icon column design E)
 	const [expandedFilterSection, setExpandedFilterSection] = useState<string | null>(null);
 
@@ -445,15 +463,16 @@ export const TimelineSlider = ({
 	}, [zoomLevel]);
 
 
-	// Pre-compute frame index map for O(1) lookups instead of O(n) indexOf
-	// This reduces 2.68M comparisons per render to just 400 Map lookups
+	// Pre-compute frame index map for O(1) lookups instead of O(n) indexOf.
+	// Uses object identity (WeakMap) so duplicate timestamps don't collide.
 	const frameIndexMap = useMemo(() => {
-		const map = new Map<string, number>();
+		const map = new WeakMap<StreamTimeSeriesResponse, number>();
 		frames.forEach((frame, index) => {
-			map.set(frame.timestamp, index);
+			map.set(frame, index);
 		});
 		return map;
 	}, [frames]);
+
 
 	// Whether the user is actively interacting (popover open, dragging, or has selection).
 	// When true we freeze the visible frames to prevent server pushes from
@@ -750,6 +769,40 @@ export const TimelineSlider = ({
 		return () => observer.disconnect();
 	}, [fetchNextDayData, currentDate, startAndEndDates]);
 
+	// Forward observer: fetch newer day's data when scrolling left (toward newer frames)
+	useEffect(() => {
+		const forwardTarget = forwardObserverTargetRef.current;
+		if (!forwardTarget) return;
+
+		const forwardObserver = new IntersectionObserver(
+			(entries) => {
+				const entry = entries[0];
+				if (!entry.isIntersecting) return;
+
+				const nextDate = addDays(currentDate, 1);
+				const today = startOfDay(new Date());
+				const now = new Date();
+				const canFetch =
+					!lastForwardFetchRef.current ||
+					now.getTime() - lastForwardFetchRef.current.getTime() > 1000;
+
+				// Don't fetch beyond today
+				if (!isAfter(startOfDay(nextDate), today) && canFetch) {
+					lastForwardFetchRef.current = now;
+					fetchNextDayData(nextDate);
+				}
+			},
+			{
+				root: containerRef.current,
+				threshold: 1.0,
+				rootMargin: "0px 0px 0px 20%",
+			},
+		);
+
+		forwardObserver.observe(forwardTarget);
+		return () => forwardObserver.disconnect();
+	}, [fetchNextDayData, currentDate]);
+
 	useEffect(() => {
 		const container = containerRef.current;
 		if (!container || !frames[currentIndex]) return;
@@ -896,12 +949,26 @@ export const TimelineSlider = ({
 		<div className="relative w-full" dir="rtl">
 			{/* Filter icon column + inline expand (design E) */}
 			<div
+				ref={(el) => { if (filtersRef) filtersRef.current = el; }}
 				className="absolute left-3 bottom-[calc(100%-60px)] z-30 flex flex-col gap-0.5 items-start"
 				dir="ltr"
 				onMouseLeave={() => setExpandedFilterSection(null)}
 			>
+				{/* Refresh row */}
+				{onRefresh && (
+					<button
+						className={cn(
+							"p-1.5 rounded-md transition-colors shrink-0",
+							"bg-background/80 backdrop-blur-sm border border-border",
+						)}
+						onClick={onRefresh}
+						title="Refresh timeline"
+					>
+						<RotateCcw className="w-3.5 h-3.5 text-foreground/70" />
+					</button>
+				)}
 				{/* Monitor row */}
-				{allDeviceIds.length > 1 && onDeviceChange && (
+				{allDeviceIds.length > 1 && onDeviceChange && !filtersCollapsed && (
 					<div
 						className="flex items-center gap-0 group/filter"
 						onMouseEnter={() => setExpandedFilterSection("monitor")}
@@ -949,7 +1016,7 @@ export const TimelineSlider = ({
 					</div>
 				)}
 				{/* App row */}
-				{viewportAppNames.length > 1 && onAppChange && (
+				{viewportAppNames.length > 1 && onAppChange && !filtersCollapsed && (
 					<div
 						className="flex items-center gap-0 group/filter"
 						onMouseEnter={() => setExpandedFilterSection("app")}
@@ -997,7 +1064,7 @@ export const TimelineSlider = ({
 					</div>
 				)}
 				{/* Domain row */}
-				{viewportDomains.length > 1 && onDomainChange && (
+				{viewportDomains.length > 1 && onDomainChange && !filtersCollapsed && (
 					<div
 						className="flex items-center gap-0 group/filter"
 						onMouseEnter={() => setExpandedFilterSection("domain")}
@@ -1045,7 +1112,7 @@ export const TimelineSlider = ({
 					</div>
 				)}
 				{/* Speaker row */}
-				{viewportSpeakers.length > 0 && onSpeakerChange && (
+				{viewportSpeakers.length > 0 && onSpeakerChange && !filtersCollapsed && (
 					<div
 						className="flex items-center gap-0 group/filter"
 						onMouseEnter={() => setExpandedFilterSection("speaker")}
@@ -1092,8 +1159,63 @@ export const TimelineSlider = ({
 						</div>
 					</div>
 				)}
+				{/* Calls row */}
+				{meetings.length > 0 && onMeetingChange && !filtersCollapsed && (
+					<div
+						className="flex items-center gap-0 group/filter"
+						onMouseEnter={() => setExpandedFilterSection("calls")}
+					>
+						<button
+							className={cn(
+								"p-1.5 rounded-l-md transition-colors shrink-0",
+								"bg-background/80 backdrop-blur-sm border border-border border-r-0",
+								expandedFilterSection === "calls" && "bg-foreground/10",
+								selectedMeeting !== "all" && "ring-1 ring-primary/50",
+							)}
+							title="Calls"
+						>
+							<Phone className="w-3.5 h-3.5 text-foreground/70" />
+						</button>
+						<div
+							className={cn(
+								"flex items-center gap-1.5 overflow-hidden transition-all duration-200 ease-out",
+								"bg-background/80 backdrop-blur-sm border border-border border-l-0 rounded-r-md",
+								expandedFilterSection === "calls" ? "max-w-[300px] px-2 py-1.5 opacity-100" : "max-w-0 px-0 py-1.5 opacity-0 border-transparent",
+							)}
+						>
+							{meetings.map((meeting) => {
+								const speakerNames = [...meeting.speakers.values()].map((s) => s.name);
+								const label = speakerNames.length > 0
+									? speakerNames.slice(0, 2).join(", ") + (speakerNames.length > 2 ? ` +${speakerNames.length - 2}` : "")
+									: `${Math.round(meeting.durationSecs / 60)}m call`;
+								const timeLabel = `${meeting.startTime.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`;
+								return (
+									<button
+										key={meeting.id}
+										onClick={() => onMeetingChange(selectedMeeting === meeting.id ? "all" : meeting.id)}
+										className="rounded-full transition-all duration-200 hover:scale-125 shrink-0"
+										style={{
+											width: selectedMeeting === meeting.id ? 8 : 6,
+											height: selectedMeeting === meeting.id ? 8 : 6,
+											backgroundColor: selectedMeeting === meeting.id
+												? "hsl(var(--primary))"
+												: selectedMeeting === "all"
+													? "hsl(142, 40%, 55%)"
+													: "hsl(var(--foreground) / 0.15)",
+										}}
+										onMouseEnter={(e) => {
+											const rect = e.currentTarget.getBoundingClientRect();
+											setHoveredFilterDot({ name: `${label} (${timeLabel})`, x: rect.right + 8, y: rect.top + rect.height / 2 });
+										}}
+										onMouseLeave={() => setHoveredFilterDot(null)}
+									/>
+								);
+							})}
+						</div>
+					</div>
+				)}
 				{/* Tag row */}
-				{viewportTags.length > 0 && onTagChange && (
+				{viewportTags.length > 0 && onTagChange && !filtersCollapsed && (
 					<div
 						className="flex items-center gap-0 group/filter"
 						onMouseEnter={() => setExpandedFilterSection("tag")}
@@ -1175,10 +1297,28 @@ export const TimelineSlider = ({
 						</span>
 					</div>
 				</div>
+				{/* Collapse/expand filters toggle */}
+				<button
+					className={cn(
+						"p-1.5 rounded-md transition-colors shrink-0",
+						"bg-background/80 backdrop-blur-sm border border-border",
+					)}
+					onClick={() => setFiltersCollapsed((prev) => !prev)}
+					title={filtersCollapsed ? "Show filters" : "Hide filters"}
+				>
+					{filtersCollapsed ? (
+						<PanelBottomOpen className="w-3.5 h-3.5 text-foreground/70" />
+					) : (
+						<PanelBottomClose className="w-3.5 h-3.5 text-foreground/70" />
+					)}
+				</button>
 			</div>
 
 			<div
-				ref={containerRef}
+				ref={(el) => {
+					(containerRef as React.MutableRefObject<HTMLDivElement | null>).current = el;
+					if (scrubberRef) (scrubberRef as React.MutableRefObject<HTMLDivElement | null>).current = el;
+				}}
 				tabIndex={0}
 				className="w-full overflow-x-auto overflow-y-visible scrollbar-hide bg-gradient-to-t from-black/50 to-black/0 outline-none"
 				style={{
@@ -1191,6 +1331,7 @@ export const TimelineSlider = ({
 					onMouseUp={handleDragEnd}
 					onMouseLeave={handleDragEnd}
 				>
+					<div ref={forwardObserverTargetRef} className="h-full w-1" />
 					{appGroups.map((group, groupIndex) => {
 						const groupWidth = getGroupWidth(group);
 						const showLabel = groupWidth > 60; // Only show label if group is wide enough
@@ -1348,8 +1489,8 @@ export const TimelineSlider = ({
 								)}
 
 								{group.frames.map((frame, frameIdx) => {
-									// O(1) lookup instead of O(n) indexOf
-									const frameIndex = frameIndexMap.get(frame.timestamp) ?? -1;
+									// O(1) lookup via object identity (WeakMap)
+									const frameIndex = frameIndexMap.get(frame) ?? -1;
 									const isSelected = selectedIndices.has(frameIndex);
 									const frameDate = new Date(frame.timestamp);
 									const isInRange =
@@ -1369,7 +1510,9 @@ export const TimelineSlider = ({
 									const frameIdForTag = frame.devices?.[0]?.frame_id || '';
 									const frameTagsForFilter = frameIdForTag ? (tags[frameIdForTag] || []) : [];
 									const matchesTag = selectedTag === "all" || frameTagsForFilter.includes(selectedTag);
-									const matchesFilter = matchesDevice && matchesApp && matchesDomain && matchesSpeaker && matchesTag;
+									const activeMeeting = selectedMeeting !== "all" ? meetings.find((m) => m.id === selectedMeeting) : null;
+									const matchesMeeting = !activeMeeting || (frameIndex >= activeMeeting.frameIndexRange.first && frameIndex <= activeMeeting.frameIndexRange.last);
+									const matchesFilter = matchesDevice && matchesApp && matchesDomain && matchesSpeaker && matchesTag && matchesMeeting;
 
 									// Show time marker on first frame of each hour
 									const showTimeMarker = timeMarkers.some(
@@ -1455,6 +1598,7 @@ export const TimelineSlider = ({
 													{timeMarker.time}
 												</div>
 											)}
+
 
 											{/* Tooltip on hover — rendered via portal to escape overflow clipping */}
 											{shouldShowTooltip && hoveredRect && createPortal(

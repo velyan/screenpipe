@@ -10,11 +10,12 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { useSettings, ChatMessage, ChatConversation } from "@/lib/hooks/use-settings";
 import { cn } from "@/lib/utils";
-import { Loader2, Send, Square, User, Settings, ExternalLink, X, ImageIcon, Zap, History, Search, Trash2, ChevronLeft, ChevronDown, ChevronUp, Plus, Copy, Check, Clock, Paperclip } from "lucide-react";
+import { Loader2, Send, Square, User, Settings, ExternalLink, X, ImageIcon, Zap, History, Search, Trash2, ChevronLeft, ChevronDown, ChevronUp, Plus, Copy, Check, Clock, Paperclip, Filter } from "lucide-react";
 import { SchedulePromptDialog } from "@/components/chat/schedule-prompt-dialog";
 import { toast } from "@/components/ui/use-toast";
 import { motion, AnimatePresence } from "framer-motion";
 import { PipeAIIcon, PipeAIIconLarge } from "@/components/pipe-ai-icon";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { MemoizedReactMarkdown } from "@/components/markdown";
 import { VideoComponent } from "@/components/rewind/video";
 import { MermaidDiagram } from "@/components/rewind/mermaid-diagram";
@@ -28,6 +29,7 @@ import { save as saveDialog, open as openFileDialog } from "@tauri-apps/plugin-d
 import { writeTextFile, readFile } from "@tauri-apps/plugin-fs";
 import { commands } from "@/lib/utils/tauri";
 import { emit } from "@tauri-apps/api/event";
+import { useChatConversations } from "@/components/hooks/use-chat-conversations";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { usePlatform } from "@/lib/hooks/use-platform";
@@ -91,42 +93,57 @@ function buildSystemPrompt(): string {
 
   return `You are a helpful AI assistant that can search through the user's Screenpipe data - their screen recordings, audio transcriptions, and UI interactions.
 
-CRITICAL SEARCH RULES (database has 600k+ entries - ALWAYS use time filters):
+BEHAVIOR RULES:
+- Act immediately on clear requests. NEVER ask for confirmation when the user's intent is obvious.
+- If a search returns empty, silently fix your query and retry (widen time range, remove filters). Do NOT list "possibilities" or ask the user what to do.
+- Be concise. Cite timestamps when relevant. Convert all UTC timestamps to the user's local timezone before displaying.
+
+TOOL SELECTION (use the right tool for the job):
+- "meeting", "call", "conversation", "what did I/they say" → search with content_type: "audio", NO q param
+- "how long", "time spent", "which apps", "most used" → use activity-summary (NOT raw frame counts or SQL)
+- "what was on screen", "what was I reading/looking at" → search with content_type: "all" or "accessibility"
+- Broad overview ("what was I doing?") → activity-summary FIRST, then drill into search-content
+
+CRITICAL SEARCH RULES (database has 600k+ entries):
 1. ALWAYS include start_time in EVERY search - NEVER search without a time range
 2. Default time range: last 1-2 hours. Expand ONLY if no results found
-3. First search: ONLY use time params (start_time, end_time). No q, no app_name, no content_type. This gives ground truth of what's recorded. Scan results to find correct app_name values, then narrow with filters using exact observed values. App names are case-sensitive and may differ from user input (e.g. "Discord" vs "Discord.exe" vs "discord"). The q param searches captured text (accessibility/OCR), NOT app names.
+3. First search: ONLY use time params (start_time, end_time). No q, no app_name, no content_type. This gives ground truth of what's recorded. Scan results to find correct app_name values, then narrow with filters using exact observed values. App names are case-sensitive (e.g. "Discord" vs "Discord.exe"). The q param searches captured text, NOT app names.
 4. NEVER report "no data found" after one filtered search. Verify with unfiltered time-only search first.
 5. Keep limit=5-10 per search. NEVER use limit > 50
 6. Maximum 10 search/API calls per user request. Stop and summarize what you have
-7. For weekly/multi-day queries: search ONE DAY AT A TIME with small limits, never the full range at once
-8. Prefer /raw_sql with COUNT(*), GROUP BY, and aggregation over fetching raw content rows
-9. All /raw_sql SELECT queries MUST include a LIMIT clause (max 10000). The server will reject queries without LIMIT
+7. For weekly/multi-day queries: search ONE DAY AT A TIME with small limits
+8. Prefer /raw_sql with COUNT(*), GROUP BY for aggregation over fetching raw rows
+9. All /raw_sql SELECT queries MUST include a LIMIT clause (max 10000)
+
+EXAMPLES OF GOOD SEARCHES:
+- User: "summarize my meeting" → search content_type:"audio", start_time:"2h ago", NO q param → summarize transcriptions
+- User: "what apps did I use today" → call activity-summary with start_time: today_start, end_time: now → report active_minutes per app
+- User: "what was I reading about X" → search q:"X", start_time:"3h ago" → show text with deep links
 
 Rules for showing videos/audio:
 - Show videos by putting .mp4 file paths in inline code blocks: \`/path/to/video.mp4\`
 - Use the exact, absolute file_path from search results
 
-Be concise. Cite timestamps when relevant.
-IMPORTANT: All timestamps from the API/database are in UTC. You MUST convert them to the user's local timezone (shown below) before displaying. For example, if the API returns "2024-01-15T13:00:00Z" and the user is in UTC+1, display "2:00 PM" not "1:00 PM".
+SPEAKER MANAGEMENT (localhost:3030):
+- GET /speakers/unnamed?limit=10 — list unnamed speakers
+- GET /speakers/search?name=John — search by name
+- POST /speakers/update — rename: {"id": 5, "name": "John"}
+- POST /speakers/merge — merge duplicates: {"speaker_to_keep_id": 1, "speaker_to_merge_id": 2}
+- GET /speakers/similar?speaker_id=5 — find similar speakers
+- POST /speakers/reassign — reassign audio chunk to different speaker
 
 FULL API REFERENCE:
-For the complete list of 60+ screenpipe API endpoints (frames, audio, vision, tags, speakers, pipes, streaming, etc.), fetch: https://docs.screenpi.pe/llms-full.txt
-Only fetch this when you need endpoints beyond /search (e.g., tags, speakers, pipes, frames, audio control).
+For the complete list of 60+ screenpipe API endpoints (frames, audio, pipes, tags, etc.), fetch: https://docs.screenpi.pe/llms-full.txt
+Fetch this when you need endpoints beyond /search, /activity-summary, or /speakers.
 
 VISUALIZATION:
-When the user asks for diagrams, flowcharts, or visualizations, generate Mermaid diagrams using fenced code blocks with the "mermaid" language tag. Example:
-\`\`\`mermaid
-graph TD
-    A[Start] --> B[Process]
-    B --> C[End]
-\`\`\`
-Use flowcharts (graph TD/LR), sequence diagrams, pie charts, etc. as appropriate.
+When the user asks for diagrams, flowcharts, or visualizations, generate Mermaid diagrams using fenced code blocks with the "mermaid" language tag.
 
 DEEP LINKS & MEDIA:
 - Frame (PREFERRED): [10:30 AM — Chrome](screenpipe://frame/12345) — use frame_id from OCR search results. NEVER invent frame IDs.
 - Timeline (audio only): [meeting at 3pm](screenpipe://timeline?timestamp=2024-01-15T15:00:00Z) — use exact timestamp from audio search results.
 - Video: show .mp4 paths in inline code: \`/path/to/video.mp4\`
-ALWAYS use screenpipe://frame/{frame_id} for OCR results. Only use screenpipe://timeline for audio results (no frame_id). Copy IDs/timestamps verbatim from search results — NEVER fabricate them.
+NEVER fabricate frame IDs or timestamps — only use values from actual search results.
 
 Current time: ${now.toISOString()}
 User's timezone: ${timezone} (UTC${offsetStr})
@@ -192,11 +209,13 @@ function GridDissolveLoader({
   label,
   toolName,
   thinkingSecs,
+  tokenCount,
 }: {
   phase?: LoaderPhase;
   label?: string;
   toolName?: string;
   thinkingSecs?: number;
+  tokenCount?: number;
 }) {
   const ROWS = 3;
   const COLS = 5;
@@ -246,6 +265,12 @@ function GridDissolveLoader({
     "analyzing..."
   );
 
+  const tokenLabel = tokenCount != null && tokenCount > 0
+    ? tokenCount >= 1000
+      ? `${(tokenCount / 1000).toFixed(1)}k tokens`
+      : `${tokenCount} tokens`
+    : null;
+
   return (
     <div className="flex items-center gap-2">
       <div
@@ -272,70 +297,147 @@ function GridDissolveLoader({
         ))}
       </div>
       <span className="text-[11px] font-mono text-muted-foreground tracking-wide">
-        {displayLabel}
+        {displayLabel}{tokenLabel && <span className="ml-1.5 opacity-60">· {tokenLabel}</span>}
       </span>
     </div>
   );
 }
 
-function ToolCallBlock({ toolCall }: { toolCall: ToolCall }) {
-  const [expanded, setExpanded] = useState(false);
-  const icon = TOOL_ICONS[toolCall.toolName] || "🔧";
+// Human-friendly label for a tool call (no JSON, no raw paths)
+function friendlyToolLabel(toolCall: ToolCall): string {
+  const fileName = (p: string) => p.split("/").pop() || p;
+  switch (toolCall.toolName) {
+    case "bash":
+      return `Ran ${toolCall.args.command ? `\`${String(toolCall.args.command).slice(0, 60)}${String(toolCall.args.command).length > 60 ? "…" : ""}\`` : "command"}`;
+    case "read":
+      return `Read ${fileName(toolCall.args.path || "")}`;
+    case "edit":
+      return `Edited ${fileName(toolCall.args.path || "")}`;
+    case "write":
+      return `Wrote ${fileName(toolCall.args.path || "")}`;
+    case "grep":
+      return `Searched for \`${toolCall.args.pattern || "pattern"}\``;
+    case "find":
+    case "ls":
+      return `Listed files`;
+    default:
+      return `${toolCall.toolName}`;
+  }
+}
 
-  // Format args for display
-  const argsPreview = toolCall.toolName === "bash"
-    ? toolCall.args.command || ""
-    : toolCall.toolName === "read"
-      ? toolCall.args.path || ""
-      : toolCall.toolName === "edit"
-        ? toolCall.args.path || ""
-        : toolCall.toolName === "write"
-          ? toolCall.args.path || ""
-          : JSON.stringify(toolCall.args).slice(0, 100);
+// Render friendly expanded details instead of raw JSON
+function FriendlyToolDetails({ toolCall }: { toolCall: ToolCall }) {
+  if (toolCall.toolName === "edit" && toolCall.args.old_string && toolCall.args.new_string) {
+    return (
+      <div className="py-1.5 text-xs font-mono space-y-0">
+        {String(toolCall.args.old_string).split("\n").map((line: string, i: number) => (
+          <div key={`old-${i}`} className="text-foreground/40">- {line}</div>
+        ))}
+        {String(toolCall.args.new_string).split("\n").map((line: string, i: number) => (
+          <div key={`new-${i}`} className="text-foreground/80">+ {line}</div>
+        ))}
+      </div>
+    );
+  }
+  if (toolCall.toolName === "bash" && toolCall.args.command) {
+    return (
+      <div className="py-1.5">
+        <pre className="whitespace-pre-wrap break-words text-foreground/70 text-xs font-mono max-h-[200px] overflow-y-auto overflow-x-hidden max-w-full">
+          {toolCall.args.command}
+        </pre>
+      </div>
+    );
+  }
+  const entries = Object.entries(toolCall.args).filter(([k]) => k !== "path" && k !== "command");
+  if (entries.length === 0) return null;
+  return (
+    <div className="py-1.5 text-xs font-mono text-muted-foreground space-y-0">
+      {entries.map(([key, val]) => (
+        <div key={key} className="truncate">
+          <span className="text-foreground/40">{key}:</span>{" "}
+          <span className="text-foreground/70">{typeof val === "string" ? val.slice(0, 200) : JSON.stringify(val).slice(0, 200)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// Single tool call row in the progress rail
+function ToolCallRailItem({ toolCall, isLast }: { toolCall: ToolCall; isLast: boolean }) {
+  const [expanded, setExpanded] = useState(false);
+  const label = friendlyToolLabel(toolCall);
 
   return (
-    <div className="rounded-lg border border-border/50 bg-background/50 text-xs font-mono overflow-hidden w-full min-w-0">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-2 px-3 py-1.5 hover:bg-muted/50 transition-colors text-left min-w-0"
-      >
-        {toolCall.isRunning ? (
-          <Loader2 className="h-3 w-3 animate-spin text-muted-foreground flex-shrink-0" />
-        ) : toolCall.isError ? (
-          <span className="text-destructive flex-shrink-0">✗</span>
-        ) : (
-          <span className="text-green-500 flex-shrink-0">✓</span>
-        )}
-        <span className="text-muted-foreground flex-shrink-0">{icon}</span>
-        <span className="font-semibold flex-shrink-0">{toolCall.toolName}</span>
-        <span className="text-muted-foreground truncate flex-1">{argsPreview}</span>
-        <span className="text-muted-foreground flex-shrink-0">{expanded ? "▾" : "▸"}</span>
-      </button>
-      {expanded && (
-        <div className="border-t border-border/50">
-          {/* Args */}
-          <div className="px-3 py-2 bg-neutral-900 dark:bg-neutral-950 text-neutral-300">
-            <div className="text-[10px] uppercase tracking-wider text-neutral-500 mb-1">input</div>
-            <pre className="whitespace-pre-wrap break-words text-neutral-100 max-h-[200px] overflow-y-auto overflow-x-hidden max-w-full">
-              {toolCall.toolName === "bash" ? toolCall.args.command : JSON.stringify(toolCall.args, null, 2)}
-            </pre>
-          </div>
-          {/* Result */}
-          {toolCall.result !== undefined && (
-            <div className="px-3 py-2 bg-neutral-900/80 dark:bg-neutral-950/80 text-neutral-300 border-t border-neutral-800">
-              <div className="text-[10px] uppercase tracking-wider text-neutral-500 mb-1">
-                {toolCall.isError ? "error" : "output"}
-              </div>
-              <pre className={cn(
-                "whitespace-pre-wrap break-words max-h-[300px] overflow-y-auto overflow-x-hidden max-w-full",
-                toolCall.isError ? "text-red-400" : "text-neutral-100"
-              )}>
-                {toolCall.result}
-              </pre>
-            </div>
+    <div className="relative flex min-w-0">
+      {/* Vertical rail line */}
+      <div className="flex flex-col items-center flex-shrink-0 w-5">
+        {/* Dot */}
+        <div className="relative flex items-center justify-center w-5 h-5">
+          {toolCall.isRunning ? (
+            // Pulsing hollow dot for running
+            <motion.div
+              className="w-2 h-2 border border-foreground"
+              animate={{ opacity: [1, 1, 0.3, 0.3, 1] }}
+              transition={{ duration: 1, repeat: Infinity, times: [0, 0.25, 0.25, 0.75, 0.75], ease: "linear" }}
+            />
+          ) : toolCall.isError ? (
+            // X mark for error
+            <span className="text-[10px] font-mono font-bold text-foreground leading-none">✗</span>
+          ) : (
+            // Solid dot for success
+            <motion.div
+              className="w-2 h-2 bg-foreground"
+              initial={{ scale: 0 }}
+              animate={{ scale: 1 }}
+              transition={{ duration: 0.15, ease: "easeOut" }}
+            />
           )}
         </div>
-      )}
+        {/* Connecting line */}
+        {!isLast && (
+          <div className="w-px flex-1 bg-border" />
+        )}
+      </div>
+
+      {/* Content */}
+      <div className="flex-1 min-w-0 pb-2">
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="w-full flex items-center gap-1.5 text-left min-w-0 group py-0.5"
+        >
+          <span className="truncate flex-1 text-xs font-mono text-foreground/70 group-hover:text-foreground transition-colors duration-150">
+            {label}
+          </span>
+          <span className="text-foreground/30 flex-shrink-0 text-[10px] font-mono group-hover:text-foreground/60 transition-colors duration-150">
+            {expanded ? "−" : "+"}
+          </span>
+        </button>
+        <AnimatePresence>
+          {expanded && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: "auto", opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              transition={{ duration: 0.15 }}
+              className="overflow-hidden"
+            >
+              <div className="border-l border-border ml-0 pl-3 mt-1 mb-1">
+                <FriendlyToolDetails toolCall={toolCall} />
+                {toolCall.result !== undefined && (
+                  <div className="mt-1 pt-1 border-t border-border/50">
+                    <pre className={cn(
+                      "whitespace-pre-wrap break-words max-h-[300px] overflow-y-auto overflow-x-hidden max-w-full text-xs font-mono",
+                      toolCall.isError ? "text-foreground/50" : "text-foreground/60"
+                    )}>
+                      {toolCall.result}
+                    </pre>
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
     </div>
   );
 }
@@ -445,7 +547,7 @@ function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
         },
         pre({ children, ...props }) {
           return (
-            <pre className="overflow-x-auto rounded-lg bg-neutral-900 dark:bg-neutral-950 text-neutral-100 p-3 my-2 text-xs max-w-full" {...props}>
+            <pre className="overflow-x-auto rounded-lg bg-muted text-foreground p-3 my-2 text-xs max-w-full" {...props}>
               {children}
             </pre>
           );
@@ -518,66 +620,104 @@ function groupContentBlocks(blocks: ContentBlock[]): GroupedBlock[] {
   return result;
 }
 
-function ToolCallGroup({ toolCalls }: { toolCalls: ToolCall[] }) {
-  const [expanded, setExpanded] = useState(false);
-
-  // For 1-2 tool calls, render individually (not worth collapsing)
-  if (toolCalls.length <= 2) {
-    return (
-      <>
-        {toolCalls.map((tc) => (
-          <ToolCallBlock key={tc.id} toolCall={tc} />
-        ))}
-      </>
-    );
+// Build natural-language summary of completed tool calls
+function buildToolSummary(toolCalls: ToolCall[]): string {
+  const counts: Record<string, number> = {};
+  for (const tc of toolCalls) {
+    const action = tc.toolName === "bash" ? "ran" : tc.toolName === "read" ? "read" : tc.toolName === "edit" ? "edited" : tc.toolName === "write" ? "wrote" : tc.toolName === "grep" ? "searched" : tc.toolName;
+    counts[action] = (counts[action] || 0) + 1;
   }
+  const parts = Object.entries(counts).map(([action, count]) => {
+    if (action === "read") return `read ${count} file${count > 1 ? "s" : ""}`;
+    if (action === "edited") return `edited ${count} file${count > 1 ? "s" : ""}`;
+    if (action === "wrote") return `wrote ${count} file${count > 1 ? "s" : ""}`;
+    if (action === "ran") return `ran ${count} command${count > 1 ? "s" : ""}`;
+    if (action === "searched") return `${count} search${count > 1 ? "es" : ""}`;
+    return `${count} ${action}`;
+  });
+  return parts.join(", ");
+}
 
-  const doneCount = toolCalls.filter((tc) => !tc.isRunning).length;
-  const total = toolCalls.length;
+function ToolCallGroup({ toolCalls }: { toolCalls: ToolCall[] }) {
+  const [manualExpand, setManualExpand] = useState<boolean | null>(null);
+
   const hasRunning = toolCalls.some((tc) => tc.isRunning);
   const hasError = toolCalls.some((tc) => tc.isError);
-  const activeCall = toolCalls.find((tc) => tc.isRunning);
+  const allDone = !hasRunning;
+  const doneCount = toolCalls.filter((tc) => !tc.isRunning).length;
+  const total = toolCalls.length;
+  const summary = allDone ? buildToolSummary(toolCalls) : "";
 
-  // Build a short preview of the active tool call
-  const activePreview = activeCall
-    ? `${activeCall.toolName} ${
-        activeCall.toolName === "bash"
-          ? activeCall.args.command || ""
-          : activeCall.toolName === "read" || activeCall.toolName === "edit" || activeCall.toolName === "write"
-            ? activeCall.args.path || ""
-            : ""
-      }`.trim()
-    : "";
+  // Auto-expand while running, auto-collapse when done (user can override)
+  const isExpanded = manualExpand !== null ? manualExpand : hasRunning;
 
   return (
-    <div className="rounded-lg border border-border/50 bg-background/50 text-xs font-mono overflow-hidden w-full min-w-0">
+    <div className="w-full min-w-0">
+      {/* Header bar — clickable to toggle */}
       <button
-        onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-2 px-3 py-1.5 hover:bg-muted/50 transition-colors text-left min-w-0"
+        onClick={() => setManualExpand(isExpanded ? false : true)}
+        className="w-full flex items-center gap-2 py-1 text-left min-w-0 group"
       >
-        {hasRunning ? (
-          <Loader2 className="h-3 w-3 animate-spin text-muted-foreground flex-shrink-0" />
-        ) : hasError ? (
-          <span className="text-destructive flex-shrink-0">✗</span>
-        ) : (
-          <span className="text-green-500 flex-shrink-0">✓</span>
-        )}
-        <span className="font-semibold flex-shrink-0">
-          {total} steps{hasRunning ? ` (${doneCount}/${total})` : ""}
+        {/* Status indicator */}
+        <span className="flex-shrink-0 text-xs font-mono text-foreground/40">
+          {hasRunning ? (
+            <motion.span
+              className="inline-block"
+              animate={{ opacity: [1, 1, 0.3, 0.3, 1] }}
+              transition={{ duration: 1, repeat: Infinity, times: [0, 0.25, 0.25, 0.75, 0.75], ease: "linear" }}
+            >
+              [{doneCount}/{total}]
+            </motion.span>
+          ) : (
+            <span>[{total}]</span>
+          )}
         </span>
-        {!expanded && activePreview && (
-          <span className="text-muted-foreground truncate flex-1">{activePreview}</span>
-        )}
-        {!activePreview && <span className="flex-1" />}
-        <span className="text-muted-foreground flex-shrink-0">{expanded ? "▾" : "▸"}</span>
+
+        {/* Summary text */}
+        <span className="truncate flex-1 text-xs font-mono text-foreground/50 group-hover:text-foreground/80 transition-colors duration-150">
+          {hasRunning
+            ? friendlyToolLabel(toolCalls.find((tc) => tc.isRunning)!)
+            : summary || `${total} steps`
+          }
+          {hasError && allDone && (
+            <span className="ml-1.5 text-foreground/30">· {toolCalls.filter(tc => tc.isError).length} failed</span>
+          )}
+        </span>
+
+        {/* Expand chevron */}
+        <span className="flex-shrink-0 text-[10px] font-mono text-foreground/30 group-hover:text-foreground/60 transition-colors duration-150">
+          {isExpanded ? "▾" : "▸"}
+        </span>
       </button>
-      {expanded && (
-        <div className="border-t border-border/50 space-y-1 p-2">
-          {toolCalls.map((tc) => (
-            <ToolCallBlock key={tc.id} toolCall={tc} />
-          ))}
-        </div>
-      )}
+
+      {/* Expanded rail view */}
+      <AnimatePresence>
+        {isExpanded && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.15 }}
+            className="overflow-hidden"
+          >
+            <div className="pl-1 pt-1">
+              {toolCalls.map((tc, i) => (
+                <motion.div
+                  key={tc.id}
+                  initial={{ opacity: 0, x: -8 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={{ duration: 0.15, delay: i * 0.03 }}
+                >
+                  <ToolCallRailItem
+                    toolCall={tc}
+                    isLast={i === toolCalls.length - 1}
+                  />
+                </motion.div>
+              ))}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }
@@ -697,6 +837,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [streamedCharCount, setStreamedCharCount] = useState(0);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [activePreset, setActivePreset] = useState<AIPreset | undefined>();
   const [showMentionDropdown, setShowMentionDropdown] = useState(false);
@@ -704,8 +845,12 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
   const [speakerSuggestions, setSpeakerSuggestions] = useState<MentionSuggestion[]>([]);
   const [isLoadingSpeakers, setIsLoadingSpeakers] = useState(false);
+  const [appFilterOpen, setAppFilterOpen] = useState(false);
+  const [recentSpeakers, setRecentSpeakers] = useState<MentionSuggestion[]>([]);
   const abortControllerRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const [isUserScrolledUp, setIsUserScrolledUp] = useState(false);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
@@ -729,6 +874,8 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const piContentBlocksRef = useRef<ContentBlock[]>([]);
   const piStartInFlightRef = useRef(false);
   const piStoppedIntentionallyRef = useRef(false);
+  const piCrashCountRef = useRef(0);
+  const piLastCrashRef = useRef(0);
   const piThinkingStartRef = useRef<number | null>(null);
   const piSessionSyncedRef = useRef(false);
 
@@ -751,8 +898,6 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
   // Chat history state
   const [conversationId, setConversationId] = useState<string | null>(null);
-  const [showHistory, setShowHistory] = useState(false);
-  const [historySearch, setHistorySearch] = useState("");
 
   // Process an image file to base64
   // Resize image to max 1024px and compress as JPEG to keep base64 payload small
@@ -790,261 +935,37 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     reader.readAsDataURL(file);
   }, [resizeImage]);
 
-  // Always start with a fresh conversation — history is accessible via the History button
-  // (No auto-load of last active conversation)
-
-  // Save conversation to settings.
-  // IMPORTANT: reads fresh from the store (not React state) to avoid
-  // race conditions where the main window overwrites chatHistory with
-  // stale data. See: multi-window store concurrency issue.
-  const saveConversation = async (msgs: Message[]) => {
-    if (msgs.length === 0) return;
-
-    // Read fresh settings from store to get latest conversations
-    const { getStore } = await import("@/lib/hooks/use-settings");
-    const store = await getStore();
-    const freshSettings = await store.get<any>("settings");
-    const history = freshSettings?.chatHistory || { conversations: [], activeConversationId: null, historyEnabled: true };
-
-    if (!history.historyEnabled) return;
-
-    const convId = conversationId || crypto.randomUUID();
-
-    const existingIndex = history.conversations.findIndex((c: any) => c.id === convId);
-    const firstUserMsg = msgs.find(m => m.role === "user");
-    const title = firstUserMsg?.content.slice(0, 50) || "New Chat";
-
-    const conversation: ChatConversation = {
-      id: convId,
-      title,
-      messages: msgs.slice(-100).map(m => {
-        // For tool-only responses, content may be empty but contentBlocks has the data.
-        // Generate a text fallback so the message isn't lost when reloaded.
-        let content = m.content;
-        if (!content && m.contentBlocks?.length) {
-          content = m.contentBlocks
-            .filter((b: any) => b.type === "text")
-            .map((b: any) => b.text)
-            .join("\n") || "(tool result)";
-        }
-        // Persist contentBlocks so tool calls/results survive reload.
-        // Strip isRunning (stale) and cap result length to keep store small.
-        const blocks = m.contentBlocks?.map((b: any) => {
-          if (b.type === "tool") {
-            const { isRunning, ...rest } = b.toolCall;
-            return {
-              type: "tool",
-              toolCall: {
-                ...rest,
-                isRunning: false,
-                result: rest.result?.slice(0, 4000),
-              },
-            };
-          }
-          if (b.type === "thinking") {
-            return { ...b, isThinking: false };
-          }
-          return b;
-        });
-        return {
-          id: m.id,
-          role: m.role,
-          content,
-          timestamp: m.timestamp,
-          ...(blocks?.length ? { contentBlocks: blocks } : {}),
-          ...(m.images?.length ? { images: m.images } : {}),
-        };
-      }),
-      createdAt: existingIndex >= 0 ? history.conversations[existingIndex].createdAt : Date.now(),
-      updatedAt: Date.now(),
-    };
-
-    let newConversations = [...history.conversations];
-    if (existingIndex >= 0) {
-      newConversations[existingIndex] = conversation;
-    } else {
-      newConversations = [conversation, ...newConversations].slice(0, 50);
-    }
-
-    // Write only chatHistory — read-modify-write with fresh data
-    const currentFull = freshSettings || {};
-    await store.set("settings", {
-      ...currentFull,
-      chatHistory: {
-        ...history,
-        conversations: newConversations,
-        activeConversationId: convId,
-      }
-    });
-    await store.save();
-
-    if (!conversationId) {
-      setConversationId(convId);
-    }
-  };
-
-  // Auto-save conversation when a response completes (isLoading transitions from true to false)
-  // Skip saving pipe watch conversations — they're transient, not user-initiated chats
-  const prevIsLoadingRef = useRef(false);
-  useEffect(() => {
-    if (prevIsLoadingRef.current && !isLoading && messages.length > 0) {
-      const isPipeWatch = messages.some((m) => m.id?.startsWith("pipe-"));
-      if (!isPipeWatch) {
-        saveConversation(messages);
-      }
-    }
-    prevIsLoadingRef.current = isLoading;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isLoading, messages]);
-
-  // Delete a conversation
-  const deleteConversation = async (convId: string) => {
-    // Read fresh from store (same pattern as saveConversation)
-    const { getStore } = await import("@/lib/hooks/use-settings");
-    const store = await getStore();
-    const freshSettings = await store.get<any>("settings");
-    const history = freshSettings?.chatHistory;
-    if (!history) return;
-
-    const newConversations = history.conversations.filter((c: any) => c.id !== convId);
-    const newActiveId = history.activeConversationId === convId ? null : history.activeConversationId;
-
-    await store.set("settings", {
-      ...freshSettings,
-      chatHistory: {
-        ...history,
-        conversations: newConversations,
-        activeConversationId: newActiveId,
-      }
-    });
-    await store.save();
-
-    if (conversationId === convId) {
-      setMessages([]);
-      setConversationId(null);
-    }
-  };
-
-  // Load a specific conversation
-  const loadConversation = async (conv: ChatConversation) => {
-    // Abort any ongoing Pi processing before switching
-    if (isLoading || isStreaming) {
-      try {
-        await commands.piAbort(PI_CHAT_SESSION);
-      } catch (e) {
-        console.warn("[Pi] Failed to abort:", e);
-      }
-      piStreamingTextRef.current = "";
-      piMessageIdRef.current = null;
-      piContentBlocksRef.current = [];
-      setIsLoading(false);
-      setIsStreaming(false);
-    }
-    setMessages(conv.messages.map(m => ({
-      id: m.id,
-      role: m.role,
-      content: m.content,
-      timestamp: m.timestamp,
-      ...(m.contentBlocks?.length ? { contentBlocks: m.contentBlocks } : {}),
-      ...((m as any).images?.length ? { images: (m as any).images } : (m as any).image ? { images: [(m as any).image] } : {}),
-    })));
-    setConversationId(conv.id);
-    setShowHistory(false);
-    piSessionSyncedRef.current = false;
-
-    // Update activeConversationId directly in the store (read fresh to avoid
-    // overwriting conversations with stale React state)
-    try {
-      const { getStore } = await import("@/lib/hooks/use-settings");
-      const store = await getStore();
-      const freshSettings = await store.get<any>("settings");
-      if (freshSettings?.chatHistory) {
-        await store.set("settings", {
-          ...freshSettings,
-          chatHistory: {
-            ...freshSettings.chatHistory,
-            activeConversationId: conv.id,
-          }
-        });
-        await store.save();
-      }
-    } catch (e) {
-      console.warn("Failed to update active conversation:", e);
-    }
-  };
-
-  // Start a new conversation
-  const startNewConversation = async () => {
-    // Abort any ongoing Pi processing and start a fresh session
-    if (piInfo?.running) {
-      try {
-        if (isLoading || isStreaming) {
-          await commands.piAbort(PI_CHAT_SESSION);
-        }
-        await commands.piNewSession(PI_CHAT_SESSION);
-      } catch (e) {
-        console.warn("[Pi] Failed to reset session:", e);
-      }
-      piStreamingTextRef.current = "";
-      piMessageIdRef.current = null;
-      piContentBlocksRef.current = [];
-      setIsLoading(false);
-      setIsStreaming(false);
-    }
-    setMessages([]);
-    setConversationId(null);
-    setInput("");
-    if (inputRef.current) inputRef.current.style.height = "auto";
-    setShowHistory(false);
-    setPastedImages([]);
-    piSessionSyncedRef.current = true;
-  };
-
-  // Filter conversations by search
-  const filteredConversations = React.useMemo(() => {
-    const convs = settings.chatHistory?.conversations || [];
-    if (!historySearch.trim()) return convs;
-
-    const search = historySearch.toLowerCase();
-    return convs.filter(c =>
-      c.title.toLowerCase().includes(search) ||
-      c.messages.some(m => m.content.toLowerCase().includes(search))
-    );
-  }, [settings.chatHistory?.conversations, historySearch]);
-
-  // Group conversations by date
-  const groupedConversations = React.useMemo(() => {
-    const groups: { label: string; conversations: ChatConversation[] }[] = [];
-    const now = new Date();
-    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000);
-    const lastWeek = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
-
-    const todayConvs: ChatConversation[] = [];
-    const yesterdayConvs: ChatConversation[] = [];
-    const lastWeekConvs: ChatConversation[] = [];
-    const olderConvs: ChatConversation[] = [];
-
-    for (const conv of filteredConversations) {
-      const convDate = new Date(conv.updatedAt);
-      if (convDate >= today) {
-        todayConvs.push(conv);
-      } else if (convDate >= yesterday) {
-        yesterdayConvs.push(conv);
-      } else if (convDate >= lastWeek) {
-        lastWeekConvs.push(conv);
-      } else {
-        olderConvs.push(conv);
-      }
-    }
-
-    if (todayConvs.length > 0) groups.push({ label: "Today", conversations: todayConvs });
-    if (yesterdayConvs.length > 0) groups.push({ label: "Yesterday", conversations: yesterdayConvs });
-    if (lastWeekConvs.length > 0) groups.push({ label: "Last 7 Days", conversations: lastWeekConvs });
-    if (olderConvs.length > 0) groups.push({ label: "Older", conversations: olderConvs });
-
-    return groups;
-  }, [filteredConversations]);
+  // Chat conversations — stored as individual JSON files in ~/.screenpipe/chats/
+  const {
+    showHistory,
+    setShowHistory,
+    historySearch,
+    setHistorySearch,
+    filteredConversations,
+    groupedConversations,
+    saveConversation,
+    loadConversation,
+    deleteConversation,
+    startNewConversation,
+  } = useChatConversations({
+    messages,
+    setMessages,
+    conversationId,
+    setConversationId,
+    setInput,
+    inputRef,
+    isLoading,
+    isStreaming,
+    piInfo,
+    piStreamingTextRef,
+    piMessageIdRef,
+    piContentBlocksRef,
+    piSessionSyncedRef,
+    setIsLoading,
+    setIsStreaming,
+    setPastedImages,
+    settings,
+  });
 
   // Read an image file by path and append it to pastedImages (base64 data URL)
   const loadImageFromPath = useCallback(async (filePath: string) => {
@@ -1159,33 +1080,42 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     const unlisten = listen("chat-ping", () => {
       emit("chat-ready", {});
     });
+    // Check for pending prefill from same-window navigation (e.g. pipes → home)
+    const pending = sessionStorage.getItem("pendingChatPrefill");
+    if (pending) {
+      sessionStorage.removeItem("pendingChatPrefill");
+      try {
+        const data = JSON.parse(pending);
+        // Small delay to let the chat fully initialize
+        setTimeout(() => emit("chat-prefill", data), 500);
+      } catch {}
+    }
     return () => { unlisten.then((fn) => fn()); };
   }, []);
 
+  // Guard against duplicate chat-prefill processing. The listener below
+  // re-subscribes when piInfo changes; during the brief overlap window
+  // (async unlisten hasn't resolved yet) both old and new listeners can
+  // receive the same event, causing duplicate abort→session→prompt sequences.
+  const prefillInFlightRef = useRef(false);
+
   // Listen for chat-prefill events from search modal and pipe creation
   useEffect(() => {
-    const unlisten = listen<{ context: string; prompt?: string; frameId?: number; autoSend?: boolean; source?: string }>("chat-prefill", (event) => {
-      const { context, prompt, frameId, autoSend, source } = event.payload;
+    const unlisten = listen<{ context: string; prompt?: string; frameId?: number; autoSend?: boolean; source?: string; targetWindow?: string }>("chat-prefill", (event) => {
+      const { context, prompt, frameId, autoSend, source, targetWindow } = event.payload;
+
+      // Only process if this window is the intended target (or no target for backwards compat)
+      if (targetWindow && getCurrentWindow().label !== targetWindow) return;
 
       if (autoSend && prompt && context) {
+        // Deduplicate: skip if another listener instance is already handling this
+        if (prefillInFlightRef.current) return;
+        prefillInFlightRef.current = true;
+
         // Auto-send: compose full message (context above, user text below) and send immediately
         const fullMessage = `${context}\n\n${prompt}`;
         // Start a new conversation then send
         (async () => {
-          if (piInfo?.running) {
-            try {
-              // Abort any in-flight processing, then reset session
-              // Always abort — Pi may be processing even if our ref was cleared
-              await commands.piAbort(PI_CHAT_SESSION);
-              // Wait for Pi to process the abort before sending new_session
-              await new Promise(r => setTimeout(r, 500));
-              await commands.piNewSession(PI_CHAT_SESSION);
-              // Wait for Pi to process the session reset before sending prompt
-              await new Promise(r => setTimeout(r, 500));
-            } catch (e) {
-              console.warn("[Pi] Failed to reset session:", e);
-            }
-          }
           // Clear all streaming state so sendPiMessage doesn't think a message is in-flight
           piStreamingTextRef.current = "";
           piMessageIdRef.current = null;
@@ -1215,6 +1145,16 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           };
           const ready = piInfo?.running || await waitForPi(10000);
           if (ready) {
+            // Reset Pi session AFTER confirming it's running to clear any
+            // stale isStreaming state from a previous conversation.
+            // This must happen here, not earlier — on fresh page loads
+            // (e.g. navigateHomeAndPrefill), piInfo is null at mount time
+            // so gating on piInfo?.running would skip this entirely.
+            try {
+              await commands.piNewSession(PI_CHAT_SESSION);
+            } catch (e) {
+              console.warn("[Pi] Failed to reset session before auto-send:", e);
+            }
             // Signal that the next sendPiMessage call should bypass the piInfo guard
             // (we just confirmed Pi is running via waitForPi but React state may be stale)
             autoSendBypassRef.current = true;
@@ -1227,6 +1167,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             }
             autoSendBypassRef.current = false;
           }
+          prefillInFlightRef.current = false;
         })();
         return;
       }
@@ -1250,17 +1191,18 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
   // Listen for chat-load-conversation events from timeline
   useEffect(() => {
-    const unlisten = listen<{ conversationId: string }>("chat-load-conversation", (event) => {
-      const { conversationId } = event.payload;
-      const convs = settings.chatHistory?.conversations || [];
-      const conv = convs.find((c: any) => c.id === conversationId);
+    const unlisten = listen<{ conversationId: string }>("chat-load-conversation", async (event) => {
+      const { conversationId: convId } = event.payload;
+      // Load from file-based storage
+      const { loadConversationFile } = await import("@/lib/chat-storage");
+      const conv = await loadConversationFile(convId);
       if (conv) {
         loadConversation(conv);
       }
     });
     return () => { unlisten.then((fn) => fn()); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings.chatHistory?.conversations]);
+  }, []);
 
   const appMentionSuggestions = React.useMemo(
     () => buildAppMentionSuggestions(appItems, APP_SUGGESTION_LIMIT),
@@ -1510,9 +1452,51 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     return () => window.removeEventListener("keydown", handleEscape);
   }, [showMentionDropdown]);
 
+  // Smart auto-scroll: only scroll to bottom if user is near the bottom.
+  // If user scrolled up to read, don't interrupt them.
   useEffect(() => {
+    if (!isUserScrolledUp) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [messages, isUserScrolledUp]);
+
+  const handleMessagesScroll = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+    // Consider "near bottom" if within 150px of the bottom
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 150;
+    setIsUserScrolledUp(!nearBottom);
+  }, []);
+
+  const scrollToBottom = useCallback(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+    setIsUserScrolledUp(false);
+  }, []);
+
+  // Preload recent speakers when filter popover opens
+  useEffect(() => {
+    if (!appFilterOpen || recentSpeakers.length > 0) return;
+    (async () => {
+      try {
+        const response = await fetch(`${SCREENPIPE_API}/speakers/search?name=`);
+        if (response.ok) {
+          const speakers: Speaker[] = await response.json();
+          setRecentSpeakers(
+            speakers
+              .filter((s) => s.name)
+              .slice(0, 5)
+              .map((s) => ({
+                tag: s.name.includes(" ") ? `@"${s.name}"` : `@${s.name}`,
+                description: "speaker",
+                category: "speaker" as const,
+              }))
+          );
+        }
+      } catch {
+        // silent
+      }
+    })();
+  }, [appFilterOpen, recentSpeakers.length]);
 
   // Pi project dir is managed Rust-side at boot
 
@@ -1610,6 +1594,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           const evt = data.assistantMessageEvent;
           if (evt.type === "text_delta" && evt.delta) {
             piStreamingTextRef.current += evt.delta;
+            setStreamedCharCount(piStreamingTextRef.current.length);
 
             // Append to last text block or create new one
             const blocks = piContentBlocksRef.current;
@@ -1850,6 +1835,11 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                 prev.map((m) => m.id === msgId ? { ...m, content: `Error: ${errMsg}` } : m)
               );
             }
+            piStreamingTextRef.current = "";
+            piMessageIdRef.current = null;
+            piContentBlocksRef.current = [];
+            setIsLoading(false);
+            setIsStreaming(false);
           }
         } else if (data.type === "agent_end") {
           // When watching a pipe, agent_end fires before pipe_done — don't
@@ -1939,6 +1929,15 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
               }
               return prev.map((m) => m.id === msgId ? { ...m, content, contentBlocks } : m);
             });
+
+            if (!isPipeWatch) {
+              posthog.capture("chat_response_received", {
+                provider: activePreset?.provider,
+                model: activePreset?.model,
+                has_tool_use: blocksSnapshot.some((b) => b.type === "tool"),
+                response_length: streamedText?.length ?? 0,
+              });
+            }
           }
           if (!isPipeWatch) {
             piStreamingTextRef.current = "";
@@ -1988,6 +1987,15 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
               );
             }
           }
+          const errorCategory = errorStr.includes("daily_limit") ? "daily_limit"
+            : errorStr.includes("rate limit") || errorStr.includes("429") ? "rate_limit"
+            : errorStr.includes("model_not_allowed") ? "model_not_allowed"
+            : "other";
+          posthog.capture("chat_response_error", {
+            provider: activePreset?.provider,
+            model: activePreset?.model,
+            error_type: errorCategory,
+          });
           piStreamingTextRef.current = "";
           if (piMessageIdRef.current?.startsWith("pipe-")) setActivePipeExecution(null);
           piMessageIdRef.current = null;
@@ -2061,8 +2069,28 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           setIsStreaming(false);
         }
 
-        // Always auto-restart — Pi is a singleton, keep it alive
-        const delay = 1500;
+        // Auto-restart with exponential backoff to avoid crash loops
+        const now = Date.now();
+        const MAX_CRASHES = 5;
+        const CRASH_WINDOW_MS = 60_000; // reset counter after 1 min of stability
+
+        // Reset crash counter if last crash was long ago (Pi was stable)
+        if (now - piLastCrashRef.current > CRASH_WINDOW_MS) {
+          piCrashCountRef.current = 0;
+        }
+        piCrashCountRef.current++;
+        piLastCrashRef.current = now;
+
+        if (piCrashCountRef.current > MAX_CRASHES) {
+          console.error(`[Pi] Crash loop detected (${piCrashCountRef.current} crashes in ${CRASH_WINDOW_MS / 1000}s) — stopping auto-restart. User action required.`);
+          setPiInfo(null);
+          return;
+        }
+
+        // Exponential backoff: 1.5s, 3s, 6s, 12s, 24s
+        const delay = 1500 * Math.pow(2, piCrashCountRef.current - 1);
+        console.log(`[Pi] Auto-restart attempt ${piCrashCountRef.current}/${MAX_CRASHES} in ${delay}ms`);
+
         setTimeout(async () => {
           if (!mounted) return;
           // Check if a newer Pi process is already running (race: stop → start → terminated)
@@ -2091,7 +2119,6 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                 }
               } else {
                 console.error("[Pi] Auto-restart failed:", result.error);
-                // Don't give up — user can still trigger restart on next message
                 setPiInfo(null);
               }
             } catch (e) {
@@ -2393,6 +2420,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         if (result.status === "ok" && result.data.running) {
           setPiInfo(result.data);
           piSessionSyncedRef.current = false;
+          piCrashCountRef.current = 0; // reset crash loop counter on manual start
           // Keep running-config ref in sync so preset watcher doesn't re-trigger
           if (providerConfig) {
             piRunningConfigRef.current = { provider: providerConfig.provider, model: providerConfig.model, token: settings.user?.token ?? null };
@@ -2410,10 +2438,20 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       }
     }
 
-    // Prevent sending while a previous message is still being processed
+    // If a previous message is still processing, abort it first.
+    // piAbort now waits for the Pi SDK to confirm the abort completed — no sleep needed.
     if (piMessageIdRef.current) {
-      toast({ title: "Please wait", description: "Previous message is still being processed", variant: "destructive" });
-      return;
+      console.warn("[Pi] Aborting previous message before sending new one");
+      try {
+        await commands.piAbort(PI_CHAT_SESSION);
+      } catch (e) {
+        console.warn("[Pi] Failed to abort previous:", e);
+      }
+      piStreamingTextRef.current = "";
+      piMessageIdRef.current = null;
+      piContentBlocksRef.current = [];
+      setIsLoading(false);
+      setIsStreaming(false);
     }
 
     const newUserMessage: Message = {
@@ -2430,6 +2468,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     piStreamingTextRef.current = "";
     piMessageIdRef.current = assistantMessageId;
     piContentBlocksRef.current = [];
+    setStreamedCharCount(0);
 
     // Clear follow-ups for new message
     setFollowUpSuggestions([]);
@@ -2446,20 +2485,17 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     setIsLoading(true);
     setIsStreaming(true);
 
-    const timeoutId = setTimeout(() => {
-      if (piMessageIdRef.current === assistantMessageId) {
-        piMessageIdRef.current = null;
-        setIsLoading(false);
-        setIsStreaming(false);
-        setMessages((prev) =>
-          prev.map((m) =>
-            m.id === assistantMessageId && m.content === "Processing..."
-              ? { ...m, content: "Request timed out. Check if Pi is running correctly." }
-              : m
-          )
-        );
-      }
-    }, 180000);
+    posthog.capture("chat_message_sent", {
+      provider: activePreset?.provider,
+      model: activePreset?.model,
+      has_images: pastedImages.length > 0 || !!prefillFrameId,
+      has_context: !!prefillContext,
+      message_index: messages.filter((m) => m.role === "user").length,
+    });
+
+    // No timeout — Pi can run for minutes on long tasks (e.g. 30-day analysis
+    // with many tool calls). Process death is detected via pi_terminated event.
+    const timeoutId: ReturnType<typeof setTimeout> | null = null;
 
     try {
       // Collect images (pasted image + prefill frame)
@@ -2526,6 +2562,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         piSessionSyncedRef.current = true;
       }
 
+      // Send prompt — abort/new_session now await completion, so no retry needed
       const result = await commands.piPrompt(
         PI_CHAT_SESSION,
         promptMessage,
@@ -2533,11 +2570,13 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       );
 
       if (result.status === "error") {
-        clearTimeout(timeoutId);
+        if (timeoutId) clearTimeout(timeoutId);
         piMessageIdRef.current = null;
         // Provide helpful error messages for common failures
         let errorMsg = result.error;
-        if (errorMsg.includes("Broken pipe") || errorMsg.includes("not running") || errorMsg.includes("has died")) {
+        if (errorMsg.includes("already processing")) {
+          errorMsg = "AI is busy — please wait a moment and try again.";
+        } else if (errorMsg.includes("Broken pipe") || errorMsg.includes("not running") || errorMsg.includes("has died")) {
           const provider = activePreset?.provider;
           if (provider === "native-ollama") {
             errorMsg = "Ollama is not running. Start it with: `ollama serve`";
@@ -2558,7 +2597,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         setIsStreaming(false);
       }
     } catch (error) {
-      clearTimeout(timeoutId);
+      if (timeoutId) clearTimeout(timeoutId);
       piMessageIdRef.current = null;
       setMessages((prev) =>
         prev.map((m) =>
@@ -2595,12 +2634,12 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       if (args.speaker_name) params.append("speaker_name", String(args.speaker_name));
 
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 30000);
+      const searchTimeoutId = setTimeout(() => controller.abort(), 120000);
 
       const response = await fetch(`${SCREENPIPE_API}/search?${params.toString()}`, {
         signal: controller.signal,
       });
-      clearTimeout(timeoutId);
+      clearTimeout(searchTimeoutId);
 
       if (!response.ok) throw new Error(`Search failed: ${response.status}`);
 
@@ -2657,7 +2696,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   }
 
   async function sendMessage(userMessage: string, displayLabel?: string) {
-    if ((!canChat && !autoSendBypassRef.current) || !activePreset) return;
+    if ((!canChat && !autoSendBypassRef.current) || (!activePreset && !autoSendBypassRef.current)) return;
 
     // All providers route through Pi agent
     return sendPiMessage(userMessage, displayLabel);
@@ -2777,8 +2816,31 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         <Button
           variant="default"
           size="sm"
-          onClick={(e) => {
+          onClick={async (e) => {
             e.stopPropagation();
+            // Kill Pi process if busy, then restart fresh
+            if (piInfo?.running && (isLoading || isStreaming)) {
+              piStoppedIntentionallyRef.current = true;
+              try { await commands.piStop(PI_CHAT_SESSION); } catch {}
+              piStreamingTextRef.current = "";
+              piMessageIdRef.current = null;
+              piContentBlocksRef.current = [];
+              setIsLoading(false);
+              setIsStreaming(false);
+              // Restart Pi fresh
+              try {
+                const providerConfig = buildProviderConfig();
+                const home = await homeDir();
+                const dir = await join(home, ".screenpipe", "pi-chat");
+                const result = await commands.piStart(PI_CHAT_SESSION, dir, settings.user?.token ?? null, providerConfig);
+                if (result.status === "ok") {
+                  setPiInfo(result.data);
+                  piSessionSyncedRef.current = true;
+                }
+              } catch (err) {
+                console.warn("[Pi] Failed to restart after new chat:", err);
+              }
+            }
             startNewConversation();
           }}
           className="h-7 px-3 gap-1.5 text-xs bg-foreground text-background hover:bg-background hover:text-foreground transition-colors duration-150"
@@ -2886,6 +2948,8 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
         {/* Messages */}
         <div
+          ref={scrollContainerRef}
+          onScroll={handleMessagesScroll}
           className="relative flex-1 overflow-y-auto overflow-x-hidden"
           onContextMenu={(e) => {
             if (messages.length === 0) return;
@@ -2955,7 +3019,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
               <Button
                 variant="outline"
                 onClick={async () => {
-                  await commands.showWindow({ Settings: { page: null } });
+                  await commands.showWindow({ Home: { page: null } });
                 }}
                 className="gap-2"
               >
@@ -3115,6 +3179,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                   phase={loaderPhase}
                   toolName={toolName}
                   thinkingSecs={thinkingSecs}
+                  tokenCount={Math.round(streamedCharCount / 4)}
                 />
               </motion.div>
             );
@@ -3122,22 +3187,191 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         </AnimatePresence>
         <div ref={messagesEndRef} />
       </div> {/* End of max-w-4xl wrapper */}
+
+      {/* Floating scroll-to-bottom pill */}
+      {isUserScrolledUp && messages.length > 0 && (
+        <button
+          onClick={scrollToBottom}
+          className="sticky bottom-4 left-1/2 -translate-x-1/2 z-10 flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-primary text-primary-foreground shadow-lg text-xs font-medium hover:bg-primary/90 transition-opacity animate-in fade-in slide-in-from-bottom-2 duration-200"
+        >
+          <ChevronDown className="h-3.5 w-3.5" />
+          new content
+        </button>
+      )}
       </div>
       </div> {/* End of main content area with history sidebar */}
 
       {/* Input */}
       <div className="relative border-t border-border/50 bg-gradient-to-t from-muted/20 to-transparent">
         <div className="max-w-4xl mx-auto w-full">
-        <div className="p-2 border-b border-border/30">
-          <AIPresetsSelector
-            onPresetChange={setActivePreset}
-            controlledPresetId={activePipeExecution ? activePreset?.id : undefined}
-            onControlledSelect={activePipeExecution ? (id) => {
-              const match = settings.aiPresets?.find((p) => p.id === id);
-              if (match) setActivePreset(match);
-            } : undefined}
-            showLoginCta={false}
-          />
+        <div className="p-2 border-b border-border/30 flex items-center gap-2">
+          <Popover open={appFilterOpen} onOpenChange={setAppFilterOpen}>
+            <PopoverTrigger asChild>
+              <button
+                type="button"
+                className={cn(
+                  "shrink-0 flex items-center gap-1 px-2 h-10 text-[11px] font-mono border rounded-md transition-colors",
+                  hasActiveFilters
+                    ? "border-foreground text-foreground"
+                    : "border-border text-muted-foreground hover:text-foreground hover:border-foreground"
+                )}
+                title="Search filters"
+              >
+                <Filter className="w-3 h-3" />
+                <span>filter</span>
+                {hasActiveFilters && (
+                  <span className="text-[10px] text-muted-foreground">
+                    ({(activeFilters.timeRanges.length > 0 ? 1 : 0) +
+                      (activeFilters.contentType ? 1 : 0) +
+                      (activeFilters.appName ? 1 : 0) +
+                      (activeFilters.speakerName ? 1 : 0)})
+                  </span>
+                )}
+              </button>
+            </PopoverTrigger>
+            <PopoverContent className="w-64 p-0 max-h-[360px] overflow-y-auto" align="start">
+              {/* Time filters */}
+              <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50">
+                time
+              </div>
+              {STATIC_MENTION_SUGGESTIONS.filter((s) => s.category === "time").map((s) => {
+                const isActive = activeFilters.timeRanges.some((r) => r.label === s.description);
+                return (
+                  <button
+                    key={s.tag}
+                    type="button"
+                    onClick={() => {
+                      if (isActive) {
+                        removeFilter("time", s.description);
+                      } else {
+                        setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                      }
+                      setAppFilterOpen(false);
+                    }}
+                    className={cn(
+                      "w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2",
+                      isActive && "bg-muted"
+                    )}
+                  >
+                    <span>{s.tag}</span>
+                    <span className="text-[10px] text-muted-foreground">{s.description}</span>
+                  </button>
+                );
+              })}
+
+              {/* Content type filters */}
+              <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50 border-t">
+                content type
+              </div>
+              {STATIC_MENTION_SUGGESTIONS.filter((s) => s.category === "content").map((s) => {
+                const contentTypeMap: Record<string, string> = { screen: "screen", audio: "audio", input: "input" };
+                const tagName = s.tag.slice(1);
+                const isActive = activeFilters.contentType === (contentTypeMap[tagName] || tagName);
+                return (
+                  <button
+                    key={s.tag}
+                    type="button"
+                    onClick={() => {
+                      if (isActive) {
+                        removeFilter("content");
+                      } else {
+                        if (activeFilters.contentType) removeFilter("content");
+                        setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                      }
+                      setAppFilterOpen(false);
+                    }}
+                    className={cn(
+                      "w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2",
+                      isActive && "bg-muted"
+                    )}
+                  >
+                    <span>{s.tag}</span>
+                    <span className="text-[10px] text-muted-foreground">{s.description}</span>
+                  </button>
+                );
+              })}
+
+              {/* App filters */}
+              <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50 border-t">
+                apps
+              </div>
+              {appMentionSuggestions.length === 0 ? (
+                <div className="px-3 py-2 text-[10px] text-muted-foreground">no apps detected yet</div>
+              ) : (
+                appMentionSuggestions.map((suggestion) => {
+                  const isActive = activeFilters.appName === suggestion.appName;
+                  return (
+                    <button
+                      key={`app-${suggestion.tag}`}
+                      type="button"
+                      onClick={() => {
+                        if (isActive) {
+                          removeFilter("app");
+                        } else {
+                          if (activeFilters.appName) removeFilter("app");
+                          setInput((prev) => `${suggestion.tag} ${prev.trim()}`.trim() + " ");
+                        }
+                        setAppFilterOpen(false);
+                      }}
+                      className={cn(
+                        "w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2",
+                        isActive && "bg-muted"
+                      )}
+                    >
+                      <span>{suggestion.tag}</span>
+                      <span className="text-[10px] text-muted-foreground truncate">{suggestion.description}</span>
+                    </button>
+                  );
+                })
+              )}
+
+              {/* Speakers */}
+              {recentSpeakers.length > 0 && (
+                <>
+                  <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50 border-t">
+                    speakers
+                  </div>
+                  {recentSpeakers.map((s) => {
+                    const speakerName = s.tag.startsWith('@"') ? s.tag.slice(2, -1) : s.tag.slice(1);
+                    const isActive = activeFilters.speakerName === speakerName;
+                    return (
+                      <button
+                        key={`speaker-${s.tag}`}
+                        type="button"
+                        onClick={() => {
+                          if (isActive) {
+                            removeFilter("speaker");
+                          } else {
+                            if (activeFilters.speakerName) removeFilter("speaker");
+                            setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                          }
+                          setAppFilterOpen(false);
+                        }}
+                        className={cn(
+                          "w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2",
+                          isActive && "bg-muted"
+                        )}
+                      >
+                        <span>{s.tag}</span>
+                        <span className="text-[10px] text-muted-foreground">speaker</span>
+                      </button>
+                    );
+                  })}
+                </>
+              )}
+            </PopoverContent>
+          </Popover>
+          <div className="flex-1 min-w-0">
+            <AIPresetsSelector
+              onPresetChange={setActivePreset}
+              controlledPresetId={activePipeExecution ? activePreset?.id : undefined}
+              onControlledSelect={activePipeExecution ? (id) => {
+                const match = settings.aiPresets?.find((p) => p.id === id);
+                if (match) setActivePreset(match);
+              } : undefined}
+              showLoginCta={false}
+            />
+          </div>
         </div>
 
         {/* Prefill context indicator from search */}
@@ -3317,7 +3551,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                     ? disabledReason
                     : "Ask about your screen... (type @ for filters, paste images)"
                 }
-                disabled={isLoading || !canChat}
+                disabled={!canChat}
                 rows={1}
                 className={cn(
                   "flex w-full border border-border bg-input px-3 py-2 text-sm font-mono ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:border-foreground disabled:cursor-not-allowed disabled:opacity-50 caret-foreground resize-none overflow-y-auto",

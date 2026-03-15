@@ -19,6 +19,7 @@ import { commands } from "@/lib/utils/tauri";
 import localforage from "localforage";
 import { LoginDialog } from "../components/login-dialog";
 import { UpdateBanner, useUpdateListener } from "../components/update-banner";
+import { useIsEnterpriseBuild } from "@/lib/hooks/use-is-enterprise-build";
 import { ModelDownloadTracker } from "../components/model-download-tracker";
 import Timeline from "@/components/rewind/timeline";
 import { Button } from "@/components/ui/button";
@@ -79,6 +80,7 @@ export default function Home() {
   const { settings, updateSettings, loadUser, reloadStore, isSettingsLoaded, loadingError } = useSettings();
   const { toast } = useToast();
   const { onboardingData } = useOnboarding();
+  const isEnterprise = useIsEnterpriseBuild();
   const { isServerDown, isLoading: isHealthLoading } = useHealthCheck();
   const { isMac } = usePlatform();
   const [isRestarting, setIsRestarting] = useState(false);
@@ -188,12 +190,36 @@ export default function Home() {
         return;
       }
 
-      // Try saved password
-      const savedPassword = localStorage.getItem("sync_password");
-      if (!savedPassword) return;
+      // Try saved password from store.bin first, then localStorage for migration
+      let password: string | null = null;
+      try {
+        const store = await getStore();
+        password = await store.get<string>("sync_password") || null;
+      } catch {
+        // Store not available yet
+      }
+
+      // Fall back to old localStorage for migration
+      if (!password) {
+        const legacy = localStorage.getItem("sync_password");
+        if (legacy) {
+          password = atob(legacy);
+          // Migrate to store.bin
+          try {
+            const store = await getStore();
+            await store.set("sync_password", password);
+            await store.save();
+            localStorage.removeItem("sync_password");
+            console.log("migrated sync password from localStorage to store.bin");
+          } catch {
+            // Non-critical
+          }
+        }
+      }
+
+      if (!password) return;
 
       try {
-        const password = atob(savedPassword);
         await invoke("init_sync", { password });
         console.log("cloud sync auto-initialized from saved password");
       } catch (e) {
@@ -326,7 +352,7 @@ export default function Home() {
         <>
           <ChangelogDialog />
 
-          <LoginDialog />
+          {!isEnterprise && <LoginDialog />}
           <ModelDownloadTracker />
           <UpdateBanner />
           

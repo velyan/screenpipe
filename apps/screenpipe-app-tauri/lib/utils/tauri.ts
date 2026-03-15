@@ -34,6 +34,13 @@ async checkMicrophonePermission() : Promise<OSPermissionStatus> {
     return await TAURI_INVOKE("check_microphone_permission");
 },
 /**
+ * Check only screen recording permission (no dialog trigger)
+ * Uses CGPreflightScreenCaptureAccess which is safe to poll repeatedly
+ */
+async checkScreenRecordingPermission() : Promise<OSPermissionStatus> {
+    return await TAURI_INVOKE("check_screen_recording_permission");
+},
+/**
  * Check only accessibility permission
  * Use this for polling to check if user has granted accessibility permission
  */
@@ -66,6 +73,29 @@ async requestArcAutomationPermission() : Promise<boolean> {
 },
 async getEnv(name: string) : Promise<string> {
     return await TAURI_INVOKE("get_env", { name });
+},
+/**
+ * Check vault lock state from filesystem (no server needed).
+ */
+async vaultStatus() : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("vault_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Fast unlock: verify password, decrypt DB only, remove sentinel.
+ * Data files are decrypted in background — server can start immediately.
+ */
+async vaultUnlock(password: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("vault_unlock", { password }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 },
 async getLogFiles() : Promise<Result<LogFile[], string>> {
     try {
@@ -134,9 +164,9 @@ async getAudioDevices() : Promise<Result<AudioDeviceInfo[], string>> {
 async isEnterpriseBuildCmd() : Promise<boolean> {
     return await TAURI_INVOKE("is_enterprise_build_cmd");
 },
-async getDiskUsage(forceRefresh: boolean | null) : Promise<Result<JsonValue, string>> {
+async getDiskUsage(forceRefresh: boolean | null, dataDir: string | null) : Promise<Result<JsonValue, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("get_disk_usage", { forceRefresh }) };
+    return { status: "ok", data: await TAURI_INVOKE("get_disk_usage", { forceRefresh, dataDir }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -210,6 +240,30 @@ async ensureWebviewFocus() : Promise<Result<null, string>> {
 async closeWindow(window: ShowRewindWindow) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("close_window", { window }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Resize the Search NSPanel. Regular Tauri setSize doesn't work on NSPanels.
+ */
+async resizeSearchWindow(width: number, height: number) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("resize_search_window", { width, height }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Navigate from Search to a timestamp on the Main timeline.
+ * Shows Main, emits the navigation event from the app handle (not a webview),
+ * then closes the Search window.
+ */
+async searchNavigateToTimeline(timestamp: string, frameId: bigint | null, searchTerms: string[] | null, searchResultsJson: string | null, searchQuery: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("search_navigate_to_timeline", { timestamp, frameId, searchTerms, searchResultsJson, searchQuery }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -471,6 +525,19 @@ async removeSyncDevice(deviceId: string) : Promise<Result<null, string>> {
 }
 },
 /**
+ * Delete all locally-stored data that was synced from a specific remote device.
+ * This calls the local screenpipe server's /data/delete-device endpoint.
+ * Refuses to delete data for the current device as a safety guard.
+ */
+async deleteDeviceLocalData(machineId: string) : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_device_local_data", { machineId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Initialize sync with password.
  * This initializes both the local SyncManager (for device queries) and
  * the server's SyncService (for actual data sync).
@@ -572,7 +639,7 @@ async piPrompt(sessionId: string | null, message: string, images: PiImageContent
 }
 },
 /**
- * Abort current Pi operation
+ * Abort current Pi operation. Waits for the Pi SDK to confirm the abort completed.
  */
 async piAbort(sessionId: string | null) : Promise<Result<null, string>> {
     try {
@@ -583,7 +650,8 @@ async piAbort(sessionId: string | null) : Promise<Result<null, string>> {
 }
 },
 /**
- * Start a new Pi session (clears conversation history)
+ * Start a new Pi session (clears conversation history).
+ * Waits for the Pi SDK to finish aborting any in-flight work and resetting state.
  */
 async piNewSession(sessionId: string | null) : Promise<Result<null, string>> {
     try {
@@ -653,124 +721,22 @@ async chatgptOauthModels() : Promise<Result<string[], string>> {
 }
 },
 /**
- * Check Reminders authorization + scheduler status (no popup).
+ * Get current pipe suggestions settings.
  */
-async remindersStatus() : Promise<Result<RemindersStatus, string>> {
+async pipeSuggestionsGetSettings() : Promise<Result<PipeSuggestionsSettings, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_status") };
+    return { status: "ok", data: await TAURI_INVOKE("pipe_suggestions_get_settings") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
 },
 /**
- * Request Reminders permission (shows one-time macOS popup).
- * Returns "granted", "denied", or an error message.
+ * Update pipe suggestions settings and restart the scheduler.
  */
-async remindersAuthorize() : Promise<Result<string, string>> {
+async pipeSuggestionsUpdateSettings(enabled: boolean, frequencyHours: number) : Promise<Result<null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_authorize") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * List existing reminders in the "Screenpipe" list.
- */
-async remindersList() : Promise<Result<ReminderItem[], string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_list") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Create a single reminder.
- */
-async remindersCreate(title: string, notes: string | null, due: string | null) : Promise<Result<ReminderItem, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_create", { title, notes, due }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Scan recent activity and create reminders from action items.
- * Optional custom_prompt appended to the AI instructions.
- */
-async remindersScan(customPrompt: string | null, audioOnly: boolean | null) : Promise<Result<ScanResult, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_scan", { customPrompt, audioOnly }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Start the background scheduler (30-min interval). Persists across page navigation.
- * Saves enabled=true to persistent store so it auto-starts on app relaunch.
- */
-async remindersStartScheduler() : Promise<Result<null, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_start_scheduler") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Stop the background scheduler. Saves enabled=false to persistent store.
- */
-async remindersStopScheduler() : Promise<Result<null, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_stop_scheduler") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Get the saved custom prompt.
- */
-async remindersGetCustomPrompt() : Promise<Result<string, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_get_custom_prompt") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Save a custom prompt.
- */
-async remindersSetCustomPrompt(prompt: string) : Promise<Result<null, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_set_custom_prompt", { prompt }) };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Get the audio_only setting.
- */
-async remindersGetAudioOnly() : Promise<Result<boolean, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_get_audio_only") };
-} catch (e) {
-    if(e instanceof Error) throw e;
-    else return { status: "error", error: e  as any };
-}
-},
-/**
- * Set the audio_only setting.
- */
-async remindersSetAudioOnly(audioOnly: boolean) : Promise<Result<null, string>> {
-    try {
-    return { status: "ok", data: await TAURI_INVOKE("reminders_set_audio_only", { audioOnly }) };
+    return { status: "ok", data: await TAURI_INVOKE("pipe_suggestions_update_settings", { enabled, frequencyHours }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -877,6 +843,18 @@ async getCachedSuggestions() : Promise<Result<CachedSuggestions, string>> {
 }
 },
 /**
+ * Force-regenerate suggestions immediately, bypassing the scheduler's
+ * CPU/power guards. Returns the fresh suggestions and updates the cache.
+ */
+async forceRegenerateSuggestions() : Promise<Result<CachedSuggestions, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("force_regenerate_suggestions") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Tauri command: validate that a path is usable as a data directory.
  * Called from the frontend before saving the setting.
  */
@@ -904,7 +882,7 @@ async getHardwareCapability() : Promise<HardwareCapability> {
 /** user-defined types **/
 
 export type AIPreset = { id: string; prompt: string; provider: AIProviderType; url?: string; model?: string; defaultPreset: boolean; apiKey: string | null; maxContextChars: number; maxTokens?: number }
-export type AIProviderType = "openai" | "openai-chatgpt" | "native-ollama" | "custom" | "screenpipe-cloud" | "pi"
+export type AIProviderType = "openai" | "openai-chatgpt" | "native-ollama" | "custom" | "screenpipe-cloud" | "pi" | "anthropic"
 export type AudioDeviceInfo = { name: string; isDefault: boolean }
 export type BrowserLogEntry = { level: string; message: string }
 export type CachedSuggestions = { suggestions: Suggestion[]; generatedAt: string; mode: string; aiGenerated: boolean; tags: string[] }
@@ -924,7 +902,12 @@ startDisplay: string;
 /**
  * Pre-formatted local time, e.g. "5:00 PM" — for display.
  */
-endDisplay: string; attendees: string[]; location: string | null; calendarName: string; isAllDay: boolean }
+endDisplay: string; attendees: string[]; location: string | null; calendarName: string; isAllDay: boolean; 
+/**
+ * Source identifier: "native" for OS calendar, "ics" for ICS feeds.
+ * Used by meeting detector to merge events from multiple publishers.
+ */
+source?: string }
 export type CalendarStatus = { available: boolean; authorized: boolean; authorizationStatus: string; calendarCount: number }
 export type ChatGptOAuthStatus = { logged_in: boolean }
 export type Credits = { amount: number }
@@ -973,9 +956,7 @@ apiKey: string | null;
  * Max output tokens (default 4096)
  */
 maxTokens?: number }
-export type ReminderItem = { identifier: string; title: string; notes: string | null; completed: boolean }
-export type RemindersStatus = { available: boolean; authorized: boolean; authorizationStatus: string; schedulerRunning: boolean; reminderCount: number }
-export type ScanResult = { remindersCreated: bigint; items: ReminderItem[]; contextChars: bigint; error: string | null }
+export type PipeSuggestionsSettings = { enabled: boolean; frequencyHours: number }
 export type SettingsStore = 
 /**
  * Catch-all for fields added by the frontend (e.g. chatHistory, deviceId)
@@ -994,7 +975,7 @@ useSystemDefaultAudio?: boolean; usePiiRemoval: boolean;
 /**
  * Filter music-dominant audio before transcription using spectral analysis
  */
-filterMusic?: boolean; port: number; dataDir: string; disableAudio: boolean; ignoredWindows: string[]; includedWindows: string[]; ignoredUrls?: string[]; fps: number; vadSensitivity: string; analyticsEnabled: boolean; audioChunkDuration: number; useChineseMirror: boolean; languages: string[]; embeddedLLM: EmbeddedLLM; autoStartEnabled: boolean; platform: string; disabledShortcuts: string[]; user: User; showScreenpipeShortcut: string; startRecordingShortcut: string; stopRecordingShortcut: string; startAudioShortcut: string; stopAudioShortcut: string; showChatShortcut: string; searchShortcut: string; realtimeAudioTranscriptionEngine: string; disableVision: boolean; 
+filterMusic?: boolean; port: number; dataDir: string; disableAudio: boolean; ignoredWindows: string[]; includedWindows: string[]; ignoredUrls?: string[]; fps: number; vadSensitivity: string; analyticsEnabled: boolean; audioChunkDuration: number; useChineseMirror: boolean; languages: string[]; embeddedLLM: EmbeddedLLM; autoStartEnabled: boolean; platform: string; disabledShortcuts: string[]; user: User; showScreenpipeShortcut: string; startRecordingShortcut: string; stopRecordingShortcut: string; startAudioShortcut: string; stopAudioShortcut: string; showChatShortcut: string; searchShortcut: string; lockVaultShortcut?: string; realtimeAudioTranscriptionEngine: string; disableVision: boolean; 
 /**
  * When true, screen capture continues but OCR text extraction is skipped.
  * Reduces CPU usage significantly while still recording video.
@@ -1034,8 +1015,18 @@ showOverlayInScreenRecording?: boolean;
  * Affects H.265 CRF during recording and JPEG quality during frame extraction.
  * Values: "low", "balanced", "high", "max". Default: "balanced".
  */
-videoQuality?: string }
-export type ShowRewindWindow = "Main" | { Settings: { page: string | null } } | { Search: { query: string | null } } | "Onboarding" | "Chat" | "PermissionRecovery"
+videoQuality?: string; 
+/**
+ * When true, the chat window stays above all other windows (default: true).
+ */
+chatAlwaysOnTop?: boolean; 
+/**
+ * Automatically detect and skip incognito / private browsing windows.
+ * Uses localized title matching (20+ languages) and on macOS, native
+ * AppleScript detection for Chromium browsers.
+ */
+ignoreIncognitoWindows?: boolean }
+export type ShowRewindWindow = "Main" | { Home: { page: string | null } } | { Search: { query: string | null } } | "Onboarding" | "Chat" | "PermissionRecovery"
 export type Suggestion = { text: string }
 /**
  * Sync configuration.

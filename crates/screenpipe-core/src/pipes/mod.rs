@@ -10,6 +10,7 @@
 //! parses configs, runs the scheduler, and delegates execution to an
 //! [`AgentExecutor`].
 
+pub mod permissions;
 pub mod sync;
 
 use crate::agents::{
@@ -25,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -60,6 +61,64 @@ pub struct PipeConfig {
     /// When set, overrides `model` and `provider` at runtime.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preset: Option<String>,
+
+    // -- Data permissions (all optional, backwards compatible) ---------------
+    /// Only data from these apps reaches the pipe (case-insensitive).
+    #[serde(default, alias = "allow-apps", skip_serializing_if = "Vec::is_empty")]
+    pub allow_apps: Vec<String>,
+    /// Data from these apps is always blocked (wins over allow_apps).
+    #[serde(default, alias = "deny-apps", skip_serializing_if = "Vec::is_empty")]
+    pub deny_apps: Vec<String>,
+    /// Only matching window titles pass (glob patterns, case-insensitive).
+    #[serde(
+        default,
+        alias = "allow-windows",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub allow_windows: Vec<String>,
+    /// Matching window titles are blocked (glob, wins over allow).
+    #[serde(default, alias = "deny-windows", skip_serializing_if = "Vec::is_empty")]
+    pub deny_windows: Vec<String>,
+    /// Allowed content types: "ocr", "audio", "input", "accessibility".
+    #[serde(
+        default,
+        alias = "allow-content-types",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub allow_content_types: Vec<String>,
+    /// Blocked content types (wins over allow).
+    #[serde(
+        default,
+        alias = "deny-content-types",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub deny_content_types: Vec<String>,
+    /// Daily time window, e.g. "09:00-17:00". Supports midnight wrap.
+    #[serde(default, alias = "time-range", skip_serializing_if = "Option::is_none")]
+    pub time_range: Option<String>,
+    /// Allowed days, e.g. "Mon,Tue,Wed,Thu,Fri".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub days: Option<String>,
+    /// Whether this pipe can use /raw_sql. Default: true (allow all by default).
+    #[serde(
+        default = "default_true",
+        alias = "allow-raw-sql",
+        skip_serializing_if = "is_true"
+    )]
+    pub allow_raw_sql: bool,
+    /// Whether this pipe can access /frames/* (screenshots). Default: true.
+    #[serde(
+        default = "default_true",
+        alias = "allow-frames",
+        skip_serializing_if = "is_true"
+    )]
+    pub allow_frames: bool,
+
+    /// Connections this pipe uses (e.g. `["obsidian", "slack"]`).
+    /// The AI can query `GET /connections/<id>` at runtime to get credentials.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connections: Vec<String>,
+
     /// Catches any extra fields from front-matter (backwards compat).
     #[serde(default, flatten, skip_serializing_if = "HashMap::is_empty")]
     pub config: HashMap<String, serde_json::Value>,
@@ -82,6 +141,9 @@ fn is_default_agent(s: &String) -> bool {
 }
 fn is_default_model(s: &String) -> bool {
     s == "claude-haiku-4-5" || s == "claude-haiku-4-5@20251001"
+}
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 /// Result of a single pipe run.
@@ -147,7 +209,7 @@ pub struct SchedulerState {
 }
 
 /// Trait for persisting pipe execution data.
-/// Implemented in `screenpipe-server` using SQLite.
+/// Implemented in `screenpipe-engine` using SQLite.
 /// `PipeManager` works without a store (CLI mode) — all methods are guarded
 /// by `Option<Arc<dyn PipeStore>>`.
 #[async_trait::async_trait]
@@ -326,7 +388,17 @@ fn resolve_preset(pipes_dir: &Path, preset_id: &str) -> Option<ResolvedPreset> {
 // Structured error parsing from stderr
 // ---------------------------------------------------------------------------
 
-/// Parse structured error types from agent stderr output.
+/// Parse structured error types from agent output (checks both stderr and stdout).
+fn parse_error_type_from_output(stderr: &str, stdout: &str) -> (Option<String>, Option<String>) {
+    let (et, em) = parse_error_type(stderr);
+    if et.is_some() {
+        return (et, em);
+    }
+    // Fallback: check stdout too — Pi may stream API errors through JSON stdout
+    parse_error_type(stdout)
+}
+
+/// Parse structured error types from a single output string.
 fn parse_error_type(stderr: &str) -> (Option<String>, Option<String>) {
     let lower = stderr.to_lowercase();
     if lower.contains("rate limit") || lower.contains("429") || lower.contains("rate_limit") {
@@ -357,6 +429,15 @@ fn parse_error_type(stderr: &str) -> (Option<String>, Option<String>) {
             Some("network error — check connectivity".to_string()),
         );
     }
+    if lower.contains("prompt is too long")
+        || lower.contains("context_length_exceeded")
+        || lower.contains("maximum context length")
+    {
+        return (
+            Some("context_overflow".to_string()),
+            Some("prompt exceeded model context window".to_string()),
+        );
+    }
     (None, None)
 }
 
@@ -366,8 +447,10 @@ fn parse_error_type(stderr: &str) -> (Option<String>, Option<String>) {
 
 /// Manages all pipes: loading, scheduling, execution, logs.
 /// Callback fired after each scheduled pipe run completes.
-/// Args: (pipe_name, success, duration_secs)
-pub type OnPipeRunComplete = Arc<dyn Fn(&str, bool, f64) + Send + Sync>;
+/// Args: (pipe_name, success, duration_secs, error_type)
+/// `error_type` is a sanitized category (e.g. "rate_limited", "auth_failed", "timeout", "crash")
+/// — never contains user data.
+pub type OnPipeRunComplete = Arc<dyn Fn(&str, bool, f64, Option<&str>) + Send + Sync>;
 
 /// Callback fired for each stdout line from a running pipe.
 /// Args: (pipe_name, execution_id, line)
@@ -375,6 +458,72 @@ pub type OnPipeOutputLine = Arc<dyn Fn(&str, i64, &str) + Send + Sync>;
 
 /// Default execution timeout: 5 minutes.
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
+
+/// Set up permissions for a Pi pipe: install extension, filtered skills,
+/// write the permissions JSON file, and register the token with the server.
+/// Returns the generated token (if any) so the caller can clean it up later.
+async fn setup_pipe_permissions(
+    pipe_dir: &Path,
+    config: &PipeConfig,
+    token_registry: Option<&Arc<dyn permissions::PipeTokenRegistry>>,
+) -> Option<String> {
+    if let Err(e) = PiExecutor::ensure_permissions_extension(pipe_dir, config) {
+        warn!("failed to install permissions extension: {}", e);
+    }
+    if let Err(e) = PiExecutor::ensure_context_pruning_extension(pipe_dir) {
+        warn!("failed to install context-pruning extension: {}", e);
+    }
+    if let Err(e) = PiExecutor::ensure_screenpipe_skill_filtered(pipe_dir, config) {
+        warn!("failed to install filtered skills: {}", e);
+    }
+
+    let mut perms = permissions::PipePermissions::from_config(config);
+
+    if perms.has_any_restrictions() {
+        // Generate a unique pipe token for server-side enforcement
+        use rand::Rng;
+        let suffix: u64 = rand::thread_rng().gen();
+        let t = format!("sp_pipe_{:016x}", suffix);
+        perms.pipe_token = Some(t.clone());
+
+        // Register with server middleware — must complete before Pi starts
+        // to avoid race where Pi's first API call arrives before token is registered
+        if let Some(registry) = token_registry {
+            registry.register_token(t.clone(), perms.clone()).await;
+        }
+
+        // Write permissions JSON for the extension to read
+        let perms_path = pipe_dir.join(".screenpipe-permissions.json");
+        match serde_json::to_string(&perms) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&perms_path, &json) {
+                    warn!("failed to write permissions file: {}", e);
+                }
+            }
+            Err(e) => warn!("failed to serialize permissions: {}", e),
+        }
+
+        Some(t)
+    } else {
+        // Clean up any stale permissions file
+        let _ = std::fs::remove_file(pipe_dir.join(".screenpipe-permissions.json"));
+        None
+    }
+}
+
+/// Remove a pipe token from the server registry.
+fn cleanup_pipe_token(
+    token: &str,
+    token_registry: Option<&Arc<dyn permissions::PipeTokenRegistry>>,
+) {
+    if let Some(registry) = token_registry {
+        let registry = registry.clone();
+        let token = token.to_string();
+        tokio::spawn(async move {
+            registry.remove_token(&token).await;
+        });
+    }
+}
 
 pub struct PipeManager {
     /// `~/.screenpipe/pipes/`
@@ -390,8 +539,6 @@ pub struct PipeManager {
     running: Arc<Mutex<HashMap<String, ExecutionHandle>>>,
     /// Currently running execution IDs (for stop API).
     running_execution_ids: Arc<Mutex<HashMap<String, i64>>>,
-    /// Global concurrency limit — only one pipe runs at a time.
-    semaphore: Arc<Semaphore>,
     /// Shutdown signal for the scheduler.
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     /// Optional callback fired after each scheduled pipe run.
@@ -404,6 +551,10 @@ pub struct PipeManager {
     api_port: u16,
     /// Timestamp of last reload_pipes() disk scan, for debouncing.
     last_reload: Arc<Mutex<Instant>>,
+    /// Optional token registry for server-side permission enforcement.
+    token_registry: Option<Arc<dyn permissions::PipeTokenRegistry>>,
+    /// Extra context appended to every pipe prompt (e.g. connected integrations).
+    extra_context: Option<String>,
 }
 
 impl PipeManager {
@@ -420,7 +571,6 @@ impl PipeManager {
             logs: Arc::new(Mutex::new(HashMap::new())),
             running: Arc::new(Mutex::new(HashMap::new())),
             running_execution_ids: Arc::new(Mutex::new(HashMap::new())),
-            semaphore: Arc::new(Semaphore::new(1)),
             shutdown_tx: None,
             on_run_complete: None,
             on_output_line: None,
@@ -429,7 +579,24 @@ impl PipeManager {
             last_reload: Arc::new(Mutex::new(
                 Instant::now() - std::time::Duration::from_secs(10),
             )),
+            token_registry: None,
+            extra_context: None,
         }
+    }
+
+    /// Set extra context that gets appended to every pipe prompt.
+    /// Used by the server to inject connected integrations info.
+    pub fn set_extra_context(&mut self, ctx: String) {
+        if ctx.is_empty() {
+            self.extra_context = None;
+        } else {
+            self.extra_context = Some(ctx);
+        }
+    }
+
+    /// Set a token registry for server-side permission enforcement.
+    pub fn set_token_registry(&mut self, registry: Arc<dyn permissions::PipeTokenRegistry>) {
+        self.token_registry = Some(registry);
     }
 
     /// Set a callback to be invoked after each scheduled pipe run.
@@ -831,8 +998,16 @@ impl PipeManager {
             None
         };
 
-        let prompt = self.render_prompt(&config, &body, preset_prompt.as_deref());
+        // Check if history/session continuation is enabled for this pipe
+        let history_enabled = config
+            .config
+            .get("history")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         let pipe_dir = self.pipes_dir.clone().join(name);
+
+        let prompt = self.render_prompt(&config, &body, preset_prompt.as_deref());
         let pipe_name = name.to_string();
 
         // Mark running in DB
@@ -863,6 +1038,7 @@ impl PipeManager {
         });
 
         // Pre-configure pi
+        let mut pipe_token: Option<String> = None;
         if config.agent == "pi" {
             if let Err(e) = PiExecutor::ensure_pi_config(
                 executor.user_token(),
@@ -873,13 +1049,16 @@ impl PipeManager {
             ) {
                 warn!("failed to pre-configure pi provider: {}", e);
             }
+
+            pipe_token =
+                setup_pipe_permissions(&pipe_dir, &config, self.token_registry.as_ref()).await;
         }
+        let token_registry_ref = self.token_registry.clone();
 
         // Clone everything needed for the background task
         let running_ref = self.running.clone();
         let running_exec_ids_ref = self.running_execution_ids.clone();
         let logs_ref = self.logs.clone();
-        let semaphore = self.semaphore.clone();
         let store_ref = self.store.clone();
         let on_complete = self.on_run_complete.clone();
         let on_output = self.on_output_line.clone();
@@ -889,7 +1068,6 @@ impl PipeManager {
 
         // Spawn the actual execution in a background task
         tokio::spawn(async move {
-            let _permit = semaphore.acquire().await;
             let started_at = Utc::now();
             let timeout_duration = std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS);
 
@@ -921,6 +1099,7 @@ impl PipeManager {
                     run_api_key.as_deref(),
                     Some(pid_tx),
                     line_tx,
+                    history_enabled,
                 ),
             )
             .await;
@@ -937,10 +1116,11 @@ impl PipeManager {
                 exec_ids.remove(&pipe_name);
             }
 
-            let log = match run_result {
+            let (log, cb_error_type): (PipeRunLog, Option<String>) = match run_result {
                 Ok(Ok(output)) => {
+                    let filtered_stdout = filter_ndjson_stdout(&output.stdout);
                     let (error_type, error_message) = if !output.success {
-                        parse_error_type(&output.stderr)
+                        parse_error_type_from_output(&output.stderr, &filtered_stdout)
                     } else {
                         (None, None)
                     };
@@ -954,7 +1134,7 @@ impl PipeManager {
                             .finish_execution(
                                 id,
                                 status,
-                                &truncate_string(&output.stdout, 50_000),
+                                &truncate_string(&filtered_stdout, 50_000),
                                 &truncate_string(&output.stderr, 10_000),
                                 None,
                                 error_type.as_deref(),
@@ -967,14 +1147,22 @@ impl PipeManager {
                             .upsert_scheduler_state(&pipe_name, output.success)
                             .await;
                     }
-                    PipeRunLog {
-                        pipe_name: pipe_name.clone(),
-                        started_at,
-                        finished_at,
-                        success: output.success,
-                        stdout: truncate_string(&output.stdout, 10_000),
-                        stderr: truncate_string(&output.stderr, 5_000),
-                    }
+                    let et = if output.success {
+                        None
+                    } else {
+                        Some(error_type.unwrap_or_else(|| "unknown".to_string()))
+                    };
+                    (
+                        PipeRunLog {
+                            pipe_name: pipe_name.clone(),
+                            started_at,
+                            finished_at,
+                            success: output.success,
+                            stdout: truncate_string(&filtered_stdout, 10_000),
+                            stderr: truncate_string(&output.stderr, 5_000),
+                        },
+                        et,
+                    )
                 }
                 Ok(Err(e)) => {
                     if let (Some(ref store), Some(id)) = (&store_ref, exec_id) {
@@ -993,14 +1181,17 @@ impl PipeManager {
                     if let Some(ref store) = store_ref {
                         let _ = store.upsert_scheduler_state(&pipe_name, false).await;
                     }
-                    PipeRunLog {
-                        pipe_name: pipe_name.clone(),
-                        started_at,
-                        finished_at,
-                        success: false,
-                        stdout: String::new(),
-                        stderr: e.to_string(),
-                    }
+                    (
+                        PipeRunLog {
+                            pipe_name: pipe_name.clone(),
+                            started_at,
+                            finished_at,
+                            success: false,
+                            stdout: String::new(),
+                            stderr: e.to_string(),
+                        },
+                        Some("crash".to_string()),
+                    )
                 }
                 Err(_elapsed) => {
                     if let Some(handle) = removed_handle {
@@ -1029,14 +1220,17 @@ impl PipeManager {
                     if let Some(ref store) = store_ref {
                         let _ = store.upsert_scheduler_state(&pipe_name, false).await;
                     }
-                    PipeRunLog {
-                        pipe_name: pipe_name.clone(),
-                        started_at,
-                        finished_at,
-                        success: false,
-                        stdout: String::new(),
-                        stderr: format!("execution timed out after {}s", DEFAULT_TIMEOUT_SECS),
-                    }
+                    (
+                        PipeRunLog {
+                            pipe_name: pipe_name.clone(),
+                            started_at,
+                            finished_at,
+                            success: false,
+                            stdout: String::new(),
+                            stderr: format!("execution timed out after {}s", DEFAULT_TIMEOUT_SECS),
+                        },
+                        Some("timeout".to_string()),
+                    )
                 }
             };
 
@@ -1048,6 +1242,19 @@ impl PipeManager {
                 &log_file,
                 serde_json::to_string_pretty(&log).unwrap_or_default(),
             );
+
+            // Auto-clear Pi session on context overflow so the next run starts fresh
+            if cb_error_type.as_deref() == Some("context_overflow") {
+                let pipe_dir = pipes_dir_for_log.join(&pipe_name);
+                if let Err(e) = delete_pi_sessions(&pipe_dir) {
+                    warn!(
+                        "failed to clear Pi session after context overflow for '{}': {}",
+                        pipe_name, e
+                    );
+                } else {
+                    info!("cleared Pi session for '{}' after context overflow — next run starts fresh", pipe_name);
+                }
+            }
 
             // Append to in-memory logs
             let duration_secs = (finished_at - started_at).num_milliseconds() as f64 / 1000.0;
@@ -1062,7 +1269,17 @@ impl PipeManager {
             drop(l);
 
             if let Some(ref cb) = on_complete {
-                cb(&name_for_cb, success, duration_secs);
+                cb(
+                    &name_for_cb,
+                    success,
+                    duration_secs,
+                    cb_error_type.as_deref(),
+                );
+            }
+
+            // Clean up pipe token from server registry
+            if let Some(ref token) = pipe_token {
+                cleanup_pipe_token(token, token_registry_ref.as_ref());
             }
         });
 
@@ -1165,14 +1382,18 @@ impl PipeManager {
             None
         };
 
+        // Check if history/session continuation is enabled for this pipe
+        let history_enabled = config
+            .config
+            .get("history")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         // Build prompt with context header
         let prompt = self.render_prompt(&config, &body, preset_prompt.as_deref());
 
         // Create a channel so the executor can report PID immediately
         let (pid_tx, pid_rx) = tokio::sync::oneshot::channel::<u32>();
-
-        // Acquire semaphore (one pipe at a time)
-        let _permit = self.semaphore.acquire().await?;
 
         // Mark as running in DB
         if let (Some(ref store), Some(id)) = (&self.store, exec_id) {
@@ -1202,6 +1423,7 @@ impl PipeManager {
 
         // Pre-configure pi with the pipe's provider so models.json has the
         // right entry before the agent subprocess starts.
+        let mut pipe_token: Option<String> = None;
         if config.agent == "pi" {
             if let Err(e) = PiExecutor::ensure_pi_config(
                 None,
@@ -1212,6 +1434,13 @@ impl PipeManager {
             ) {
                 warn!("failed to pre-configure pi provider: {}", e);
             }
+
+            pipe_token = setup_pipe_permissions(
+                &self.pipes_dir.join(name),
+                &config,
+                self.token_registry.as_ref(),
+            )
+            .await;
         }
 
         // Run with timeout + streaming
@@ -1244,6 +1473,7 @@ impl PipeManager {
                 run_api_key.as_deref(),
                 Some(pid_tx),
                 line_tx,
+                history_enabled,
             ),
         )
         .await;
@@ -1264,8 +1494,9 @@ impl PipeManager {
         let log = match run_result {
             Ok(Ok(output)) => {
                 // Normal completion
+                let filtered_stdout = filter_ndjson_stdout(&output.stdout);
                 let (error_type, error_message) = if !output.success {
-                    parse_error_type(&output.stderr)
+                    parse_error_type_from_output(&output.stderr, &filtered_stdout)
                 } else {
                     (None, None)
                 };
@@ -1280,7 +1511,7 @@ impl PipeManager {
                         .finish_execution(
                             id,
                             status,
-                            &truncate_string(&output.stdout, 50_000),
+                            &truncate_string(&filtered_stdout, 50_000),
                             &truncate_string(&output.stderr, 10_000),
                             None,
                             error_type.as_deref(),
@@ -1297,7 +1528,7 @@ impl PipeManager {
                     started_at,
                     finished_at,
                     success: output.success,
-                    stdout: truncate_string(&output.stdout, 10_000),
+                    stdout: truncate_string(&filtered_stdout, 10_000),
                     stderr: truncate_string(&output.stderr, 5_000),
                 }
             }
@@ -1373,6 +1604,11 @@ impl PipeManager {
                 }
             }
         };
+
+        // Clean up pipe token from server registry
+        if let Some(ref token) = pipe_token {
+            cleanup_pipe_token(token, self.token_registry.as_ref());
+        }
 
         // Save log (in-memory + disk)
         self.append_log(name, &log).await;
@@ -1480,6 +1716,14 @@ impl PipeManager {
                         config.preset = None;
                     } else if let Some(s) = v.as_str() {
                         config.preset = Some(s.to_string());
+                    }
+                }
+                "connections" => {
+                    if let Some(arr) = v.as_array() {
+                        config.connections = arr
+                            .iter()
+                            .filter_map(|item| item.as_str().map(String::from))
+                            .collect();
                     }
                 }
                 _ => {
@@ -1608,6 +1852,17 @@ impl PipeManager {
         Ok(())
     }
 
+    /// Clear a pipe's chat history by deleting its Pi session files.
+    pub async fn clear_pipe_history(&self, name: &str) -> Result<()> {
+        let pipe_dir = self.pipes_dir.join(name);
+        if !pipe_dir.exists() {
+            return Err(anyhow!("pipe '{}' not found", name));
+        }
+        delete_pi_sessions(&pipe_dir)?;
+        info!("cleared history for pipe '{}'", name);
+        Ok(())
+    }
+
     /// Stop a running pipe.
     pub async fn stop_pipe(&self, name: &str) -> Result<()> {
         let handle = {
@@ -1652,13 +1907,14 @@ impl PipeManager {
         let logs = self.logs.clone();
         let running = self.running.clone();
         let running_execution_ids = self.running_execution_ids.clone();
-        let semaphore = self.semaphore.clone();
         let executors = self.executors.clone();
         let pipes_dir = self.pipes_dir.clone();
         let on_run_complete = self.on_run_complete.clone();
         let on_output_line = self.on_output_line.clone();
         let store = self.store.clone();
         let api_port = self.api_port;
+        let token_registry = self.token_registry.clone();
+        let extra_context = self.extra_context.clone();
 
         tokio::spawn(async move {
             info!("pipe scheduler started");
@@ -1775,6 +2031,7 @@ impl PipeManager {
                     };
 
                     // Pre-configure pi with the pipe's provider
+                    let mut pipe_token: Option<String> = None;
                     if config.agent == "pi" {
                         if let Err(e) = PiExecutor::ensure_pi_config(
                             executor.user_token(),
@@ -1785,20 +2042,40 @@ impl PipeManager {
                         ) {
                             warn!("scheduler: failed to pre-configure pi provider: {}", e);
                         }
+
+                        pipe_token = setup_pipe_permissions(
+                            &pipes_dir.join(name),
+                            config,
+                            token_registry.as_ref(),
+                        )
+                        .await;
                     }
 
-                    let prompt =
-                        render_prompt_with_port(config, body, api_port, preset_prompt.as_deref());
+                    // Check if history/session continuation is enabled
+                    let history_enabled = config
+                        .config
+                        .get("history")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+
                     let pipe_dir = pipes_dir.join(name);
+
+                    let prompt = render_prompt_with_port(
+                        config,
+                        body,
+                        api_port,
+                        preset_prompt.as_deref(),
+                        extra_context.as_deref(),
+                    );
                     let pipe_name = name.clone();
                     let logs_ref = logs.clone();
                     let running_ref = running.clone();
                     let running_exec_ids_ref = running_execution_ids.clone();
-                    let sem = semaphore.clone();
                     let pipes_dir_for_log = pipes_dir.clone();
                     let on_complete = on_run_complete.clone();
                     let on_output = on_output_line.clone();
                     let store_ref = store.clone();
+                    let token_registry_ref = token_registry.clone();
 
                     tokio::spawn(async move {
                         // Create DB execution row
@@ -1825,8 +2102,6 @@ impl PipeManager {
                         } else {
                             None
                         };
-
-                        let _permit = sem.acquire().await;
 
                         // Mark running in DB
                         if let (Some(ref store), Some(id)) = (&store_ref, exec_id) {
@@ -1889,6 +2164,7 @@ impl PipeManager {
                                 api_key.as_deref(),
                                 Some(pid_tx),
                                 line_tx,
+                                history_enabled,
                             ),
                         )
                         .await;
@@ -1905,10 +2181,11 @@ impl PipeManager {
                             exec_ids.remove(&pipe_name);
                         }
 
-                        let log = match run_result {
+                        let (log, cb_error_type): (PipeRunLog, Option<String>) = match run_result {
                             Ok(Ok(output)) => {
+                                let filtered_stdout = filter_ndjson_stdout(&output.stdout);
                                 let (error_type, error_message) = if !output.success {
-                                    parse_error_type(&output.stderr)
+                                    parse_error_type_from_output(&output.stderr, &filtered_stdout)
                                 } else {
                                     (None, None)
                                 };
@@ -1917,13 +2194,12 @@ impl PipeManager {
                                 } else {
                                     "failed"
                                 };
-
                                 if let (Some(ref store), Some(id)) = (&store_ref, exec_id) {
                                     let _ = store
                                         .finish_execution(
                                             id,
                                             status,
-                                            &truncate_string(&output.stdout, 50_000),
+                                            &truncate_string(&filtered_stdout, 50_000),
                                             &truncate_string(&output.stderr, 10_000),
                                             None,
                                             error_type.as_deref(),
@@ -1942,14 +2218,22 @@ impl PipeManager {
                                 } else {
                                     warn!("pipe '{}' failed: {}", pipe_name, output.stderr);
                                 }
-                                PipeRunLog {
-                                    pipe_name: pipe_name.clone(),
-                                    started_at,
-                                    finished_at,
-                                    success: output.success,
-                                    stdout: truncate_string(&output.stdout, 10_000),
-                                    stderr: truncate_string(&output.stderr, 5_000),
-                                }
+                                let et = if output.success {
+                                    None
+                                } else {
+                                    Some(error_type.unwrap_or_else(|| "unknown".to_string()))
+                                };
+                                (
+                                    PipeRunLog {
+                                        pipe_name: pipe_name.clone(),
+                                        started_at,
+                                        finished_at,
+                                        success: output.success,
+                                        stdout: truncate_string(&filtered_stdout, 10_000),
+                                        stderr: truncate_string(&output.stderr, 5_000),
+                                    },
+                                    et,
+                                )
                             }
                             Ok(Err(e)) => {
                                 error!("pipe '{}' error: {}", pipe_name, e);
@@ -1969,14 +2253,17 @@ impl PipeManager {
                                 if let Some(ref store) = store_ref {
                                     let _ = store.upsert_scheduler_state(&pipe_name, false).await;
                                 }
-                                PipeRunLog {
-                                    pipe_name: pipe_name.clone(),
-                                    started_at,
-                                    finished_at,
-                                    success: false,
-                                    stdout: String::new(),
-                                    stderr: e.to_string(),
-                                }
+                                (
+                                    PipeRunLog {
+                                        pipe_name: pipe_name.clone(),
+                                        started_at,
+                                        finished_at,
+                                        success: false,
+                                        stdout: String::new(),
+                                        stderr: e.to_string(),
+                                    },
+                                    Some("crash".to_string()),
+                                )
                             }
                             Err(_elapsed) => {
                                 warn!(
@@ -2007,17 +2294,20 @@ impl PipeManager {
                                 if let Some(ref store) = store_ref {
                                     let _ = store.upsert_scheduler_state(&pipe_name, false).await;
                                 }
-                                PipeRunLog {
-                                    pipe_name: pipe_name.clone(),
-                                    started_at,
-                                    finished_at,
-                                    success: false,
-                                    stdout: String::new(),
-                                    stderr: format!(
-                                        "execution timed out after {}s",
-                                        DEFAULT_TIMEOUT_SECS
-                                    ),
-                                }
+                                (
+                                    PipeRunLog {
+                                        pipe_name: pipe_name.clone(),
+                                        started_at,
+                                        finished_at,
+                                        success: false,
+                                        stdout: String::new(),
+                                        stderr: format!(
+                                            "execution timed out after {}s",
+                                            DEFAULT_TIMEOUT_SECS
+                                        ),
+                                    },
+                                    Some("timeout".to_string()),
+                                )
                             }
                         };
 
@@ -2030,6 +2320,16 @@ impl PipeManager {
                             &log_file,
                             serde_json::to_string_pretty(&log).unwrap_or_default(),
                         );
+
+                        // Auto-clear Pi session on context overflow so the next run starts fresh
+                        if cb_error_type.as_deref() == Some("context_overflow") {
+                            let pipe_dir = pipes_dir_for_log.join(&pipe_name);
+                            if let Err(e) = delete_pi_sessions(&pipe_dir) {
+                                warn!("failed to clear Pi session after context overflow for '{}': {}", pipe_name, e);
+                            } else {
+                                info!("cleared Pi session for '{}' after context overflow — next run starts fresh", pipe_name);
+                            }
+                        }
 
                         // Append to in-memory logs
                         let duration_secs =
@@ -2046,7 +2346,17 @@ impl PipeManager {
 
                         // Fire run-complete callback (analytics, etc.)
                         if let Some(ref cb) = on_complete {
-                            cb(&name_for_cb, success, duration_secs);
+                            cb(
+                                &name_for_cb,
+                                success,
+                                duration_secs,
+                                cb_error_type.as_deref(),
+                            );
+                        }
+
+                        // Clean up pipe token from server registry
+                        if let Some(ref token) = pipe_token {
+                            cleanup_pipe_token(token, token_registry_ref.as_ref());
                         }
                     });
                 }
@@ -2135,13 +2445,6 @@ impl PipeManager {
             ),
         ];
 
-        // reminders pipe uses Apple Reminders via osascript — macOS only
-        #[cfg(target_os = "macos")]
-        builtins.push((
-            "reminders",
-            include_str!("../../assets/pipes/reminders/pipe.md"),
-        ));
-
         for (name, content) in builtins {
             let dir = self.pipes_dir.join(name);
             let pipe_md = dir.join("pipe.md");
@@ -2166,7 +2469,13 @@ impl PipeManager {
         body: &str,
         system_prompt: Option<&str>,
     ) -> String {
-        render_prompt_with_port(config, body, self.api_port, system_prompt)
+        render_prompt_with_port(
+            config,
+            body,
+            self.api_port,
+            system_prompt,
+            self.extra_context.as_deref(),
+        )
     }
 
     async fn append_log(&self, name: &str, log: &PipeRunLog) {
@@ -2233,6 +2542,7 @@ fn render_prompt_with_port(
     body: &str,
     api_port: u16,
     system_prompt: Option<&str>,
+    extra_context: Option<&str>,
 ) -> String {
     let now = Local::now();
     let date = now.format("%Y-%m-%d").to_string();
@@ -2272,6 +2582,11 @@ Screenpipe API: http://localhost:{api_port}
     );
 
     prompt.push_str(&header);
+
+    if let Some(ctx) = extra_context {
+        prompt.push_str(ctx);
+    }
+
     prompt.push('\n');
     prompt.push_str(body);
     prompt
@@ -2384,11 +2699,46 @@ fn parse_duration_str(s: &str) -> Option<std::time::Duration> {
 // Utility helpers
 // ---------------------------------------------------------------------------
 
+/// Filter NDJSON stdout to remove bulky streaming events before storage.
+/// `toolcall_delta` and `thinking_delta` events are only useful for live
+/// streaming — they dominate the output and push useful `text_delta` /
+/// `message_end` / `agent_end` events past the truncation limit.
+fn filter_ndjson_stdout(s: &str) -> String {
+    // Quick check: if it doesn't look like NDJSON, return as-is
+    if !s.starts_with('{') {
+        return s.to_string();
+    }
+
+    let mut out = String::with_capacity(s.len() / 2);
+    for line in s.split('\n') {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Only filter JSON lines that are complete objects
+        if trimmed.starts_with('{') && trimmed.ends_with('}') {
+            // Fast substring check before paying for a full JSON parse
+            if trimmed.contains("\"toolcall_delta\"") || trimmed.contains("\"thinking_delta\"") {
+                continue;
+            }
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 fn truncate_string(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {
-        format!("{}…[truncated]", &s[..max_len])
+        let mut end = max_len;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…[truncated]", &s[..end])
     }
 }
 
@@ -2413,6 +2763,36 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         } else {
             std::fs::copy(&src_path, &dst_path)?;
         }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Pi session helpers (for pipe history / --continue)
+// ---------------------------------------------------------------------------
+
+/// Encode a working-directory path the same way Pi does for session storage.
+/// Pi uses the CWD as a key: `~/.pi/agent/sessions/<encoded-cwd>/`.
+/// The encoding wraps the path with `--` and replaces `/` (or `\`) with `-`.
+/// Example: `/Users/me/.screenpipe/pipes/foo/` → `--Users-me-.screenpipe-pipes-foo--`
+fn encode_pi_session_dir(working_dir: &Path) -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let sessions_base = home.join(".pi").join("agent").join("sessions");
+    // Pi encodes: strip leading/trailing separators, replace all separators
+    // with `-`, wrap with `--` prefix and `--` suffix
+    let cwd_str = working_dir.to_string_lossy();
+    let stripped = cwd_str.trim_matches(|c| c == '/' || c == '\\');
+    let encoded = format!("--{}--", stripped.replace(['/', '\\'], "-"));
+    Some(sessions_base.join(encoded))
+}
+
+/// Delete all Pi session files for a pipe's working directory.
+pub fn delete_pi_sessions(pipe_dir: &Path) -> Result<()> {
+    let session_dir = encode_pi_session_dir(pipe_dir)
+        .ok_or_else(|| anyhow!("could not determine Pi session directory"))?;
+    if session_dir.exists() {
+        std::fs::remove_dir_all(&session_dir)?;
+        info!("deleted Pi sessions at {:?}", session_dir);
     }
     Ok(())
 }
@@ -2522,7 +2902,18 @@ mod tests {
             model: "claude-haiku-4-5".to_string(),
             provider: None,
             preset: Some("default".to_string()),
+            allow_apps: vec![],
+            deny_apps: vec![],
+            allow_windows: vec![],
+            deny_windows: vec![],
+            allow_content_types: vec![],
+            deny_content_types: vec![],
+            time_range: None,
+            days: None,
+            allow_raw_sql: true,
+            allow_frames: true,
             config: HashMap::new(),
+            connections: vec![],
         };
         let body = "Do something useful";
         let serialized = serialize_pipe(&config, body).unwrap();
@@ -2606,9 +2997,20 @@ mod tests {
             model: "test-model".to_string(),
             provider: None,
             preset: None,
+            allow_apps: vec![],
+            deny_apps: vec![],
+            allow_windows: vec![],
+            deny_windows: vec![],
+            allow_content_types: vec![],
+            deny_content_types: vec![],
+            time_range: None,
+            days: None,
+            allow_raw_sql: true,
+            allow_frames: true,
             config: HashMap::new(),
+            connections: vec![],
         };
-        let prompt = render_prompt_with_port(&config, "body text", 3031, None);
+        let prompt = render_prompt_with_port(&config, "body text", 3031, None, None);
         assert!(prompt.contains("http://localhost:3031"));
         assert!(!prompt.contains("http://localhost:3030"));
         assert!(prompt.contains("body text"));
@@ -2624,9 +3026,20 @@ mod tests {
             model: "test-model".to_string(),
             provider: None,
             preset: None,
+            allow_apps: vec![],
+            deny_apps: vec![],
+            allow_windows: vec![],
+            deny_windows: vec![],
+            allow_content_types: vec![],
+            deny_content_types: vec![],
+            time_range: None,
+            days: None,
+            allow_raw_sql: true,
+            allow_frames: true,
             config: HashMap::new(),
+            connections: vec![],
         };
-        let prompt = render_prompt_with_port(&config, "hello", 3030, None);
+        let prompt = render_prompt_with_port(&config, "hello", 3030, None, None);
         assert!(prompt.contains("http://localhost:3030"));
     }
 
@@ -2640,13 +3053,25 @@ mod tests {
             model: "test-model".to_string(),
             provider: None,
             preset: None,
+            allow_apps: vec![],
+            deny_apps: vec![],
+            allow_windows: vec![],
+            deny_windows: vec![],
+            allow_content_types: vec![],
+            deny_content_types: vec![],
+            time_range: None,
+            days: None,
+            allow_raw_sql: true,
+            allow_frames: true,
             config: HashMap::new(),
+            connections: vec![],
         };
         let prompt = render_prompt_with_port(
             &config,
             "body text",
             3030,
             Some("You are a helpful assistant"),
+            None,
         );
         assert!(prompt.starts_with("System prompt:\nYou are a helpful assistant\n\n"));
         assert!(prompt.contains("body text"));
@@ -2663,9 +3088,20 @@ mod tests {
             model: "test-model".to_string(),
             provider: None,
             preset: None,
+            allow_apps: vec![],
+            deny_apps: vec![],
+            allow_windows: vec![],
+            deny_windows: vec![],
+            allow_content_types: vec![],
+            deny_content_types: vec![],
+            time_range: None,
+            days: None,
+            allow_raw_sql: true,
+            allow_frames: true,
             config: HashMap::new(),
+            connections: vec![],
         };
-        let prompt = render_prompt_with_port(&config, "body text", 3030, None);
+        let prompt = render_prompt_with_port(&config, "body text", 3030, None, None);
         assert!(!prompt.contains("System prompt:"));
         assert!(prompt.contains("body text"));
     }
@@ -2726,7 +3162,18 @@ mod tests {
                 model: "test".to_string(),
                 provider: None,
                 preset: None,
+                allow_apps: vec![],
+                deny_apps: vec![],
+                allow_windows: vec![],
+                deny_windows: vec![],
+                allow_content_types: vec![],
+                deny_content_types: vec![],
+                time_range: None,
+                days: None,
+                allow_raw_sql: true,
+                allow_frames: true,
                 config: HashMap::new(),
+                connections: vec![],
             },
             last_run: None,
             last_success: None,
@@ -2777,5 +3224,57 @@ mod tests {
             url_to_pipe_name("https://example.com/pipes/my-pipe"),
             "my-pipe"
         );
+    }
+
+    // -- Pi session encoding ------------------------------------------------
+
+    #[test]
+    fn test_encode_pi_session_dir_unix_path() {
+        // Verify the encoding matches Pi's actual format:
+        // /Users/me/.screenpipe/pipes/foo → --Users-me-.screenpipe-pipes-foo--
+        let dir = Path::new("/Users/me/.screenpipe/pipes/foo");
+        let result = encode_pi_session_dir(dir);
+        // We can't assert the full path (depends on $HOME), but we can check
+        // the directory name component
+        if let Some(path) = result {
+            let dir_name = path.file_name().unwrap().to_str().unwrap();
+            assert_eq!(dir_name, "--Users-me-.screenpipe-pipes-foo--");
+        }
+    }
+
+    #[test]
+    fn test_encode_pi_session_dir_trailing_slash() {
+        let dir = Path::new("/Users/me/.screenpipe/pipes/foo/");
+        if let Some(path) = encode_pi_session_dir(dir) {
+            let dir_name = path.file_name().unwrap().to_str().unwrap();
+            // Trailing slash is stripped
+            assert_eq!(dir_name, "--Users-me-.screenpipe-pipes-foo--");
+        }
+    }
+
+    // -- frontmatter history flag -------------------------------------------
+
+    #[test]
+    fn test_parse_frontmatter_history_flag() {
+        let content = "---\nschedule: every 4h\nenabled: true\nhistory: true\n---\n\nPrompt";
+        let (config, _) = parse_frontmatter(content).unwrap();
+        let history = config
+            .config
+            .get("history")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(history, "history flag should be true");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_history_default_false() {
+        let content = "---\nschedule: every 1h\n---\n\nPrompt";
+        let (config, _) = parse_frontmatter(content).unwrap();
+        let history = config
+            .config
+            .get("history")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(!history, "history should default to false");
     }
 }

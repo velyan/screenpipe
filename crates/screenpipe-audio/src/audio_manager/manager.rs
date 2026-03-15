@@ -41,8 +41,8 @@ use crate::{
         stt::{process_audio_input, SAMPLE_RATE},
     },
     utils::{
-        audio::{normalize_v2, resample},
-        ffmpeg::{get_new_file_path, write_audio_to_file},
+        audio::resample,
+        ffmpeg::{get_new_file_path_with_timestamp, write_audio_to_file},
     },
     vad::{silero::SileroVad, webrtc::WebRtcVad, VadEngine, VadEngineEnum},
     AudioInput, TranscriptionResult,
@@ -163,6 +163,8 @@ impl AudioManager {
             let engine_ref = self.engine.clone();
             let on_insert_bg = self.on_transcription_insert.clone();
             let options_ref = self.options.clone();
+            let seg_mgr = self.segmentation_manager.clone();
+            let output_path_bg = self.options.read().await.output_path.clone();
             tokio::spawn(async move {
                 // Wait for model to load + initial recordings
                 tokio::time::sleep(Duration::from_secs(120)).await;
@@ -175,11 +177,13 @@ impl AudioManager {
                         let openai_config = opts.openai_compatible_config.clone();
                         let langs = opts.languages.clone();
                         let vocab = opts.vocabulary.clone();
+                        let batch_max_dur = opts.batch_max_duration_secs;
                         drop(opts);
 
                         // Get whisper context from transcription engine
                         let whisper_ctx = transcription_engine.whisper_context();
 
+                        let data_dir = output_path_bg.as_deref();
                         let count = super::reconciliation::reconcile_untranscribed(
                             &db,
                             transcription_engine,
@@ -190,6 +194,9 @@ impl AudioManager {
                             openai_config,
                             langs,
                             &vocab,
+                            Some(seg_mgr.clone()),
+                            data_dir,
+                            batch_max_dur,
                         )
                         .await;
                         if count > 0 {
@@ -363,6 +370,7 @@ impl AudioManager {
                 (record_and_transcribe_handle.await, Ok(Ok(())))
             };
 
+            // Check for JoinError (task panic/cancel)
             if record_result.is_err() || realtime_result.is_err() {
                 let mut e = anyhow!("record_device failed");
 
@@ -381,12 +389,31 @@ impl AudioManager {
                 return Err(e);
             }
 
-            debug!(
-                "recording handle for device {} quit unexpectedly",
+            // Check for inner Result errors (record_and_transcribe returned Err)
+            if let Ok(Err(ref e)) = record_result {
+                warn!(
+                    "recording for device {} exited with error: {}",
+                    device_clone, e
+                );
+                return Err(anyhow!("record_device {} failed: {}", device_clone, e));
+            }
+            if let Ok(Err(ref e)) = realtime_result {
+                warn!(
+                    "realtime recording for device {} exited with error: {}",
+                    device_clone, e
+                );
+                return Err(anyhow!("realtime {} failed: {}", device_clone, e));
+            }
+
+            warn!(
+                "recording handle for device {} exited unexpectedly with Ok",
                 device_clone
             );
 
-            Ok(())
+            Err(anyhow!(
+                "recording handle for device {} exited unexpectedly",
+                device_clone
+            ))
         });
 
         Ok(recording_handle)
@@ -406,6 +433,7 @@ impl AudioManager {
         let audio_transcription_engine = options.transcription_engine.clone();
         let vocabulary = options.vocabulary.clone();
         let is_batch_mode = options.transcription_mode == TranscriptionMode::Batch;
+        let batch_max_duration_secs = options.batch_max_duration_secs;
         let filter_music = options.filter_music;
         let vad_engine = self.vad_engine.clone();
         let whisper_receiver = self.recording_receiver.clone();
@@ -439,7 +467,15 @@ impl AudioManager {
             // (i.e. the 45s output-speech window expires between deliveries).
             let mut had_deferred_segments = false;
 
+            // Max deferral cap: force reconciliation after this duration even if the
+            // session is still active. Prevents infinite deferral during long calls
+            // or perpetual output-audio sessions (the meeting detector's 45s window
+            // can keep the session alive indefinitely).
+            const MAX_DEFERRAL_SECS: u64 = 600; // 10 minutes
+            let mut deferral_started: Option<std::time::Instant> = None;
+
             while let Ok(audio) = whisper_receiver.recv() {
+                metrics.record_chunk_received();
                 debug!("received audio from device: {:?}", audio.device.name);
 
                 // Audio-based call detection: update meeting detector with speech activity.
@@ -473,7 +509,13 @@ impl AudioManager {
                     } else {
                         audio.data.as_ref().to_vec()
                     };
-                    let path = get_new_file_path(&audio.device.to_string(), out);
+                    let capture_dt =
+                        chrono::DateTime::from_timestamp(audio.capture_timestamp as i64, 0);
+                    let path = get_new_file_path_with_timestamp(
+                        &audio.device.to_string(),
+                        out,
+                        capture_dt,
+                    );
                     if let Err(e) =
                         write_audio_to_file(&resampled, SAMPLE_RATE, &PathBuf::from(&path), false)
                     {
@@ -483,8 +525,35 @@ impl AudioManager {
                         debug!("audio persisted to disk: {}", path);
                         // Insert into DB immediately so retranscribe can find this audio
                         // even if transcription is deferred. No transcription yet — just the chunk.
-                        if let Err(e) = db.insert_audio_chunk(&path, None).await {
-                            error!("failed to insert audio chunk into db: {:?}", e);
+                        // Use the original capture timestamp so audio appears at the correct
+                        // position on the timeline, not when processing happened.
+                        // Retry DB insertion with backoff to survive transient pool saturation.
+                        // Without this, audio files are written to disk but orphaned from the DB,
+                        // causing silent data loss on the timeline.
+                        let mut inserted = false;
+                        for retry in 0..3u32 {
+                            match db.insert_audio_chunk(&path, capture_dt).await {
+                                Ok(_) => {
+                                    inserted = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "failed to insert audio chunk into db (attempt {}/3): {:?}",
+                                        retry + 1,
+                                        e
+                                    );
+                                    if retry < 2 {
+                                        tokio::time::sleep(std::time::Duration::from_millis(
+                                            500 * (retry as u64 + 1),
+                                        ))
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                        if !inserted {
+                            error!("audio chunk DB insert failed after 3 retries, data may be missing from timeline: {}", path);
                         }
                         Some(path)
                     }
@@ -504,16 +573,32 @@ impl AudioManager {
                         // Detect session-end: either the transition happened during
                         // check_grace_period (was=true, now=false), OR it happened
                         // between chunks (was=false, now=false, but we had deferred).
-                        let session_just_ended = (was_in_session && !now_in_session)
-                            || (!now_in_session && had_deferred_segments);
+                        let session_just_ended =
+                            !now_in_session && (was_in_session || had_deferred_segments);
 
-                        if session_just_ended {
-                            // Audio session ended — trigger immediate reconciliation
+                        // Max deferral cap: force reconciliation if we've been
+                        // deferring longer than MAX_DEFERRAL_SECS, even during an
+                        // active session. Prevents infinite deferral during long
+                        // calls or perpetual output-audio activity.
+                        let deferral_cap_hit = now_in_session
+                            && deferral_started
+                                .is_some_and(|t| t.elapsed().as_secs() >= MAX_DEFERRAL_SECS);
+
+                        if session_just_ended || deferral_cap_hit {
+                            // Reconcile: session ended or deferral cap reached
                             had_deferred_segments = false;
-                            info!(
-                                "batch mode: audio session ended, transcribing accumulated audio"
-                            );
+                            deferral_started = None;
+                            if deferral_cap_hit {
+                                info!(
+                                    "batch mode: deferral cap ({MAX_DEFERRAL_SECS}s) reached during active session, force-transcribing"
+                                );
+                            } else {
+                                info!(
+                                    "batch mode: audio session ended, transcribing accumulated audio"
+                                );
+                            }
                             let whisper_ctx = engine.whisper_context();
+                            let data_dir = output_path.as_deref();
                             let count = super::reconciliation::reconcile_untranscribed(
                                 &db,
                                 &engine,
@@ -524,13 +609,19 @@ impl AudioManager {
                                 openai_compatible_config.clone(),
                                 languages.clone(),
                                 &vocabulary,
+                                Some(segmentation_manager.clone()),
+                                data_dir,
+                                batch_max_duration_secs,
                             )
                             .await;
                             for _ in 0..count {
                                 metrics.record_segment_batch_processed();
                             }
-                            info!("batch mode: transcribed {} chunks after session end", count);
+                            info!("batch mode: transcribed {} chunks", count);
                         } else if now_in_session {
+                            if deferral_started.is_none() {
+                                deferral_started = Some(std::time::Instant::now());
+                            }
                             had_deferred_segments = true;
                             metrics.record_segment_deferred();
                             debug!("batch mode: in audio session, deferring transcription");
@@ -555,6 +646,7 @@ impl AudioManager {
                             )
                             .await
                             {
+                                metrics.record_process_error();
                                 error!("Error processing audio: {:?}", e);
                             }
                         }
@@ -579,6 +671,7 @@ impl AudioManager {
                         )
                         .await
                         {
+                            metrics.record_process_error();
                             error!("Error processing audio: {:?}", e);
                         }
                     }
@@ -603,6 +696,7 @@ impl AudioManager {
                     )
                     .await
                     {
+                        metrics.record_process_error();
                         error!("Error processing audio: {:?}", e);
                     }
                 }

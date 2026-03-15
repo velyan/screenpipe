@@ -5,9 +5,10 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef } from "react";
-import { listen } from "@tauri-apps/api/event";
+import { listen, emit } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import posthog from "posthog-js";
+import ReactMarkdown from "react-markdown";
 
 interface NotificationAction {
   label: string;
@@ -65,6 +66,17 @@ export default function NotificationPanelPage() {
           await invoke("show_window", { window: "Main" });
         } else if (action === "open_chat") {
           await invoke("show_window", { window: "Chat" });
+        } else if (action === "open_pipe_suggestions") {
+          await emit("open-pipe-suggestions", {});
+        } else if (action === "restart_recording") {
+          try {
+            await invoke("stop_screenpipe");
+          } catch {
+            // may already be stopped
+          }
+          // wait for port release + cooldown
+          await new Promise((r) => setTimeout(r, 2000));
+          await invoke("spawn_screenpipe");
         }
       } catch {
         // ignore
@@ -161,6 +173,20 @@ export default function NotificationPanelPage() {
               transform: translateX(0);
             }
           }
+          .notif-md p { margin: 0 0 4px 0; }
+          .notif-md p:last-child { margin: 0; }
+          .notif-md strong { color: rgba(0, 0, 0, 0.9); }
+          .notif-md a { color: rgba(0, 0, 0, 0.7); text-decoration: underline; }
+          .notif-md code {
+            background: rgba(0, 0, 0, 0.06);
+            padding: 1px 4px;
+            font-size: 10px;
+          }
+          .notif-md ul, .notif-md ol {
+            margin: 2px 0;
+            padding-left: 16px;
+          }
+          .notif-md li { margin: 1px 0; }
         `}</style>
 
         {/* Header */}
@@ -207,7 +233,7 @@ export default function NotificationPanelPage() {
         </div>
 
         {/* Body */}
-        <div style={{ padding: "8px 14px", flex: 1 }}>
+        <div style={{ padding: "8px 14px", flex: 1, overflow: "auto" }}>
           <div
             style={{
               fontSize: "12px",
@@ -219,73 +245,77 @@ export default function NotificationPanelPage() {
             {payload.title}
           </div>
           <div
+            className="notif-md"
             style={{
               fontSize: "11px",
               lineHeight: "1.4",
               color: "rgba(0, 0, 0, 0.5)",
             }}
           >
-            {payload.body}
+            <ReactMarkdown>{payload.body}</ReactMarkdown>
           </div>
         </div>
 
         {/* Actions */}
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            padding: "0 14px 10px 14px",
-            gap: "8px",
-          }}
-        >
-          {payload.actions.map((action) => (
-            <button
-              key={action.action}
-              onClick={() => handleAction(action.action)}
+        {payload.actions.length > 0 && (
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              padding: "0 14px 10px 14px",
+              gap: "8px",
+              flexWrap: "wrap",
+            }}
+          >
+            {payload.actions.map((action) => (
+              <button
+                key={action.action}
+                onClick={() => handleAction(action.action)}
+                style={{
+                  background: action.primary
+                    ? "rgba(0, 0, 0, 0.06)"
+                    : "none",
+                  border: "1px solid rgba(0, 0, 0, 0.12)",
+                  color: "rgba(0, 0, 0, 0.75)",
+                  cursor: "pointer",
+                  padding: "4px 10px",
+                  fontSize: "10px",
+                  fontFamily: '"IBM Plex Mono", monospace',
+                  fontWeight: 500,
+                  letterSpacing: "0.03em",
+                }}
+                onMouseEnter={(e) =>
+                  (e.currentTarget.style.background = "rgba(0, 0, 0, 0.08)")
+                }
+                onMouseLeave={(e) =>
+                  (e.currentTarget.style.background = action.primary
+                    ? "rgba(0, 0, 0, 0.06)"
+                    : "none")
+                }
+              >
+                {action.label}
+              </button>
+            ))}
+            <span
+              onClick={() => hide(false)}
               style={{
-                background: action.primary
-                  ? "rgba(0, 0, 0, 0.06)"
-                  : "none",
-                border: "1px solid rgba(0, 0, 0, 0.12)",
-                color: "rgba(0, 0, 0, 0.75)",
-                cursor: "pointer",
-                padding: "4px 10px",
+                marginLeft: "auto",
                 fontSize: "10px",
+                color: "rgba(0, 0, 0, 0.3)",
+                cursor: "pointer",
                 fontFamily: '"IBM Plex Mono", monospace',
-                fontWeight: 500,
-                letterSpacing: "0.03em",
               }}
               onMouseEnter={(e) =>
-                (e.currentTarget.style.background = "rgba(0, 0, 0, 0.08)")
+                (e.currentTarget.style.color = "rgba(0, 0, 0, 0.6)")
               }
               onMouseLeave={(e) =>
-                (e.currentTarget.style.background = action.primary
-                  ? "rgba(0, 0, 0, 0.06)"
-                  : "none")
+                (e.currentTarget.style.color = "rgba(0, 0, 0, 0.3)")
               }
             >
-              {action.label}
-            </button>
-          ))}
-          <span
-            onClick={() => hide(false)}
-            style={{
-              marginLeft: "auto",
-              fontSize: "10px",
-              color: "rgba(0, 0, 0, 0.3)",
-              cursor: "pointer",
-              fontFamily: '"IBM Plex Mono", monospace',
-            }}
-            onMouseEnter={(e) =>
-              (e.currentTarget.style.color = "rgba(0, 0, 0, 0.6)")
-            }
-            onMouseLeave={(e) =>
-              (e.currentTarget.style.color = "rgba(0, 0, 0, 0.3)")
-            }
-          >
-            dismiss →
-          </span>
-        </div>
+              dismiss →
+            </span>
+          </div>
+        )}
 
         {/* Progress bar */}
         <div

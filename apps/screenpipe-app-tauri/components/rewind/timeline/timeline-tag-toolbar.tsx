@@ -4,12 +4,12 @@
 import { useTimelineSelection } from "@/lib/hooks/use-timeline-selection";
 import { cn } from "@/lib/utils";
 import { format } from "date-fns";
-import { Tag, Plus, Trash2, RefreshCw, Loader2 } from "lucide-react";
+import { Tag, Plus, Trash2, RefreshCw, Loader2, X } from "lucide-react";
 import { useState, useRef, useMemo, useCallback, useEffect } from "react";
 import { createPortal } from "react-dom";
 import { toast } from "@/components/ui/use-toast";
 import { clearTimelineCache } from "@/lib/hooks/use-timeline-cache";
-import { clearOcrCache } from "@/lib/hooks/use-frame-ocr-data";
+import { clearTextCache } from "@/lib/hooks/use-frame-text-data";
 import {
 	AlertDialog,
 	AlertDialogAction,
@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import posthog from "posthog-js";
 import { PipeAIIcon } from "@/components/pipe-ai-icon";
+import { showChatWithPrefill } from "@/lib/chat-utils";
 import { type TemplatePipe } from "@/lib/hooks/use-pipes";
 import { AnimatePresence, motion } from "framer-motion";
 
@@ -71,8 +72,6 @@ export function TimelineTagToolbar({ anchorRect, onAskAI, onRunPipe, templatePip
 	const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 	const [isDeleting, setIsDeleting] = useState(false);
 	const [isRetranscribing, setIsRetranscribing] = useState(false);
-	const [showRetranscribe, setShowRetranscribe] = useState(false);
-	const [retranscribePrompt, setRetranscribePrompt] = useState("");
 	const inputRef = useRef<HTMLInputElement>(null);
 
 	// eslint-disable-next-line react-hooks/exhaustive-deps
@@ -189,7 +188,7 @@ export function TimelineTagToolbar({ anchorRect, onAskAI, onRunPipe, templatePip
 			});
 			setSelectionRange(null);
 			setShowDeleteConfirm(false);
-			clearOcrCache();
+			clearTextCache();
 			await clearTimelineCache();
 			window.location.reload();
 		} catch (e) {
@@ -203,51 +202,21 @@ export function TimelineTagToolbar({ anchorRect, onAskAI, onRunPipe, templatePip
 		if (!selectionRange || isRetranscribing) return;
 		setIsRetranscribing(true);
 
-		const body: any = {
-			start: selectionRange.start.toISOString(),
-			end: selectionRange.end.toISOString(),
-		};
-		if (retranscribePrompt.trim()) {
-			body.prompt = retranscribePrompt.trim();
-		}
-		const hadPrompt = !!retranscribePrompt.trim();
-
-		// close panel immediately — the request runs server-side
-		setShowRetranscribe(false);
-		setRetranscribePrompt("");
-
-		const mins = Math.round((selectionRange.end.getTime() - selectionRange.start.getTime()) / 60000);
-		const durLabel = mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : mins >= 1 ? `${mins}m` : "<1m";
-		toast({
-			title: "re-transcribing audio...",
-			description: `${durLabel} of audio — runs in background, you can close this panel`,
-			duration: 60_000,
-		});
+		const start = selectionRange.start.toISOString();
+		const end = selectionRange.end.toISOString();
 
 		try {
-			const resp = await fetch("http://localhost:3030/audio/retranscribe", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify(body),
+			posthog.capture("timeline_retranscribe", { method: "ai_chat" });
+			await showChatWithPrefill({
+				context: "",
+				prompt: `please read your screenpipe-api skill first, then retranscribe the audio from ${start} to ${end}. after retranscribing, ask me if i want to assign speaker names to the different speakers in the transcription.`,
+				autoSend: true,
+				source: "retranscribe-button",
 			});
-			if (!resp.ok) throw new Error(await resp.text());
-			const data = await resp.json();
-			toast({
-				title: "re-transcription done",
-				description: `${data.chunks_processed} audio chunks updated`,
-			});
-			posthog.capture("timeline_retranscribe", {
-				chunks_processed: data.chunks_processed,
-				had_prompt: hadPrompt,
-			});
-			clearOcrCache();
-			await clearTimelineCache();
-		} catch (e) {
-			toast({ title: "re-transcription failed", description: String(e), variant: "destructive" });
 		} finally {
 			setIsRetranscribing(false);
 		}
-	}, [selectionRange, isRetranscribing, retranscribePrompt]);
+	}, [selectionRange, isRetranscribing]);
 
 	// Early return AFTER all hooks
 	if (!selectionRange || !anchorRect || frameIds.length === 0) {
@@ -280,9 +249,18 @@ export function TimelineTagToolbar({ anchorRect, onAskAI, onRunPipe, templatePip
 				transform: "translate(-50%, -100%) translateY(-12px)",
 			}}
 		>
-			<div className="bg-popover border border-border rounded-xl shadow-2xl px-3 py-2.5 flex flex-col gap-2 min-w-[280px] max-w-[380px]">
+			<div className="bg-popover border border-border rounded-xl shadow-2xl px-3 py-2.5 flex flex-col gap-2 min-w-[280px] max-w-[380px] relative">
+				{/* Close button */}
+				<button
+					onClick={() => setSelectionRange(null)}
+					className="absolute top-1.5 right-1.5 p-0.5 text-muted-foreground hover:text-foreground transition-colors"
+					title="close"
+				>
+					<X className="w-3 h-3" />
+				</button>
+
 				{/* Selection info + ask AI */}
-				<div className="flex items-center justify-between gap-2">
+				<div className="flex items-center justify-between gap-2 pr-4">
 					<div className="flex items-center gap-2 text-xs text-muted-foreground min-w-0">
 						<Tag className="w-3 h-3 flex-shrink-0" />
 						<span className="truncate">
@@ -290,6 +268,13 @@ export function TimelineTagToolbar({ anchorRect, onAskAI, onRunPipe, templatePip
 						</span>
 					</div>
 					<div className="flex items-stretch gap-1 flex-shrink-0">
+					<button
+						onClick={() => setShowDeleteConfirm(true)}
+						className="flex items-center justify-center text-xs px-1.5 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors flex-shrink-0"
+						title="delete selected range"
+					>
+						<Trash2 className="w-3.5 h-3.5" />
+					</button>
 						{onAskAI && (
 							<div
 								className="relative"
@@ -436,10 +421,10 @@ export function TimelineTagToolbar({ anchorRect, onAskAI, onRunPipe, templatePip
 							</div>
 						)}
 						<button
-							onClick={() => setShowRetranscribe(!showRetranscribe)}
+							onClick={handleRetranscribe}
 							disabled={isRetranscribing}
 							className="flex items-center gap-1 text-xs px-2 py-1 rounded-md border border-border hover:bg-muted transition-colors flex-shrink-0"
-							title="re-transcribe audio in this range"
+							title="re-transcribe audio in this range via AI"
 						>
 							{isRetranscribing ? (
 								<Loader2 className="w-3 h-3 animate-spin" />
@@ -447,13 +432,6 @@ export function TimelineTagToolbar({ anchorRect, onAskAI, onRunPipe, templatePip
 								<RefreshCw className="w-3 h-3" />
 							)}
 							re-transcribe
-						</button>
-						<button
-							onClick={() => setShowDeleteConfirm(true)}
-							className="flex items-center justify-center text-xs px-2 rounded-md text-destructive hover:bg-destructive hover:text-destructive-foreground transition-colors flex-shrink-0"
-							title="delete selected range"
-						>
-							<Trash2 className="w-3.5 h-3.5" />
 						</button>
 					</div>
 				</div>
@@ -469,39 +447,6 @@ export function TimelineTagToolbar({ anchorRect, onAskAI, onRunPipe, templatePip
 								{t}
 							</span>
 						))}
-					</div>
-				)}
-
-				{/* Re-transcribe panel */}
-				{showRetranscribe && (
-					<div className="border border-border rounded-lg p-2 bg-muted/30 space-y-2">
-						<input
-							type="text"
-							value={retranscribePrompt}
-							onChange={(e) => setRetranscribePrompt(e.target.value)}
-							placeholder="hint words: e.g. screenpipe, posthog..."
-							className="w-full text-xs px-2 py-1 rounded-md border border-border bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary/50"
-						/>
-						<button
-							onClick={handleRetranscribe}
-							disabled={isRetranscribing}
-							className="w-full text-xs px-2 py-1.5 rounded-md bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-1"
-						>
-							{isRetranscribing ? (
-								<>
-									<Loader2 className="w-3 h-3 animate-spin" />
-									processing...
-								</>
-							) : (
-								<>
-									<RefreshCw className="w-3 h-3" />
-									re-transcribe
-								</>
-							)}
-						</button>
-						<p className="text-[10px] text-muted-foreground leading-tight">
-							runs in background — safe to close this panel
-						</p>
 					</div>
 				)}
 

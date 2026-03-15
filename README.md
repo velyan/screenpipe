@@ -27,27 +27,22 @@
 </p>
 
 
-
-
 <p align="center">
-    <a href="https://screenpi.pe" target="_blank">
-        <img src="https://img.shields.io/badge/download-desktop%20app-black?style=for-the-badge" alt="download">
-    </a>
-    <a href="https://github.com/screenpipe/screenpipe/releases/download/mcp-v0.8.0/screenpipe-mcp.mcpb" target="_blank">
-        <img src="https://img.shields.io/badge/install-Claude%20Extension-D97706?style=for-the-badge&logo=anthropic&logoColor=white" alt="install claude extension">
-    </a>
+  <a href="https://screenpi.pe/onboarding" target="_blank">
+    <img src="https://img.shields.io/badge/download-desktop%20app-black?style=for-the-badge" alt="download">
+  </a>
 </p>
 
 <p align="center">
-    <a href="https://discord.gg/dU9EBuw7Uq">
-        <img src="https://img.shields.io/discord/823813159592001537?color=5865F2&logo=discord&logoColor=white&style=flat-square" alt="discord">
-    </a>
-    <a href="https://twitter.com/screen_pipe">
-        <img alt="x" src="https://img.shields.io/twitter/url/https/twitter.com/diffuserslib.svg?style=social&label=follow%20%40screen_pipe">
-    </a>
-    <a href="https://www.youtube.com/@screen_pipe">
-      <img src="https://img.shields.io/badge/YouTube-subscribe-red?style=flat-square&logo=youtube&logoColor=white" alt="youtube">
-    </a>
+  <a href="https://discord.gg/screenpipe">
+    <img src="https://img.shields.io/discord/823813159592001537?style=for-the-badge&logo=discord&logoColor=white" alt="discord">
+  </a>
+  <a href="https://twitter.com/screen_pipe">
+    <img src="https://img.shields.io/twitter/follow/screen_pipe?style=for-the-badge&logo=x&logoColor=white&label=follow" alt="twitter">
+  </a>
+  <a href="https://www.youtube.com/@screen_pipe">
+    <img src="https://img.shields.io/youtube/channel/subscribers/UCwjkpAsb70_mENKvy7hT5bw?style=for-the-badge&logo=youtube&logoColor=white&label=subscribers" alt="youtube">
+  </a>
 </p>
 
 ![image](https://github.com/user-attachments/assets/dec2e07c-b3d5-46dd-9f36-c0c26a82c9fb)
@@ -79,7 +74,7 @@ screenpipe turns your computer into a personal AI that knows everything you've d
 
 ## install
 
-[download the desktop app](https://screenpi.pe) — one-time purchase, all features, auto-updates
+[download the desktop app](https://screenpi.pe/onboarding) — one-time purchase, all features, auto-updates
 
 or run the CLI:
 
@@ -87,23 +82,41 @@ or run the CLI:
 npx screenpipe@latest record
 ```
 
+then 
+
+```bash
+claude mcp add screenpipe -- npx -y screenpipe-mcp
+```
+
+then ask claude `what did i see in the last 5 mins?` or `summarize today conversations` or `create a pipe that updates linear every time i work on task X`
+
+
 ## specs
 
 - 5-10% cpu usage
 - 0.5-3gb ram
-- ~5-10gb storage/month
+- ~20gb storage/month
 - works offline
-- optional encrypted device sync
 
 ---
 
 <p align="center">
     <a href="https://docs.screenpi.pe">docs</a> ·
-    <a href="https://discord.gg/dU9EBuw7Uq">discord</a> ·
+    <a href="https://discord.gg/screenpipe">discord</a> ·
     <a href="https://twitter.com/screen_pipe">x</a> ·
     <a href="https://www.youtube.com/@screen_pipe">youtube</a> ·
     <a href="https://www.reddit.com/r/screen_pipe">reddit</a>
 </p>
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines, maintainers, and how to submit PRs. AI/vibe-coded PRs welcome!
+
+Thanks to all contributors:
+
+<a href="https://github.com/screenpipe/screenpipe/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=screenpipe/screenpipe" />
+</a>
 
 <details>
 <summary>📖 LLM reference</summary>
@@ -114,7 +127,7 @@ screenpipe is an open source application (MIT license) that continuously capture
 
 - **Website**: https://screenpi.pe
 - **Documentation**: https://docs.screenpi.pe
-- **Discord**: https://discord.gg/dU9EBuw7Uq
+- **Discord**: https://discord.gg/screenpipe
 - **License**: MIT
 
 ## Who screenpipe is for
@@ -124,6 +137,7 @@ screenpipe is an open source application (MIT license) that continuously capture
 - **Researchers** who need to search through large volumes of screen-based information
 - **People with ADHD** who frequently lose track of tabs, documents, and conversations
 - **Remote workers** who want automatic meeting transcription and notes
+- **Teams & enterprises** who want to deploy AI across their organization with deterministic data permissions and central config management ([screenpi.pe/team](https://screenpi.pe/team))
 - **Anyone** who wants a private, local-first alternative to cloud-based AI memory tools
 
 ## Platform support
@@ -159,6 +173,15 @@ Pipes are scheduled AI agents defined as markdown files. Each pipe is a `pipe.md
 
 Developers can create pipes by writing a markdown file in `~/.screenpipe/pipes/`.
 
+#### Pipe data permissions
+Each pipe supports YAML frontmatter fields that give admins deterministic, OS-level control over what data AI agents can access:
+- **App & window filtering**: `allow-apps`, `deny-apps`, `deny-windows` (glob patterns)
+- **Content type control**: restrict to `ocr`, `audio`, `input`, or `accessibility`
+- **Time & day restrictions**: e.g. `time-range: 09:00-18:00`, `days: Mon,Tue,Wed,Thu,Fri`
+- **Endpoint gating**: `allow-raw-sql: false`, `allow-frames: false`
+
+Enforced at three layers — skill gating (AI never learns denied endpoints), agent interception (blocked before execution), and server middleware (per-pipe cryptographic tokens). Not prompt-based. Deterministic.
+
 ### MCP server (Model Context Protocol)
 screenpipe runs as an MCP server, allowing AI assistants to query your screen history:
 - Works with Claude Desktop, Cursor, VS Code (Cline, Continue), and any MCP-compatible client
@@ -179,6 +202,7 @@ On supported Macs, screenpipe uses Apple Intelligence for on-device AI processin
 - **No account required**: Core application works without any sign-up.
 - **You own your data**: Export, delete, or back up at any time.
 - **Optional encrypted sync**: End-to-end encrypted sync between devices (zero-knowledge encryption).
+- **AI data permissions**: Per-pipe YAML-based access control — deterministic enforcement at the OS level, not prompt-based. Three enforcement layers prevent AI agents from accessing unauthorized data.
 
 ## How screenpipe compares to alternatives
 
@@ -192,6 +216,7 @@ On supported Macs, screenpipe uses Apple Intelligence for on-device AI processin
 | Developer API | ✅ Full REST API + SDK | Limited | ❌ | ❌ |
 | Plugin system | ✅ Pipes (AI agents) | ❌ | ❌ | ❌ |
 | AI model choice | Any (local or cloud) | Proprietary | Microsoft AI | Proprietary |
+| Team deployment | ✅ Central config, AI permissions | ❌ | ❌ | ❌ |
 | Pricing | One-time purchase | Subscription | Bundled with Windows | Subscription |
 
 ## Pricing
@@ -199,6 +224,7 @@ On supported Macs, screenpipe uses Apple Intelligence for on-device AI processin
 - **Lifetime**: $400 one-time purchase. All features, all future updates, forever.
 - **Lifetime + Pro 1 year**: $600 one-time. Includes lifetime app + 1 year of Pro (cloud sync, priority support).
 - **Pro subscription**: $39/month for cloud sync between devices, priority support, and pro AI models.
+- **Teams**: Custom pricing. Shared configs, shared pipes, per-pipe AI data permissions, admin dashboard, MDM ready (Intune / SCCM). See [screenpi.pe/team](https://screenpi.pe/team).
 
 ## Integrations
 
@@ -207,6 +233,18 @@ On supported Macs, screenpipe uses Apple Intelligence for on-device AI processin
 - **Note-taking**: Obsidian, Notion
 - **Local AI**: Ollama, any OpenAI-compatible model server
 - **Automation**: Custom pipes (scheduled AI agents as markdown files)
+
+## Teams & enterprise
+
+screenpipe Teams lets organizations deploy AI agents across their team with full control over what AI can access. See [screenpi.pe/team](https://screenpi.pe/team).
+
+- **Central config management**: Push capture settings (app filters, schedules, URL rules) to every device from an admin dashboard.
+- **Shared pipes**: Deploy AI workflows (auto-standups, meeting-to-tickets, time tracking) team-wide.
+- **Per-pipe AI data permissions**: YAML frontmatter controls what each pipe can access — apps, windows, content types, time ranges, endpoints. Enforced deterministically at the OS level via three layers (skill gating, agent interception, server middleware with per-pipe cryptographic tokens).
+- **Privacy boundary**: Admins control what gets captured and what AI accesses. They never see the actual data — everything stays on each employee's device.
+- **Override rules**: Employees can add stricter filters (e.g. also block personal email) but cannot weaken admin-set rules.
+- **MDM ready**: Deploy via Intune, SCCM, Robopack, or any MDM solution.
+- **Enterprise**: SSO/SAML, audit logs, SLA, SOC 2 / HIPAA compliance ready.
 
 ## Technical architecture
 
@@ -263,6 +301,12 @@ Yes. screenpipe captures all connected monitors simultaneously.
 
 **How does text extraction work?**
 screenpipe primarily uses the OS accessibility tree to get structured text (buttons, labels, text fields) — this is faster and more accurate than OCR. When accessibility data isn't available (remote desktops, games, some Linux apps), it falls back to OCR: Apple Vision on macOS, Windows native OCR, or Tesseract on Linux.
+
+**Can I deploy screenpipe to my team?**
+Yes. Screenpipe Teams provides central config management, shared AI pipes, and per-pipe data permissions. Admins control what gets captured and what AI can access — employees' actual data never leaves their devices. See [screenpi.pe/team](https://screenpi.pe/team).
+
+**How do AI data permissions work?**
+Each pipe supports YAML frontmatter fields (allow-apps, deny-apps, deny-windows, allow-content-types, time-range, days, allow-raw-sql, allow-frames) that deterministically control what data the AI agent can access. Enforcement happens at three OS-level layers — not by prompting the AI to behave. Even a compromised agent cannot access denied data.
 
 ## Company
 

@@ -8,19 +8,15 @@ use analytics::AnalyticsManager;
 use commands::show_main_window;
 use serde_json::json;
 use std::env;
-use std::fs::File;
-use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use tauri::Emitter;
 use tauri::Manager;
 use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
-use tauri_plugin_global_shortcut::ShortcutState;
 #[allow(unused_imports)]
 use tauri_plugin_shell::process::CommandEvent;
-use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::prelude::*;
@@ -29,7 +25,7 @@ use tracing_subscriber::EnvFilter;
 #[cfg(target_os = "macos")]
 use tracing_oslog::OsLogger;
 use updates::start_update_check;
-use window_api::ShowRewindWindow;
+use window::ShowRewindWindow;
 
 // TypeScript bindings generation imports (only in debug builds)
 #[cfg(debug_assertions)]
@@ -41,19 +37,22 @@ mod analytics;
 #[allow(deprecated)]
 mod icons;
 use crate::analytics::start_analytics;
-use crate::store::SettingsStore;
-
 mod calendar;
+mod chatgpt_oauth;
 #[allow(deprecated)]
 mod commands;
 mod disk_usage;
 mod embedded_server;
 mod hardware;
 mod ics_calendar;
+mod livetext;
+#[cfg(target_os = "macos")]
+mod livetext_ffi;
 mod permissions;
 mod pi;
+mod pipe_suggestions_scheduler;
 mod recording;
-mod reminders;
+mod remote_sync_commands;
 mod server;
 #[cfg(target_os = "macos")]
 #[allow(deprecated)]
@@ -64,11 +63,9 @@ mod sync;
 mod tray;
 mod updates;
 mod voice_training;
-#[allow(deprecated)]
-mod window_api;
+mod window;
 #[cfg(target_os = "windows")]
 mod windows_overlay;
-mod chatgpt_oauth;
 
 pub use server::*;
 
@@ -89,636 +86,32 @@ pub use recording::stop_screenpipe;
 pub use server::spawn_server;
 // Removed: pub use store::get_profiles_store; // Profile functionality has been removed
 
-use crate::commands::hide_main_window;
 pub use permissions::do_permissions_check;
 pub use permissions::open_permission_settings;
 pub use permissions::request_permission;
 use sentry;
-use std::collections::HashMap;
 use tauri::AppHandle;
-use tauri_plugin_global_shortcut::GlobalShortcutExt;
-use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut};
+#[cfg(target_os = "macos")]
+mod dock_menu;
 mod health;
+mod log_files;
 mod safe_icon;
+mod shortcuts;
+mod vault;
 use base64::Engine;
 use health::start_health_check;
-use window_api::RewindWindowId;
-
-/// Setup macOS dock right-click menu as fallback for when tray icon is
-/// hidden behind the MacBook Pro notch.
-#[cfg(target_os = "macos")]
-#[allow(deprecated)]
-fn setup_dock_menu(app_handle: AppHandle) {
-    use cocoa::base::{id, nil};
-    use cocoa::foundation::NSString;
-    use objc::runtime::{Object, Sel};
-    use objc::{class, msg_send, sel, sel_impl};
-
-    unsafe {
-        // Store app handle in a global so the dock menu callbacks can use it
-        static mut DOCK_APP_HANDLE: Option<AppHandle> = None;
-        DOCK_APP_HANDLE = Some(app_handle);
-
-        // Callback functions for dock menu items
-        extern "C" fn show_screenpipe(_this: &Object, _sel: Sel, _sender: id) {
-            unsafe {
-                if let Some(ref app) = DOCK_APP_HANDLE {
-                    let app_for_closure = app.clone();
-                    let _ = app.run_on_main_thread(move || {
-                        show_main_window(&app_for_closure, false);
-                    });
-                }
-            }
-        }
-        extern "C" fn open_settings(_this: &Object, _sel: Sel, _sender: id) {
-            unsafe {
-                if let Some(ref app) = DOCK_APP_HANDLE {
-                    let app_for_closure = app.clone();
-                    let _ = app.run_on_main_thread(move || {
-                        let _ = ShowRewindWindow::Settings { page: None }.show(&app_for_closure);
-                    });
-                }
-            }
-        }
-        extern "C" fn check_updates(_this: &Object, _sel: Sel, _sender: id) {
-            unsafe {
-                if let Some(ref app) = DOCK_APP_HANDLE {
-                    let app = app.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let state = app.state::<std::sync::Arc<crate::updates::UpdatesManager>>();
-                        if let Err(e) = state.check_for_updates(true).await {
-                            tracing::error!("dock menu: check for updates failed: {}", e);
-                        }
-                    });
-                }
-            }
-        }
-        extern "C" fn dock_menu(_this: &Object, _sel: Sel, _sender: id) -> id {
-            unsafe {
-                let menu: id = msg_send![class!(NSMenu), new];
-
-                // "Show screenpipe"
-                let title = NSString::alloc(nil).init_str("Show screenpipe");
-                let action = sel!(showScreenpipe:);
-                let key = NSString::alloc(nil).init_str("");
-                let item: id = msg_send![class!(NSMenuItem), alloc];
-                let item: id = msg_send![item, initWithTitle:title action:action keyEquivalent:key];
-                let _: () = msg_send![item, setTarget: _this];
-                let _: () = msg_send![menu, addItem: item];
-
-                // "Settings"
-                let title = NSString::alloc(nil).init_str("Settings");
-                let action = sel!(openSettings:);
-                let key = NSString::alloc(nil).init_str("");
-                let item: id = msg_send![class!(NSMenuItem), alloc];
-                let item: id = msg_send![item, initWithTitle:title action:action keyEquivalent:key];
-                let _: () = msg_send![item, setTarget: _this];
-                let _: () = msg_send![menu, addItem: item];
-
-                // "Check for updates"
-                let title = NSString::alloc(nil).init_str("Check for updates");
-                let action = sel!(checkUpdates:);
-                let key = NSString::alloc(nil).init_str("");
-                let item: id = msg_send![class!(NSMenuItem), alloc];
-                let item: id = msg_send![item, initWithTitle:title action:action keyEquivalent:key];
-                let _: () = msg_send![item, setTarget: _this];
-                let _: () = msg_send![menu, addItem: item];
-
-                // Note: macOS adds native "Quit" to dock menu automatically
-                menu
-            }
-        }
-
-        // Register a custom class that handles dock menu
-        let superclass = class!(NSObject);
-        let mut decl =
-            objc::declare::ClassDecl::new("ScreenpipeDockMenuDelegate", superclass).unwrap();
-        decl.add_method(
-            sel!(showScreenpipe:),
-            show_screenpipe as extern "C" fn(&Object, Sel, id),
-        );
-        decl.add_method(
-            sel!(openSettings:),
-            open_settings as extern "C" fn(&Object, Sel, id),
-        );
-        decl.add_method(
-            sel!(checkUpdates:),
-            check_updates as extern "C" fn(&Object, Sel, id),
-        );
-        decl.add_method(
-            sel!(applicationDockMenu:),
-            dock_menu as extern "C" fn(&Object, Sel, id) -> id,
-        );
-        let delegate_class = decl.register();
-
-        let delegate: id = msg_send![delegate_class, new];
-
-        // Get NSApplication and set our delegate for dock menu
-        let ns_app: id = msg_send![class!(NSApplication), sharedApplication];
-        let current_delegate: id = msg_send![ns_app, delegate];
-
-        // Swizzle applicationDockMenu: onto the existing app delegate
-        let dock_menu_sel = sel!(applicationDockMenu:);
-        let method = objc::runtime::class_getInstanceMethod(
-            object_getClass(delegate) as *const _,
-            dock_menu_sel,
-        );
-        if !method.is_null() {
-            let imp = objc::runtime::method_getImplementation(method);
-            let encoding = b"@:@\0".as_ptr() as *const std::ffi::c_char;
-            let delegate_class = object_getClass(current_delegate);
-            objc::runtime::class_addMethod(delegate_class as *mut _, dock_menu_sel, imp, encoding);
-            // Also add the action methods
-            let void_encoding = b"v:@\0".as_ptr() as *const std::ffi::c_char;
-            for sel_name in &[sel!(showScreenpipe:), sel!(openSettings:)] {
-                let m = objc::runtime::class_getInstanceMethod(
-                    object_getClass(delegate) as *const _,
-                    *sel_name,
-                );
-                if !m.is_null() {
-                    let imp = objc::runtime::method_getImplementation(m);
-                    objc::runtime::class_addMethod(
-                        delegate_class as *mut _,
-                        *sel_name,
-                        imp,
-                        void_encoding,
-                    );
-                }
-            }
-        }
-
-        info!("macOS dock menu set up");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[allow(non_snake_case, deprecated)]
-    unsafe fn object_getClass(obj: id) -> *const objc::runtime::Class {
-        msg_send![obj, class]
-    }
-}
-
-// New struct to hold shortcut configuration
-#[derive(Debug, Default)]
-struct ShortcutConfig {
-    show: String,
-    start: String,
-    stop: String,
-    start_audio: String,
-    stop_audio: String,
-    show_chat: String,
-    search: String,
-    disabled: Vec<String>,
-}
-
-impl ShortcutConfig {
-    async fn from_store(app: &AppHandle) -> Result<Self, String> {
-        let store = SettingsStore::get(app)
-            .unwrap_or_default()
-            .unwrap_or_default();
-
-        Ok(Self {
-            show: store.show_screenpipe_shortcut,
-            start: store.start_recording_shortcut,
-            stop: store.stop_recording_shortcut,
-            start_audio: store.start_audio_shortcut,
-            stop_audio: store.stop_audio_shortcut,
-            show_chat: store.show_chat_shortcut,
-            search: store.search_shortcut,
-            disabled: store.disabled_shortcuts,
-        })
-    }
-
-    fn is_disabled(&self, shortcut_type: &str) -> bool {
-        self.disabled.contains(&shortcut_type.to_string())
-    }
-}
-
-// Helper to register a single shortcut
-async fn register_shortcut(
-    app: &AppHandle,
-    shortcut_str: &str,
-    is_disabled: bool,
-    handler: impl Fn(&AppHandle) + Send + Sync + 'static,
-) -> Result<(), String> {
-    if shortcut_str.is_empty() || is_disabled {
-        return Ok(());
-    }
-
-    let shortcut = parse_shortcut(shortcut_str)?;
-
-    let global_shortcut = app.global_shortcut();
-
-    global_shortcut
-        .on_shortcut(shortcut, move |app, _shortcut, event| {
-            // Only trigger on key press, not release.
-            // Shortcut handlers are called from tao::send_event (Obj-C FFI, nounwind).
-            // Handler must defer heavy work itself (clone + run_on_main_thread) so sync path stays minimal.
-            if matches!(event.state, ShortcutState::Pressed) {
-                if let Err(e) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    handler(app);
-                })) {
-                    error!("panic in shortcut handler: {:?}", e);
-                }
-            }
-        })
-        .map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-#[specta::specta]
-async fn update_global_shortcuts(
-    app: AppHandle,
-    show_shortcut: String,
-    start_shortcut: String,
-    stop_shortcut: String,
-    start_audio_shortcut: String,
-    stop_audio_shortcut: String,
-    _profile_shortcuts: HashMap<String, String>, // Keep for API compatibility but ignore
-) -> Result<(), String> {
-    let store_config = ShortcutConfig::from_store(&app).await?;
-    let config = ShortcutConfig {
-        show: show_shortcut,
-        start: start_shortcut,
-        stop: stop_shortcut,
-        start_audio: start_audio_shortcut,
-        stop_audio: stop_audio_shortcut,
-        show_chat: store_config.show_chat,
-        search: store_config.search,
-        disabled: store_config.disabled,
-    };
-    apply_shortcuts(&app, &config).await
-}
-
-async fn initialize_global_shortcuts(app: &AppHandle) -> Result<(), String> {
-    let config = ShortcutConfig::from_store(app).await?;
-    apply_shortcuts(app, &config).await
-}
-
-async fn apply_shortcuts(app: &AppHandle, config: &ShortcutConfig) -> Result<(), String> {
-    let global_shortcut = app.global_shortcut();
-    if let Err(e) = global_shortcut.unregister_all() {
-        error!("failed to unregister all shortcuts: {}", e);
-    }
-
-    // Register show shortcut (defer off event stack: handler runs from tao::send_event)
-    register_shortcut(app, &config.show, config.is_disabled("show"), |app| {
-        let app_for_closure = app.clone();
-        let _ = app.run_on_main_thread(move || {
-            let app = &app_for_closure;
-            info!("show shortcut triggered - attempting to show/hide main overlay");
-            let _ = app.emit("shortcut-show", ());
-            #[cfg(target_os = "macos")]
-            {
-                use crate::store::SettingsStore;
-                use crate::window_api::main_label_for_mode;
-                // Get current mode to find the right window label
-                let mode = SettingsStore::get(app)
-                    .unwrap_or_default()
-                    .unwrap_or_default()
-                    .overlay_mode;
-                let label = main_label_for_mode(&mode);
-
-                if let Some(window) = app.get_webview_window(label) {
-                    match window.is_visible() {
-                        Ok(true) => {
-                            info!("window is visible, hiding main window");
-                            hide_main_window(app)
-                        }
-                        _ => {
-                            info!("window is not visible, showing main window");
-                            show_main_window(app, false)
-                        }
-                    }
-                } else {
-                    info!("main window not found for mode '{}', creating it", mode);
-                    show_main_window(app, false)
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                use crate::store::SettingsStore;
-                use crate::window_api::main_label_for_mode;
-                let mode = SettingsStore::get(app)
-                    .unwrap_or_default()
-                    .unwrap_or_default()
-                    .overlay_mode;
-                let label = main_label_for_mode(&mode);
-
-                // Debug: list all existing windows
-                for (wlabel, _) in app.webview_windows() {
-                    info!("existing window: {}", wlabel);
-                }
-
-                if let Some(window) = app.get_webview_window(label) {
-                    info!("found {} window, checking visibility", label);
-                    match window.is_visible() {
-                        Ok(true) => {
-                            info!("{} window is visible, hiding it", label);
-                            hide_main_window(app)
-                        }
-                        Ok(false) => {
-                            info!("{} window exists but not visible, showing it", label);
-                            show_main_window(app, false)
-                        }
-                        Err(e) => {
-                            info!(
-                                "error checking visibility: {}, showing main window anyway",
-                                e
-                            );
-                            show_main_window(app, false)
-                        }
-                    }
-                } else {
-                    info!("{} window not found, creating it", label);
-                    show_main_window(app, false)
-                }
-            }
-        });
-    })
-    .await?;
-
-    // Register start shortcut
-    register_shortcut(
-        app,
-        &config.start,
-        config.is_disabled("start_recording"),
-        |app| {
-            let _ = app.emit("shortcut-start-recording", ());
-        },
-    )
-    .await?;
-
-    // Register stop shortcut
-    register_shortcut(
-        app,
-        &config.stop,
-        config.is_disabled("stop_recording"),
-        |app| {
-            let _ = app.emit("shortcut-stop-recording", ());
-        },
-    )
-    .await?;
-
-    // Register start audio shortcut
-    register_shortcut(
-        app,
-        &config.start_audio,
-        config.is_disabled("start_audio"),
-        |app| {
-            if let Ok(store) = get_store(app, None) {
-                store.set("disableAudio", false);
-                let _ = store.save();
-            }
-            let _ = app.emit("shortcut-start-audio", ());
-            info!("start audio shortcut triggered");
-        },
-    )
-    .await?;
-
-    // Register stop audio shortcut
-    register_shortcut(
-        app,
-        &config.stop_audio,
-        config.is_disabled("stop_audio"),
-        |app| {
-            if let Ok(store) = get_store(app, None) {
-                store.set("disableAudio", true);
-                let _ = store.save();
-            }
-            let _ = app.emit("shortcut-stop-audio", ());
-            info!("stop audio shortcut triggered");
-        },
-    )
-    .await?;
-
-    // Register show chat shortcut (global - toggles standalone AI chat window) (defer off event stack)
-    register_shortcut(
-        app,
-        &config.show_chat,
-        config.is_disabled("show_chat"),
-        |app| {
-            let app_for_closure = app.clone();
-            let _ = app.run_on_main_thread(move || {
-                let app = &app_for_closure;
-                info!("show chat shortcut triggered");
-                let _ = app.emit("shortcut-show-chat", ());
-                // Toggle the chat window - hide if visible, show if not.
-                // Use order_out (not close) to preserve the pre-created panel
-                // so it can reappear on fullscreen Spaces without re-creation.
-                if let Some(_window) = app.get_webview_window("chat") {
-                    #[cfg(target_os = "macos")]
-                    {
-                        use tauri_nspanel::ManagerExt;
-                        if let Ok(panel) = app.get_webview_panel("chat") {
-                            if panel.is_visible() {
-                                panel.order_out(None);
-                                return;
-                            }
-                        }
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    {
-                        if _window.is_visible().unwrap_or(false) {
-                            let _ = _window.hide();
-                            return;
-                        }
-                    }
-                }
-                let _ = ShowRewindWindow::Chat.show(app);
-            });
-        },
-    )
-    .await?;
-
-    // Register search shortcut (global - opens overlay with search focused) (defer off event stack)
-    register_shortcut(app, &config.search, config.is_disabled("search"), |app| {
-        let app_for_closure = app.clone();
-        let _ = app.run_on_main_thread(move || {
-            let app = &app_for_closure;
-            info!("search shortcut triggered");
-            // Always show the overlay, then emit search event to focus the search input
-            #[cfg(target_os = "macos")]
-            {
-                use crate::store::SettingsStore;
-                use crate::window_api::main_label_for_mode;
-                let mode = SettingsStore::get(app)
-                    .unwrap_or_default()
-                    .unwrap_or_default()
-                    .overlay_mode;
-                let label = main_label_for_mode(&mode);
-                if let Some(window) = app.get_webview_window(label) {
-                    if !window.is_visible().unwrap_or(false) {
-                        show_main_window(app, false);
-                    }
-                } else {
-                    show_main_window(app, false);
-                }
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                use crate::store::SettingsStore;
-                use crate::window_api::main_label_for_mode;
-                let mode = SettingsStore::get(app)
-                    .unwrap_or_default()
-                    .unwrap_or_default()
-                    .overlay_mode;
-                let label = main_label_for_mode(&mode);
-                if let Some(window) = app.get_webview_window(label) {
-                    if !window.is_visible().unwrap_or(false) {
-                        show_main_window(app, false);
-                    }
-                } else {
-                    show_main_window(app, false);
-                }
-            }
-            // Emit event so the frontend opens the search modal
-            let _ = app.emit("open-search", ());
-        });
-    })
-    .await?;
-
-    Ok(())
-}
-
-#[tauri::command]
-#[specta::specta]
-async fn suspend_global_shortcuts(app: AppHandle) -> Result<(), String> {
-    let global_shortcut = app.global_shortcut();
-    global_shortcut
-        .unregister_all()
-        .map_err(|e| format!("failed to suspend shortcuts: {}", e))?;
-    info!("global shortcuts suspended for recording");
-    Ok(())
-}
-
-#[tauri::command]
-#[specta::specta]
-async fn resume_global_shortcuts(app: AppHandle) -> Result<(), String> {
-    initialize_global_shortcuts(&app).await?;
-    info!("global shortcuts resumed after recording");
-    Ok(())
-}
+use log_files::{get_log_files, get_screenpipe_data_dir};
+use shortcuts::{
+    initialize_global_shortcuts, resume_global_shortcuts,
+    suspend_global_shortcuts, update_global_shortcuts,
+};
+use vault::{vault_status, vault_unlock};
+use window::RewindWindowId;
 
 #[tauri::command]
 #[specta::specta]
 fn get_env(name: &str) -> String {
     std::env::var(String::from(name)).unwrap_or(String::from(""))
-}
-
-#[derive(Debug, serde::Serialize, specta::Type)]
-pub struct LogFile {
-    name: String,
-    path: String,
-    modified_at: u64,
-}
-
-#[tauri::command]
-#[specta::specta]
-async fn get_log_files(app: AppHandle) -> Result<Vec<LogFile>, String> {
-    let data_dir = get_screenpipe_data_dir(&app).map_err(|e| e.to_string())?;
-    let screenpipe_data_dir = get_data_dir(&app).map_err(|e| e.to_string())?;
-    let mut log_files = Vec::new();
-
-    // Collect all entries first
-    let mut entries = Vec::new();
-    let mut dir = tokio::fs::read_dir(&data_dir)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut screenpipe_dir = tokio::fs::read_dir(&screenpipe_data_dir)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    while let Some(entry) = dir.next_entry().await.map_err(|e| e.to_string())? {
-        // Get metadata immediately for each entry
-        if let Ok(metadata) = entry.metadata().await {
-            entries.push((entry, metadata));
-        }
-    }
-
-    while let Some(entry) = screenpipe_dir
-        .next_entry()
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        // Get metadata immediately for each entry
-        if let Ok(metadata) = entry.metadata().await {
-            entries.push((entry, metadata));
-        }
-    }
-
-    // Sort by modified time descending (newest first)
-    entries.sort_by_key(|(_, metadata)| {
-        std::cmp::Reverse(
-            metadata
-                .modified()
-                .ok()
-                .and_then(|m| m.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-        )
-    });
-
-    // Process sorted entries
-    for (entry, metadata) in entries {
-        let path = entry.path();
-        if let Some(extension) = path.extension() {
-            if extension == "log" {
-                let modified = metadata
-                    .modified()
-                    .map_err(|e| e.to_string())?
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .map_err(|e| e.to_string())?
-                    .as_secs();
-
-                log_files.push(LogFile {
-                    name: path
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string(),
-                    path: path.to_string_lossy().to_string(),
-                    modified_at: modified,
-                });
-            }
-        }
-    }
-
-    Ok(log_files)
-}
-
-fn get_data_dir(app: &tauri::AppHandle) -> anyhow::Result<PathBuf> {
-    let default_path = app.path().home_dir().unwrap().join(".screenpipe");
-
-    // Try to get dataDir from settings in store
-    // The store structure is: { "settings": { "dataDir": "default", ... }, ... }
-    let data_dir = match get_store(app, None) {
-        Ok(store) => {
-            if let Some(settings) = store.get("settings") {
-                settings
-                    .get("dataDir")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| "default".to_string())
-            } else {
-                "default".to_string()
-            }
-        }
-        Err(e) => {
-            warn!("Failed to get store for data dir, using default: {}", e);
-            "default".to_string()
-        }
-    };
-
-    if data_dir == "default" || data_dir.is_empty() {
-        Ok(default_path)
-    } else {
-        get_base_dir(app, Some(data_dir))
-    }
-}
-
-fn get_screenpipe_data_dir(app: &tauri::AppHandle) -> anyhow::Result<PathBuf> {
-    let default_path = app.path().home_dir().unwrap().join(".screenpipe");
-    Ok(default_path)
 }
 
 use tokio::time::{sleep, Duration};
@@ -877,94 +270,6 @@ async fn upload_file_to_s3(file_path: &str, signed_url: &str) -> Result<bool, St
         "Upload failed after {} attempts. Last error: {}",
         max_retries, last_error
     ))
-}
-
-// Helper function to parse shortcut string
-pub fn parse_shortcut(shortcut_str: &str) -> Result<Shortcut, String> {
-    let parts: Vec<&str> = shortcut_str.split('+').collect();
-    let key = parts.last().ok_or("Invalid shortcut format")?;
-
-    let mut modifiers = Modifiers::empty();
-    for modifier in &parts[..parts.len() - 1] {
-        match modifier.to_uppercase().as_str() {
-            "SUPER" | "CMD" | "COMMAND" => modifiers |= Modifiers::META,
-            "CTRL" | "CONTROL" => modifiers |= Modifiers::CONTROL,
-            "ALT" | "OPTION" => modifiers |= Modifiers::ALT,
-            "SHIFT" => modifiers |= Modifiers::SHIFT,
-            _ => return Err(format!("Unknown modifier: {}", modifier)),
-        }
-    }
-
-    // Parse the key code - make case insensitive
-    let code = match key.to_uppercase().as_str() {
-        // Letters
-        "A" => Code::KeyA,
-        "B" => Code::KeyB,
-        "C" => Code::KeyC,
-        "D" => Code::KeyD,
-        "E" => Code::KeyE,
-        "F" => Code::KeyF,
-        "G" => Code::KeyG,
-        "H" => Code::KeyH,
-        "I" => Code::KeyI,
-        "J" => Code::KeyJ,
-        "K" => Code::KeyK,
-        "L" => Code::KeyL,
-        "M" => Code::KeyM,
-        "N" => Code::KeyN,
-        "O" => Code::KeyO,
-        "P" => Code::KeyP,
-        "Q" => Code::KeyQ,
-        "R" => Code::KeyR,
-        "S" => Code::KeyS,
-        "T" => Code::KeyT,
-        "U" => Code::KeyU,
-        "V" => Code::KeyV,
-        "W" => Code::KeyW,
-        "X" => Code::KeyX,
-        "Y" => Code::KeyY,
-        "Z" => Code::KeyZ,
-
-        // Numbers
-        "0" => Code::Digit0,
-        "1" => Code::Digit1,
-        "2" => Code::Digit2,
-        "3" => Code::Digit3,
-        "4" => Code::Digit4,
-        "5" => Code::Digit5,
-        "6" => Code::Digit6,
-        "7" => Code::Digit7,
-        "8" => Code::Digit8,
-        "9" => Code::Digit9,
-
-        // Function keys
-        "F1" => Code::F1,
-        "F2" => Code::F2,
-        "F3" => Code::F3,
-        "F4" => Code::F4,
-        "F5" => Code::F5,
-        "F6" => Code::F6,
-        "F7" => Code::F7,
-        "F8" => Code::F8,
-        "F9" => Code::F9,
-        "F10" => Code::F10,
-        "F11" => Code::F11,
-        "F12" => Code::F12,
-
-        // Special keys
-        "SPACE" => Code::Space,
-        "TAB" => Code::Tab,
-        "ENTER" => Code::Enter,
-        "ESCAPE" | "ESC" => Code::Escape,
-        "UP" => Code::ArrowUp,
-        "DOWN" => Code::ArrowDown,
-        "LEFT" => Code::ArrowLeft,
-        "RIGHT" => Code::ArrowRight,
-
-        _ => return Err(format!("Unsupported key: {}", key)),
-    };
-
-    Ok(Shortcut::new(Some(modifiers), code))
 }
 
 // check if the server is running
@@ -1191,12 +496,15 @@ async fn main() {
                 permissions::reset_and_request_permission,
                 permissions::do_permissions_check,
                 permissions::check_microphone_permission,
+                permissions::check_screen_recording_permission,
                 permissions::check_accessibility_permission_cmd,
                 permissions::check_arc_installed,
                 permissions::check_arc_automation_permission,
                 permissions::request_arc_automation_permission,
                 // Commands from main.rs
                 get_env,
+                vault_status,
+                vault_unlock,
                 get_log_files,
                 get_media_file,
                 upload_file_to_s3,
@@ -1215,6 +523,8 @@ async fn main() {
                 commands::open_google_calendar_auth_window,
                 commands::ensure_webview_focus,
                 commands::close_window,
+                commands::resize_search_window,
+                commands::search_navigate_to_timeline,
                 commands::reset_main_window,
                 commands::set_window_size,
                 // Onboarding commands
@@ -1253,6 +563,7 @@ async fn main() {
                 sync::update_sync_config,
                 sync::get_sync_devices,
                 sync::remove_sync_device,
+                sync::delete_device_local_data,
                 sync::init_sync,
                 sync::lock_sync,
                 sync::delete_cloud_data,
@@ -1272,18 +583,9 @@ async fn main() {
                 chatgpt_oauth::chatgpt_oauth_get_token,
                 chatgpt_oauth::chatgpt_oauth_logout,
                 chatgpt_oauth::chatgpt_oauth_models,
-                // Reminders commands
-                reminders::reminders_status,
-                reminders::reminders_authorize,
-                reminders::reminders_list,
-                reminders::reminders_create,
-                reminders::reminders_scan,
-                reminders::reminders_start_scheduler,
-                reminders::reminders_stop_scheduler,
-                reminders::reminders_get_custom_prompt,
-                reminders::reminders_set_custom_prompt,
-                reminders::reminders_get_audio_only,
-                reminders::reminders_set_audio_only,
+                // Pipe suggestions scheduler commands
+                pipe_suggestions_scheduler::pipe_suggestions_get_settings,
+                pipe_suggestions_scheduler::pipe_suggestions_update_settings,
                 // Calendar commands
                 calendar::calendar_status,
                 calendar::calendar_authorize,
@@ -1298,6 +600,7 @@ async fn main() {
                 voice_training::train_voice,
                 // Suggestions
                 suggestions::get_cached_suggestions,
+                suggestions::force_regenerate_suggestions,
                 // Config commands
                 config::validate_data_dir,
                 // Hardware detection
@@ -1308,9 +611,6 @@ async fn main() {
             .typ::<sync::SyncStatusResponse>()
             .typ::<sync::SyncDeviceInfo>()
             .typ::<sync::SyncConfig>()
-            .typ::<reminders::RemindersStatus>()
-            .typ::<reminders::ReminderItem>()
-            .typ::<reminders::ScanResult>()
             .typ::<calendar::CalendarStatus>()
             .typ::<calendar::CalendarEventItem>()
             .typ::<store::IcsCalendarEntry>()
@@ -1330,10 +630,11 @@ async fn main() {
     let recording_state = RecordingState {
         handle: Arc::new(tokio::sync::Mutex::new(None)),
         is_starting: Arc::new(AtomicBool::new(false)),
+        last_spawn_epoch: Arc::new(AtomicU64::new(0)),
     };
     let pi_state = pi::PiState(Arc::new(tokio::sync::Mutex::new(pi::PiPool::new())));
-    let reminders_state = reminders::RemindersState::new();
     let suggestions_state = suggestions::SuggestionsState::new();
+    let pipe_suggestions_state = pipe_suggestions_scheduler::PipeSuggestionsState::new();
     #[allow(clippy::single_match)]
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -1343,15 +644,19 @@ async fn main() {
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 let _ = window.set_always_on_top(false);
                 let _ = window.set_visible_on_all_workspaces(false);
+
                 #[cfg(target_os = "macos")]
-                crate::window_api::reset_to_regular_and_refresh_tray(window.app_handle());
-                // On Windows, minimize the main windowed window so it stays
-                // visible in the taskbar instead of vanishing to the tray.
+                crate::window::reset_to_regular_and_refresh_tray(window.app_handle());
+                // On Windows, let the settings window close normally when user
+                // clicks X. For other windows, minimize or hide.
                 #[cfg(target_os = "windows")]
                 {
-                    if window.label() == "main-window" {
+                    if window.label() == "home" {
+                        // Minimize instead of closing so the Home window stays in the
+                        // taskbar as the persistent app icon.
                         let _ = window.minimize();
                     } else {
+                        // Overlay and other windows: hide (they're skip_taskbar anyway)
                         let _ = window.hide();
                     }
                 }
@@ -1413,8 +718,8 @@ async fn main() {
 
     let app = app.manage(recording_state)
         .manage(pi_state)
-        .manage(reminders_state)
         .manage(suggestions_state)
+        .manage(pipe_suggestions_state)
         .invoke_handler(tauri::generate_handler![
             commands::is_enterprise_build_cmd,
             spawn_screenpipe,
@@ -1425,6 +730,7 @@ async fn main() {
             permissions::request_permission,
             permissions::do_permissions_check,
             permissions::check_microphone_permission,
+            permissions::check_screen_recording_permission,
             permissions::check_accessibility_permission_cmd,
             permissions::reset_and_request_permission,
             permissions::get_missing_permissions,
@@ -1442,6 +748,8 @@ async fn main() {
             commands::open_login_window,
             commands::ensure_webview_focus,
             commands::close_window,
+            commands::resize_search_window,
+            commands::search_navigate_to_timeline,
             commands::reset_main_window,
             commands::set_window_size,
             // Permission recovery commands
@@ -1477,6 +785,8 @@ async fn main() {
             suspend_global_shortcuts,
             resume_global_shortcuts,
             get_env,
+            vault_status,
+            vault_unlock,
             // Sync commands
             sync::get_sync_status,
             sync::set_sync_enabled,
@@ -1504,18 +814,9 @@ async fn main() {
             chatgpt_oauth::chatgpt_oauth_get_token,
             chatgpt_oauth::chatgpt_oauth_logout,
             chatgpt_oauth::chatgpt_oauth_models,
-            // Reminders commands
-            reminders::reminders_status,
-            reminders::reminders_authorize,
-            reminders::reminders_list,
-            reminders::reminders_create,
-            reminders::reminders_scan,
-            reminders::reminders_start_scheduler,
-            reminders::reminders_stop_scheduler,
-            reminders::reminders_get_custom_prompt,
-            reminders::reminders_set_custom_prompt,
-            reminders::reminders_get_audio_only,
-            reminders::reminders_set_audio_only,
+            // Pipe suggestions scheduler commands
+            pipe_suggestions_scheduler::pipe_suggestions_get_settings,
+            pipe_suggestions_scheduler::pipe_suggestions_update_settings,
             // Calendar commands
             calendar::calendar_status,
             calendar::calendar_authorize,
@@ -1530,14 +831,29 @@ async fn main() {
             commands::rollback_to_version,
             // OCR commands
             commands::perform_ocr_on_image,
+            // Live Text (native macOS ImageAnalysisOverlayView)
+            livetext::livetext_is_available,
+            livetext::livetext_init,
+            livetext::livetext_analyze,
+            livetext::livetext_prefetch,
+            livetext::livetext_update_position,
+            livetext::livetext_highlight,
+            livetext::livetext_clear_highlights,
+            livetext::livetext_hide,
+            livetext::livetext_set_guard_rect,
             // Voice training
             voice_training::train_voice,
             // Suggestions
             suggestions::get_cached_suggestions,
+                suggestions::force_regenerate_suggestions,
             // Config commands
             config::validate_data_dir,
             // Hardware detection
-            hardware::get_hardware_capability
+            hardware::get_hardware_capability,
+            // Remote sync (OpenClaw)
+            remote_sync_commands::remote_sync_test,
+            remote_sync_commands::remote_sync_now,
+            remote_sync_commands::remote_sync_discover_hosts
         ])
         .setup(move |app| {
             //deep link register_all
@@ -1592,7 +908,7 @@ async fn main() {
                             // Defer off event stack (same as tray: runs from tao::send_event).
                             let app_for_closure = app_handle.clone();
                             let _ = app_handle.run_on_main_thread(move || {
-                                let _ = ShowRewindWindow::Settings { page: None }.show(&app_for_closure);
+                                let _ = ShowRewindWindow::Home { page: None }.show(&app_for_closure);
                             });
                         }
                         "check_for_updates" => {
@@ -1614,8 +930,9 @@ async fn main() {
                 space_monitor::setup_space_listener(app.handle().clone());
 
                 // Set up pinch-to-zoom: store the app handle so the gesture
-                // recognizer callback (in window_api.rs) can emit Tauri events.
-                crate::window_api::init_magnify_handler(app.handle().clone());
+                // recognizer callback (in window/gesture.rs) can emit Tauri events.
+                crate::window::init_magnify_handler(app.handle().clone());
+
             }
 
             // Logging setup
@@ -1692,14 +1009,9 @@ async fn main() {
             let posthog_api_key = "phc_Bt8GoTBPgkCpDrbaIZzJIEYt0CrJjhBiuLaBck1clce".to_string();
             let interval_hours = 6;
 
-            let path = base_dir.join("store.bin");
-            if !path.exists() {
-                if let Err(e) = File::create(path.clone()) {
-                    error!("Failed to create store.bin: {}", e);
-                }
-            }
-
             // Store setup and initialization - must be done first
+            // Note: StoreBuilder handles file creation internally — pre-creating
+            // store.bin here caused TOCTOU race conditions ("File exists" os error 17).
             // Use unwrap_or_default to prevent crashes from corrupted stores
             let store = store::init_store(&app.handle()).unwrap_or_else(|e| {
                 error!("Failed to init settings store, using defaults: {}", e);
@@ -1846,7 +1158,7 @@ async fn main() {
             if !onboarding_store.is_completed {
                 let _ = ShowRewindWindow::Onboarding.show(&app.handle());
             } else {
-                let _ = ShowRewindWindow::Main.show(&app.handle());
+                let _ = ShowRewindWindow::Home { page: None }.show(&app.handle());
             }
 
             // Pre-create chat panel (hidden) so the shortcut can show an
@@ -1900,9 +1212,6 @@ async fn main() {
             let server_shutdown_tx = spawn_server(app_handle.clone(), 11435);
             app.manage(server_shutdown_tx);
 
-            // Dev mode check
-            let use_dev_mode = store.dev_mode;
-            info!("use_dev_mode: {}", use_dev_mode);
 
             // Startup permission gate: check permissions immediately after onboarding
             // and show recovery window if any critical permission is missing.
@@ -1930,9 +1239,19 @@ async fn main() {
                 }
             }
 
-            // Start embedded server in non-dev mode
-            // Use a dedicated thread with its own tokio runtime to avoid competing with Tauri's UI runtime
-            if !use_dev_mode {
+            // TODO: vault lock app integration disabled — CLI-only for now
+            // let vault_is_locked = data_dir.join(".vault_locked").exists()
+            //     || (data_dir.join("vault.meta").exists()
+            //         && data_dir.join("db.sqlite").exists()
+            //         && screenpipe_vault::crypto::is_encrypted_file(&data_dir.join("db.sqlite")).unwrap_or(false));
+            // if vault_is_locked {
+            //     info!("Vault is locked — skipping server start, waiting for unlock");
+            //     let _ = app_handle.emit("vault-locked-on-startup", ());
+            // }
+
+            // Start embedded server on a dedicated thread with its own tokio runtime
+            // to avoid competing with Tauri's UI runtime
+            {
                 let store_clone = store.clone();
                 let data_dir_clone = data_dir.clone();
                 let recording_state = app_handle.state::<RecordingState>();
@@ -2044,8 +1363,6 @@ async fn main() {
                         });
                     })
                     .expect("Failed to spawn server thread");
-            } else {
-                debug!("Skipping server start: dev_mode enabled");
             }
 
             // Initialize update check
@@ -2100,7 +1417,7 @@ async fn main() {
                     posthog_api_key,
                     interval_hours,
                     "http://localhost:3030".to_string(),
-                    base_dir.clone(),
+                    data_dir.clone(),
                     is_analytics_enabled,
                 ) {
                     Ok(analytics_manager) => {
@@ -2127,7 +1444,7 @@ async fn main() {
             });
 
             #[cfg(target_os = "macos")]
-            crate::window_api::reset_to_regular_and_refresh_tray(&app_handle);
+            crate::window::reset_to_regular_and_refresh_tray(&app_handle);
 
             // NOTE: Accessory mode watchdog removed — we no longer toggle activation policy
             // The app stays in Regular mode permanently so dock+tray are always visible.
@@ -2154,15 +1471,15 @@ async fn main() {
                 suggestions::auto_start_scheduler(&suggestions_state_clone).await;
             });
 
-            // Auto-start reminders scheduler if it was enabled
+            // Auto-start pipe suggestions scheduler if enabled
             let app_handle_clone = app_handle.clone();
-            let reminders_state = app_handle.state::<reminders::RemindersState>();
-            let reminders_state_clone = reminders::RemindersState {
-                scheduler_handle: reminders_state.scheduler_handle.clone(),
+            let pipe_suggestions_state = app_handle.state::<pipe_suggestions_scheduler::PipeSuggestionsState>();
+            let pipe_suggestions_state_clone = pipe_suggestions_scheduler::PipeSuggestionsState {
+                scheduler_handle: pipe_suggestions_state.scheduler_handle.clone(),
             };
             tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
-                reminders::auto_start_scheduler(app_handle_clone, &reminders_state_clone).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+                pipe_suggestions_scheduler::auto_start_scheduler(app_handle_clone, &pipe_suggestions_state_clone).await;
             });
 
             // Start calendar events publisher (publishes to event bus for meeting detection)
@@ -2211,7 +1528,7 @@ async fn main() {
     #[cfg(target_os = "macos")]
     {
         let app_handle_dock = app.app_handle().clone();
-        setup_dock_menu(app_handle_dock);
+        dock_menu::setup_dock_menu(app_handle_dock);
     }
 
     app.run(|app_handle, event| {
@@ -2270,10 +1587,24 @@ async fn main() {
                         }
                     });
 
-                    // Shutdown server
-                    if let Some(server_shutdown_tx) = app_handle.try_state::<mpsc::Sender<()>>() {
-                        drop(server_shutdown_tx.send(()));
-                    }
+                    // Shut down embedded server (incl. audio manager / ggml Metal cleanup)
+                    // MUST happen synchronously before exit() runs C++ static destructors,
+                    // otherwise the ggml Metal device destructor hits a freed resource → SIGABRT.
+                    //
+                    // Run on a dedicated thread to avoid "Cannot start a runtime from within
+                    // a runtime" panic when the Exit event fires from a tokio async context.
+                    let app_handle_shutdown = app_handle.app_handle().clone();
+                    let _ = std::thread::spawn(move || {
+                        tauri::async_runtime::block_on(async move {
+                            if let Some(recording_state) =
+                                app_handle_shutdown.try_state::<recording::RecordingState>()
+                            {
+                                if let Some(handle) = recording_state.handle.lock().await.take() {
+                                    handle.shutdown_and_wait().await;
+                                }
+                            }
+                        })
+                    }).join();
 
                     // Cleanup Pi sidecar
                     let app_handle_pi = app_handle.app_handle().clone();
@@ -2291,7 +1622,7 @@ async fn main() {
                 } => {
                     if let Ok(window_id) = RewindWindowId::from_str(label.as_str()) {
                         match window_id {
-                            RewindWindowId::Settings => {
+                            RewindWindowId::Home => {
                                 // Closing Settings hides the Main panel (it's always a panel now).
                                 // Defer off the event stack: run handler must stay panic-free.
                                 let app = app_handle.app_handle().clone();
@@ -2310,7 +1641,7 @@ async fn main() {
                     // Open the settings/app window (not the timeline overlay).
                     let app = app_handle.app_handle().clone();
                     let _ = app_handle.app_handle().run_on_main_thread(move || {
-                        let _ = ShowRewindWindow::Settings { page: None }.show(&app);
+                        let _ = ShowRewindWindow::Home { page: None }.show(&app);
                     });
                 }
                 _ => {}
