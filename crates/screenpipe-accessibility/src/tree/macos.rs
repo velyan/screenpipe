@@ -37,6 +37,185 @@ fn is_browser(app_lower: &str) -> bool {
     BROWSER_NAMES.iter().any(|b| app_lower.contains(b))
 }
 
+fn should_retry_focused_app_lookup(error: ax::Error) -> bool {
+    error == ax::err::NO_VALUE
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FocusedAppRetrySource {
+    CgWindowList,
+    NsWorkspace,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct RetryWindowInfo {
+    pid: i32,
+    layer: i32,
+    width: i32,
+    height: i32,
+    owner_name: String,
+}
+
+fn retry_skip_app(owner_name: &str) -> bool {
+    matches!(
+        owner_name,
+        "Window Server"
+            | "SystemUIServer"
+            | "ControlCenter"
+            | "Dock"
+            | "NotificationCenter"
+            | "loginwindow"
+            | "WindowManager"
+            | "Contexts"
+            | "Screenshot"
+    ) || owner_name.to_lowercase().contains("screenpipe")
+}
+
+fn retry_frontmost_pid_via_cg_window_list() -> Option<i32> {
+    use core_foundation::base::TCFType;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+    use core_graphics::window::{
+        copy_window_info, kCGNullWindowID, kCGWindowListExcludeDesktopElements,
+        kCGWindowListOptionOnScreenOnly,
+    };
+
+    let options = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements;
+    let window_list = copy_window_info(options, kCGNullWindowID)?;
+    let count =
+        unsafe { core_foundation::array::CFArrayGetCount(window_list.as_concrete_TypeRef()) };
+
+    for i in 0..count {
+        let maybe_window = unsafe {
+            let dict_ref = core_foundation::array::CFArrayGetValueAtIndex(
+                window_list.as_concrete_TypeRef(),
+                i,
+            );
+            if dict_ref.is_null() {
+                None
+            } else {
+                let dict = dict_ref as core_foundation::dictionary::CFDictionaryRef;
+
+                let pid_key = CFString::new("kCGWindowOwnerPID");
+                let layer_key = CFString::new("kCGWindowLayer");
+                let owner_key = CFString::new("kCGWindowOwnerName");
+                let bounds_key = CFString::new("kCGWindowBounds");
+
+                let mut pid_val = std::ptr::null();
+                let mut layer_val = std::ptr::null();
+                let mut owner_val = std::ptr::null();
+                let mut bounds_val = std::ptr::null();
+
+                if core_foundation::dictionary::CFDictionaryGetValueIfPresent(
+                    dict,
+                    pid_key.as_concrete_TypeRef() as *const _,
+                    &mut pid_val,
+                ) == 0
+                    || pid_val.is_null()
+                    || core_foundation::dictionary::CFDictionaryGetValueIfPresent(
+                        dict,
+                        layer_key.as_concrete_TypeRef() as *const _,
+                        &mut layer_val,
+                    ) == 0
+                    || layer_val.is_null()
+                    || core_foundation::dictionary::CFDictionaryGetValueIfPresent(
+                        dict,
+                        owner_key.as_concrete_TypeRef() as *const _,
+                        &mut owner_val,
+                    ) == 0
+                    || owner_val.is_null()
+                    || core_foundation::dictionary::CFDictionaryGetValueIfPresent(
+                        dict,
+                        bounds_key.as_concrete_TypeRef() as *const _,
+                        &mut bounds_val,
+                    ) == 0
+                    || bounds_val.is_null()
+                {
+                    None
+                } else {
+                    let pid_num = CFNumber::wrap_under_get_rule(
+                        pid_val as core_foundation::number::CFNumberRef,
+                    );
+                    let layer_num = CFNumber::wrap_under_get_rule(
+                        layer_val as core_foundation::number::CFNumberRef,
+                    );
+                    let owner_name = CFString::wrap_under_get_rule(
+                        owner_val as core_foundation::string::CFStringRef,
+                    )
+                    .to_string();
+
+                    let bounds_dict = bounds_val as core_foundation::dictionary::CFDictionaryRef;
+                    let width_key = CFString::new("Width");
+                    let height_key = CFString::new("Height");
+                    let mut width_val = std::ptr::null();
+                    let mut height_val = std::ptr::null();
+                    if core_foundation::dictionary::CFDictionaryGetValueIfPresent(
+                        bounds_dict,
+                        width_key.as_concrete_TypeRef() as *const _,
+                        &mut width_val,
+                    ) == 0
+                        || width_val.is_null()
+                        || core_foundation::dictionary::CFDictionaryGetValueIfPresent(
+                            bounds_dict,
+                            height_key.as_concrete_TypeRef() as *const _,
+                            &mut height_val,
+                        ) == 0
+                        || height_val.is_null()
+                    {
+                        None
+                    } else {
+                        let width_num = CFNumber::wrap_under_get_rule(
+                            width_val as core_foundation::number::CFNumberRef,
+                        );
+                        let height_num = CFNumber::wrap_under_get_rule(
+                            height_val as core_foundation::number::CFNumberRef,
+                        );
+                        Some(RetryWindowInfo {
+                            pid: pid_num.to_i32().unwrap_or(-1),
+                            layer: layer_num.to_i32().unwrap_or(-1),
+                            width: width_num.to_i32().unwrap_or(0),
+                            height: height_num.to_i32().unwrap_or(0),
+                            owner_name,
+                        })
+                    }
+                }
+            }
+        };
+
+        if let Some(window) = maybe_window {
+            if window.layer != 0
+                || window.width < 100
+                || window.height < 100
+                || window.owner_name.is_empty()
+                || retry_skip_app(window.owner_name.as_str())
+            {
+                continue;
+            }
+            return Some(window.pid);
+        }
+    }
+
+    None
+}
+
+fn active_workspace_app_pid() -> Option<i32> {
+    let workspace = ns::Workspace::shared();
+    let apps = workspace.running_apps();
+    for app in apps.iter() {
+        if app.is_active() {
+            return Some(app.pid());
+        }
+    }
+    None
+}
+
+fn retry_focused_app_pid() -> Option<(i32, FocusedAppRetrySource)> {
+    retry_frontmost_pid_via_cg_window_list()
+        .map(|pid| (pid, FocusedAppRetrySource::CgWindowList))
+        .or_else(|| active_workspace_app_pid().map(|pid| (pid, FocusedAppRetrySource::NsWorkspace)))
+}
+
 /// Extract the browser URL from the focused window using AX APIs.
 /// Tries AXDocument first (works for Safari, Chrome, etc.), then
 /// AppleScript for Arc, then falls back to shallow AXTextField walk.
@@ -223,25 +402,40 @@ impl MacosTreeWalker {
         // processes in some setups, which causes event-driven capture to keep
         // resolving the wrong focused app (often Terminal).
         let system = ax::UiElement::sys_wide();
-        let ax_app = match system.focused_app() {
-            Ok(app) => app,
+        let pid = match system.focused_app() {
+            Ok(app) => match app.pid() {
+                Ok(pid) => pid,
+                Err(_) => {
+                    log_no_snapshot(
+                        "focused_app_pid_unavailable",
+                        SnapshotLogContext::visible(None, None),
+                        None,
+                    );
+                    return Ok(None);
+                }
+            },
+            Err(e) if should_retry_focused_app_lookup(e.into()) => {
+                let detail = e.to_string();
+                let Some((pid, source)) = retry_focused_app_pid() else {
+                    log_no_snapshot(
+                        "focused_app_unavailable",
+                        SnapshotLogContext::visible(None, None),
+                        Some(&detail),
+                    );
+                    return Ok(None);
+                };
+                debug!(
+                    "tree walk: AX focused app unavailable ({}), retrying with {:?} pid={}",
+                    detail, source, pid
+                );
+                pid
+            }
             Err(e) => {
                 let detail = e.to_string();
                 log_no_snapshot(
                     "focused_app_unavailable",
                     SnapshotLogContext::visible(None, None),
                     Some(&detail),
-                );
-                return Ok(None);
-            }
-        };
-        let pid = match ax_app.pid() {
-            Ok(pid) => pid,
-            Err(_) => {
-                log_no_snapshot(
-                    "focused_app_pid_unavailable",
-                    SnapshotLogContext::visible(None, None),
-                    None,
                 );
                 return Ok(None);
             }
@@ -968,6 +1162,14 @@ mod tests {
         assert!(!looks_like_url("hello world"));
         assert!(!looks_like_url(".hidden"));
         assert!(!looks_like_url("abc"));
+    }
+
+    #[test]
+    fn test_should_retry_focused_app_lookup_only_for_no_value() {
+        assert!(should_retry_focused_app_lookup(ax::err::NO_VALUE.into()));
+        assert!(!should_retry_focused_app_lookup(
+            ax::err::API_DISABLED.into()
+        ));
     }
 
     #[test]
