@@ -12,7 +12,7 @@ use anyhow::Result;
 use chrono::Utc;
 use cidre::{ax, cf, ns};
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 /// Known browser app names (lowercase). Matches vision crate's list.
@@ -32,9 +32,211 @@ const BROWSER_NAMES: &[&str] = &[
     "microsoft edge",
 ];
 
+/// Chromium/Electron apps can materialize an empty tree immediately after
+/// AXEnhancedUserInterface is enabled. Give the focused window one short,
+/// deterministic retry before OCR takes over.
+const EMPTY_TREE_RETRY_DELAY: Duration = Duration::from_millis(75);
+
 /// Check if the app (lowercase name) is a known browser.
 fn is_browser(app_lower: &str) -> bool {
     BROWSER_NAMES.iter().any(|b| app_lower.contains(b))
+}
+
+fn should_retry_focused_app_lookup(error: ax::Error) -> bool {
+    error == ax::err::NO_VALUE
+}
+
+fn should_retry_empty_text_walk(state: &WalkState) -> bool {
+    state.text_buffer.is_empty() && state.node_count > 0
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FocusedAppRetrySource {
+    CgWindowList,
+    NsWorkspace,
+}
+
+#[derive(Debug)]
+struct RetryWindowInfo {
+    pid: i32,
+    layer: i32,
+    width: i32,
+    height: i32,
+    owner_name: String,
+}
+
+fn log_no_snapshot(
+    reason: &str,
+    app_name: Option<&str>,
+    window_name: Option<&str>,
+    detail: Option<&str>,
+) {
+    debug!(
+        "tree walk: no focused window snapshot (reason={}, app={}, window={}, detail={})",
+        reason,
+        app_name.unwrap_or("<unknown>"),
+        window_name.unwrap_or("<unknown>"),
+        detail.unwrap_or("<none>")
+    );
+}
+
+fn retry_skip_app(owner_name: &str) -> bool {
+    matches!(
+        owner_name,
+        "Window Server"
+            | "SystemUIServer"
+            | "ControlCenter"
+            | "Dock"
+            | "NotificationCenter"
+            | "loginwindow"
+            | "WindowManager"
+            | "Contexts"
+            | "Screenshot"
+    ) || owner_name.to_lowercase().contains("screenpipe")
+}
+
+fn retry_frontmost_pid_via_cg_window_list() -> Option<i32> {
+    use core_foundation::base::TCFType;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+    use core_graphics::window::{
+        copy_window_info, kCGNullWindowID, kCGWindowListExcludeDesktopElements,
+        kCGWindowListOptionOnScreenOnly,
+    };
+
+    let options = kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements;
+    let window_list = copy_window_info(options, kCGNullWindowID)?;
+    let count =
+        unsafe { core_foundation::array::CFArrayGetCount(window_list.as_concrete_TypeRef()) };
+
+    for i in 0..count {
+        let maybe_window = unsafe {
+            let dict_ref = core_foundation::array::CFArrayGetValueAtIndex(
+                window_list.as_concrete_TypeRef(),
+                i,
+            );
+            if dict_ref.is_null() {
+                None
+            } else {
+                let dict = dict_ref as core_foundation::dictionary::CFDictionaryRef;
+
+                let pid_key = CFString::new("kCGWindowOwnerPID");
+                let layer_key = CFString::new("kCGWindowLayer");
+                let owner_key = CFString::new("kCGWindowOwnerName");
+                let bounds_key = CFString::new("kCGWindowBounds");
+
+                let mut pid_val = std::ptr::null();
+                let mut layer_val = std::ptr::null();
+                let mut owner_val = std::ptr::null();
+                let mut bounds_val = std::ptr::null();
+
+                if core_foundation::dictionary::CFDictionaryGetValueIfPresent(
+                    dict,
+                    pid_key.as_concrete_TypeRef() as *const _,
+                    &mut pid_val,
+                ) == 0
+                    || pid_val.is_null()
+                    || core_foundation::dictionary::CFDictionaryGetValueIfPresent(
+                        dict,
+                        layer_key.as_concrete_TypeRef() as *const _,
+                        &mut layer_val,
+                    ) == 0
+                    || layer_val.is_null()
+                    || core_foundation::dictionary::CFDictionaryGetValueIfPresent(
+                        dict,
+                        owner_key.as_concrete_TypeRef() as *const _,
+                        &mut owner_val,
+                    ) == 0
+                    || owner_val.is_null()
+                    || core_foundation::dictionary::CFDictionaryGetValueIfPresent(
+                        dict,
+                        bounds_key.as_concrete_TypeRef() as *const _,
+                        &mut bounds_val,
+                    ) == 0
+                    || bounds_val.is_null()
+                {
+                    None
+                } else {
+                    let pid_num = CFNumber::wrap_under_get_rule(
+                        pid_val as core_foundation::number::CFNumberRef,
+                    );
+                    let layer_num = CFNumber::wrap_under_get_rule(
+                        layer_val as core_foundation::number::CFNumberRef,
+                    );
+                    let owner_name = CFString::wrap_under_get_rule(
+                        owner_val as core_foundation::string::CFStringRef,
+                    )
+                    .to_string();
+
+                    let bounds_dict = bounds_val as core_foundation::dictionary::CFDictionaryRef;
+                    let width_key = CFString::new("Width");
+                    let height_key = CFString::new("Height");
+                    let mut width_val = std::ptr::null();
+                    let mut height_val = std::ptr::null();
+                    if core_foundation::dictionary::CFDictionaryGetValueIfPresent(
+                        bounds_dict,
+                        width_key.as_concrete_TypeRef() as *const _,
+                        &mut width_val,
+                    ) == 0
+                        || width_val.is_null()
+                        || core_foundation::dictionary::CFDictionaryGetValueIfPresent(
+                            bounds_dict,
+                            height_key.as_concrete_TypeRef() as *const _,
+                            &mut height_val,
+                        ) == 0
+                        || height_val.is_null()
+                    {
+                        None
+                    } else {
+                        let width_num = CFNumber::wrap_under_get_rule(
+                            width_val as core_foundation::number::CFNumberRef,
+                        );
+                        let height_num = CFNumber::wrap_under_get_rule(
+                            height_val as core_foundation::number::CFNumberRef,
+                        );
+                        Some(RetryWindowInfo {
+                            pid: pid_num.to_i32().unwrap_or(-1),
+                            layer: layer_num.to_i32().unwrap_or(-1),
+                            width: width_num.to_i32().unwrap_or(0),
+                            height: height_num.to_i32().unwrap_or(0),
+                            owner_name,
+                        })
+                    }
+                }
+            }
+        };
+
+        if let Some(window) = maybe_window {
+            if window.layer != 0
+                || window.width < 100
+                || window.height < 100
+                || window.owner_name.is_empty()
+                || retry_skip_app(window.owner_name.as_str())
+            {
+                continue;
+            }
+            return Some(window.pid);
+        }
+    }
+
+    None
+}
+
+fn active_workspace_app_pid() -> Option<i32> {
+    let workspace = ns::Workspace::shared();
+    let apps = workspace.running_apps();
+    for app in apps.iter() {
+        if app.is_active() {
+            return Some(app.pid());
+        }
+    }
+    None
+}
+
+fn retry_focused_app_pid() -> Option<(i32, FocusedAppRetrySource)> {
+    retry_frontmost_pid_via_cg_window_list()
+        .map(|pid| (pid, FocusedAppRetrySource::CgWindowList))
+        .or_else(|| active_workspace_app_pid().map(|pid| (pid, FocusedAppRetrySource::NsWorkspace)))
 }
 
 /// Extract the browser URL from the focused window using AX APIs.
@@ -186,6 +388,31 @@ impl TreeWalkerPlatform for MacosTreeWalker {
 }
 
 impl MacosTreeWalker {
+    fn walk_window_once(
+        &self,
+        window: &ax::UiElement,
+        start: Instant,
+    ) -> (WalkState, Option<WindowBounds>) {
+        let mut state = WalkState::new(&self.config, start);
+        let mut window_bounds = None;
+        if let Some((wx, wy, ww, wh)) = get_element_frame(window) {
+            if ww > 0.0 && wh > 0.0 {
+                state.window_x = wx;
+                state.window_y = wy;
+                state.window_w = ww;
+                state.window_h = wh;
+                window_bounds = Some(WindowBounds {
+                    x: wx,
+                    y: wy,
+                    width: ww,
+                    height: wh,
+                });
+            }
+        }
+        walk_element(window, 0, &mut state);
+        (state, window_bounds)
+    }
+
     fn walk_focused_window_inner(&self) -> Result<TreeWalkResult> {
         let start = Instant::now();
 
@@ -193,15 +420,34 @@ impl MacosTreeWalker {
         // This stays within the accessibility stack instead of relying on
         // NSWorkspace's foreground-app state from a background thread.
         let sys = ax::UiElement::sys_wide();
-        let focused_app = match sys.focused_app() {
-            Ok(app) => app,
-            Err(_) => return Ok(TreeWalkResult::NotFound),
-        };
-        let pid = match focused_app.pid() {
-            Ok(pid) => pid,
-            Err(_) => return Ok(TreeWalkResult::NotFound),
+        let pid = match sys.focused_app() {
+            Ok(app) => match app.pid() {
+                Ok(pid) => pid,
+                Err(_) => {
+                    log_no_snapshot("focused_app_pid_unavailable", None, None, None);
+                    return Ok(TreeWalkResult::NotFound);
+                }
+            },
+            Err(e) if should_retry_focused_app_lookup(e.into()) => {
+                let detail = e.to_string();
+                let Some((pid, source)) = retry_focused_app_pid() else {
+                    log_no_snapshot("focused_app_unavailable", None, None, Some(&detail));
+                    return Ok(TreeWalkResult::NotFound);
+                };
+                debug!(
+                    "tree walk: AX focused app unavailable ({}), retrying with {:?} pid={}",
+                    detail, source, pid
+                );
+                pid
+            }
+            Err(e) => {
+                let detail = e.to_string();
+                log_no_snapshot("focused_app_unavailable", None, None, Some(&detail));
+                return Ok(TreeWalkResult::NotFound);
+            }
         };
         let Some(app) = ns::RunningApp::with_pid(pid) else {
+            log_no_snapshot("running_app_lookup_failed", None, None, None);
             return Ok(TreeWalkResult::NotFound);
         };
 
@@ -229,7 +475,7 @@ impl MacosTreeWalker {
         }
 
         // 2. Get the focused window via AX API
-        let mut ax_app = focused_app;
+        let mut ax_app = ax::UiElement::with_app_pid(pid);
         let _ = ax_app.set_messaging_timeout_secs(self.config.element_timeout_secs);
 
         // Enable accessibility for Chromium/Electron apps. These apps only build
@@ -244,10 +490,14 @@ impl MacosTreeWalker {
 
         let window_val = match ax_app.attr_value(ax::attr::focused_window()) {
             Ok(v) => v,
-            Err(_) => return Ok(TreeWalkResult::NotFound),
+            Err(_) => {
+                log_no_snapshot("focused_window_unavailable", Some(&app_name), None, None);
+                return Ok(TreeWalkResult::NotFound);
+            }
         };
 
         if window_val.get_type_id() != ax::UiElement::type_id() {
+            log_no_snapshot("focused_window_wrong_type", Some(&app_name), None, None);
             return Ok(TreeWalkResult::NotFound);
         }
         let window: &ax::UiElement = unsafe { std::mem::transmute(&*window_val) };
@@ -299,32 +549,37 @@ impl MacosTreeWalker {
             }
         }
 
-        // 3. Read window frame for normalizing element bounds to 0-1 coords
-        let mut state = WalkState::new(&self.config, start);
-        let mut window_bounds = None;
-        if let Some((wx, wy, ww, wh)) = get_element_frame(window) {
-            if ww > 0.0 && wh > 0.0 {
-                state.window_x = wx;
-                state.window_y = wy;
-                state.window_w = ww;
-                state.window_h = wh;
-                window_bounds = Some(WindowBounds {
-                    x: wx,
-                    y: wy,
-                    width: ww,
-                    height: wh,
-                });
+        let (mut state, mut window_bounds) = self.walk_window_once(window, start);
+        if should_retry_empty_text_walk(&state) {
+            debug!(
+                "tree walk: empty first-pass accessibility tree for app={}, window={}, nodes={}, retrying after {:?}",
+                app_name,
+                window_name,
+                state.node_count,
+                EMPTY_TREE_RETRY_DELAY
+            );
+            std::thread::sleep(EMPTY_TREE_RETRY_DELAY);
+            let (retry_state, retry_window_bounds) = self.walk_window_once(window, start);
+            debug!(
+                "tree walk: retry result for app={}, window={}, nodes={}, text_len={}",
+                app_name,
+                window_name,
+                retry_state.node_count,
+                retry_state.text_buffer.len()
+            );
+            if !retry_state.text_buffer.is_empty() || retry_state.node_count > state.node_count {
+                state = retry_state;
+                if retry_window_bounds.is_some() {
+                    window_bounds = retry_window_bounds;
+                }
             }
         }
         let focused_element = extract_focused_element_context(window_bounds.as_ref());
 
-        // Walk the accessibility tree
-        walk_element(window, 0, &mut state);
-
         let text_content = state.text_buffer;
         // Don't bail on empty text — we still need the app_name and window_name
-        // for frame metadata. Some apps may return empty text on the first walk
-        // after AXEnhancedUserInterface is set (Chromium builds the tree async).
+        // for frame metadata. If the one-shot warm-up retry still yields no text,
+        // downstream capture logic will fall back to OCR explicitly.
 
         // Truncate if needed
         let text_content = if text_content.len() > self.config.max_text_length {
@@ -837,6 +1092,26 @@ mod tests {
         assert!(!looks_like_url("hello world"));
         assert!(!looks_like_url(".hidden"));
         assert!(!looks_like_url("abc"));
+    }
+
+    #[test]
+    fn test_should_retry_focused_app_lookup_only_for_no_value() {
+        assert!(should_retry_focused_app_lookup(ax::err::NO_VALUE.into()));
+        assert!(!should_retry_focused_app_lookup(
+            ax::err::API_DISABLED.into()
+        ));
+    }
+
+    #[test]
+    fn test_should_retry_empty_text_walk_only_for_non_empty_node_tree() {
+        let mut state = WalkState::new(&TreeWalkerConfig::default(), Instant::now());
+        assert!(!should_retry_empty_text_walk(&state));
+
+        state.node_count = 3;
+        assert!(should_retry_empty_text_walk(&state));
+
+        state.text_buffer = "ready".into();
+        assert!(!should_retry_empty_text_walk(&state));
     }
 
     #[test]
