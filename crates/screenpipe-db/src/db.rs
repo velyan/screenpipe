@@ -5,6 +5,7 @@ use crate::{AudioChunkInfo, UntranscribedChunk};
 use chrono::{DateTime, Utc};
 use image::DynamicImage;
 use libsqlite3_sys::sqlite3_auto_extension;
+use screenpipe_config::DbConfig;
 use sqlite_vec::sqlite3_vec_init;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::pool::PoolConnection;
@@ -42,6 +43,7 @@ const DEDUP_TIME_WINDOW_SECS: i64 = 45;
 /// Similarity threshold for cross-device deduplication (0.0 to 1.0).
 /// Higher = stricter matching, lower = more aggressive deduplication.
 const DEDUP_SIMILARITY_THRESHOLD: f64 = 0.85;
+const FRAMES_FTS_EXTERNAL_CONTENT_MIGRATION_VERSION: i64 = 20260415000000;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct FrameCaptureMetadata {
@@ -158,11 +160,11 @@ impl Drop for ImmediateTx {
 }
 
 pub struct DatabaseManager {
-    /// Read-only pool (27 connections). Used for all SELECT queries.
+    /// Read-only pool. Used for all SELECT queries.
     /// Separated from writes so read bursts (search, timeline, API) can never
-    /// starve the write pipeline.
+    /// starve the write pipeline. Size depends on DbConfig tier.
     pub pool: SqlitePool,
-    /// Dedicated write pool (3 connections). Used exclusively by
+    /// Dedicated write pool. Used exclusively by
     /// begin_immediate_with_retry(). Small pool is fine because writes are
     /// serialized by write_semaphore anyway — the extra connections handle
     /// the rare case of connection detach without killing the pool.
@@ -177,13 +179,68 @@ pub struct DatabaseManager {
     /// starving the pool for writes and fast reads. By capping at 2 concurrent
     /// heavy reads, we guarantee 25+ connections remain available for normal ops.
     heavy_read_semaphore: Arc<Semaphore>,
+    /// Write coalescing queue. Hot-path writes are submitted here and
+    /// batched into single transactions every 100ms.
+    write_queue: crate::write_queue::WriteQueue,
+}
+
+/// One level-0 OCR element row, buffered for bulk insertion.
+struct Level0Row<'a> {
+    text: &'a str,
+    left: Option<f64>,
+    top: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
+    confidence: Option<f64>,
+    sort_order: i32,
+}
+
+/// Bulk-insert a batch of level-0 OCR elements (no hierarchy, parent_id = NULL).
+/// One INSERT statement with `chunk.len()` VALUES rows replaces N round-trips
+/// through `RETURNING id`. Used by the level-0 fast path in
+/// `DatabaseManager::insert_ocr_elements`.
+async fn flush_level0_bulk(
+    tx: &mut sqlx::pool::PoolConnection<Sqlite>,
+    frame_id: i64,
+    chunk: &[Level0Row<'_>],
+) -> Result<(), sqlx::Error> {
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    let mut sql = String::with_capacity(200 + chunk.len() * 40);
+    sql.push_str(
+        "INSERT INTO elements (frame_id, source, role, text, parent_id, depth, left_bound, top_bound, width_bound, height_bound, confidence, sort_order) VALUES ",
+    );
+    for i in 0..chunk.len() {
+        if i > 0 {
+            sql.push(',');
+        }
+        sql.push_str("(?,'ocr','block',?,NULL,0,?,?,?,?,?,?)");
+    }
+    let mut q = sqlx::query(&sql);
+    for row in chunk {
+        q = q
+            .bind(frame_id)
+            .bind(row.text)
+            .bind(row.left)
+            .bind(row.top)
+            .bind(row.width)
+            .bind(row.height)
+            .bind(row.confidence)
+            .bind(row.sort_order);
+    }
+    q.execute(&mut **tx).await?;
+    Ok(())
 }
 
 impl DatabaseManager {
-    pub async fn new(database_path: &str) -> Result<Self, sqlx::Error> {
+    pub async fn new(database_path: &str, config: DbConfig) -> Result<Self, sqlx::Error> {
         debug!(
-            "Initializing DatabaseManager with database path: {}",
-            database_path
+            "Initializing DatabaseManager with database path: {} (mmap={}MB, cache={}KB, read_pool={})",
+            database_path,
+            config.mmap_size / (1024 * 1024),
+            config.cache_size_kb,
+            config.read_pool_max,
         );
         let connection_string = format!("sqlite:{}", database_path);
 
@@ -213,8 +270,8 @@ impl DatabaseManager {
             // write, not fsync to main DB. Reduces commit latency significantly.
             // Default (FULL) fsyncs on every commit which is unnecessary in WAL.
             .pragma("synchronous", "NORMAL")
-            .pragma("cache_size", "-64000") // 64 MB page cache
-            .pragma("mmap_size", "268435456") // 256 MB memory-mapped I/O
+            .pragma("cache_size", format!("-{}", config.cache_size_kb))
+            .pragma("mmap_size", config.mmap_size.to_string())
             .pragma("temp_store", "MEMORY")
             // Checkpoint after 4000 pages (~16MB) instead of default 1000 (~4MB).
             // Reduces checkpoint stalls during write bursts — checkpoint happens
@@ -223,29 +280,32 @@ impl DatabaseManager {
             .pragma("wal_autocheckpoint", "4000");
 
         // Read pool: handles all SELECT queries (search, timeline, API, pipes).
-        // 27 connections — large enough to handle read bursts without starving.
         let read_pool = SqlitePoolOptions::new()
-            .max_connections(27)
-            .min_connections(3)
+            .max_connections(config.read_pool_max)
+            .min_connections(config.read_pool_min)
             .acquire_timeout(Duration::from_secs(5))
             .connect_with(connect_options.clone())
             .await?;
 
         // Write pool: dedicated to INSERT/UPDATE/DELETE via begin_immediate_with_retry().
-        // 3 connections — writes are serialized by write_semaphore so only 1 is active
+        // Writes are serialized by write_semaphore so only 1 is active
         // at a time; extras absorb connection detach without killing the pool.
         let write_pool = SqlitePoolOptions::new()
-            .max_connections(3)
+            .max_connections(config.write_pool_max)
             .min_connections(1)
             .acquire_timeout(Duration::from_secs(10))
             .connect_with(connect_options)
             .await?;
 
+        let write_semaphore = Arc::new(Semaphore::new(1));
+        let write_queue =
+            crate::write_queue::spawn_write_drain(write_pool.clone(), Arc::clone(&write_semaphore));
         let db_manager = DatabaseManager {
             pool: read_pool,
             write_pool,
-            write_semaphore: Arc::new(Semaphore::new(1)),
+            write_semaphore,
             heavy_read_semaphore: Arc::new(Semaphore::new(2)),
+            write_queue,
         };
 
         // Checkpoint any stale WAL before running migrations or starting captures.
@@ -278,6 +338,7 @@ impl DatabaseManager {
     async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         let mut migrator = sqlx::migrate!("./src/migrations");
         migrator.set_ignore_missing(true);
+        Self::log_pending_search_index_migration(pool, &migrator).await;
         match migrator.run(pool).await {
             Ok(_) => {}
             Err(e) => {
@@ -307,6 +368,63 @@ impl DatabaseManager {
         Self::ensure_event_driven_columns(pool).await?;
 
         Ok(())
+    }
+
+    async fn log_pending_search_index_migration(
+        pool: &SqlitePool,
+        migrator: &sqlx::migrate::Migrator,
+    ) {
+        if !migrator
+            .iter()
+            .any(|migration| migration.version == FRAMES_FTS_EXTERNAL_CONTENT_MIGRATION_VERSION)
+        {
+            return;
+        }
+
+        let migration_table_exists = match sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+        )
+        .fetch_one(pool)
+        .await
+        {
+            Ok(count) => count > 0,
+            Err(e) => {
+                debug!("could not inspect _sqlx_migrations before migrate: {}", e);
+                return;
+            }
+        };
+
+        let migration_pending = if migration_table_exists {
+            match sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM _sqlx_migrations WHERE version = ?",
+            )
+            .bind(FRAMES_FTS_EXTERNAL_CONTENT_MIGRATION_VERSION)
+            .fetch_one(pool)
+            .await
+            {
+                Ok(count) => count == 0,
+                Err(e) => {
+                    debug!("could not inspect applied migrations before migrate: {}", e);
+                    return;
+                }
+            }
+        } else {
+            match sqlx::query_scalar::<_, i64>("SELECT 1 FROM frames LIMIT 1")
+                .fetch_optional(pool)
+                .await
+            {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(e) => {
+                    debug!("could not inspect existing frames before migrate: {}", e);
+                    return;
+                }
+            }
+        };
+
+        if migration_pending {
+            info!("migrating frames_fts search index, this may take a few minutes on large databases...");
+        }
     }
 
     /// Fix checksum mismatches by updating stored checksums to match current migration files.
@@ -343,6 +461,7 @@ impl DatabaseManager {
             ("accessibility_tree_json", "TEXT DEFAULT NULL"),
             ("content_hash", "INTEGER DEFAULT NULL"),
             ("simhash", "INTEGER DEFAULT NULL"),
+            ("elements_ref_frame_id", "INTEGER DEFAULT NULL"),
         ];
 
         for (col_name, col_type) in missing_columns {
@@ -422,13 +541,31 @@ impl DatabaseManager {
                     })
                 }
                 Err(e) if Self::is_nested_transaction_error(&e) => {
-                    // Connection has a stuck transaction — detach it from the pool
-                    // so it doesn't poison subsequent acquire() calls.
+                    // Connection has a stuck transaction — ROLLBACK it and retry.
+                    // Previous approach: detach the connection. Problem: detach
+                    // permanently removes the slot from the pool. After ~3 detaches
+                    // the write pool (max_connections=3) is dead and ALL writes fail
+                    // with PoolTimedOut forever until restart.
+                    // New approach: ROLLBACK cleans the connection so it returns to
+                    // the pool healthy. Only detach as last resort if ROLLBACK fails.
                     warn!(
-                        "BEGIN IMMEDIATE hit stuck transaction (attempt {}/{}), detaching connection",
+                        "BEGIN IMMEDIATE hit stuck transaction (attempt {}/{}), rolling back",
                         attempt, max_retries
                     );
-                    let _raw = conn.detach();
+                    match sqlx::query("ROLLBACK").execute(&mut *conn).await {
+                        Ok(_) => {
+                            debug!("stuck transaction rolled back, connection recovered");
+                            // Connection is clean — drop returns it to pool
+                            drop(conn);
+                        }
+                        Err(rb_err) => {
+                            warn!(
+                                "ROLLBACK failed ({}), detaching connection as last resort",
+                                rb_err
+                            );
+                            let _raw = conn.detach();
+                        }
+                    }
                     last_error = Some(e);
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
@@ -482,21 +619,318 @@ impl DatabaseManager {
         }
     }
 
+    /// Mark records as synced via the write coalescing queue.
+    /// This ensures sync UPDATEs go through the write semaphore and don't
+    /// bypass the write pool (which was causing WAL lock contention).
+    pub async fn mark_synced(
+        &self,
+        table: crate::write_queue::SyncTable,
+        synced_at: &str,
+        time_start: &str,
+        time_end: &str,
+    ) -> Result<(), sqlx::Error> {
+        use crate::write_queue::WriteOp;
+        self.write_queue
+            .submit(WriteOp::MarkSynced {
+                table,
+                synced_at: synced_at.to_string(),
+                time_start: time_start.to_string(),
+                time_end: time_end.to_string(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Insert a synced frame via the write queue. Returns the frame ID (0 if skipped due to conflict).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sync_insert_frame(
+        &self,
+        sync_id: &str,
+        machine_id: &str,
+        timestamp: &str,
+        offset_index: i64,
+        app_name: Option<&str>,
+        window_name: Option<&str>,
+        browser_url: Option<&str>,
+        device_name: &str,
+    ) -> Result<i64, sqlx::Error> {
+        use crate::write_queue::{WriteOp, WriteResult};
+        match self
+            .write_queue
+            .submit(WriteOp::SyncInsertFrame {
+                sync_id: sync_id.to_string(),
+                machine_id: machine_id.to_string(),
+                timestamp: timestamp.to_string(),
+                offset_index,
+                app_name: app_name.map(|s| s.to_string()),
+                window_name: window_name.map(|s| s.to_string()),
+                browser_url: browser_url.map(|s| s.to_string()),
+                device_name: device_name.to_string(),
+            })
+            .await?
+        {
+            WriteResult::Id(id) => Ok(id),
+            _ => Ok(0),
+        }
+    }
+
+    /// Insert a synced OCR record via the write queue.
+    pub async fn sync_insert_ocr(
+        &self,
+        frame_id: i64,
+        text: &str,
+        focused: bool,
+        app_name: &str,
+        window_name: Option<&str>,
+        sync_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        use crate::write_queue::WriteOp;
+        self.write_queue
+            .submit(WriteOp::SyncInsertOcr {
+                frame_id,
+                text: text.to_string(),
+                focused,
+                app_name: app_name.to_string(),
+                window_name: window_name.map(|s| s.to_string()),
+                sync_id: sync_id.to_string(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Insert a synced transcription via the write queue. Returns the audio_chunk_id.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sync_insert_transcription(
+        &self,
+        sync_id: &str,
+        machine_id: &str,
+        timestamp: &str,
+        transcription: &str,
+        device: &str,
+        is_input_device: bool,
+        speaker_id: Option<i64>,
+    ) -> Result<i64, sqlx::Error> {
+        use crate::write_queue::{WriteOp, WriteResult};
+        match self
+            .write_queue
+            .submit(WriteOp::SyncInsertTranscription {
+                sync_id: sync_id.to_string(),
+                machine_id: machine_id.to_string(),
+                timestamp: timestamp.to_string(),
+                transcription: transcription.to_string(),
+                device: device.to_string(),
+                is_input_device,
+                speaker_id,
+            })
+            .await?
+        {
+            WriteResult::Id(id) => Ok(id),
+            _ => Ok(0),
+        }
+    }
+
+    /// Insert a synced accessibility record via the write queue.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sync_insert_accessibility(
+        &self,
+        sync_id: &str,
+        machine_id: &str,
+        timestamp: &str,
+        app_name: &str,
+        window_name: &str,
+        browser_url: Option<&str>,
+        text_content: &str,
+    ) -> Result<(), sqlx::Error> {
+        use crate::write_queue::WriteOp;
+        self.write_queue
+            .submit(WriteOp::SyncInsertAccessibility {
+                sync_id: sync_id.to_string(),
+                machine_id: machine_id.to_string(),
+                timestamp: timestamp.to_string(),
+                app_name: app_name.to_string(),
+                window_name: window_name.to_string(),
+                browser_url: browser_url.map(|s| s.to_string()),
+                text_content: text_content.to_string(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Insert a synced UI event via the write queue.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn sync_insert_ui_event(
+        &self,
+        sync_id: &str,
+        machine_id: &str,
+        timestamp: &str,
+        event_type: &str,
+        app_name: Option<&str>,
+        window_title: Option<&str>,
+        browser_url: Option<&str>,
+        text_content: Option<&str>,
+        x: Option<i32>,
+        y: Option<i32>,
+        key_code: Option<i32>,
+        modifiers: Option<i32>,
+        element_role: Option<&str>,
+        element_name: Option<&str>,
+        session_id: Option<&str>,
+        relative_ms: Option<i32>,
+        delta_x: Option<i32>,
+        delta_y: Option<i32>,
+        button: Option<i32>,
+        click_count: Option<i32>,
+        text_length: Option<i32>,
+        app_pid: Option<i32>,
+        element_value: Option<&str>,
+        element_description: Option<&str>,
+        element_automation_id: Option<&str>,
+        element_bounds: Option<&str>,
+        frame_id: Option<i64>,
+    ) -> Result<(), sqlx::Error> {
+        use crate::write_queue::WriteOp;
+        self.write_queue
+            .submit(WriteOp::SyncInsertUiEvent {
+                sync_id: sync_id.to_string(),
+                machine_id: machine_id.to_string(),
+                timestamp: timestamp.to_string(),
+                event_type: event_type.to_string(),
+                app_name: app_name.map(|s| s.to_string()),
+                window_title: window_title.map(|s| s.to_string()),
+                browser_url: browser_url.map(|s| s.to_string()),
+                text_content: text_content.map(|s| s.to_string()),
+                x,
+                y,
+                key_code,
+                modifiers,
+                element_role: element_role.map(|s| s.to_string()),
+                element_name: element_name.map(|s| s.to_string()),
+                session_id: session_id.map(|s| s.to_string()),
+                relative_ms,
+                delta_x,
+                delta_y,
+                button,
+                click_count,
+                text_length,
+                app_pid,
+                element_value: element_value.map(|s| s.to_string()),
+                element_description: element_description.map(|s| s.to_string()),
+                element_automation_id: element_automation_id.map(|s| s.to_string()),
+                element_bounds: element_bounds.map(|s| s.to_string()),
+                frame_id,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Compact snapshots via the write coalescing queue.
+    pub async fn compact_snapshots_queued(
+        &self,
+        chunk_id: i64,
+        batch: Vec<(i64, u32)>,
+    ) -> Result<(), sqlx::Error> {
+        use crate::write_queue::WriteOp;
+        self.write_queue
+            .submit(WriteOp::CompactSnapshots { chunk_id, batch })
+            .await?;
+        Ok(())
+    }
+
+    /// Clear snapshot_path for frames with missing JPEG files, via write queue.
+    pub async fn clear_snapshot_paths_queued(
+        &self,
+        frame_ids: Vec<i64>,
+    ) -> Result<(), sqlx::Error> {
+        use crate::write_queue::WriteOp;
+        self.write_queue
+            .submit(WriteOp::ClearSnapshotPaths { frame_ids })
+            .await?;
+        Ok(())
+    }
+
+    /// Create a pipe execution via the write queue. Returns the new row ID.
+    pub async fn pipe_create_execution_queued(
+        &self,
+        pipe_name: &str,
+        trigger_type: &str,
+        model: &str,
+        provider: Option<&str>,
+    ) -> Result<i64, sqlx::Error> {
+        use crate::write_queue::{WriteOp, WriteResult};
+        let result = self
+            .write_queue
+            .submit(WriteOp::PipeCreateExecution {
+                pipe_name: pipe_name.to_string(),
+                trigger_type: trigger_type.to_string(),
+                model: model.to_string(),
+                provider: provider.map(|s| s.to_string()),
+                started_at: chrono::Utc::now().to_rfc3339(),
+            })
+            .await?;
+        match result {
+            WriteResult::Id(id) => Ok(id),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Execute a pipe UPDATE/INSERT/DELETE via the write queue.
+    pub async fn pipe_execute_write_queued(
+        &self,
+        _id: i64,
+        sql: &str,
+        binds: Vec<crate::write_queue::PipeBindValue>,
+    ) -> Result<(), sqlx::Error> {
+        use crate::write_queue::WriteOp;
+        self.write_queue
+            .submit(WriteOp::PipeUpdateExecution {
+                sql: sql.to_string(),
+                binds,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Delete old pipe executions via the write queue.
+    pub async fn pipe_delete_old_executions_queued(
+        &self,
+        keep_per_pipe: i32,
+    ) -> Result<(), sqlx::Error> {
+        use crate::write_queue::WriteOp;
+        self.write_queue
+            .submit(WriteOp::PipeDeleteOldExecutions { keep_per_pipe })
+            .await?;
+        Ok(())
+    }
+
+    /// Delete audio chunks in batch via the write coalescing queue.
+    pub async fn delete_audio_chunks_batch_queued(
+        &self,
+        chunk_ids: Vec<i64>,
+    ) -> Result<(), sqlx::Error> {
+        use crate::write_queue::WriteOp;
+        self.write_queue
+            .submit(WriteOp::DeleteAudioChunksBatch { chunk_ids })
+            .await?;
+        Ok(())
+    }
+
     pub async fn insert_audio_chunk(
         &self,
         file_path: &str,
         timestamp: Option<DateTime<Utc>>,
     ) -> Result<i64, sqlx::Error> {
-        let ts = timestamp.unwrap_or_else(Utc::now);
-        let mut tx = self.begin_immediate_with_retry().await?;
-        let id = sqlx::query("INSERT INTO audio_chunks (file_path, timestamp) VALUES (?1, ?2)")
-            .bind(file_path)
-            .bind(ts)
-            .execute(&mut **tx.conn())
-            .await?
-            .last_insert_rowid();
-        tx.commit().await?;
-        Ok(id)
+        use crate::write_queue::{WriteOp, WriteResult};
+        let result = self
+            .write_queue
+            .submit(WriteOp::InsertAudioChunk {
+                file_path: file_path.to_string(),
+                timestamp,
+            })
+            .await?;
+        match result {
+            WriteResult::Id(id) => Ok(id),
+            _ => unreachable!(),
+        }
     }
 
     async fn get_audio_chunk_id(&self, file_path: &str) -> Result<i64, sqlx::Error> {
@@ -532,6 +966,46 @@ impl DatabaseManager {
              LEFT JOIN audio_transcriptions at ON ac.id = at.audio_chunk_id
              WHERE at.id IS NULL AND ac.timestamp >= ?1
              ORDER BY ac.timestamp DESC
+             LIMIT ?2",
+        )
+        .bind(since)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Returns true if there are audio transcriptions from output devices
+    /// within the given number of seconds. Used by meeting detection to keep
+    /// browser-based meetings alive when the user switches tabs but audio is
+    /// still flowing (i.e. the meeting is still going).
+    pub async fn has_recent_output_audio(&self, within_secs: i64) -> Result<bool, sqlx::Error> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audio_transcriptions
+             WHERE is_input_device = 0
+               AND timestamp >= strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now', ?1)
+             LIMIT 1",
+        )
+        .bind(format!("-{} seconds", within_secs))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count > 0)
+    }
+
+    /// Returns recently transcribed chunks that still have no assigned speaker.
+    /// Used for speaker backfill after segmentation models become available.
+    pub async fn get_recent_transcriptions_without_speaker(
+        &self,
+        since: DateTime<Utc>,
+        limit: i64,
+    ) -> Result<Vec<UntranscribedChunk>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, UntranscribedChunk>(
+            "SELECT ac.id, ac.file_path, ac.timestamp
+             FROM audio_transcriptions at
+             INNER JOIN audio_chunks ac ON ac.id = at.audio_chunk_id
+             WHERE at.speaker_id IS NULL
+               AND at.timestamp >= ?1
+             ORDER BY at.timestamp DESC
              LIMIT ?2",
         )
         .bind(since)
@@ -614,16 +1088,15 @@ impl DatabaseManager {
         end_time: Option<f64>,
         timestamp: Option<DateTime<Utc>>,
     ) -> Result<i64, sqlx::Error> {
-        // Skip empty transcriptions
+        use crate::write_queue::{WriteOp, WriteResult};
+
+        // Skip empty transcriptions (no DB access needed)
         let trimmed = transcription.trim();
         if trimmed.is_empty() {
             return Ok(0);
         }
 
-        // CROSS-DEVICE DEDUPLICATION CHECK
-        // Check if similar transcription exists in the last N seconds from ANY device.
-        // This prevents the same audio content from being stored twice when captured
-        // by both system output and microphone.
+        // Pre-read phase: dedup check on read pool (no write lock)
         if self
             .has_similar_recent_transcription(trimmed, DEDUP_TIME_WINDOW_SECS)
             .await?
@@ -635,39 +1108,25 @@ impl DatabaseManager {
             return Ok(0);
         }
 
-        let ts = timestamp.unwrap_or_else(Utc::now);
-        let text_length = transcription.len() as i64;
-        let mut tx = self.begin_immediate_with_retry().await?;
+        let result = self
+            .write_queue
+            .submit(WriteOp::InsertAudioTranscription {
+                audio_chunk_id,
+                transcription: trimmed.to_string(),
+                offset_index,
+                transcription_engine: transcription_engine.to_string(),
+                device_name: device.name.clone(),
+                is_input_device: device.device_type == DeviceType::Input,
+                speaker_id,
+                start_time,
+                end_time,
+                timestamp,
+            })
+            .await?;
 
-        // Insert the transcription, ignoring duplicates (same audio_chunk_id + transcription)
-        // This prevents duplicates from VAD segment overlap issues within the same device
-        let result = sqlx::query(
-            "INSERT OR IGNORE INTO audio_transcriptions (audio_chunk_id, transcription, offset_index, timestamp, transcription_engine, device, is_input_device, speaker_id, start_time, end_time, text_length) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        )
-        .bind(audio_chunk_id)
-        .bind(transcription)
-        .bind(offset_index)
-        .bind(ts)
-        .bind(transcription_engine)
-        .bind(&device.name)
-        .bind(device.device_type == DeviceType::Input)
-        .bind(speaker_id)
-        .bind(start_time)
-        .bind(end_time)
-        .bind(text_length)
-        .execute(&mut **tx.conn())
-        .await?;
-
-        // Commit the transaction
-        tx.commit().await?;
-
-        // Returns 0 if the insert was ignored (duplicate), otherwise returns the new id
-        // Note: last_insert_rowid() returns the previous successful insert's id when ignored,
-        // so we check rows_affected() to detect ignored inserts
-        if result.rows_affected() == 0 {
-            Ok(0)
-        } else {
-            Ok(result.last_insert_rowid())
+        match result {
+            WriteResult::Id(id) => Ok(id),
+            _ => unreachable!(),
         }
     }
 
@@ -687,70 +1146,48 @@ impl DatabaseManager {
         end_time: Option<f64>,
         timestamp: Option<DateTime<Utc>>,
     ) -> Result<i64, sqlx::Error> {
-        // Skip empty transcriptions early (no lock needed)
+        use crate::write_queue::{WriteOp, WriteResult};
+
         let trimmed = transcription.trim();
-        if trimmed.is_empty() {
-            // Still need to ensure the audio chunk exists
-            return self.get_or_insert_audio_chunk(file_path, timestamp).await;
-        }
 
-        // Read phase: no write lock needed
+        // Pre-read phase: runs on read pool, no write lock held
         let existing_chunk_id = self.get_audio_chunk_id(file_path).await?;
+        let is_duplicate = if !trimmed.is_empty() {
+            self.has_similar_recent_transcription(trimmed, DEDUP_TIME_WINDOW_SECS)
+                .await?
+        } else {
+            false
+        };
 
-        if self
-            .has_similar_recent_transcription(trimmed, DEDUP_TIME_WINDOW_SECS)
-            .await?
-        {
+        if is_duplicate {
             debug!(
                 "Skipping duplicate transcription (cross-device): {:?}",
                 &trimmed[..trimmed.len().min(50)]
             );
-            // Still return the chunk id
-            if existing_chunk_id != 0 {
-                return Ok(existing_chunk_id);
-            }
-            // Need to insert the chunk even if transcription is skipped
-            return self.insert_audio_chunk(file_path, timestamp).await;
         }
 
-        // Write phase: single transaction for both chunk + transcription
-        let ts = timestamp.unwrap_or_else(Utc::now);
-        let text_length = transcription.len() as i64;
-        let mut tx = self.begin_immediate_with_retry().await?;
+        let result = self
+            .write_queue
+            .submit(WriteOp::InsertAudioChunkAndTranscription {
+                file_path: file_path.to_string(),
+                transcription: transcription.to_string(),
+                offset_index,
+                transcription_engine: transcription_engine.to_string(),
+                device_name: device.name.clone(),
+                is_input_device: device.device_type == DeviceType::Input,
+                speaker_id,
+                start_time,
+                end_time,
+                timestamp,
+                existing_chunk_id,
+                is_duplicate,
+            })
+            .await?;
 
-        // Insert audio chunk if it doesn't exist yet
-        let audio_chunk_id = if existing_chunk_id != 0 {
-            existing_chunk_id
-        } else {
-            sqlx::query("INSERT INTO audio_chunks (file_path, timestamp) VALUES (?1, ?2)")
-                .bind(file_path)
-                .bind(ts)
-                .execute(&mut **tx.conn())
-                .await?
-                .last_insert_rowid()
-        };
-
-        // Insert the transcription
-        sqlx::query(
-            "INSERT OR IGNORE INTO audio_transcriptions (audio_chunk_id, transcription, offset_index, timestamp, transcription_engine, device, is_input_device, speaker_id, start_time, end_time, text_length) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        )
-        .bind(audio_chunk_id)
-        .bind(transcription)
-        .bind(offset_index)
-        .bind(ts)
-        .bind(transcription_engine)
-        .bind(&device.name)
-        .bind(device.device_type == DeviceType::Input)
-        .bind(speaker_id)
-        .bind(start_time)
-        .bind(end_time)
-        .bind(text_length)
-        .execute(&mut **tx.conn())
-        .await?;
-
-        tx.commit().await?;
-
-        Ok(audio_chunk_id)
+        match result {
+            WriteResult::Id(id) => Ok(id),
+            _ => unreachable!(),
+        }
     }
 
     /// Check if a similar transcription exists in the recent time window.
@@ -763,7 +1200,7 @@ impl DatabaseManager {
         // Fetch recent transcriptions from ALL devices
         let recent: Vec<(String,)> = sqlx::query_as(
             "SELECT transcription FROM audio_transcriptions
-             WHERE timestamp > datetime('now', ?1)
+             WHERE timestamp > strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now', ?1)
              ORDER BY timestamp DESC
              LIMIT 50",
         )
@@ -813,6 +1250,7 @@ impl DatabaseManager {
     /// Replace all transcription rows for an audio chunk with a single new transcription.
     /// Used by the re-transcribe endpoint. Deletes existing rows first to avoid
     /// UNIQUE constraint violations on (audio_chunk_id, transcription).
+    #[allow(clippy::too_many_arguments)]
     pub async fn replace_audio_transcription(
         &self,
         audio_chunk_id: i64,
@@ -1140,6 +1578,36 @@ impl DatabaseManager {
         Ok(())
     }
 
+    /// Get named speakers with non-null centroids for seeding the embedding manager.
+    /// Returns (speaker_id, name, centroid as Vec<f32>).
+    pub async fn get_named_speakers_with_centroids(
+        &self,
+    ) -> Result<Vec<(i64, String, Vec<f32>)>, SqlxError> {
+        let rows: Vec<(i64, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, name, centroid FROM speakers \
+             WHERE name IS NOT NULL AND name != '' \
+             AND centroid IS NOT NULL \
+             AND (hallucination IS NULL OR hallucination = 0)",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|(id, name, blob)| {
+                if blob.len() == 512 * 4 {
+                    let floats: Vec<f32> = blob
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    Some((id, name, floats))
+                } else {
+                    None
+                }
+            })
+            .collect())
+    }
+
     /// Get speakers active during a time range, grouped by device type.
     /// Returns speaker_id, current name, device type, and transcription count.
     /// Excludes hallucination speakers.
@@ -1228,18 +1696,19 @@ impl DatabaseManager {
         device_name: &str,
         fps: f64,
     ) -> Result<i64, sqlx::Error> {
-        let mut tx = self.begin_immediate_with_retry().await?;
-        let id = sqlx::query(
-            "INSERT INTO video_chunks (file_path, device_name, fps) VALUES (?1, ?2, ?3)",
-        )
-        .bind(file_path)
-        .bind(device_name)
-        .bind(fps)
-        .execute(&mut **tx.conn())
-        .await?
-        .last_insert_rowid();
-        tx.commit().await?;
-        Ok(id)
+        use crate::write_queue::{WriteOp, WriteResult};
+        let result = self
+            .write_queue
+            .submit(WriteOp::InsertVideoChunkWithFps {
+                file_path: file_path.to_string(),
+                device_name: device_name.to_string(),
+                fps,
+            })
+            .await?;
+        match result {
+            WriteResult::Id(id) => Ok(id),
+            _ => unreachable!(),
+        }
     }
 
     /// Insert a frame record into the database.
@@ -1352,6 +1821,7 @@ impl DatabaseManager {
             content_hash,
             simhash,
             None,
+            None, // elements_ref_frame_id
         )
         .await
     }
@@ -1364,9 +1834,14 @@ impl DatabaseManager {
     /// `elements` table. Builds a page→block→paragraph→line→word hierarchy using
     /// `RETURNING id` to chain parent IDs within the same transaction.
     ///
+    /// Level-0 blocks (Apple Native OCR — the default macOS path) have no hierarchy,
+    /// so they are accumulated and bulk-inserted in chunks via multi-row VALUES.
+    /// Hierarchical levels (Tesseract: 1-5) still go through per-row `RETURNING id`
+    /// because each row's id may become the parent of a later row.
+    ///
     /// Errors are logged and swallowed so that the primary OCR insert path is never
     /// blocked by a failure in the new elements table.
-    async fn insert_ocr_elements(
+    pub(crate) async fn insert_ocr_elements(
         tx: &mut sqlx::pool::PoolConnection<Sqlite>,
         frame_id: i64,
         text_json: &str,
@@ -1382,8 +1857,16 @@ impl DatabaseManager {
             return;
         }
 
+        // 12 params per row × 80 rows = 960 params, well below SQLite's
+        // default SQLITE_LIMIT_VARIABLE_NUMBER (999 on older builds, 32766 on
+        // newer). Larger flushes save round-trips on the hot path.
+        const BULK_CHUNK: usize = 80;
+
+        // Buffer of ready-to-insert level-0 rows. Flushed when full or when
+        // we encounter a hierarchical block that needs RETURNING.
+        let mut buf: Vec<Level0Row<'_>> = Vec::with_capacity(BULK_CHUNK);
+
         // Track hierarchy: (page, block, par, line) → element_id
-        // We use a BTreeMap so keys are ordered.
         let mut page_ids: BTreeMap<i64, i64> = BTreeMap::new();
         let mut block_ids: BTreeMap<(i64, i64), i64> = BTreeMap::new();
         let mut par_ids: BTreeMap<(i64, i64, i64), i64> = BTreeMap::new();
@@ -1403,16 +1886,49 @@ impl DatabaseManager {
             let height: Option<f64> = block.height.parse().ok();
             let conf: Option<f64> = block.conf.parse().ok();
 
-            let (role, text, parent_id, depth, confidence) = match level {
-                // Level 0: flat text blocks from Apple Native OCR (no hierarchy).
-                // Each block is a standalone text element (like a line/word).
-                0 => {
-                    let text_val = block.text.as_str();
-                    if text_val.trim().is_empty() {
-                        continue;
-                    }
-                    ("block", Some(text_val), None::<i64>, 0i32, conf)
+            // Fast path for level 0 (Apple Native, vast majority of Mac frames).
+            if level == 0 {
+                let text_val = block.text.as_str();
+                if text_val.trim().is_empty() {
+                    continue;
                 }
+                buf.push(Level0Row {
+                    text: text_val,
+                    left,
+                    top,
+                    width,
+                    height,
+                    confidence: conf,
+                    sort_order,
+                });
+                sort_order += 1;
+                if buf.len() >= BULK_CHUNK {
+                    if let Err(e) = flush_level0_bulk(tx, frame_id, &buf).await {
+                        debug!(
+                            "elements: OCR bulk insert failed for frame {}: {}",
+                            frame_id, e
+                        );
+                        return;
+                    }
+                    buf.clear();
+                }
+                continue;
+            }
+
+            // Hierarchical levels (Tesseract). Flush any pending level-0 rows
+            // first so sort_order interleaves correctly.
+            if !buf.is_empty() {
+                if let Err(e) = flush_level0_bulk(tx, frame_id, &buf).await {
+                    debug!(
+                        "elements: OCR bulk insert failed for frame {}: {}",
+                        frame_id, e
+                    );
+                    return;
+                }
+                buf.clear();
+            }
+
+            let (role, text, parent_id, depth, confidence) = match level {
                 1 => {
                     if page_ids.contains_key(&page_num) {
                         continue;
@@ -1495,6 +2011,16 @@ impl DatabaseManager {
                 }
             }
         }
+
+        // Flush any remaining buffered level-0 rows.
+        if !buf.is_empty() {
+            if let Err(e) = flush_level0_bulk(tx, frame_id, &buf).await {
+                debug!(
+                    "elements: OCR bulk insert failed for frame {}: {}",
+                    frame_id, e
+                );
+            }
+        }
     }
 
     /// Insert accessibility tree nodes from `tree_json` (serialized
@@ -1504,20 +2030,53 @@ impl DatabaseManager {
     /// used to resolve parent references.
     ///
     /// Errors are logged and swallowed.
-    async fn insert_accessibility_elements(
+    pub(crate) async fn insert_accessibility_elements(
         tx: &mut sqlx::pool::PoolConnection<Sqlite>,
         frame_id: i64,
         tree_json: &str,
     ) {
-        // AccessibilityTreeNode: { role, text, depth, bounds? }
-        #[derive(serde::Deserialize)]
+        // AccessibilityTreeNode: { role, text, depth, bounds?, automation props... }
+        #[derive(serde::Deserialize, serde::Serialize)]
         struct AxNode {
             role: String,
             text: String,
             depth: u8,
+            #[serde(skip_serializing_if = "Option::is_none")]
             bounds: Option<AxBounds>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            automation_id: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            class_name: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            value: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            help_text: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            url: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            placeholder: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            role_description: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            subrole: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            is_enabled: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            is_focused: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            is_selected: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            is_expanded: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            is_password: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            is_keyboard_focusable: Option<bool>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            accelerator_key: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            access_key: Option<String>,
         }
-        #[derive(serde::Deserialize)]
+        #[derive(serde::Deserialize, serde::Serialize)]
         struct AxBounds {
             left: f32,
             top: f32,
@@ -1570,8 +2129,72 @@ impl DatabaseManager {
                 None => (None, None, None, None),
             };
 
+            // Serialize automation properties as JSON (only non-None fields)
+            let properties = {
+                let mut props = serde_json::Map::new();
+                if let Some(ref v) = node.automation_id {
+                    props.insert("automation_id".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(ref v) = node.class_name {
+                    props.insert("class_name".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(ref v) = node.value {
+                    props.insert("value".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(ref v) = node.help_text {
+                    props.insert("help_text".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(ref v) = node.url {
+                    props.insert("url".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(ref v) = node.placeholder {
+                    props.insert("placeholder".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(ref v) = node.role_description {
+                    props.insert(
+                        "role_description".into(),
+                        serde_json::Value::String(v.clone()),
+                    );
+                }
+                if let Some(ref v) = node.subrole {
+                    props.insert("subrole".into(), serde_json::Value::String(v.clone()));
+                }
+                if let Some(v) = node.is_enabled {
+                    props.insert("is_enabled".into(), serde_json::Value::Bool(v));
+                }
+                if let Some(v) = node.is_focused {
+                    props.insert("is_focused".into(), serde_json::Value::Bool(v));
+                }
+                if let Some(v) = node.is_selected {
+                    props.insert("is_selected".into(), serde_json::Value::Bool(v));
+                }
+                if let Some(v) = node.is_expanded {
+                    props.insert("is_expanded".into(), serde_json::Value::Bool(v));
+                }
+                if let Some(v) = node.is_password {
+                    props.insert("is_password".into(), serde_json::Value::Bool(v));
+                }
+                if let Some(v) = node.is_keyboard_focusable {
+                    props.insert("is_keyboard_focusable".into(), serde_json::Value::Bool(v));
+                }
+                if let Some(ref v) = node.accelerator_key {
+                    props.insert(
+                        "accelerator_key".into(),
+                        serde_json::Value::String(v.clone()),
+                    );
+                }
+                if let Some(ref v) = node.access_key {
+                    props.insert("access_key".into(), serde_json::Value::String(v.clone()));
+                }
+                if props.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::Value::Object(props).to_string())
+                }
+            };
+
             let result = sqlx::query_scalar::<_, i64>(
-                "INSERT INTO elements (frame_id, source, role, text, parent_id, depth, left_bound, top_bound, width_bound, height_bound, confidence, sort_order) VALUES (?1, 'accessibility', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10) RETURNING id",
+                "INSERT INTO elements (frame_id, source, role, text, parent_id, depth, left_bound, top_bound, width_bound, height_bound, confidence, sort_order, properties) VALUES (?1, 'accessibility', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, ?11) RETURNING id",
             )
             .bind(frame_id)
             .bind(&node.role)
@@ -1583,6 +2206,7 @@ impl DatabaseManager {
             .bind(width)
             .bind(height)
             .bind(sort_order)
+            .bind(&properties)
             .fetch_one(&mut **tx)
             .await;
 
@@ -1622,10 +2246,11 @@ impl DatabaseManager {
         content_hash: Option<i64>,
         simhash: Option<i64>,
         ocr_data: Option<(&str, &str, &str)>, // (text, text_json, ocr_engine)
+        elements_ref_frame_id: Option<i64>,
     ) -> Result<i64, sqlx::Error> {
-        // Compute full_text: the single searchable text blob for this frame.
-        // For hybrid frames, concatenate accessibility + OCR text.
-        // For single-source frames, use whichever text is available.
+        use crate::write_queue::{WriteOp, WriteResult};
+
+        // Compute full_text before submitting to queue (pure computation, no DB)
         let ocr_text_str = ocr_data.map(|(text, _, _)| text);
         let full_text = match text_source {
             Some("hybrid") => {
@@ -1641,83 +2266,78 @@ impl DatabaseManager {
                     Some(format!("{}\n{}", a11y, ocr))
                 }
             }
-            _ => {
-                // accessibility or ocr — use accessibility_text (already the best source)
-                // Fall back to OCR text if no accessibility
-                accessibility_text
-                    .filter(|t| !t.is_empty())
-                    .map(String::from)
-                    .or_else(|| ocr_text_str.filter(|t| !t.is_empty()).map(String::from))
-            }
+            _ => accessibility_text
+                .filter(|t| !t.is_empty())
+                .map(String::from)
+                .or_else(|| ocr_text_str.filter(|t| !t.is_empty()).map(String::from)),
         };
 
-        let mut tx = self.begin_immediate_with_retry().await?;
+        // Capture element data before moving into the frame write op
+        let ocr_json_for_elements = if elements_ref_frame_id.is_none() {
+            ocr_data.map(|(_, j, _)| j.to_string())
+        } else {
+            None
+        };
+        let a11y_json_for_elements = if elements_ref_frame_id.is_none() {
+            accessibility_tree_json.map(String::from)
+        } else {
+            None
+        };
 
-        let id = sqlx::query(
-            r#"INSERT INTO frames (
-                video_chunk_id, offset_index, timestamp, name,
-                browser_url, app_name, window_name, focused, device_name,
-                snapshot_path, capture_trigger, accessibility_text, text_source,
-                accessibility_tree_json, content_hash, simhash, full_text
-            ) VALUES (
-                NULL, 0, ?1, ?2,
-                ?3, ?4, ?5, ?6, ?7,
-                ?8, ?9, ?10, ?11,
-                ?12, ?13, ?14, ?15
-            )"#,
-        )
-        .bind(timestamp)
-        .bind(snapshot_path) // name = snapshot_path for compatibility
-        .bind(browser_url)
-        .bind(app_name)
-        .bind(window_name)
-        .bind(focused)
-        .bind(device_name)
-        .bind(snapshot_path)
-        .bind(capture_trigger)
-        .bind(accessibility_text)
-        .bind(text_source)
-        .bind(accessibility_tree_json)
-        .bind(content_hash)
-        .bind(simhash)
-        .bind(&full_text)
-        .execute(&mut **tx.conn())
-        .await?
-        .last_insert_rowid();
-
-        // Insert OCR text positions in the same transaction (no extra connection needed)
-        if let Some((text, text_json, ocr_engine)) = ocr_data {
-            let text_length = text.len() as i64;
-            sqlx::query(
-                "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine, text_length) VALUES (?1, ?2, ?3, ?4, ?5)",
-            )
-            .bind(id)
-            .bind(text)
-            .bind(text_json)
-            .bind(ocr_engine)
-            .bind(text_length)
-            .execute(&mut **tx.conn())
+        let result = self
+            .write_queue
+            .submit(WriteOp::InsertSnapshotFrameWithOcr {
+                device_name: device_name.to_string(),
+                timestamp,
+                snapshot_path: snapshot_path.to_string(),
+                app_name: app_name.map(String::from),
+                window_name: window_name.map(String::from),
+                browser_url: browser_url.map(String::from),
+                focused,
+                capture_trigger: capture_trigger.map(String::from),
+                accessibility_text: accessibility_text.map(String::from),
+                text_source: text_source.map(String::from),
+                accessibility_tree_json: accessibility_tree_json.map(String::from),
+                content_hash,
+                simhash,
+                ocr_text: ocr_data.map(|(t, _, _)| t.to_string()),
+                ocr_text_json: ocr_data.map(|(_, j, _)| j.to_string()),
+                ocr_engine: ocr_data.map(|(_, _, e)| e.to_string()),
+                full_text,
+                elements_ref_frame_id,
+            })
             .await?;
 
-            // Dual-write: insert OCR elements into unified elements table
-            Self::insert_ocr_elements(tx.conn(), id, text_json).await;
+        let frame_id = match result {
+            WriteResult::Id(id) => id,
+            _ => unreachable!(),
+        };
+
+        // Submit element inserts as a separate write op so they don't hold
+        // the write lock during the frame transaction. Elements are supplementary
+        // data — the frame is usable for search immediately after the first commit.
+        let has_elements = ocr_json_for_elements
+            .as_ref()
+            .is_some_and(|j| !j.is_empty())
+            || a11y_json_for_elements
+                .as_ref()
+                .is_some_and(|j| !j.is_empty());
+        if has_elements {
+            // Fire-and-forget: spawn so we don't block the capture loop waiting
+            // for element insertion. Errors are logged inside insert_*_elements.
+            let queue = self.write_queue.clone();
+            tokio::spawn(async move {
+                let _ = queue
+                    .submit(WriteOp::InsertDeferredElements {
+                        frame_id,
+                        ocr_text_json: ocr_json_for_elements,
+                        accessibility_tree_json: a11y_json_for_elements,
+                    })
+                    .await;
+            });
         }
 
-        // Dual-write: insert accessibility elements if tree JSON is present
-        if let Some(tree_json) = accessibility_tree_json {
-            if !tree_json.is_empty() {
-                Self::insert_accessibility_elements(tx.conn(), id, tree_json).await;
-            }
-        }
-
-        tx.commit().await?;
-        debug!(
-            "insert_snapshot_frame: id={}, trigger={:?}, has_ocr={}",
-            id,
-            capture_trigger,
-            ocr_data.is_some()
-        );
-        Ok(id)
+        Ok(frame_id)
     }
 
     /// Get the next frame offset for a device.
@@ -1812,7 +2432,7 @@ impl DatabaseManager {
             return Ok(vec![]);
         }
 
-        // Read the latest video_chunk OUTSIDE the write transaction.
+        // Read the latest video_chunk OUTSIDE the write queue.
         // This SELECT only needs a shared read lock, not the exclusive write lock.
         // Moving it out reduces write lock hold time significantly.
         let video_chunk: Option<(i64, String)> = sqlx::query_as(
@@ -1835,66 +2455,48 @@ impl DatabaseManager {
 
         let timestamp = timestamp.unwrap_or_else(Utc::now);
         let ocr_engine_str = format!("{:?}", *ocr_engine);
-        let mut results = Vec::with_capacity(windows.len());
 
-        // Now acquire the write lock — only INSERTs run inside the transaction.
-        let mut tx = self.begin_immediate_with_retry().await?;
+        // Build owned window data for the queue
+        let batch_windows: Vec<crate::write_queue::FrameBatchWindow> = windows
+            .iter()
+            .map(|w| crate::write_queue::FrameBatchWindow {
+                app_name: w.app_name.clone(),
+                window_name: w.window_name.clone(),
+                browser_url: w.browser_url.clone(),
+                focused: w.focused,
+                text: w.text.clone(),
+                text_json: w.text_json.clone(),
+            })
+            .collect();
 
-        for (idx, window) in windows.iter().enumerate() {
-            // Compute full_text for FTS indexing
-            let full_text = if window.text.is_empty() {
-                None
-            } else {
-                Some(window.text.as_str())
-            };
-
-            // Insert frame
-            let frame_id = sqlx::query(
-                "INSERT INTO frames (video_chunk_id, offset_index, timestamp, name, browser_url, app_name, window_name, focused, device_name, full_text) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            )
-            .bind(video_chunk_id)
-            .bind(offset_index)
-            .bind(timestamp)
-            .bind(&file_path)
-            .bind(window.browser_url.as_deref())
-            .bind(window.app_name.as_deref())
-            .bind(window.window_name.as_deref())
-            .bind(window.focused)
-            .bind(device_name)
-            .bind(full_text)
-            .execute(&mut **tx.conn())
-            .await?
-            .last_insert_rowid();
-
-            // Insert OCR text
-            let text_length = window.text.len() as i64;
-            sqlx::query(
-                "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine, text_length) VALUES (?1, ?2, ?3, ?4, ?5)",
-            )
-            .bind(frame_id)
-            .bind(&window.text)
-            .bind(&window.text_json)
-            .bind(&ocr_engine_str)
-            .bind(text_length)
-            .execute(&mut **tx.conn())
+        // Submit through the write queue instead of acquiring the write lock directly.
+        let result = self
+            .write_queue
+            .submit(crate::write_queue::WriteOp::InsertFramesBatch {
+                video_chunk_id,
+                file_path,
+                device_name: device_name.to_string(),
+                timestamp,
+                offset_index,
+                ocr_engine_str,
+                windows: batch_windows,
+            })
             .await?;
 
-            // Dual-write: insert OCR elements into unified elements table
-            if !window.text_json.is_empty() {
-                Self::insert_ocr_elements(tx.conn(), frame_id, &window.text_json).await;
+        match result {
+            crate::write_queue::WriteResult::FrameBatch(results) => {
+                debug!(
+                    "Batch inserted {} frames with OCR for device {}",
+                    results.len(),
+                    device_name
+                );
+                Ok(results)
             }
-
-            results.push((frame_id, idx));
+            _ => {
+                tracing::warn!("Unexpected WriteResult variant from InsertFramesBatch");
+                Ok(vec![])
+            }
         }
-
-        tx.commit().await?;
-        debug!(
-            "Batch inserted {} frames with OCR for device {}",
-            results.len(),
-            device_name
-        );
-
-        Ok(results)
     }
 
     /// Insert multiple frames (each with their own offset and windows) in a single
@@ -2223,6 +2825,8 @@ impl DatabaseManager {
                         end_str.as_deref(),
                         limit,
                         offset,
+                        None,
+                        None,
                     )
                     .await?;
                 results.extend(memory_results.into_iter().map(SearchResult::Memory));
@@ -2368,7 +2972,7 @@ impl DatabaseManager {
         LIMIT ?10 OFFSET ?11
         "#,
             fts_join = if has_fts {
-                "JOIN frames_fts ON frames.id = frames_fts.id"
+                "JOIN frames_fts ON frames.id = frames_fts.rowid"
             } else {
                 ""
             },
@@ -2595,8 +3199,8 @@ impl DatabaseManager {
                 .await?;
 
         match snapshot {
-            Some((Some(path),)) => Ok(Some((path, 0, true))),
-            Some((None,)) => {
+            Some((Some(path),)) if !path.is_empty() => Ok(Some((path, 0, true))),
+            Some((Some(_),)) | Some((None,)) => {
                 // Legacy frame — get from video_chunks
                 let result = sqlx::query_as::<_, (String, i64)>(
                     r#"
@@ -3007,14 +3611,20 @@ impl DatabaseManager {
                        AND (?4 IS NULL OR LENGTH(COALESCE(frames.full_text, '')) >= ?4)
                        AND (?5 IS NULL OR LENGTH(COALESCE(frames.full_text, '')) <= ?5)
                        AND (?6 IS NULL OR frames.name LIKE '%' || ?6 || '%')
-                       AND (?7 IS NULL OR frames.focused = ?7)"#,
+                       AND (?7 IS NULL OR frames.focused = ?7)
+                       {a11y_filter}"#,
                 fts_join = if has_fts {
-                    "JOIN frames_fts ON frames.id = frames_fts.id"
+                    "JOIN frames_fts ON frames.id = frames_fts.rowid"
                 } else {
                     ""
                 },
                 fts_condition = if has_fts {
                     "AND frames_fts MATCH ?1"
+                } else {
+                    ""
+                },
+                a11y_filter = if content_type == ContentType::Accessibility {
+                    "AND frames.accessibility_text IS NOT NULL AND frames.accessibility_text != ''"
                 } else {
                     ""
                 }
@@ -3691,12 +4301,12 @@ impl DatabaseManager {
                 {fts_condition}
                 AND (?2 IS NULL OR f.timestamp >= ?2)
                 AND (?3 IS NULL OR f.timestamp <= ?3)
-                AND f.full_text IS NOT NULL AND f.full_text != ''
+                AND f.accessibility_text IS NOT NULL AND f.accessibility_text != ''
             ORDER BY f.timestamp DESC
             LIMIT ?4 OFFSET ?5
             "#,
             fts_join = if has_fts {
-                "JOIN frames_fts ON f.id = frames_fts.id"
+                "JOIN frames_fts ON f.id = frames_fts.rowid"
             } else {
                 ""
             },
@@ -3871,7 +4481,8 @@ impl DatabaseManager {
                     ac.file_path,
                     at.transcription,
                     at.start_time,
-                    at.end_time
+                    at.end_time,
+                    CAST(unixepoch(at.timestamp) AS INTEGER) as abs_timestamp
                 FROM speakers s
                 JOIN audio_transcriptions at ON s.id = at.speaker_id
                 JOIN audio_chunks ac ON at.audio_chunk_id = ac.id
@@ -3909,7 +4520,8 @@ impl DatabaseManager {
                             'path', rap.file_path,
                             'transcript', rap.transcription,
                             'start_time', rap.start_time,
-                            'end_time', rap.end_time
+                            'end_time', rap.end_time,
+                            'timestamp', rap.abs_timestamp
                         )
                     ))
                     ELSE json_patch(
@@ -3919,7 +4531,8 @@ impl DatabaseManager {
                                 'path', rap.file_path,
                                 'transcript', rap.transcription,
                                 'start_time', rap.start_time,
-                                'end_time', rap.end_time
+                                'end_time', rap.end_time,
+                                'timestamp', rap.abs_timestamp
                             )
                         ))
                     )
@@ -3984,8 +4597,62 @@ impl DatabaseManager {
     }
 
     pub async fn search_speakers(&self, name_prefix: &str) -> Result<Vec<Speaker>, sqlx::Error> {
+        // Group by name so duplicate names (e.g. multiple "Louis" rows from
+        // separate voice embeddings) appear as a single entry in the dropdown.
+        // Pick the lowest id per name so reassignment targets a stable speaker.
+        // Include recent audio samples so the UI can display voice clips.
         sqlx::query_as::<_, Speaker>(
-            "SELECT DISTINCT * FROM speakers WHERE name LIKE ? || '%' AND hallucination = 0",
+            r#"
+            WITH NamedSpeakers AS (
+                SELECT MIN(id) as id, name
+                FROM speakers
+                WHERE name LIKE ? || '%' AND hallucination = 0 AND name IS NOT NULL AND name != ''
+                GROUP BY name
+            ),
+            RecentAudioPaths AS (
+                SELECT DISTINCT
+                    ns.id as speaker_id,
+                    ac.file_path,
+                    at2.transcription,
+                    at2.start_time,
+                    at2.end_time,
+                    CAST(unixepoch(at2.timestamp) AS INTEGER) as abs_timestamp
+                FROM NamedSpeakers ns
+                JOIN audio_transcriptions at2 ON at2.speaker_id IN (
+                    SELECT s2.id FROM speakers s2 WHERE s2.name = ns.name AND s2.hallucination = 0
+                )
+                JOIN audio_chunks ac ON at2.audio_chunk_id = ac.id
+                WHERE ac.file_path NOT LIKE 'cloud://%'
+                AND at2.timestamp IN (
+                    SELECT at3.timestamp
+                    FROM audio_transcriptions at3
+                    JOIN speakers s3 ON at3.speaker_id = s3.id
+                    WHERE s3.name = ns.name AND s3.hallucination = 0
+                    ORDER BY at3.timestamp DESC
+                    LIMIT 3
+                )
+            )
+            SELECT
+                ns.id,
+                ns.name,
+                CASE
+                    WHEN rap.file_path IS NULL THEN COALESCE(s.metadata, '{}')
+                    ELSE json_object('audio_samples', json_group_array(
+                        DISTINCT json_object(
+                            'path', rap.file_path,
+                            'transcript', rap.transcription,
+                            'start_time', rap.start_time,
+                            'end_time', rap.end_time,
+                            'timestamp', rap.abs_timestamp
+                        )
+                    ))
+                END as metadata
+            FROM NamedSpeakers ns
+            JOIN speakers s ON s.id = ns.id
+            LEFT JOIN RecentAudioPaths rap ON ns.id = rap.speaker_id
+            GROUP BY ns.id, ns.name
+            ORDER BY ns.name
+            "#,
         )
         .bind(name_prefix)
         .fetch_all(&self.pool)
@@ -4092,6 +4759,69 @@ impl DatabaseManager {
         .await?;
         let ocr_deleted = ocr_result.rows_affected();
 
+        // 4b. Migrate elements from anchor frames being deleted that are referenced
+        // by frames outside the delete range. For each such anchor, move its elements
+        // to the first referencing frame and update all references.
+        let anchor_ids: Vec<i64> = sqlx::query_scalar(
+            r#"SELECT DISTINCT f.id FROM frames f
+               WHERE f.timestamp BETWEEN ?1 AND ?2
+               AND EXISTS (
+                   SELECT 1 FROM frames ref
+                   WHERE ref.elements_ref_frame_id = f.id
+                   AND ref.timestamp NOT BETWEEN ?1 AND ?2
+               )"#,
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .fetch_all(&mut **tx.conn())
+        .await?;
+
+        for anchor_id in &anchor_ids {
+            // Find the first referencing frame outside the delete range
+            let new_anchor_id: Option<i64> = sqlx::query_scalar(
+                r#"SELECT MIN(id) FROM frames
+                   WHERE elements_ref_frame_id = ?1
+                   AND timestamp NOT BETWEEN ?2 AND ?3"#,
+            )
+            .bind(anchor_id)
+            .bind(&start_str)
+            .bind(&end_str)
+            .fetch_optional(&mut **tx.conn())
+            .await?
+            .flatten();
+
+            if let Some(new_id) = new_anchor_id {
+                // Move elements to the new anchor frame
+                sqlx::query("UPDATE elements SET frame_id = ?1 WHERE frame_id = ?2")
+                    .bind(new_id)
+                    .bind(anchor_id)
+                    .execute(&mut **tx.conn())
+                    .await?;
+                // Update all references to point to new anchor
+                sqlx::query(
+                    "UPDATE frames SET elements_ref_frame_id = ?1 WHERE elements_ref_frame_id = ?2",
+                )
+                .bind(new_id)
+                .bind(anchor_id)
+                .execute(&mut **tx.conn())
+                .await?;
+                // Clear ref on the new anchor (it now owns the elements)
+                sqlx::query("UPDATE frames SET elements_ref_frame_id = NULL WHERE id = ?1")
+                    .bind(new_id)
+                    .execute(&mut **tx.conn())
+                    .await?;
+            }
+        }
+
+        // 4c. Delete elements belonging to frames in the delete range (no CASCADE on FK)
+        sqlx::query(
+            "DELETE FROM elements WHERE frame_id IN (SELECT id FROM frames WHERE timestamp BETWEEN ?1 AND ?2)",
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .execute(&mut **tx.conn())
+        .await?;
+
         // 5. Delete frames — triggers frames_fts delete; vision_tags CASCADE'd automatically
         let frames_result = sqlx::query("DELETE FROM frames WHERE timestamp BETWEEN ?1 AND ?2")
             .bind(&start_str)
@@ -4125,7 +4855,7 @@ impl DatabaseManager {
         .await?;
         let audio_chunks_deleted = audio_chunks_result.rows_affected();
 
-        // 9. accessibility table was dropped by migration
+        // 9. accessibility table was dropped by migration 20260312000000
         let accessibility_deleted: u64 = 0;
 
         // 10. Delete ui_events — triggers ui_events_fts delete
@@ -4162,6 +4892,440 @@ impl DatabaseManager {
         })
     }
 
+    /// Delete data in a time range and return ALL local file paths for deletion.
+    /// Unlike `delete_time_range` (which only returns cloud-uploaded files),
+    /// this variant returns every video/audio/snapshot file — used by local
+    /// retention to free disk space without requiring cloud archive.
+    pub async fn delete_time_range_local(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<DeleteTimeRangeResult, sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+
+        let start_str = start.to_rfc3339();
+        let end_str = end.to_rfc3339();
+
+        // 1. Collect ALL video file paths for chunks that become fully orphaned
+        let video_files: Vec<String> = sqlx::query_scalar(
+            r#"SELECT file_path FROM video_chunks
+               WHERE id IN (SELECT DISTINCT video_chunk_id FROM frames WHERE timestamp BETWEEN ?1 AND ?2)
+               AND id NOT IN (SELECT DISTINCT video_chunk_id FROM frames WHERE timestamp NOT BETWEEN ?1 AND ?2)
+               AND file_path NOT LIKE 'cloud://%'"#,
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .fetch_all(&mut **tx.conn())
+        .await?;
+
+        // 2. Collect ALL snapshot files (not just cloud-uploaded)
+        let snapshot_files: Vec<String> = sqlx::query_scalar(
+            r#"SELECT snapshot_path FROM frames
+               WHERE timestamp BETWEEN ?1 AND ?2
+               AND snapshot_path IS NOT NULL"#,
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .fetch_all(&mut **tx.conn())
+        .await?;
+
+        // 3. Collect ALL audio file paths for chunks that become fully orphaned
+        let audio_files: Vec<String> = sqlx::query_scalar(
+            r#"SELECT file_path FROM audio_chunks
+               WHERE id IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions WHERE timestamp BETWEEN ?1 AND ?2)
+               AND id NOT IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions WHERE timestamp NOT BETWEEN ?1 AND ?2)
+               AND file_path NOT LIKE 'cloud://%'"#,
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .fetch_all(&mut **tx.conn())
+        .await?;
+
+        // 4. Delete ocr_text
+        let ocr_result = sqlx::query(
+            "DELETE FROM ocr_text WHERE frame_id IN (SELECT id FROM frames WHERE timestamp BETWEEN ?1 AND ?2)",
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .execute(&mut **tx.conn())
+        .await?;
+        let ocr_deleted = ocr_result.rows_affected();
+
+        // 5. Migrate elements from anchor frames being deleted
+        let anchor_ids: Vec<i64> = sqlx::query_scalar(
+            r#"SELECT DISTINCT f.id FROM frames f
+               WHERE f.timestamp BETWEEN ?1 AND ?2
+               AND EXISTS (
+                   SELECT 1 FROM frames ref
+                   WHERE ref.elements_ref_frame_id = f.id
+                   AND ref.timestamp NOT BETWEEN ?1 AND ?2
+               )"#,
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .fetch_all(&mut **tx.conn())
+        .await?;
+
+        for anchor_id in &anchor_ids {
+            let new_anchor_id: Option<i64> = sqlx::query_scalar(
+                r#"SELECT MIN(id) FROM frames
+                   WHERE elements_ref_frame_id = ?1
+                   AND timestamp NOT BETWEEN ?2 AND ?3"#,
+            )
+            .bind(anchor_id)
+            .bind(&start_str)
+            .bind(&end_str)
+            .fetch_optional(&mut **tx.conn())
+            .await?
+            .flatten();
+
+            if let Some(new_id) = new_anchor_id {
+                sqlx::query("UPDATE elements SET frame_id = ?1 WHERE frame_id = ?2")
+                    .bind(new_id)
+                    .bind(anchor_id)
+                    .execute(&mut **tx.conn())
+                    .await?;
+                sqlx::query(
+                    "UPDATE frames SET elements_ref_frame_id = ?1 WHERE elements_ref_frame_id = ?2",
+                )
+                .bind(new_id)
+                .bind(anchor_id)
+                .execute(&mut **tx.conn())
+                .await?;
+                sqlx::query("UPDATE frames SET elements_ref_frame_id = NULL WHERE id = ?1")
+                    .bind(new_id)
+                    .execute(&mut **tx.conn())
+                    .await?;
+            }
+        }
+
+        // 6. Delete elements belonging to frames in the delete range
+        sqlx::query(
+            "DELETE FROM elements WHERE frame_id IN (SELECT id FROM frames WHERE timestamp BETWEEN ?1 AND ?2)",
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .execute(&mut **tx.conn())
+        .await?;
+
+        // 7. Delete frames
+        let frames_result = sqlx::query("DELETE FROM frames WHERE timestamp BETWEEN ?1 AND ?2")
+            .bind(&start_str)
+            .bind(&end_str)
+            .execute(&mut **tx.conn())
+            .await?;
+        let frames_deleted = frames_result.rows_affected();
+
+        // 8. Delete orphaned video_chunks
+        let video_chunks_result = sqlx::query(
+            "DELETE FROM video_chunks WHERE id NOT IN (SELECT DISTINCT video_chunk_id FROM frames)",
+        )
+        .execute(&mut **tx.conn())
+        .await?;
+        let video_chunks_deleted = video_chunks_result.rows_affected();
+
+        // 9. Delete audio_transcriptions
+        let audio_transcriptions_result =
+            sqlx::query("DELETE FROM audio_transcriptions WHERE timestamp BETWEEN ?1 AND ?2")
+                .bind(&start_str)
+                .bind(&end_str)
+                .execute(&mut **tx.conn())
+                .await?;
+        let audio_transcriptions_deleted = audio_transcriptions_result.rows_affected();
+
+        // 10. Delete orphaned audio_chunks
+        let audio_chunks_result = sqlx::query(
+            "DELETE FROM audio_chunks WHERE id NOT IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions)",
+        )
+        .execute(&mut **tx.conn())
+        .await?;
+        let audio_chunks_deleted = audio_chunks_result.rows_affected();
+
+        // 11. accessibility table was dropped by migration 20260312000000
+        let accessibility_deleted: u64 = 0;
+
+        // 12. Delete ui_events
+        let ui_events_result =
+            sqlx::query("DELETE FROM ui_events WHERE timestamp BETWEEN ?1 AND ?2")
+                .bind(&start_str)
+                .bind(&end_str)
+                .execute(&mut **tx.conn())
+                .await?;
+        let ui_events_deleted = ui_events_result.rows_affected();
+
+        // 12. Commit — if this fails, no files are touched
+        tx.commit().await.map_err(|e| {
+            error!(
+                "failed to commit delete_time_range_local transaction: {}",
+                e
+            );
+            e
+        })?;
+
+        debug!(
+            "delete_time_range_local committed: frames={}, ocr={}, audio_transcriptions={}, audio_chunks={}, video_chunks={}, ui_events={}",
+            frames_deleted, ocr_deleted, audio_transcriptions_deleted, audio_chunks_deleted, video_chunks_deleted, ui_events_deleted
+        );
+
+        Ok(DeleteTimeRangeResult {
+            frames_deleted,
+            ocr_deleted,
+            audio_transcriptions_deleted,
+            audio_chunks_deleted,
+            video_chunks_deleted,
+            accessibility_deleted,
+            ui_events_deleted,
+            video_files,
+            audio_files,
+            snapshot_files,
+        })
+    }
+
+    /// Fast batch delete: only deletes time-range-bounded rows (ocr_text,
+    /// elements, frames, audio_transcriptions, ui_events). Skips the expensive
+    /// orphan cleanup (video_chunks, audio_chunks) which requires full-table
+    /// NOT IN scans. Call `cleanup_orphaned_chunks` once after all batches.
+    ///
+    /// Returns file paths and row counts. video_chunks_deleted and
+    /// audio_chunks_deleted will always be 0 — orphans are cleaned separately.
+    pub async fn delete_time_range_batch(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        collect_all_files: bool,
+    ) -> Result<DeleteTimeRangeResult, sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+
+        let start_str = start.to_rfc3339();
+        let end_str = end.to_rfc3339();
+
+        // Collect snapshot files
+        let snapshot_files: Vec<String> = sqlx::query_scalar(
+            r#"SELECT snapshot_path FROM frames
+               WHERE timestamp BETWEEN ?1 AND ?2
+               AND snapshot_path IS NOT NULL"#,
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .fetch_all(&mut **tx.conn())
+        .await?;
+
+        // Collect video files that are fully within this batch (all frames in chunk are in range)
+        let video_query = if collect_all_files {
+            // Local retention: collect all files regardless of cloud status
+            r#"SELECT file_path FROM video_chunks
+               WHERE id IN (SELECT DISTINCT video_chunk_id FROM frames WHERE timestamp BETWEEN ?1 AND ?2)
+               AND id NOT IN (SELECT DISTINCT video_chunk_id FROM frames WHERE timestamp NOT BETWEEN ?1 AND ?2)
+               AND file_path NOT LIKE 'cloud://%'"#
+        } else {
+            // Archive: only collect cloud-uploaded files
+            r#"SELECT file_path FROM video_chunks
+               WHERE id IN (SELECT DISTINCT video_chunk_id FROM frames WHERE timestamp BETWEEN ?1 AND ?2)
+               AND id NOT IN (SELECT DISTINCT video_chunk_id FROM frames WHERE timestamp NOT BETWEEN ?1 AND ?2)
+               AND (cloud_blob_id IS NOT NULL OR file_path LIKE 'cloud://%')"#
+        };
+        let video_files: Vec<String> = sqlx::query_scalar(video_query)
+            .bind(&start_str)
+            .bind(&end_str)
+            .fetch_all(&mut **tx.conn())
+            .await?;
+
+        // Collect audio files
+        let audio_files: Vec<String> = sqlx::query_scalar(
+            r#"SELECT file_path FROM audio_chunks
+               WHERE id IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions WHERE timestamp BETWEEN ?1 AND ?2)
+               AND id NOT IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions WHERE timestamp NOT BETWEEN ?1 AND ?2)
+               AND file_path NOT LIKE 'cloud://%'"#,
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .fetch_all(&mut **tx.conn())
+        .await?;
+
+        // Delete ocr_text
+        let ocr_result = sqlx::query(
+            "DELETE FROM ocr_text WHERE frame_id IN (SELECT id FROM frames WHERE timestamp BETWEEN ?1 AND ?2)",
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .execute(&mut **tx.conn())
+        .await?;
+        let ocr_deleted = ocr_result.rows_affected();
+
+        // Migrate elements from anchor frames
+        let anchor_ids: Vec<i64> = sqlx::query_scalar(
+            r#"SELECT DISTINCT f.id FROM frames f
+               WHERE f.timestamp BETWEEN ?1 AND ?2
+               AND EXISTS (
+                   SELECT 1 FROM frames ref
+                   WHERE ref.elements_ref_frame_id = f.id
+                   AND ref.timestamp NOT BETWEEN ?1 AND ?2
+               )"#,
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .fetch_all(&mut **tx.conn())
+        .await?;
+
+        for anchor_id in &anchor_ids {
+            let new_anchor_id: Option<i64> = sqlx::query_scalar(
+                r#"SELECT MIN(id) FROM frames
+                   WHERE elements_ref_frame_id = ?1
+                   AND timestamp NOT BETWEEN ?2 AND ?3"#,
+            )
+            .bind(anchor_id)
+            .bind(&start_str)
+            .bind(&end_str)
+            .fetch_optional(&mut **tx.conn())
+            .await?
+            .flatten();
+
+            if let Some(new_id) = new_anchor_id {
+                sqlx::query("UPDATE elements SET frame_id = ?1 WHERE frame_id = ?2")
+                    .bind(new_id)
+                    .bind(anchor_id)
+                    .execute(&mut **tx.conn())
+                    .await?;
+                sqlx::query(
+                    "UPDATE frames SET elements_ref_frame_id = ?1 WHERE elements_ref_frame_id = ?2",
+                )
+                .bind(new_id)
+                .bind(anchor_id)
+                .execute(&mut **tx.conn())
+                .await?;
+                sqlx::query("UPDATE frames SET elements_ref_frame_id = NULL WHERE id = ?1")
+                    .bind(new_id)
+                    .execute(&mut **tx.conn())
+                    .await?;
+            }
+        }
+
+        // Delete elements
+        sqlx::query(
+            "DELETE FROM elements WHERE frame_id IN (SELECT id FROM frames WHERE timestamp BETWEEN ?1 AND ?2)",
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .execute(&mut **tx.conn())
+        .await?;
+
+        // Delete frames
+        let frames_result = sqlx::query("DELETE FROM frames WHERE timestamp BETWEEN ?1 AND ?2")
+            .bind(&start_str)
+            .bind(&end_str)
+            .execute(&mut **tx.conn())
+            .await?;
+        let frames_deleted = frames_result.rows_affected();
+
+        // NO orphan video_chunks cleanup here — done separately
+
+        // Delete audio_transcriptions
+        let audio_transcriptions_result =
+            sqlx::query("DELETE FROM audio_transcriptions WHERE timestamp BETWEEN ?1 AND ?2")
+                .bind(&start_str)
+                .bind(&end_str)
+                .execute(&mut **tx.conn())
+                .await?;
+        let audio_transcriptions_deleted = audio_transcriptions_result.rows_affected();
+
+        // NO orphan audio_chunks cleanup here — done separately
+
+        // accessibility table was dropped by migration 20260312000000
+        let accessibility_deleted: u64 = 0;
+
+        // Delete ui_events
+        let ui_events_result =
+            sqlx::query("DELETE FROM ui_events WHERE timestamp BETWEEN ?1 AND ?2")
+                .bind(&start_str)
+                .bind(&end_str)
+                .execute(&mut **tx.conn())
+                .await?;
+        let ui_events_deleted = ui_events_result.rows_affected();
+
+        tx.commit().await.map_err(|e| {
+            error!(
+                "failed to commit delete_time_range_batch transaction: {}",
+                e
+            );
+            e
+        })?;
+
+        debug!(
+            "delete_time_range_batch committed: frames={}, ocr={}, audio_transcriptions={}, accessibility={}, ui_events={}",
+            frames_deleted, ocr_deleted, audio_transcriptions_deleted, accessibility_deleted, ui_events_deleted
+        );
+
+        Ok(DeleteTimeRangeResult {
+            frames_deleted,
+            ocr_deleted,
+            audio_transcriptions_deleted,
+            audio_chunks_deleted: 0,
+            video_chunks_deleted: 0,
+            accessibility_deleted,
+            ui_events_deleted,
+            video_files,
+            audio_files,
+            snapshot_files,
+        })
+    }
+
+    /// Clean up orphaned video_chunks and audio_chunks that no longer have
+    /// any referencing frames/transcriptions. This is the expensive operation
+    /// (full-table NOT IN scan) that should only run once after all batch
+    /// deletes are complete.
+    pub async fn cleanup_orphaned_chunks(&self) -> Result<(u64, u64), sqlx::Error> {
+        let mut tx = self.begin_immediate_with_retry().await?;
+
+        let video_chunks_result = sqlx::query(
+            "DELETE FROM video_chunks WHERE id NOT IN (SELECT DISTINCT video_chunk_id FROM frames)",
+        )
+        .execute(&mut **tx.conn())
+        .await?;
+        let video_chunks_deleted = video_chunks_result.rows_affected();
+
+        let audio_chunks_result = sqlx::query(
+            "DELETE FROM audio_chunks WHERE id NOT IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions)",
+        )
+        .execute(&mut **tx.conn())
+        .await?;
+        let audio_chunks_deleted = audio_chunks_result.rows_affected();
+
+        tx.commit().await.map_err(|e| {
+            error!(
+                "failed to commit cleanup_orphaned_chunks transaction: {}",
+                e
+            );
+            e
+        })?;
+
+        debug!(
+            "cleanup_orphaned_chunks committed: video_chunks={}, audio_chunks={}",
+            video_chunks_deleted, audio_chunks_deleted
+        );
+
+        Ok((video_chunks_deleted, audio_chunks_deleted))
+    }
+
+    /// Returns the oldest timestamp across frames and audio_transcriptions.
+    /// Used by retention to avoid scanning from epoch.
+    pub async fn get_oldest_timestamp(&self) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+        let oldest: Option<String> = sqlx::query_scalar(
+            r#"SELECT MIN(ts) FROM (
+                SELECT MIN(timestamp) AS ts FROM frames
+                UNION ALL
+                SELECT MIN(timestamp) AS ts FROM audio_transcriptions
+            )"#,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(oldest.and_then(|s| {
+            DateTime::parse_from_rfc3339(&s)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc))
+        }))
+    }
+
     /// Delete all locally-stored data that was synced from a specific remote device.
     /// Uses JOINs to find related OCR/transcription records since those tables
     /// lack a direct machine_id column.
@@ -4180,7 +5344,15 @@ impl DatabaseManager {
         .await?;
         let ocr_deleted = ocr_result.rows_affected();
 
-        // 2. Delete frames from this machine (vision_tags CASCADE automatically)
+        // 2. Delete elements for frames from this machine (no CASCADE on FK)
+        sqlx::query(
+            "DELETE FROM elements WHERE frame_id IN (SELECT id FROM frames WHERE machine_id = ?1)",
+        )
+        .bind(machine_id)
+        .execute(&mut **tx.conn())
+        .await?;
+
+        // 3. Delete frames from this machine (vision_tags CASCADE automatically)
         let frames_result = sqlx::query("DELETE FROM frames WHERE machine_id = ?1")
             .bind(machine_id)
             .execute(&mut **tx.conn())
@@ -4243,6 +5415,32 @@ impl DatabaseManager {
             audio_files: vec![],
             snapshot_files: vec![],
         })
+    }
+
+    /// Count synced records per machine_id. Returns (machine_id, frames, audio_transcriptions).
+    pub async fn count_by_machine_id(&self) -> Result<Vec<(String, i64, i64)>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, (String, i64)>(
+            "SELECT machine_id, COUNT(*) FROM frames WHERE machine_id IS NOT NULL GROUP BY machine_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let audio_rows = sqlx::query_as::<_, (String, i64)>(
+            "SELECT machine_id, COUNT(*) FROM audio_chunks WHERE machine_id IS NOT NULL GROUP BY machine_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut map: std::collections::HashMap<String, (i64, i64)> =
+            std::collections::HashMap::new();
+        for (mid, count) in rows {
+            map.entry(mid).or_default().0 = count;
+        }
+        for (mid, count) in audio_rows {
+            map.entry(mid).or_default().1 = count;
+        }
+
+        Ok(map.into_iter().map(|(mid, (f, a))| (mid, f, a)).collect())
     }
 
     // =========================================================================
@@ -4341,7 +5539,8 @@ impl DatabaseManager {
                     ac.file_path,
                     at.transcription,
                     at.start_time,
-                    at.end_time
+                    at.end_time,
+                    CAST(unixepoch(at.timestamp) AS INTEGER) as abs_timestamp
                 FROM speakers s
                 JOIN audio_transcriptions at ON s.id = at.speaker_id
                 JOIN audio_chunks ac ON at.audio_chunk_id = ac.id
@@ -4367,7 +5566,8 @@ impl DatabaseManager {
                         'path', rap.file_path,
                         'transcript', rap.transcription,
                         'start_time', rap.start_time,
-                        'end_time', rap.end_time
+                        'end_time', rap.end_time,
+                        'timestamp', rap.abs_timestamp
                     )))
                     ELSE json_patch(
                         json(s.metadata),
@@ -4375,7 +5575,8 @@ impl DatabaseManager {
                             'path', rap.file_path,
                             'transcript', rap.transcription,
                             'start_time', rap.start_time,
-                            'end_time', rap.end_time
+                            'end_time', rap.end_time,
+                            'timestamp', rap.abs_timestamp
                         )))
                     )
                 END as metadata
@@ -4614,7 +5815,7 @@ impl DatabaseManager {
                 crate::text_normalizer::sanitize_fts5_query(query)
             };
             conditions.push(
-                "f.id IN (SELECT id FROM frames_fts WHERE frames_fts MATCH ? ORDER BY rank LIMIT 5000)",
+                "f.id IN (SELECT rowid FROM frames_fts WHERE frames_fts MATCH ? ORDER BY rank LIMIT 5000)",
             );
             fts_match
         } else {
@@ -4890,18 +6091,30 @@ LIMIT ? OFFSET ?
 
     /// Get all elements for a single frame, ordered by sort_order.
     /// Returns the full tree; clients reconstruct hierarchy from `parent_id`/`depth`.
+    ///
+    /// If the frame has `elements_ref_frame_id` set (element dedup), this follows
+    /// the reference and returns elements from the anchor frame instead.
     pub async fn get_frame_elements(
         &self,
         frame_id: i64,
         source: Option<&ElementSource>,
     ) -> Result<Vec<Element>, sqlx::Error> {
+        // Check if this frame references another frame's elements
+        let effective_frame_id: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(elements_ref_frame_id, id) FROM frames WHERE id = ?1",
+        )
+        .bind(frame_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(frame_id);
+
         let sql = if source.is_some() {
             "SELECT id, frame_id, source, role, text, parent_id, depth, left_bound, top_bound, width_bound, height_bound, confidence, sort_order FROM elements WHERE frame_id = ?1 AND source = ?2 ORDER BY sort_order"
         } else {
             "SELECT id, frame_id, source, role, text, parent_id, depth, left_bound, top_bound, width_bound, height_bound, confidence, sort_order FROM elements WHERE frame_id = ?1 ORDER BY sort_order"
         };
 
-        let mut query = sqlx::query_as::<_, ElementRow>(sql).bind(frame_id);
+        let mut query = sqlx::query_as::<_, ElementRow>(sql).bind(effective_frame_id);
         if let Some(src) = source {
             query = query.bind(src.to_string());
         }
@@ -4954,7 +6167,7 @@ LIMIT ? OFFSET ?
                 crate::text_normalizer::sanitize_fts5_query(query)
             };
             conditions.push(
-                "f.id IN (SELECT id FROM frames_fts WHERE frames_fts MATCH ? ORDER BY rank LIMIT 5000)",
+                "f.id IN (SELECT rowid FROM frames_fts WHERE frames_fts MATCH ? ORDER BY rank LIMIT 5000)",
             );
             fts_match
         } else {
@@ -5281,9 +6494,13 @@ LIMIT ? OFFSET ?
                 None => return Err(sqlx::Error::RowNotFound),
             };
 
-            // 2. Find or create the target speaker
+            // 2. Find or create the target speaker (pick the one with most embeddings
+            //    to act as canonical when duplicates exist)
             let target_speaker: Speaker = match sqlx::query_as::<_, Speaker>(
-                "SELECT id, name, metadata FROM speakers WHERE name = ? AND hallucination = 0",
+                "SELECT s.id, s.name, s.metadata FROM speakers s \
+                 LEFT JOIN speaker_embeddings se ON se.speaker_id = s.id \
+                 WHERE s.name = ? AND s.hallucination = 0 \
+                 GROUP BY s.id ORDER BY COUNT(se.id) DESC LIMIT 1",
             )
             .bind(new_speaker_name)
             .fetch_optional(&mut **tx.conn())
@@ -5512,68 +6729,47 @@ LIMIT ? OFFSET ?
     // UI Events (Input Capture Modality)
     // ============================================================================
 
-    /// Insert a UI event into the database
+    /// Insert a UI event via the write coalescing queue.
     pub async fn insert_ui_event(&self, event: &InsertUiEvent) -> Result<i64, sqlx::Error> {
+        use crate::write_queue::{WriteOp, WriteResult};
         let text_length = event.text_content.as_ref().map(|s| s.len() as i32);
-
-        let mut tx = self.begin_immediate_with_retry().await?;
-
-        let result = sqlx::query(
-            r#"
-            INSERT INTO ui_events (
-                timestamp, session_id, relative_ms, event_type,
-                x, y, delta_x, delta_y,
-                button, click_count, key_code, modifiers,
-                text_content, text_length,
-                app_name, app_pid, window_title, browser_url,
-                element_role, element_name, element_value, element_description,
-                element_automation_id, element_bounds, frame_id
-            ) VALUES (
-                ?1, ?2, ?3, ?4,
-                ?5, ?6, ?7, ?8,
-                ?9, ?10, ?11, ?12,
-                ?13, ?14,
-                ?15, ?16, ?17, ?18,
-                ?19, ?20, ?21, ?22,
-                ?23, ?24, ?25
-            )
-            "#,
-        )
-        .bind(event.timestamp)
-        .bind(&event.session_id)
-        .bind(event.relative_ms)
-        .bind(event.event_type.to_string())
-        .bind(event.x)
-        .bind(event.y)
-        .bind(event.delta_x.map(|v| v as i32))
-        .bind(event.delta_y.map(|v| v as i32))
-        .bind(event.button.map(|v| v as i32))
-        .bind(event.click_count.map(|v| v as i32))
-        .bind(event.key_code.map(|v| v as i32))
-        .bind(event.modifiers.map(|v| v as i32))
-        .bind(&event.text_content)
-        .bind(text_length)
-        .bind(&event.app_name)
-        .bind(event.app_pid)
-        .bind(&event.window_title)
-        .bind(&event.browser_url)
-        .bind(&event.element_role)
-        .bind(&event.element_name)
-        .bind(&event.element_value)
-        .bind(&event.element_description)
-        .bind(&event.element_automation_id)
-        .bind(&event.element_bounds)
-        .bind(event.frame_id)
-        .execute(&mut **tx.conn())
-        .await?;
-
-        let id = result.last_insert_rowid();
-        tx.commit().await?;
-
-        Ok(id)
+        let result = self
+            .write_queue
+            .submit(WriteOp::InsertUiEvent {
+                timestamp: event.timestamp.to_rfc3339(),
+                session_id: event.session_id.clone(),
+                relative_ms: event.relative_ms,
+                event_type: event.event_type.to_string(),
+                x: event.x,
+                y: event.y,
+                delta_x: event.delta_x.map(|v| v as i32),
+                delta_y: event.delta_y.map(|v| v as i32),
+                button: event.button.map(|v| v as i32),
+                click_count: event.click_count.map(|v| v as i32),
+                key_code: event.key_code.map(|v| v as i32),
+                modifiers: event.modifiers.map(|v| v as i32),
+                text_content: event.text_content.clone(),
+                text_length,
+                app_name: event.app_name.clone(),
+                app_pid: event.app_pid,
+                window_title: event.window_title.clone(),
+                browser_url: event.browser_url.clone(),
+                element_role: event.element_role.clone(),
+                element_name: event.element_name.clone(),
+                element_value: event.element_value.clone(),
+                element_description: event.element_description.clone(),
+                element_automation_id: event.element_automation_id.clone(),
+                element_bounds: event.element_bounds.clone(),
+                frame_id: event.frame_id,
+            })
+            .await?;
+        match result {
+            WriteResult::Id(id) => Ok(id),
+            _ => unreachable!(),
+        }
     }
 
-    /// Insert multiple UI events in a batch
+    /// Insert multiple UI events via the write coalescing queue.
     pub async fn insert_ui_events_batch(
         &self,
         events: &[InsertUiEvent],
@@ -5581,67 +6777,11 @@ LIMIT ? OFFSET ?
         if events.is_empty() {
             return Ok(0);
         }
-
-        let mut tx = self.begin_immediate_with_retry().await?;
         let mut count = 0;
-
         for event in events {
-            let text_length = event.text_content.as_ref().map(|s| s.len() as i32);
-
-            sqlx::query(
-                r#"
-                INSERT INTO ui_events (
-                    timestamp, session_id, relative_ms, event_type,
-                    x, y, delta_x, delta_y,
-                    button, click_count, key_code, modifiers,
-                    text_content, text_length,
-                    app_name, app_pid, window_title, browser_url,
-                    element_role, element_name, element_value, element_description,
-                    element_automation_id, element_bounds, frame_id
-                ) VALUES (
-                    ?1, ?2, ?3, ?4,
-                    ?5, ?6, ?7, ?8,
-                    ?9, ?10, ?11, ?12,
-                    ?13, ?14,
-                    ?15, ?16, ?17, ?18,
-                    ?19, ?20, ?21, ?22,
-                    ?23, ?24, ?25
-                )
-                "#,
-            )
-            .bind(event.timestamp)
-            .bind(&event.session_id)
-            .bind(event.relative_ms)
-            .bind(event.event_type.to_string())
-            .bind(event.x)
-            .bind(event.y)
-            .bind(event.delta_x.map(|v| v as i32))
-            .bind(event.delta_y.map(|v| v as i32))
-            .bind(event.button.map(|v| v as i32))
-            .bind(event.click_count.map(|v| v as i32))
-            .bind(event.key_code.map(|v| v as i32))
-            .bind(event.modifiers.map(|v| v as i32))
-            .bind(&event.text_content)
-            .bind(text_length)
-            .bind(&event.app_name)
-            .bind(event.app_pid)
-            .bind(&event.window_title)
-            .bind(&event.browser_url)
-            .bind(&event.element_role)
-            .bind(&event.element_name)
-            .bind(&event.element_value)
-            .bind(&event.element_description)
-            .bind(&event.element_automation_id)
-            .bind(&event.element_bounds)
-            .bind(event.frame_id)
-            .execute(&mut **tx.conn())
-            .await?;
-
+            self.insert_ui_event(event).await?;
             count += 1;
         }
-
-        tx.commit().await?;
-        debug!("Inserted {} UI events in batch", count);
         Ok(count)
     }
 
@@ -5649,15 +6789,33 @@ LIMIT ? OFFSET ?
     // Accessibility Text (Tree Walker)
     // ============================================================================
 
-    /// Deprecated: accessibility table was dropped. This is a no-op kept for test compat.
+    /// Insert accessibility text as a snapshot frame with full_text populated.
+    /// This replaces the old accessibility table insert — data now lives in frames.
     pub async fn insert_accessibility_text(
         &self,
-        _app_name: &str,
-        _window_name: &str,
-        _text_content: &str,
-        _browser_url: Option<&str>,
+        app_name: &str,
+        window_name: &str,
+        text_content: &str,
+        browser_url: Option<&str>,
     ) -> Result<i64, sqlx::Error> {
-        Ok(0)
+        self.insert_snapshot_frame_with_ocr(
+            "test",
+            Utc::now(),
+            "",
+            Some(app_name),
+            Some(window_name),
+            browser_url,
+            false,
+            None,
+            Some(text_content),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     /// Get recent UI events for a specific app
@@ -5764,6 +6922,25 @@ LIMIT ? OFFSET ?
         });
     }
 
+    /// Run `PRAGMA wal_checkpoint(TRUNCATE)` on demand, flushing WAL into the
+    /// main database file so it can be safely copied.
+    /// Returns (busy, log_pages, checkpointed_pages).
+    pub async fn wal_checkpoint(&self) -> Result<(i32, i32, i32), sqlx::Error> {
+        let row = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok((row.get(0), row.get(1), row.get(2)))
+    }
+
+    /// Create an atomic backup of the database using `VACUUM INTO`.
+    /// The destination path must not already exist.
+    pub async fn backup_to(&self, dest: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(&format!("VACUUM INTO '{}'", dest.replace('\'', "''")))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     // ── Meeting persistence ──────────────────────────────────────────
 
     pub async fn insert_meeting(
@@ -5803,6 +6980,103 @@ LIMIT ? OFFSET ?
         Ok(())
     }
 
+    /// Collect text typed during a meeting's time interval from ui_events.
+    /// Returns deduplicated text grouped by app+window, or None if nothing was typed.
+    pub async fn get_meeting_typed_text(&self, id: i64) -> Result<Option<String>, SqlxError> {
+        // Get meeting time range
+        let row: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT meeting_start, meeting_end FROM meetings WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        let (start, end) = match row {
+            Some((s, Some(e))) => (s, e),
+            _ => return Ok(None),
+        };
+
+        // Query typed text during meeting (text events contain batched words)
+        let rows: Vec<(String,)> = sqlx::query_as(
+            r#"SELECT COALESCE(text_content, '') as txt
+            FROM ui_events
+            WHERE timestamp >= ?1 AND timestamp <= ?2
+                AND text_content IS NOT NULL
+                AND text_content != ''
+                AND event_type = 'text'
+            ORDER BY timestamp ASC
+            LIMIT 5000"#,
+        )
+        .bind(&start)
+        .bind(&end)
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(None);
+        }
+
+        let mut all_text = String::new();
+        for (txt,) in &rows {
+            all_text.push_str(txt);
+        }
+
+        // Trim and truncate
+        let all_text = all_text.trim().to_string();
+        if all_text.is_empty() {
+            return Ok(None);
+        }
+
+        let display = if all_text.len() > 5000 {
+            format!("{}… (truncated)", &all_text[..5000])
+        } else {
+            all_text
+        };
+
+        Ok(Some(format!("## typed during meeting\n\n{}", display)))
+    }
+
+    /// End a meeting and optionally append typed text to its note.
+    pub async fn end_meeting_with_typed_text(
+        &self,
+        id: i64,
+        meeting_end: &str,
+        append_typed_text: bool,
+    ) -> Result<(), SqlxError> {
+        // First end the meeting so the time range is set
+        self.end_meeting(id, meeting_end).await?;
+
+        if !append_typed_text {
+            return Ok(());
+        }
+
+        // Collect typed text
+        if let Ok(Some(typed_text)) = self.get_meeting_typed_text(id).await {
+            // Append to existing note
+            let existing_note: Option<(Option<String>,)> =
+                sqlx::query_as("SELECT note FROM meetings WHERE id = ?1")
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+
+            let new_note = match existing_note {
+                Some((Some(existing),)) if !existing.is_empty() => {
+                    format!("{}\n\n{}", existing, typed_text)
+                }
+                _ => typed_text,
+            };
+
+            let mut tx = self.begin_immediate_with_retry().await?;
+            sqlx::query("UPDATE meetings SET note = ?1 WHERE id = ?2")
+                .bind(&new_note)
+                .bind(id)
+                .execute(&mut **tx.conn())
+                .await?;
+            tx.commit().await?;
+        }
+
+        Ok(())
+    }
+
     pub async fn reopen_meeting(&self, id: i64) -> Result<(), SqlxError> {
         let mut tx = self.begin_immediate_with_retry().await?;
         sqlx::query("UPDATE meetings SET meeting_end = NULL WHERE id = ?1")
@@ -5818,13 +7092,29 @@ LIMIT ? OFFSET ?
         let now = chrono::Utc::now()
             .format("%Y-%m-%dT%H:%M:%S%.3fZ")
             .to_string();
-        let rows = sqlx::query("UPDATE meetings SET meeting_end = ?1 WHERE meeting_end IS NULL")
+        let rows = sqlx::query("UPDATE meetings SET meeting_end = ?1 WHERE meeting_end IS NULL AND detection_source != 'manual'")
             .bind(&now)
             .execute(&mut **tx.conn())
             .await?
             .rows_affected();
         tx.commit().await?;
         Ok(rows)
+    }
+
+    pub async fn has_active_meeting(&self) -> Result<bool, SqlxError> {
+        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM meetings WHERE meeting_end IS NULL")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0 > 0)
+    }
+
+    pub async fn get_most_recent_active_meeting_id(&self) -> Result<Option<i64>, SqlxError> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT id FROM meetings WHERE meeting_end IS NULL ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.0))
     }
 
     pub async fn list_meetings(
@@ -5835,7 +7125,7 @@ LIMIT ? OFFSET ?
         offset: u32,
     ) -> Result<Vec<MeetingRecord>, SqlxError> {
         let mut sql = String::from(
-            "SELECT id, meeting_start, meeting_end, meeting_app, title, attendees, \
+            "SELECT id, meeting_start, meeting_end, meeting_app, title, attendees, note, \
              detection_source, created_at FROM meetings WHERE 1=1",
         );
         if start_time.is_some() {
@@ -5872,7 +7162,7 @@ LIMIT ? OFFSET ?
 
     pub async fn get_meeting_by_id(&self, id: i64) -> Result<MeetingRecord, SqlxError> {
         let meeting = sqlx::query_as::<_, MeetingRecord>(
-            "SELECT id, meeting_start, meeting_end, meeting_app, title, attendees, \
+            "SELECT id, meeting_start, meeting_end, meeting_app, title, attendees, note, \
              detection_source, created_at FROM meetings WHERE id = ?1",
         )
         .bind(id)
@@ -5892,6 +7182,7 @@ LIMIT ? OFFSET ?
         Ok(rows)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_meeting(
         &self,
         id: i64,
@@ -5899,6 +7190,7 @@ LIMIT ? OFFSET ?
         meeting_end: Option<&str>,
         title: Option<&str>,
         attendees: Option<&str>,
+        note: Option<&str>,
         meeting_app: Option<&str>,
     ) -> Result<(), SqlxError> {
         let mut sets: Vec<&str> = Vec::new();
@@ -5913,6 +7205,9 @@ LIMIT ? OFFSET ?
         }
         if attendees.is_some() {
             sets.push("attendees = ?");
+        }
+        if note.is_some() {
+            sets.push("note = ?");
         }
         if meeting_app.is_some() {
             sets.push("meeting_app = ?");
@@ -5943,6 +7238,9 @@ LIMIT ? OFFSET ?
             query = query.bind(v);
         }
         if let Some(v) = attendees {
+            query = query.bind(v);
+        }
+        if let Some(v) = note {
             query = query.bind(v);
         }
         if let Some(v) = meeting_app {
@@ -5981,9 +7279,8 @@ LIMIT ? OFFSET ?
         let merged_start: Option<String> = row.try_get("ms")?;
         let merged_end: Option<String> = row.try_get("me")?;
         // Update the survivor row
-        let update_sql =
-            format!("UPDATE meetings SET meeting_start = ?1, meeting_end = ?2 WHERE id = ?3");
-        sqlx::query(&update_sql)
+        let update_sql = "UPDATE meetings SET meeting_start = ?1, meeting_end = ?2 WHERE id = ?3";
+        sqlx::query(update_sql)
             .bind(&merged_start)
             .bind(&merged_end)
             .bind(survivor_id)
@@ -6011,7 +7308,7 @@ LIMIT ? OFFSET ?
         tx.commit().await?;
         // Fetch and return the surviving record
         let meeting = sqlx::query_as::<_, MeetingRecord>(
-            "SELECT id, meeting_start, meeting_end, meeting_app, title, attendees, \
+            "SELECT id, meeting_start, meeting_end, meeting_app, title, attendees, note, \
              detection_source, created_at FROM meetings WHERE id = ?1",
         )
         .bind(survivor_id)
@@ -6030,7 +7327,7 @@ LIMIT ? OFFSET ?
             .to_string();
         let meeting = sqlx::query_as::<_, MeetingRecord>(
             "SELECT id, meeting_start, meeting_end, meeting_app, title, attendees, \
-             detection_source, created_at \
+             note, detection_source, created_at \
              FROM meetings \
              WHERE meeting_app = ?1 \
                AND meeting_end IS NOT NULL \
@@ -6056,17 +7353,19 @@ LIMIT ? OFFSET ?
         source_context: Option<&str>,
         tags: Option<&str>,
         importance: f64,
+        frame_id: Option<i64>,
     ) -> Result<i64, SqlxError> {
         let mut tx = self.begin_immediate_with_retry().await?;
         let id = sqlx::query(
-            "INSERT INTO memories (content, source, source_context, tags, importance) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO memories (content, source, source_context, tags, importance, frame_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .bind(content)
         .bind(source)
         .bind(source_context)
         .bind(tags.unwrap_or("[]"))
         .bind(importance)
+        .bind(frame_id)
         .execute(&mut **tx.conn())
         .await?
         .last_insert_rowid();
@@ -6076,7 +7375,7 @@ LIMIT ? OFFSET ?
 
     pub async fn get_memory_by_id(&self, id: i64) -> Result<MemoryRecord, SqlxError> {
         sqlx::query_as::<_, MemoryRecord>(
-            "SELECT id, content, source, source_context, tags, importance, \
+            "SELECT id, content, source, source_context, tags, importance, frame_id, \
              created_at, updated_at \
              FROM memories WHERE id = ?1",
         )
@@ -6137,6 +7436,7 @@ LIMIT ? OFFSET ?
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_memories(
         &self,
         query: Option<&str>,
@@ -6147,12 +7447,14 @@ LIMIT ? OFFSET ?
         end_time: Option<&str>,
         limit: u32,
         offset: u32,
+        order_by: Option<&str>,
+        order_dir: Option<&str>,
     ) -> Result<Vec<MemoryRecord>, SqlxError> {
         let use_fts = query.is_some_and(|q| !q.is_empty());
 
         let mut sql = if use_fts {
             String::from(
-                "SELECT m.id, m.content, m.source, m.source_context, m.tags, m.importance, \
+                "SELECT m.id, m.content, m.source, m.source_context, m.tags, m.importance, m.frame_id, \
                  m.created_at, m.updated_at \
                  FROM memories_fts fts \
                  JOIN memories m ON m.id = fts.rowid \
@@ -6160,7 +7462,7 @@ LIMIT ? OFFSET ?
             )
         } else {
             String::from(
-                "SELECT id, content, source, source_context, tags, importance, \
+                "SELECT id, content, source, source_context, tags, importance, frame_id, \
                  created_at, updated_at \
                  FROM memories WHERE 1=1",
             )
@@ -6185,9 +7487,21 @@ LIMIT ? OFFSET ?
             sql.push_str(" AND created_at <= ?6");
         }
 
-        sql.push_str(" ORDER BY importance DESC, created_at DESC LIMIT ?7 OFFSET ?8");
+        // Allow caller to control sort order; default to newest first
+        let order_col = match order_by {
+            Some("importance") => "importance",
+            _ => "created_at",
+        };
+        let order_direction = match order_dir {
+            Some("asc") => "ASC",
+            _ => "DESC",
+        };
+        sql.push_str(&format!(
+            " ORDER BY {} {} LIMIT ?7 OFFSET ?8",
+            order_col, order_direction
+        ));
 
-        let fts_query = query.map(|q| crate::text_normalizer::sanitize_fts5_query(q));
+        let fts_query = query.map(crate::text_normalizer::sanitize_fts5_query);
 
         sqlx::query_as::<_, MemoryRecord>(&sql)
             .bind(fts_query.as_deref())
@@ -6242,7 +7556,7 @@ LIMIT ? OFFSET ?
             sql.push_str(" AND created_at <= ?6");
         }
 
-        let fts_query = query.map(|q| crate::text_normalizer::sanitize_fts5_query(q));
+        let fts_query = query.map(crate::text_normalizer::sanitize_fts5_query);
 
         sqlx::query_scalar::<_, i64>(&sql)
             .bind(fts_query.as_deref())
@@ -6253,6 +7567,17 @@ LIMIT ? OFFSET ?
             .bind(end_time)
             .fetch_one(&self.pool)
             .await
+    }
+    pub async fn list_memory_tags(&self) -> Result<Vec<String>, SqlxError> {
+        // Tags are stored as JSON arrays. Extract all unique tag values across all memories.
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT j.value FROM memories, json_each(memories.tags) j \
+             WHERE j.value IS NOT NULL AND j.value != '' \
+             ORDER BY j.value",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.0).collect())
     }
 }
 

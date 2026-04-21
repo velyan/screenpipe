@@ -11,34 +11,48 @@ interface ModelPricing {
 }
 
 const MODEL_PRICING: Record<string, ModelPricing> = {
+  // Vertex AI MaaS — free for users (GCP credits absorb the cost)
+  'glm-4.7': { input: 0, output: 0 },
+  'glm-5': { input: 0, output: 0 },
+  'kimi-k2.5': { input: 0, output: 0 },
+  // Tinfoil — confidential inference (secure enclaves)
+  'gemma4-31b': { input: 0.45, output: 1.00 },
   // Anthropic Claude
   'claude-haiku-4-5': { input: 0.80, output: 4.00 },
   'claude-sonnet-4-5': { input: 3.00, output: 15.00 },
   'claude-opus-4-5': { input: 15.00, output: 75.00 },
   'claude-sonnet-4-6': { input: 3.00, output: 15.00 },
   'claude-opus-4-6': { input: 15.00, output: 75.00 },
+  'claude-opus-4-7': { input: 5.00, output: 25.00 },
   'claude-3-5-sonnet': { input: 3.00, output: 15.00 },
   'claude-3-5-haiku': { input: 0.80, output: 4.00 },
-  // OpenAI
-  'gpt-4o': { input: 2.50, output: 10.00 },
-  'gpt-4o-mini': { input: 0.15, output: 0.60 },
-  'gpt-4-turbo': { input: 10.00, output: 30.00 },
-  'gpt-4': { input: 30.00, output: 60.00 },
-  'gpt-3.5-turbo': { input: 0.50, output: 1.50 },
-  'o1': { input: 15.00, output: 60.00 },
-  'o1-mini': { input: 3.00, output: 12.00 },
-  'o3-mini': { input: 1.10, output: 4.40 },
+  // OpenRouter models
+  'qwen3.5-flash': { input: 0.065, output: 0.26 },
+  'qwen3.5-397b': { input: 0.39, output: 2.34 },
+  'deepseek-chat': { input: 0.26, output: 0.38 },
+  'deepseek-v3.2-speciale': { input: 0.40, output: 1.20 },
+  'llama-4-maverick': { input: 0.20, output: 0.60 },
+  'llama-4-scout': { input: 0.11, output: 0.34 },
+  'qwen3-coder:free': { input: 0.00, output: 0.00 },
+  'qwen3-coder': { input: 0.22, output: 1.00 },
+  'step-3.5-flash:free': { input: 0.00, output: 0.00 },
+  'step-3.5-flash': { input: 0.00, output: 0.00 },
+  // Screenpipe internal models (self-hosted, zero cost)
+  'screenpipe-event-classifier': { input: 0.00, output: 0.00 },
   // Google Gemini
   'gemini-2.5-flash': { input: 0.15, output: 0.60 },
   'gemini-2.5-pro': { input: 1.25, output: 10.00 },
   'gemini-3-flash': { input: 0.10, output: 0.40 },
   'gemini-3-pro': { input: 1.25, output: 10.00 },
+  'gemini-3.1-flash-lite': { input: 0.25, output: 1.50 },
   'gemini-1.5-flash': { input: 0.075, output: 0.30 },
   'gemini-1.5-pro': { input: 1.25, output: 5.00 },
 };
 
-// Default cost per request when we can't determine tokens (streaming)
-const DEFAULT_STREAMING_COST_USD = 0.002;
+// Estimated average tokens per request when streaming can't determine actual usage.
+// Conservative estimate: ~2000 input tokens, ~500 output tokens (typical pipe/chat call).
+const DEFAULT_INPUT_TOKENS = 2000;
+const DEFAULT_OUTPUT_TOKENS = 500;
 
 /**
  * Fuzzy-match a model string to a pricing entry.
@@ -60,13 +74,20 @@ function findPricing(model: string): ModelPricing | null {
 
 /**
  * Calculate estimated cost for a request given model and token counts.
+ * When tokens are unknown (streaming without usage tracking), estimates based
+ * on average request size and the model's actual pricing — NOT a flat fallback.
  */
 export function getModelCost(model: string, inputTokens: number | null, outputTokens: number | null): number {
   const pricing = findPricing(model);
-  if (!pricing) return DEFAULT_STREAMING_COST_USD;
-  if (inputTokens === null && outputTokens === null) return DEFAULT_STREAMING_COST_USD;
-  const inCost = ((inputTokens ?? 0) / 1_000_000) * pricing.input;
-  const outCost = ((outputTokens ?? 0) / 1_000_000) * pricing.output;
+  if (!pricing) {
+    // Unknown model — use a conservative estimate
+    return 0.01;
+  }
+  // When tokens are unknown, estimate from model pricing × average request size
+  const inTokens = inputTokens ?? (outputTokens === null ? DEFAULT_INPUT_TOKENS : 0);
+  const outTokens = outputTokens ?? (inputTokens === null ? DEFAULT_OUTPUT_TOKENS : 0);
+  const inCost = (inTokens / 1_000_000) * pricing.input;
+  const outCost = (outTokens / 1_000_000) * pricing.output;
   return inCost + outCost;
 }
 
@@ -118,7 +139,54 @@ export function inferProvider(model: string): string {
   if (lower.includes('claude')) return 'anthropic';
   if (lower.includes('gpt') || lower.includes('o1') || lower.includes('o3')) return 'openai';
   if (lower.includes('gemini')) return 'google';
+  if (lower.includes('gemma4')) return 'tinfoil';
+  if (lower.includes('glm-') || lower.includes('kimi-k')) return 'vertex-maas';
+  if (lower.includes('deepseek') || lower.includes('llama') || lower.includes('qwen') || lower.includes('mistral') || lower.includes('step-3.5') || lower.includes('stepfun')) return 'openrouter';
+  if (lower.includes('screenpipe-event')) return 'screenpipe-vllm';
   return 'unknown';
+}
+
+/** Returns true for models that cost us $0 (free on OpenRouter, free Gemini tier, etc.) */
+export function isZeroCostModel(model: string): boolean {
+  const pricing = findPricing(model);
+  return pricing !== null && pricing.input === 0 && pricing.output === 0;
+}
+
+// Default max daily cost per user in USD (overridable via env.MAX_DAILY_COST_PER_USER)
+const DEFAULT_MAX_DAILY_COST_USD = 5.0;
+
+export function getMaxDailyCostPerUser(env?: Env): number {
+  return parseFloat((env as any)?.MAX_DAILY_COST_PER_USER || '') || DEFAULT_MAX_DAILY_COST_USD;
+}
+
+// Tier-aware daily cost cap:
+//   anonymous:  ~5 opus reqs/day  ($1.60)
+//   logged_in:  ~10 opus reqs/day ($3.20)
+//   subscribed: ~109 opus reqs/day ($35)
+export function getTierDailyCostCap(tier: string, env?: Env): number {
+  const baseCap = getMaxDailyCostPerUser(env);
+  switch (tier) {
+    case 'subscribed': return baseCap * 7;   // $35
+    case 'logged_in':  return baseCap * 0.64; // $3.20
+    default:           return baseCap * 0.32; // $1.60 (anonymous)
+  }
+}
+
+/**
+ * Get a user's estimated cost for today. Used to enforce per-user daily cost caps.
+ */
+export async function getDailyUserCost(env: Env, deviceId: string): Promise<number> {
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const result = await env.DB.prepare(
+      `SELECT COALESCE(SUM(estimated_cost_usd), 0) as daily_cost
+       FROM cost_log WHERE device_id = ? AND timestamp >= ?`
+    ).bind(deviceId, today + ' 00:00:00').first<{ daily_cost: number }>();
+    return result?.daily_cost ?? 0;
+  } catch (error) {
+    console.error('getDailyUserCost failed:', error);
+    return 0; // On error, allow the request
+  }
 }
 
 export interface SpendSummary {

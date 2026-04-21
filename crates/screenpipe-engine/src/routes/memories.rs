@@ -25,6 +25,7 @@ pub(crate) struct CreateMemoryRequest {
     pub tags: Vec<String>,
     #[serde(default = "default_importance")]
     pub importance: f64,
+    pub frame_id: Option<i64>,
 }
 
 fn default_source() -> String {
@@ -43,13 +44,26 @@ pub(crate) struct MemoryResponse {
     pub source_context: Option<Value>,
     pub tags: Vec<String>,
     pub importance: f64,
+    pub frame_id: Option<i64>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(OaSchema, Serialize)]
+pub(crate) struct MemoryListItem {
+    pub id: i64,
+    pub content: String,
+    pub source: String,
+    pub tags: Vec<String>,
+    pub importance: f64,
+    pub frame_id: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }
 
 #[derive(OaSchema, Serialize)]
 pub(crate) struct MemoryListResponse {
-    pub data: Vec<MemoryResponse>,
+    pub data: Vec<MemoryListItem>,
     pub pagination: PaginationInfo,
 }
 
@@ -65,6 +79,10 @@ pub(crate) struct ListMemoriesQuery {
     pub limit: u32,
     #[serde(default)]
     pub offset: u32,
+    /// "created_at" (default) or "importance"
+    pub order_by: Option<String>,
+    /// "desc" (default) or "asc"
+    pub order_dir: Option<String>,
 }
 
 fn default_limit() -> u32 {
@@ -94,9 +112,48 @@ fn memory_to_response(m: screenpipe_db::MemoryRecord) -> MemoryResponse {
             .and_then(|t| serde_json::from_str(t).ok())
             .unwrap_or_default(),
         importance: m.importance,
+        frame_id: m.frame_id,
         created_at: m.created_at,
         updated_at: m.updated_at,
     }
+}
+
+const MAX_TAG_LENGTH: usize = 100;
+const MAX_TAGS_COUNT: usize = 50;
+const MAX_CONTENT_LENGTH: usize = 50_000;
+
+fn validate_tags(tags: &[String]) -> Result<(), (StatusCode, JsonResponse<Value>)> {
+    if tags.len() > MAX_TAGS_COUNT {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            JsonResponse(
+                json!({"error": format!("too many tags: {} (max {})", tags.len(), MAX_TAGS_COUNT)}),
+            ),
+        ));
+    }
+    for tag in tags {
+        if tag.len() > MAX_TAG_LENGTH {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                JsonResponse(
+                    json!({"error": format!("tag too long: '{}...' ({} chars, max {})", &tag[..40.min(tag.len())], tag.len(), MAX_TAG_LENGTH)}),
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_content(content: &str) -> Result<(), (StatusCode, JsonResponse<Value>)> {
+    if content.len() > MAX_CONTENT_LENGTH {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            JsonResponse(
+                json!({"error": format!("content too long: {} chars (max {})", content.len(), MAX_CONTENT_LENGTH)}),
+            ),
+        ));
+    }
+    Ok(())
 }
 
 #[oasgen]
@@ -104,6 +161,9 @@ pub(crate) async fn create_memory_handler(
     State(state): State<Arc<AppState>>,
     JsonResponse(payload): JsonResponse<CreateMemoryRequest>,
 ) -> Result<JsonResponse<MemoryResponse>, (StatusCode, JsonResponse<Value>)> {
+    validate_content(&payload.content)?;
+    validate_tags(&payload.tags)?;
+
     let tags_json = serde_json::to_string(&payload.tags).unwrap_or_else(|_| "[]".to_string());
     let source_context_json = payload.source_context.map(|v| v.to_string());
 
@@ -115,6 +175,7 @@ pub(crate) async fn create_memory_handler(
             source_context_json.as_deref(),
             Some(&tags_json),
             payload.importance,
+            payload.frame_id,
         )
         .await
         .map_err(|e| {
@@ -139,9 +200,8 @@ pub(crate) async fn list_memories_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ListMemoriesQuery>,
 ) -> Result<JsonResponse<MemoryListResponse>, (StatusCode, JsonResponse<Value>)> {
-    let memories = state
-        .db
-        .list_memories(
+    let (memories_result, total_result) = tokio::join!(
+        state.db.list_memories(
             query.q.as_deref(),
             query.source.as_deref(),
             query.tags.as_deref(),
@@ -150,18 +210,10 @@ pub(crate) async fn list_memories_handler(
             query.end_time.as_deref(),
             query.limit,
             query.offset,
-        )
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                JsonResponse(json!({"error": e.to_string()})),
-            )
-        })?;
-
-    let total = state
-        .db
-        .count_memories(
+            query.order_by.as_deref(),
+            query.order_dir.as_deref(),
+        ),
+        state.db.count_memories(
             query.q.as_deref(),
             query.source.as_deref(),
             query.tags.as_deref(),
@@ -169,16 +221,40 @@ pub(crate) async fn list_memories_handler(
             query.start_time.as_deref(),
             query.end_time.as_deref(),
         )
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                JsonResponse(json!({"error": e.to_string()})),
-            )
-        })?;
+    );
+
+    let memories = memories_result.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            JsonResponse(json!({"error": e.to_string()})),
+        )
+    })?;
+
+    let total = total_result.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            JsonResponse(json!({"error": e.to_string()})),
+        )
+    })?;
 
     Ok(JsonResponse(MemoryListResponse {
-        data: memories.into_iter().map(memory_to_response).collect(),
+        data: memories
+            .into_iter()
+            .map(|m| MemoryListItem {
+                id: m.id,
+                content: m.content,
+                source: m.source,
+                tags: m
+                    .tags
+                    .as_ref()
+                    .and_then(|t| serde_json::from_str(t).ok())
+                    .unwrap_or_default(),
+                importance: m.importance,
+                frame_id: m.frame_id,
+                created_at: m.created_at,
+                updated_at: m.updated_at,
+            })
+            .collect(),
         pagination: PaginationInfo {
             limit: query.limit,
             offset: query.offset,
@@ -208,6 +284,13 @@ pub(crate) async fn update_memory_handler(
     Path(id): Path<i64>,
     JsonResponse(payload): JsonResponse<UpdateMemoryRequest>,
 ) -> Result<JsonResponse<MemoryResponse>, (StatusCode, JsonResponse<Value>)> {
+    if let Some(ref content) = payload.content {
+        validate_content(content)?;
+    }
+    if let Some(ref tags) = payload.tags {
+        validate_tags(tags)?;
+    }
+
     let tags_json = payload
         .tags
         .map(|t| serde_json::to_string(&t).unwrap_or_else(|_| "[]".to_string()));
@@ -253,4 +336,17 @@ pub(crate) async fn delete_memory_handler(
     })?;
 
     Ok(JsonResponse(json!({"ok": true})))
+}
+
+#[oasgen]
+pub(crate) async fn list_memory_tags_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<JsonResponse<Vec<String>>, (StatusCode, JsonResponse<Value>)> {
+    let tags = state.db.list_memory_tags().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            JsonResponse(json!({"error": e.to_string()})),
+        )
+    })?;
+    Ok(JsonResponse(tags))
 }

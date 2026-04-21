@@ -4,13 +4,19 @@
 
 //! Debug tool: dumps the raw AT-SPI2 tree to understand what's visible.
 
+#[cfg(target_os = "linux")]
 use zbus::blocking::Connection;
+#[cfg(target_os = "linux")]
 use zbus::names::{BusName, InterfaceName};
+#[cfg(target_os = "linux")]
 use zbus::zvariant::{ObjectPath, OwnedValue};
 
+#[cfg(target_os = "linux")]
 const ATSPI_ACCESSIBLE: &str = "org.a11y.atspi.Accessible";
+#[cfg(target_os = "linux")]
 const DBUS_PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 
+#[cfg(target_os = "linux")]
 fn dbus_call<B: serde::ser::Serialize + zbus::zvariant::DynamicType>(
     conn: &Connection,
     dest: &str,
@@ -25,6 +31,7 @@ fn dbus_call<B: serde::ser::Serialize + zbus::zvariant::DynamicType>(
     conn.call_method(Some(dest), obj_path, Some(iface_name), method, body)
 }
 
+#[cfg(target_os = "linux")]
 fn get_prop(
     conn: &Connection,
     dest: &str,
@@ -46,12 +53,14 @@ fn get_prop(
     .and_then(|r| r.body().deserialize::<OwnedValue>().ok())
 }
 
+#[cfg(target_os = "linux")]
 fn get_name(conn: &Connection, dest: &str, path: &str) -> String {
     get_prop(conn, dest, path, ATSPI_ACCESSIBLE, "Name")
         .and_then(|v| v.try_into().ok())
         .unwrap_or_else(|| "<unnamed>".to_string())
 }
 
+#[cfg(target_os = "linux")]
 fn get_role(conn: &Connection, dest: &str, path: &str) -> u32 {
     dbus_call(conn, dest, path, ATSPI_ACCESSIBLE, "GetRole", &())
         .ok()
@@ -59,6 +68,7 @@ fn get_role(conn: &Connection, dest: &str, path: &str) -> u32 {
         .unwrap_or(0)
 }
 
+#[cfg(target_os = "linux")]
 fn get_state(conn: &Connection, dest: &str, path: &str) -> Vec<u32> {
     dbus_call(conn, dest, path, ATSPI_ACCESSIBLE, "GetState", &())
         .ok()
@@ -66,6 +76,7 @@ fn get_state(conn: &Connection, dest: &str, path: &str) -> Vec<u32> {
         .unwrap_or_default()
 }
 
+#[cfg(target_os = "linux")]
 fn role_name(id: u32) -> &'static str {
     match id {
         1 => "alert",
@@ -99,6 +110,7 @@ fn role_name(id: u32) -> &'static str {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn has_state(states: &[u32], bit: u32) -> bool {
     let word = (bit / 32) as usize;
     let bit_in_word = bit % 32;
@@ -107,6 +119,7 @@ fn has_state(states: &[u32], bit: u32) -> bool {
         .map_or(false, |w| (w >> bit_in_word) & 1 == 1)
 }
 
+#[cfg(target_os = "linux")]
 fn main() {
     println!("=== AT-SPI2 Debug Dump ===\n");
 
@@ -245,4 +258,9 @@ fn main() {
     }
 
     println!("\nDone!");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("linux_debug is only supported on Linux");
 }

@@ -60,6 +60,19 @@ curl "http://localhost:3030/speakers/similar?speaker_id=1"
 - `whisper-large-v3-turbo` gives best accuracy
 - set language to English in settings if you only speak English (faster)
 
+## long meetings and batch sizing
+
+by default, screenpipe batches audio for transcription in chunks:
+- **Whisper/OpenAI**: 600 seconds (10 minutes)
+- **Deepgram**: up to 5000 seconds (83 minutes)
+
+if you notice meetings longer than one hour losing context between batches, you can customize the batch size in settings > advanced > `batch_max_duration_secs`. set to your meeting's typical duration to preserve context across the entire recording.
+
+in smart/batch transcription mode, large meetings may be split across multiple transcription jobs. if you need full meeting context in a single batch, consider:
+- switching to **realtime** transcription (transcription happens immediately as audio is captured, trading cost/latency for guaranteed continuity)
+- increasing `batch_max_duration_secs` to match your meeting length (supported up to engine limits: 5000s for Deepgram, 3000s for OpenAI)
+- using [retranscription API](/api/retranscribe-data) to re-process a full meeting with custom settings
+
 ## privacy
 
 - all transcription runs locally on your device

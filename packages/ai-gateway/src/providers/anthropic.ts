@@ -24,9 +24,11 @@ export class AnthropicProvider implements AIProvider {
 	}
 
 	/**
-	 * Build the system prompt from system messages and response_format
+	 * Build the system prompt from system messages and response_format.
+	 * Returns an array of content blocks with cache_control on the last block
+	 * to enable Anthropic prompt caching (90% input cost reduction on cache hits).
 	 */
-	private buildSystemPrompt(body: RequestBody): string | undefined {
+	private buildSystemPrompt(body: RequestBody): Array<{ type: 'text'; text: string; cache_control?: { type: 'ephemeral' } }> | undefined {
 		const parts: string[] = [];
 
 		// Extract system messages from the conversation
@@ -50,7 +52,18 @@ export class AnthropicProvider implements AIProvider {
 			}
 		}
 
-		return parts.length > 0 ? parts.join('\n\n') : undefined;
+		if (parts.length === 0) return undefined;
+
+		const combined = parts.join('\n\n');
+		// Only cache system prompts with enough tokens to benefit (Anthropic min: 1024 tokens for haiku, 2048 for sonnet/opus)
+		// Rough heuristic: 4 chars ≈ 1 token, so 4096 chars ≈ 1024 tokens
+		const shouldCache = combined.length >= 4096;
+
+		return [{
+			type: 'text' as const,
+			text: combined,
+			...(shouldCache ? { cache_control: { type: 'ephemeral' as const } } : {}),
+		}];
 	}
 
 	/**
@@ -94,8 +107,18 @@ export class AnthropicProvider implements AIProvider {
 				try {
 					let currentToolCall: { index: number; id: string; name: string; arguments: string } | null = null;
 					let toolCallIndex = 0;
+					let inputTokens = 0;
+					let outputTokens = 0;
 
 					for await (const chunk of stream) {
+						// Capture usage from message_start and message_delta events
+						if (chunk.type === 'message_start' && (chunk as any).message?.usage) {
+							inputTokens = (chunk as any).message.usage.input_tokens || 0;
+						}
+						if (chunk.type === 'message_delta' && (chunk as any).usage) {
+							outputTokens = (chunk as any).usage.output_tokens || 0;
+						}
+
 						// Handle text content
 						if (chunk.type === 'content_block_delta' && chunk.delta?.type === 'text_delta') {
 							controller.enqueue(
@@ -164,6 +187,19 @@ export class AnthropicProvider implements AIProvider {
 							currentToolCall = null;
 						}
 					}
+					// Emit usage data in OpenAI format before [DONE]
+					controller.enqueue(
+						new TextEncoder().encode(
+							`data: ${JSON.stringify({
+								choices: [],
+								usage: {
+									prompt_tokens: inputTokens,
+									completion_tokens: outputTokens,
+									total_tokens: inputTokens + outputTokens,
+								},
+							})}\n\n`
+						)
+					);
 					controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
 					controller.close();
 				} catch (error: any) {
@@ -266,6 +302,17 @@ export class AnthropicProvider implements AIProvider {
 								text: `[Image URL: ${url}]`,
 							} as TextBlock;
 						}
+						// Handle Pi native format: { type: "image", data: "base64...", mimeType: "image/png" }
+						if (part.type === 'image' && part.data && part.mimeType) {
+							return {
+								type: 'image',
+								source: {
+									type: 'base64',
+									media_type: part.mimeType as 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp',
+									data: part.data as string,
+								},
+							} as ImageBlockParam;
+						}
 						// Handle Anthropic native format (from Pi agent)
 						// Normalize mediaType (camelCase) to media_type (snake_case)
 						if (part.type === 'image' && part.source?.type === 'base64') {
@@ -322,15 +369,7 @@ export class AnthropicProvider implements AIProvider {
 		return result;
 	}
 
-	formatResponse(response: AnthropicMessage): {
-		choices: Array<{
-			message: {
-				content: string;
-				role: string;
-				tool_calls?: any[];
-			};
-		}>;
-	} {
+	formatResponse(response: AnthropicMessage): any {
 		const textBlock = response.content.find((block): block is TextBlock => block.type === 'text');
 
 		const textContent = textBlock?.text || '';
@@ -353,6 +392,11 @@ export class AnthropicProvider implements AIProvider {
 					},
 				},
 			],
+			usage: {
+				prompt_tokens: response.usage?.input_tokens ?? 0,
+				completion_tokens: response.usage?.output_tokens ?? 0,
+				total_tokens: (response.usage?.input_tokens ?? 0) + (response.usage?.output_tokens ?? 0),
+			},
 		};
 	}
 

@@ -18,12 +18,14 @@ oasgen = { workspace = true }
 screenpipe-events = { path = "../screenpipe-events" }
 screenpipe-screen = { path = "../screenpipe-screen" }
 screenpipe-audio = { path = "../screenpipe-audio" }
-screenpipe-core = { path = "../screenpipe-core", features = ["security", "cloud-sync"] }
+screenpipe-core = { path = "../screenpipe-core", features = ["security", "cloud-sync", "secrets"] }
 screenpipe-db = { path = "../screenpipe-db" }
 screenpipe-a11y = { path = "../screenpipe-a11y", features = ["db"] }
 screenpipe-apple-intelligence = { path = "../screenpipe-apple-intelligence", optional = true }
+screenpipe-config = { path = "../screenpipe-config" }
 screenpipe-connect = { path = "../screenpipe-connect" }
 screenpipe-vault = { path = "../screenpipe-vault" }
+screenpipe-secrets = { path = "../screenpipe-secrets" }
 
 
 # Image processing
@@ -36,7 +38,7 @@ chrono = { version = "0.4.31", features = ["serde"] }
 # Database
 sqlx = { version = "0.7", features = [
     "sqlite",
-    "runtime-tokio-native-tls",
+    "runtime-tokio-rustls",
     "chrono",
     "migrate",
 ] }
@@ -49,7 +51,7 @@ moka = { version = "0.12", features = ["future"] }
 sentry = { workspace = true }
 
 # Server
-axum = { version = "0.7.5", features = ["ws"] }
+axum = { version = "0.7.5", features = ["ws", "multipart"] }
 http-body-util = "0.1"
 tokio = { version = "1.15", features = ["full", "tracing"] }
 tokio-stream = "0.1"
@@ -113,6 +115,15 @@ tokio-util = { version = "0.7", features = ["io"] }
 
 once_cell = { workspace = true }
 dashmap = { workspace = true }
+arc-swap = "1"
+
+# Heap profiling (opt-in via --features heap-prof)
+dhat = { version = "0.3", optional = true }
+
+# jemalloc — aggressively returns freed pages to OS, reducing RSS bloat from fragmentation.
+# Default allocator on macOS/Linux. Not used on Windows (unsupported).
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
 
 [dev-dependencies]
 env_logger = "0.10"
@@ -124,14 +135,19 @@ tower = { version = "0.4", features = ["util"] }
 criterion = { workspace = true }
 
 [features]
-default = ["qwen3-asr"]
+default = ["qwen3-asr", "parakeet"]
 metal = ["screenpipe-audio/metal"]
+heap-prof = ["dhat"]
 cuda = ["screenpipe-audio/cuda"]
+directml = ["screenpipe-audio/directml"]
 vulkan = ["screenpipe-audio/vulkan"]
 debug-console = ["console-subscriber"]
 pulseaudio = ["screenpipe-audio/pulseaudio"]
 apple-intelligence = ["dep:screenpipe-apple-intelligence"]
 qwen3-asr = ["screenpipe-audio/qwen3-asr"]
+parakeet = ["screenpipe-audio/parakeet"]
+parakeet-mlx = ["screenpipe-audio/parakeet-mlx"]
+jemalloc = ["tikv-jemallocator"]
 
 [[bin]]
 name = "screenpipe"
@@ -144,11 +160,15 @@ nix = { version = "0.29", features = ["signal"] }
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
     "Win32_Foundation",
     "Win32_System_StationsAndDesktops",
+    "Win32_System_Com",
+    "Win32_UI_Accessibility",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 socket2 = "0.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-cidre = { git = "https://github.com/yury/cidre.git", features = ["ns"] }
+cidre = { git = "https://github.com/yury/cidre.git", features = ["ax", "ns", "av", "blocks"] }
 tracing-oslog = { workspace = true }

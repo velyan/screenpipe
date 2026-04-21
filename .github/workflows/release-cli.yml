@@ -16,6 +16,9 @@ on:
 permissions:
   contents: write
 
+env:
+  GIT_LFS_SKIP_SMUDGE: 1
+
 jobs:
   check_commit:
     runs-on: ubuntu-latest
@@ -122,8 +125,10 @@ jobs:
           if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
             export CFLAGS="-mcpu=apple-m1 -U__ARM_FEATURE_MATMUL_INT8"
             export CXXFLAGS="-mcpu=apple-m1 -U__ARM_FEATURE_MATMUL_INT8"
+            cargo build --release --features metal,parakeet-mlx --target ${{ matrix.target }}
+          else
+            cargo build --release --features metal --target ${{ matrix.target }}
           fi
-          cargo build --release --features metal --target ${{ matrix.target }}
 
       - name: Upload debug symbols to Sentry
         env:
@@ -200,6 +205,17 @@ jobs:
         run: |
           mkdir -p screenpipe-${{ env.VERSION }}-${{ matrix.target }}/bin
           cp target/${{ matrix.target }}/release/screenpipe screenpipe-${{ env.VERSION }}-${{ matrix.target }}/bin/
+
+          # Bundle mlx.metallib next to CLI binary (macOS aarch64 only)
+          # MLX searches for mlx.metallib next to the binary at runtime.
+          # CI cmake uses JIT mode so metallib isn't compiled — download pre-built from GitHub releases.
+          if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
+            curl -L -f -o screenpipe-${{ env.VERSION }}-${{ matrix.target }}/bin/mlx.metallib \
+              "https://github.com/screenpipe/screenpipe/releases/download/mlx-metallib-v0.2.0/mlx.metallib" \
+              && echo "✅ Bundled mlx.metallib for CLI ($(du -h screenpipe-${{ env.VERSION }}-${{ matrix.target }}/bin/mlx.metallib | cut -f1))" \
+              || echo "⚠️ Failed to download mlx.metallib"
+          fi
+
           tar -czf screenpipe-${{ env.VERSION }}-${{ matrix.target }}.tar.gz -C screenpipe-${{ env.VERSION }}-${{ matrix.target }} .
 
       - name: Calculate SHA256
@@ -274,6 +290,27 @@ jobs:
           Write-Host "ONNX Runtime extracted to $extractDir"
           Get-ChildItem "$extractDir/lib" | ForEach-Object { Write-Host $_.Name }
 
+      - name: Install wget (Windows)
+        shell: powershell
+        run: |
+          $wgetDir = "C:\wget"
+          if (-not (Test-Path "$wgetDir\wget.exe")) {
+            New-Item -ItemType Directory -Force -Path $wgetDir | Out-Null
+            Invoke-WebRequest -Uri "https://eternallybored.org/misc/wget/1.21.3/64/wget.exe" -OutFile "$wgetDir\wget.exe"
+          }
+          $env:Path = "$wgetDir;$env:Path"
+          echo "$wgetDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Setup OpenBLAS
+        shell: pwsh
+        run: |
+          cd apps/screenpipe-app-tauri
+          bun scripts/setup_openblas.js
+          "OPENBLAS_PATH=${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas" | Out-File -FilePath $env:GITHUB_ENV -Append
+
       - name: Shorten target dir to avoid MAX_PATH
         shell: powershell
         run: |
@@ -290,9 +327,22 @@ jobs:
           CARGO_PROFILE_RELEASE_STRIP: "none"
           CARGO_PROFILE_RELEASE_PANIC: "abort"
           CARGO_PROFILE_RELEASE_INCREMENTAL: "false"
-          RUSTFLAGS: "-C link-arg=/LTCG"
+          # LTCG removed: MSVC LTCG ignores /arch:AVX2 and can emit AVX-512 on Xeon CI runners
+          # causing STATUS_ILLEGAL_INSTRUCTION on consumer CPUs (Arrow Lake, Panther Lake, Lunar Lake)
+          RUSTFLAGS: ""
+          CFLAGS: "/arch:AVX2"
+          CXXFLAGS: "/arch:AVX2"
+          # whisper-rs build.rs passes GGML_* env vars as cmake defines.
+          # CMAKE_ARGS string was ignored — these individual vars actually work.
+          GGML_NATIVE: "OFF"
+          GGML_AVX512: "OFF"
+          GGML_AVX512_VBMI: "OFF"
+          GGML_AVX512_VNNI: "OFF"
+          GGML_AVX512_BF16: "OFF"
+          CMAKE_ARGS: "-DGGML_NATIVE=OFF -DGGML_AVX512=OFF -DGGML_AVX512_VBMI=OFF -DGGML_AVX512_VNNI=OFF -DGGML_AVX512_BF16=OFF -DCMAKE_C_FLAGS=/arch:AVX2 -DCMAKE_CXX_FLAGS=/arch:AVX2"
           ORT_STRATEGY: system
           ORT_LIB_LOCATION: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.19.2
+          OPENBLAS_PATH: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas
           # Use prebuilt NASM objects on Windows: https://aws.github.io/aws-lc-rs/requirements/windows.html#prebuilt-nasm-objects
           AWS_LC_SYS_PREBUILT_NASM: "1"
         run: |
@@ -339,6 +389,11 @@ jobs:
             $ortDll = "apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.19.2/lib/onnxruntime.dll"
           }
           Copy-Item $ortDll "$packageDir/bin/"
+          # Copy OpenBLAS DLL(s) for qwen3-asr (libopenblas.dll or openblas.dll)
+          $openblasBin = "apps/screenpipe-app-tauri/src-tauri/openblas/bin"
+          if (Test-Path $openblasBin) {
+            Copy-Item "$openblasBin/*.dll" "$packageDir/bin/" -Force
+          }
           # Bundle vcruntime DLLs for onnxruntime.dll (it uses dynamic CRT)
           Copy-Item C:\Windows\System32\vcruntime140.dll "$packageDir/bin/" -Force
           Copy-Item C:\Windows\System32\vcruntime140_1.dll "$packageDir/bin/" -Force -ErrorAction SilentlyContinue
@@ -415,7 +470,14 @@ jobs:
             libwayland-dev \
             libpipewire-0.3-dev \
             libgbm-dev \
-            libegl-dev
+            libegl-dev \
+            libopenblas-dev
+          # antirez-asr-sys build script emits -llibopenblas (double lib prefix).
+          # Create a symlink so the linker can find it.
+          sudo mkdir -p /usr/lib/x86_64-linux-gnu/openblas/lib
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libopenblas.so /usr/lib/x86_64-linux-gnu/openblas/lib/liblibopenblas.so
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libopenblas.a /usr/lib/x86_64-linux-gnu/openblas/lib/liblibopenblas.a
+          echo "OPENBLAS_PATH=/usr/lib/x86_64-linux-gnu/openblas" >> $GITHUB_ENV
 
       - uses: actions/cache@v4
         with:
@@ -505,6 +567,10 @@ jobs:
           tar -xzf artifacts/screenpipe-macos-aarch64-apple-darwin/screenpipe-*.tar.gz -C /tmp/darwin-arm64 || true
           cp /tmp/darwin-arm64/bin/screenpipe packages/cli/screenpipe-darwin-arm64/bin/ 2>/dev/null || \
             (cd artifacts/screenpipe-macos-aarch64-apple-darwin && tar -xzf screenpipe-*.tar.gz && cp bin/screenpipe ../../packages/cli/screenpipe-darwin-arm64/bin/)
+          # Bundle mlx.metallib for Parakeet MLX GPU support
+          cp /tmp/darwin-arm64/bin/mlx.metallib packages/cli/screenpipe-darwin-arm64/bin/ 2>/dev/null || \
+            (cd artifacts/screenpipe-macos-aarch64-apple-darwin && cp bin/mlx.metallib ../../packages/cli/screenpipe-darwin-arm64/bin/ 2>/dev/null) || \
+            echo "⚠️ mlx.metallib not found in artifact"
           chmod +x packages/cli/screenpipe-darwin-arm64/bin/screenpipe
 
           # macOS x64
@@ -519,7 +585,7 @@ jobs:
 
           # Windows x64
           mkdir -p packages/cli/screenpipe-win32-x64/bin
-          cd artifacts/screenpipe-windows && unzip -o screenpipe-*.zip -d extracted && cp extracted/bin/screenpipe.exe ../../packages/cli/screenpipe-win32-x64/bin/ && cp extracted/bin/onnxruntime.dll ../../packages/cli/screenpipe-win32-x64/bin/ 2>/dev/null || true && cd ../..
+          cd artifacts/screenpipe-windows && unzip -o screenpipe-*.zip -d extracted && cp extracted/bin/screenpipe.exe ../../packages/cli/screenpipe-win32-x64/bin/ && cp extracted/bin/*.dll ../../packages/cli/screenpipe-win32-x64/bin/ 2>/dev/null || true && cd ../..
 
       - name: Update package versions
         run: |

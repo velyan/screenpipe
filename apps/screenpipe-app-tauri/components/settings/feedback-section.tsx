@@ -16,15 +16,10 @@ export function FeedbackSection() {
   const isLoggedIn = !!settings.user?.email;
 
   return (
-    <div className="space-y-5">
-      <div className="space-y-1">
-        <h1 className="text-xl font-bold tracking-tight text-foreground">
-          Help
-        </h1>
-        <p className="text-muted-foreground text-sm">
-          Get support, send logs, or suggest features
-        </p>
-      </div>
+    <div className="space-y-5" data-testid="section-help">
+      <p className="text-muted-foreground text-sm mb-4">
+        Get support, send logs, or suggest features
+      </p>
 
       <div className="space-y-2">
         <div className="px-3 py-2.5 bg-card border border-border">

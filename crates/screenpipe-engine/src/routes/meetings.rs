@@ -23,6 +23,7 @@ pub struct UpdateMeetingRequest {
     pub meeting_end: Option<String>,
     pub title: Option<String>,
     pub attendees: Option<String>,
+    pub note: Option<String>,
     pub meeting_app: Option<String>,
 }
 
@@ -32,8 +33,13 @@ pub struct MergeMeetingsRequest {
 }
 
 #[derive(OaSchema, Deserialize, Debug)]
+pub struct BulkDeleteMeetingsRequest {
+    pub ids: Vec<i64>,
+}
+
+#[derive(OaSchema, Deserialize, Debug)]
 pub struct StartMeetingRequest {
-    pub app: String,
+    pub app: Option<String>,
     pub title: Option<String>,
     pub attendees: Option<String>,
 }
@@ -120,6 +126,7 @@ pub(crate) async fn update_meeting_handler(
             body.meeting_end.as_deref(),
             body.title.as_deref(),
             body.attendees.as_deref(),
+            body.note.as_deref(),
             body.meeting_app.as_deref(),
         )
         .await
@@ -138,6 +145,36 @@ pub(crate) async fn update_meeting_handler(
     })?;
 
     Ok(JsonResponse(meeting))
+}
+
+#[oasgen]
+pub(crate) async fn bulk_delete_meetings_handler(
+    State(state): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<BulkDeleteMeetingsRequest>,
+) -> Result<JsonResponse<Value>, (StatusCode, JsonResponse<Value>)> {
+    if body.ids.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            JsonResponse(json!({"error": "at least 1 meeting id is required"})),
+        ));
+    }
+
+    let mut total_deleted = 0u64;
+    for id in &body.ids {
+        match state.db.delete_meeting(*id).await {
+            Ok(n) => total_deleted += n,
+            Err(e) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    JsonResponse(
+                        json!({"error": format!("failed to delete meeting {}: {}", id, e)}),
+                    ),
+                ));
+            }
+        }
+    }
+
+    Ok(JsonResponse(json!({"deleted": total_deleted})))
 }
 
 #[oasgen]
@@ -163,14 +200,37 @@ pub(crate) async fn merge_meetings_handler(
 }
 
 #[oasgen]
+pub(crate) async fn meeting_status_handler(
+    State(state): State<Arc<AppState>>,
+) -> Result<JsonResponse<Value>, (StatusCode, JsonResponse<Value>)> {
+    // Check manual meeting first
+    let manual_active = {
+        let lock = state.manual_meeting.read().await;
+        lock.is_some()
+    };
+
+    // Also check DB for any ongoing meeting (auto-detected)
+    let any_active = if manual_active {
+        true
+    } else {
+        state.db.has_active_meeting().await.unwrap_or(false)
+    };
+
+    Ok(JsonResponse(
+        json!({ "active": any_active, "manual": manual_active }),
+    ))
+}
+
+#[oasgen]
 pub(crate) async fn start_meeting_handler(
     State(state): State<Arc<AppState>>,
     axum::Json(body): axum::Json<StartMeetingRequest>,
 ) -> Result<JsonResponse<MeetingRecord>, (StatusCode, JsonResponse<Value>)> {
+    let app = body.app.as_deref().unwrap_or("manual");
     let id = state
         .db
         .insert_meeting(
-            &body.app,
+            app,
             "manual",
             body.title.as_deref(),
             body.attendees.as_deref(),
@@ -186,6 +246,14 @@ pub(crate) async fn start_meeting_handler(
     {
         let mut lock = state.manual_meeting.write().await;
         *lock = Some(id);
+    }
+
+    // Emit event so triggered pipes can react
+    if let Err(e) = screenpipe_events::send_event(
+        "meeting_started",
+        serde_json::json!({ "meeting_id": id, "app": app, "title": body.title }),
+    ) {
+        tracing::warn!("failed to emit meeting_started event: {}", e);
     }
 
     let meeting = state.db.get_meeting_by_id(id).await.map_err(|e| {
@@ -207,25 +275,54 @@ pub(crate) async fn stop_meeting_handler(
         *lock
     };
 
-    let id = id.ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            JsonResponse(json!({"error": "no active manual meeting"})),
-        )
-    })?;
+    // If no manual meeting, find any active meeting (auto-detected) and end it.
+    // This lets users stop auto-detected meetings (Google Meet, Zoom, etc.)
+    // from the overlay button.
+    let id = match id {
+        Some(id) => id,
+        None => {
+            let active_id = state
+                .db
+                .get_most_recent_active_meeting_id()
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        JsonResponse(json!({"error": e.to_string()})),
+                    )
+                })?;
+            active_id.ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    JsonResponse(json!({"error": "no active meeting"})),
+                )
+            })?
+        }
+    };
 
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
-    state.db.end_meeting(id, &now).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            JsonResponse(json!({"error": e.to_string()})),
-        )
-    })?;
+    state
+        .db
+        .end_meeting_with_typed_text(id, &now, true)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonResponse(json!({"error": e.to_string()})),
+            )
+        })?;
 
     {
         let mut lock = state.manual_meeting.write().await;
         *lock = None;
+    }
+
+    // Emit event so triggered pipes can react
+    if let Err(e) =
+        screenpipe_events::send_event("meeting_ended", serde_json::json!({ "meeting_id": id }))
+    {
+        tracing::warn!("failed to emit meeting_ended event: {}", e);
     }
 
     let meeting = state.db.get_meeting_by_id(id).await.map_err(|e| {

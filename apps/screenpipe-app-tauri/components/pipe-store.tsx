@@ -4,7 +4,10 @@
 
 "use client";
 
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
+// PipeMonitorView merged into PipesSection as device dropdown
+import { apiCache } from "@/lib/cache";
+import { localFetch } from "@/lib/api";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -30,7 +33,6 @@ import {
 } from "@/components/ui/select";
 import {
   Search,
-  Star,
   Download,
   Shield,
   ChevronDown,
@@ -44,12 +46,15 @@ import {
   Database,
   Image,
   Plug,
+  Accessibility,
   Clock,
   BadgeCheck,
   Upload,
   AlertTriangle,
   ArrowLeft,
   ExternalLink,
+  GitFork,
+  Star,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSettings } from "@/lib/hooks/use-settings";
@@ -58,7 +63,17 @@ import { MemoizedReactMarkdown } from "@/components/markdown";
 import remarkGfm from "remark-gfm";
 import posthog from "posthog-js";
 import { PipesSection } from "@/components/settings/pipes-section";
-
+import { ChatPrefillData } from "@/lib/chat-utils";
+import {
+  IntegrationIcon,
+  IntegrationInfo,
+} from "@/components/settings/connections-section";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+  TooltipProvider,
+} from "@/components/ui/tooltip";
 // --- Types ---
 
 interface StorePipe {
@@ -67,6 +82,7 @@ interface StorePipe {
   description: string;
   icon: string;
   author: string;
+  author_id?: string;
   author_verified: boolean;
   category: string;
   version: string;
@@ -75,12 +91,19 @@ interface StorePipe {
   review_count: number;
   install_count: number;
   featured: boolean;
-  permissions: PipePermissions;
+  permissions?: PipePermissions;
   source?: string;
   readme_md?: string;
 }
 
 interface PipePermissions {
+  /// Unified permissions preset or rule summary from pipe.md frontmatter.
+  preset?: string; // "reader", "writer", "admin", "none"
+  allow_rules?: string[]; // e.g. ["Api(GET /search)", "App(Slack)", "Content(ocr)"]
+  deny_rules?: string[]; // e.g. ["Api(* /meetings/stop)", "App(1Password)"]
+  time?: string;
+  days?: string;
+  // Legacy fields for backwards compat with older store entries
   allow_ocr?: boolean;
   allow_audio?: boolean;
   allow_input?: boolean;
@@ -115,11 +138,12 @@ interface LocalPipe {
 
 // --- Helpers ---
 
-const CATEGORIES = ["All", "Productivity", "Dev", "Health", "Social", "Other"];
+// Categories are derived dynamically from pipe metadata — no hardcoded taxonomy.
+// Only PUBLISH_CATEGORIES is kept as a suggestion list for the publish form.
+const PUBLISH_CATEGORIES = ["Productivity", "Dev", "Health", "Social", "Other"];
 const SORT_OPTIONS = [
   { value: "popular", label: "Popular" },
   { value: "newest", label: "Newest" },
-  { value: "top_rated", label: "Top Rated" },
 ];
 
 const PERMISSION_LABELS: { key: string; label: string; icon: React.ReactNode }[] = [
@@ -129,9 +153,11 @@ const PERMISSION_LABELS: { key: string; label: string; icon: React.ReactNode }[]
   { key: "raw_sql", label: "Raw SQL", icon: <Database className="h-3.5 w-3.5" /> },
   { key: "frames", label: "Screenshots", icon: <Image className="h-3.5 w-3.5" /> },
   { key: "connections", label: "Connections", icon: <Plug className="h-3.5 w-3.5" /> },
+  { key: "accessibility", label: "Accessibility", icon: <Accessibility className="h-3.5 w-3.5" /> },
 ];
 
-function getPermissionStatus(perms: PipePermissions, key: string): "allowed" | "denied" | "unset" {
+function getPermissionStatus(perms: PipePermissions | undefined, key: string): "allowed" | "denied" | "unset" {
+  if (!perms) return "unset";
   const allowKey = `allow_${key}` as keyof PipePermissions;
   const denyKey = `deny_${key}` as keyof PipePermissions;
   if (perms[denyKey] === true) return "denied";
@@ -140,7 +166,8 @@ function getPermissionStatus(perms: PipePermissions, key: string): "allowed" | "
   return "unset";
 }
 
-function isUnrestricted(perms: PipePermissions): boolean {
+function isUnrestricted(perms?: PipePermissions): boolean {
+  if (!perms) return true; // no permissions declared = unrestricted
   return (
     !perms.deny_ocr &&
     !perms.deny_audio &&
@@ -158,59 +185,25 @@ function getReadmeFromPipeMd(raw: string): string {
   return trimmed.slice(end + 3).trim();
 }
 
-function StarRating({
-  rating,
-  size = "sm",
-  interactive = false,
-  onChange,
-}: {
-  rating: number;
-  size?: "sm" | "md";
-  interactive?: boolean;
-  onChange?: (r: number) => void;
-}) {
-  const [hovered, setHovered] = useState(0);
-  const iconSize = size === "sm" ? "h-3 w-3" : "h-4 w-4";
-  return (
-    <div className="flex items-center gap-0.5">
-      {[1, 2, 3, 4, 5].map((i) => {
-        const filled = interactive ? i <= (hovered || rating) : i <= Math.round(rating);
-        return (
-          <button
-            key={i}
-            type="button"
-            disabled={!interactive}
-            className={cn(
-              "transition-colors",
-              interactive && "cursor-pointer hover:scale-110",
-              !interactive && "cursor-default"
-            )}
-            onMouseEnter={() => interactive && setHovered(i)}
-            onMouseLeave={() => interactive && setHovered(0)}
-            onClick={() => interactive && onChange?.(i)}
-          >
-            <Star
-              className={cn(
-                iconSize,
-                filled
-                  ? "fill-yellow-500 text-yellow-500"
-                  : "text-muted-foreground/30"
-              )}
-            />
-          </button>
-        );
-      })}
-    </div>
-  );
+function navigateHomeAndPrefill(data: ChatPrefillData): void {
+  sessionStorage.setItem("pendingChatPrefill", JSON.stringify(data));
+  const url = new URL(window.location.href);
+  url.searchParams.set("section", "home");
+  window.location.href = url.toString();
 }
+
+
 
 function formatCount(n: number): string {
   if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
   return String(n);
 }
 
-function relativeDate(dateStr: string): string {
-  const diff = Date.now() - new Date(dateStr).getTime();
+function relativeDate(dateStr: string | null | undefined): string {
+  if (!dateStr) return "unknown";
+  const time = new Date(dateStr).getTime();
+  if (isNaN(time)) return "unknown";
+  const diff = Date.now() - time;
   const days = Math.floor(diff / 86400000);
   if (days < 1) return "today";
   if (days === 1) return "yesterday";
@@ -219,21 +212,165 @@ function relativeDate(dateStr: string): string {
   return `${Math.floor(days / 365)}y ago`;
 }
 
+/**
+ * Normalize pipe data from the API response.
+ * The backend returns `avg_rating` (not `rating`), `author_id` (not `author`),
+ * `source_md` (not `source`), and values can be null.
+ */
+function normalizePipe(raw: any): any {
+  if (!raw) return raw;
+  return {
+    ...raw,
+    title: raw.title || raw.slug || "untitled pipe",
+    author: raw.author || raw.author_name || "",
+    author_id: raw.author_id || null,
+    rating: raw.rating ?? raw.avg_rating ?? 0,
+    review_count: raw.review_count ?? 0,
+    install_count: raw.install_count ?? 0,
+    version: raw.version ?? "0",
+    updated_at: raw.updated_at || raw.created_at || null,
+    category: raw.category || "other",
+    source: raw.source || raw.source_md || null,
+    description: raw.description || "",
+    icon: raw.icon || "🔧",
+  };
+}
+
 // --- Main Unified Component ---
 
-export function PipeStoreView() {
-  const [activeTab, setActiveTab] = useState<"discover" | "my-pipes">("my-pipes");
+function ConnectionsStrip() {
+  const [integrations, setIntegrations] = useState<IntegrationInfo[]>([]);
+
+  useEffect(() => {
+    const cached = apiCache.get<IntegrationInfo[]>("connections/strip");
+    if (cached) {
+      setIntegrations(cached);
+      return;
+    }
+    localFetch("/connections")
+      .then((r) => r.json())
+      .then((data) => {
+        const list: IntegrationInfo[] = data.data || [];
+        // only show integrations that have fields (API keys) or OAuth — skip empty ones
+        const relevant = list.filter((i) => i.fields.length > 0 || i.is_oauth);
+        apiCache.set("connections/strip", relevant, 30_000);
+        setIntegrations(relevant);
+      })
+      .catch(() => {});
+  }, []);
+
+  if (integrations.length === 0) return null;
+
+  const connected = integrations.filter((i) => i.connected);
+  const disconnected = integrations.filter((i) => !i.connected);
+  const sorted = [...connected, ...disconnected];
+
+  const openConnections = () => {
+    window.dispatchEvent(
+      new CustomEvent("open-settings", {
+        detail: { section: "connections" },
+      })
+    );
+  };
 
   return (
-    <div className="space-y-0">
+    <TooltipProvider delayDuration={200}>
+      <div className="flex items-center gap-2 mb-6">
+        <div className="flex-1 overflow-x-auto scrollbar-hide">
+          <div className="flex items-center gap-1.5 py-1">
+            {sorted.map((integration) => (
+              <Tooltip key={integration.id}>
+                <TooltipTrigger asChild>
+                  <button
+                    onClick={() => {
+                      sessionStorage.setItem("openConnection", integration.id);
+                      openConnections();
+                    }}
+                    className={cn(
+                      "relative flex items-center justify-center w-8 h-8 shrink-0 border rounded transition-colors",
+                      integration.connected
+                        ? "border-foreground/20 hover:border-foreground/40"
+                        : "border-dashed border-muted-foreground/20 opacity-40 hover:opacity-70"
+                    )}
+                  >
+                    <IntegrationIcon icon={integration.icon} />
+                    {integration.connected && (
+                      <div className="absolute -bottom-0.5 -right-0.5 w-2 h-2 rounded-full bg-foreground" />
+                    )}
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" className="text-xs">
+                  {integration.name}
+                  {integration.connected ? " · connected" : " · not set up"}
+                </TooltipContent>
+              </Tooltip>
+            ))}
+          </div>
+        </div>
+        <button
+          onClick={openConnections}
+          className="shrink-0 flex items-center gap-1.5 px-2 py-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors"
+          title="manage connections"
+        >
+          <Plug className="w-3 h-3" />
+        </button>
+      </div>
+    </TooltipProvider>
+  );
+}
+
+export function PipeStoreView() {
+  // Track installed pipe count to auto-switch to Discover for new users
+  const [installedCount, setInstalledCount] = useState<number | null>(null);
+
+  useEffect(() => {
+    localFetch("/pipes")
+      .then((r) => r.json())
+      .then((data) => {
+        const list = Array.isArray(data) ? data : data.data || data.pipes || [];
+        setInstalledCount(list.length);
+      })
+      .catch(() => setInstalledCount(0));
+  }, []);
+
+  const [activeTab, setActiveTab] = useState<"discover" | "my-pipes">("my-pipes");
+
+  // Read ?tab= from URL after mount, then strip it so it doesn't persist
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const tab = params.get("tab");
+    if (tab === "discover") setActiveTab("discover");
+    else if (tab === "my-pipes") setActiveTab("my-pipes");
+    if (tab) {
+      params.delete("tab");
+      window.history.replaceState({}, "", `${window.location.pathname}?${params}`);
+    }
+  }, []);
+
+  // Once we know installed count, switch new users to discover
+  useEffect(() => {
+    if (installedCount !== null && installedCount === 0) {
+      const params = new URLSearchParams(window.location.search);
+      if (!params.get("tab")) setActiveTab("discover");
+    }
+  }, [installedCount]);
+
+  const tabs = [
+    { key: "my-pipes" as const, label: "My Pipes" },
+    { key: "discover" as const, label: "Discover" },
+  ];
+
+  return (
+    <div className="space-y-4">
+      {/* Connections strip */}
+      <ConnectionsStrip />
+
       {/* Tab bar */}
       <div className="flex items-center gap-6 border-b border-border pb-0 mb-6">
-        {([
-          { key: "my-pipes" as const, label: "My Pipes" },
-          { key: "discover" as const, label: "Discover" },
-        ]).map(({ key, label }) => (
+        {tabs.map(({ key, label }) => (
           <button
             key={key}
+            data-testid={`tab-${key}`}
             onClick={() => setActiveTab(key)}
             className={cn(
               "pb-3 text-sm font-medium transition-colors duration-150 border-b-2 -mb-px",
@@ -249,7 +386,7 @@ export function PipeStoreView() {
 
       {/* Tab content */}
       {activeTab === "discover" ? (
-        <DiscoverView />
+        <DiscoverView onInstalled={() => setActiveTab("my-pipes")} />
       ) : (
         <PipesSection />
       )}
@@ -259,7 +396,7 @@ export function PipeStoreView() {
 
 // --- Discover View ---
 
-function DiscoverView() {
+function DiscoverView({ onInstalled }: { onInstalled?: () => void }) {
   const { settings } = useSettings();
   const { toast } = useToast();
   const token = settings.user?.token;
@@ -269,8 +406,32 @@ function DiscoverView() {
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
+
+  // Prefill search from ?q= URL param after mount, then strip it so it doesn't persist
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const q = params.get("q") ?? "";
+    if (q) {
+      setSearchQuery(q);
+      setDebouncedQuery(q);
+      params.delete("q");
+      window.history.replaceState({}, "", `${window.location.pathname}?${params}`);
+    }
+  }, []);
   const [category, setCategory] = useState("All");
   const [sort, setSort] = useState("popular");
+
+  // Derive unique categories from pipe data
+  const dynamicCategories = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const p of pipes) {
+      const cat = p.category || "other";
+      const label = cat.charAt(0).toUpperCase() + cat.slice(1);
+      counts.set(label, (counts.get(label) || 0) + 1);
+    }
+    // Sort by count descending
+    return ["All", ...Array.from(counts.entries()).sort((a, b) => b[1] - a[1]).map(([name]) => name)];
+  }, [pipes]);
 
   // Detail view
   const [selectedPipe, setSelectedPipe] = useState<PipeDetail | null>(null);
@@ -290,19 +451,48 @@ function DiscoverView() {
   // Source section
   const [sourceExpanded, setSourceExpanded] = useState(false);
 
+  // Unpublish state
+  const [unpublishing, setUnpublishing] = useState(false);
+
   // Publish dialog
   const [publishOpen, setPublishOpen] = useState(false);
 
   // Installed pipe names (for "Installed" badge)
   const [installedNames, setInstalledNames] = useState<Set<string>>(new Set());
 
-  // Fetch installed pipes
+  // Available updates from store
+  const [availableUpdates, setAvailableUpdates] = useState<Record<string, { latest_version: number; installed_version: number; locally_modified: boolean }>>({});
+
+  // Fetch installed pipes (cached 30s, invalidated on install)
   useEffect(() => {
-    fetch("http://localhost:3030/pipes")
+    const cacheKey = "pipes/installed";
+    const cached = apiCache.get<Set<string>>(cacheKey);
+    if (cached) {
+      setInstalledNames(cached);
+      return;
+    }
+    localFetch("/pipes")
       .then((r) => r.json())
       .then((data) => {
         const list = Array.isArray(data) ? data : data.data || data.pipes || [];
-        setInstalledNames(new Set(list.map((p: any) => p.config?.name || p.name)));
+        const names = new Set<string>(list.map((p: any) => p.config?.name || p.name));
+        apiCache.set(cacheKey, names, 30_000);
+        setInstalledNames(names);
+      })
+      .catch(() => {});
+  }, [showDetail]);
+
+  // Check for pipe updates
+  useEffect(() => {
+    localFetch("/pipes/store/check-updates")
+      .then((r) => r.ok ? r.json() : null)
+      .then((json) => {
+        if (!json) return;
+        const updates: Record<string, { latest_version: number; installed_version: number; locally_modified: boolean }> = {};
+        for (const u of json.data || []) {
+          updates[u.pipe_name] = { latest_version: u.latest_version, installed_version: u.installed_version, locally_modified: u.locally_modified };
+        }
+        setAvailableUpdates(updates);
       })
       .catch(() => {});
   }, [showDetail]);
@@ -314,26 +504,46 @@ function DiscoverView() {
     return () => clearTimeout(debounceRef.current);
   }, [searchQuery]);
 
-  // Fetch pipes
+  // Fetch pipes with stale-while-revalidate caching
+  // Category filtering is done client-side so we always have all categories for the pills
   const fetchPipes = useCallback(async () => {
-    setLoading(true);
+    const params = new URLSearchParams();
+    if (debouncedQuery) params.set("q", debouncedQuery);
+    if (sort) params.set("sort", sort);
+    const cacheKey = `pipes/store?${params}`;
+
+    // Show cached data immediately if available
+    const cached = apiCache.getStale<any[]>(cacheKey);
+    if (cached) {
+      setPipes(cached);
+      // If cache is still fresh, skip network request
+      if (apiCache.isFresh(cacheKey)) {
+        setLoading(false);
+        return;
+      }
+    } else {
+      setLoading(true);
+    }
+
+    // Fetch fresh data in background (10s timeout to avoid infinite skeletons)
     try {
-      const params = new URLSearchParams();
-      if (debouncedQuery) params.set("q", debouncedQuery);
-      if (category !== "All") params.set("category", category.toLowerCase());
-      if (sort) params.set("sort", sort);
-      const res = await fetch(`http://localhost:3030/pipes/store?${params}`);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10_000);
+      const res = await localFetch(`/pipes/store?${params}`, { signal: controller.signal });
+      clearTimeout(timeoutId);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
       const list = data.data || data.pipes || (Array.isArray(data) ? data : []);
-      setPipes(list);
+      const normalized = list.map(normalizePipe);
+      apiCache.set(cacheKey, normalized, 5 * 60_000); // 5 min TTL
+      setPipes(normalized);
     } catch (err) {
       console.error("failed to fetch pipe store:", err);
-      setPipes([]);
+      if (!cached) setPipes([]);
     } finally {
       setLoading(false);
     }
-  }, [debouncedQuery, category, sort]);
+  }, [debouncedQuery, sort]);
 
   useEffect(() => {
     fetchPipes();
@@ -349,10 +559,13 @@ function DiscoverView() {
     setReviewRating(0);
     setReviewComment("");
     try {
-      const res = await fetch(`http://localhost:3030/pipes/store/${slug}`);
+      const res = await localFetch(`/pipes/store/${slug}`, {
+        headers: token ? { Authorization: `Bearer ${token}` } : {},
+      });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      setSelectedPipe(data);
+      const pipeData = data.data || data;
+      setSelectedPipe(normalizePipe(pipeData));
     } catch (err) {
       console.error("failed to fetch pipe detail:", err);
       toast({
@@ -371,7 +584,7 @@ function DiscoverView() {
     try {
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       if (token) headers["Authorization"] = `Bearer ${token}`;
-      const res = await fetch("http://localhost:3030/pipes/store/install", {
+      const res = await localFetch("/pipes/store/install", {
         method: "POST",
         headers,
         body: JSON.stringify({ slug }),
@@ -379,12 +592,37 @@ function DiscoverView() {
       const data = await res.json();
       if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
       posthog.capture("pipe_installed_from_store", { slug });
+
+      // Override the pipe's preset with the user's default preset so it
+      // works out of the box (published pipes may reference presets the
+      // user doesn't have).
+      const pipeName = data.name || slug;
+      const defaultPreset = settings.aiPresets?.find((p: any) => p.defaultPreset);
+      if (defaultPreset?.id) {
+        try {
+          await localFetch(`/pipes/${pipeName}/config`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ preset: defaultPreset.id }),
+          });
+        } catch {}
+      }
+
       toast({
-        title: `"${data.name || slug}" installed`,
+        title: `"${pipeName}" installed`,
         description: "switch to my pipes to configure and run it",
       });
-      // Refresh installed names
-      setInstalledNames((prev) => new Set([...prev, data.name || slug]));
+      // Invalidate cache and update installed names
+      apiCache.invalidate("pipes/installed");
+      setInstalledNames((prev) => new Set([...prev, pipeName]));
+
+      // Set sessionStorage so PipesSection picks it up when it mounts on the my-pipes tab
+      const pipeConnections: string[] = data.connections || [];
+      if (pipeConnections.length > 0) {
+        sessionStorage.setItem(`justInstalled:${pipeName}`, "1");
+      }
+      // Switch to my-pipes tab — PipesSection mounts and auto-opens the connection modal
+      onInstalled?.();
     } catch (err: any) {
       toast({
         title: "failed to install pipe",
@@ -403,8 +641,8 @@ function DiscoverView() {
     try {
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       if (token) headers["Authorization"] = `Bearer ${token}`;
-      const res = await fetch(
-        `http://localhost:3030/pipes/store/${selectedPipe.slug}/review`,
+      const res = await localFetch(
+        `/pipes/store/${selectedPipe.slug}/review`,
         {
           method: "POST",
           headers,
@@ -428,6 +666,44 @@ function DiscoverView() {
       setSubmittingReview(false);
     }
   };
+
+  // Unpublish pipe
+  const handleUnpublish = async (slug: string) => {
+    setUnpublishing(true);
+    try {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      if (token) headers["Authorization"] = `Bearer ${token}`;
+      const res = await localFetch(`/pipes/store/${slug}`, {
+        method: "DELETE",
+        headers,
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+      posthog.capture("pipe_unpublished_from_store", { slug });
+      toast({ title: `"${slug}" unpublished from store` });
+      setShowDetail(false);
+      setSelectedPipe(null);
+      apiCache.invalidatePrefix("pipes/store");
+      fetchPipes();
+    } catch (err: any) {
+      toast({
+        title: "failed to unpublish pipe",
+        description: err.message,
+        variant: "destructive",
+      });
+    } finally {
+      setUnpublishing(false);
+    }
+  };
+
+  // Client-side category filter (must be before any early returns to keep hook count stable)
+  const filteredPipes = useMemo(() => {
+    if (category === "All") return pipes;
+    return pipes.filter((p) => {
+      const cat = (p.category || "other").charAt(0).toUpperCase() + (p.category || "other").slice(1);
+      return cat === category;
+    });
+  }, [pipes, category]);
 
   // If showing detail view, render full-width detail panel
   if (showDetail) {
@@ -456,38 +732,64 @@ function DiscoverView() {
             onSourceReviewedChange={setSourceReviewed}
             onInstall={handleInstall}
             isInstalled={installedNames.has(selectedPipe.slug)}
-            reviewExpanded={reviewExpanded}
-            onToggleReview={() => setReviewExpanded(!reviewExpanded)}
-            reviewRating={reviewRating}
-            onReviewRatingChange={setReviewRating}
-            reviewComment={reviewComment}
-            onReviewCommentChange={setReviewComment}
-            submittingReview={submittingReview}
-            onSubmitReview={handleSubmitReview}
+            hasUpdate={!!availableUpdates[selectedPipe.slug]}
             sourceExpanded={sourceExpanded}
             onToggleSource={() => setSourceExpanded(!sourceExpanded)}
-            token={token}
+            currentUserId={settings.user?.id}
+            onUnpublish={handleUnpublish}
+            unpublishing={unpublishing}
+            onRefresh={() => openDetail(selectedPipe.slug)}
           />
         ) : null}
       </div>
     );
   }
 
-  const featuredPipes = pipes.filter((p) => p.featured);
+  // First-visit banner — show once, dismiss permanently
+  // Initialize false to match server render, set true after mount if not dismissed
+  const [showWelcome, setShowWelcome] = useState(false);
+  useEffect(() => {
+    if (!localStorage.getItem("screenpipe:pipes-welcome-dismissed")) {
+      setShowWelcome(true);
+    }
+  }, []);
+
+  const dismissWelcome = () => {
+    setShowWelcome(false);
+    localStorage.setItem("screenpipe:pipes-welcome-dismissed", "1");
+  };
 
   return (
     <div className="space-y-6">
+      {/* First-visit welcome banner */}
+      {showWelcome && (
+        <div className="relative border border-foreground/20 bg-muted/50 rounded-md p-4">
+          <button
+            onClick={dismissWelcome}
+            className="absolute top-2 right-2 text-muted-foreground hover:text-foreground text-sm px-1.5"
+            aria-label="dismiss"
+          >
+            ✕
+          </button>
+          <p className="text-sm font-medium text-foreground">
+            pipes are AI automations that run on your screen data
+          </p>
+          <p className="text-sm text-muted-foreground mt-1">
+            they can summarize your day, track your time, build a digital memory, sync notes to obsidian, auto-update your CRM, and more. install one below to get started — click GET, then enable it in My Pipes.
+          </p>
+        </div>
+      )}
+
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h3 className="text-xl font-semibold tracking-tight">Discover Pipes</h3>
-          <p className="text-sm text-muted-foreground mt-0.5">
+          <p className="text-sm text-muted-foreground">
             browse, install, and review community pipes
           </p>
         </div>
         <Button variant="outline" size="sm" onClick={() => setPublishOpen(true)}>
           <Upload className="h-4 w-4 mr-1.5" />
-          publish
+          PUBLISH
         </Button>
       </div>
 
@@ -519,12 +821,12 @@ function DiscoverView() {
 
         {/* Category pills */}
         <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
-          {CATEGORIES.map((c) => (
+          {dynamicCategories.map((c) => (
             <button
               key={c}
               onClick={() => setCategory(c)}
               className={cn(
-                "px-3 py-1.5 rounded-full text-xs font-medium transition-colors whitespace-nowrap",
+                "px-3 py-1.5 rounded-none text-xs font-medium transition-colors duration-150 whitespace-nowrap",
                 category === c
                   ? "bg-foreground text-background"
                   : "bg-muted text-muted-foreground hover:text-foreground"
@@ -536,27 +838,6 @@ function DiscoverView() {
         </div>
       </div>
 
-      {/* Featured Section */}
-      {featuredPipes.length > 0 && !debouncedQuery && category === "All" && (
-        <div>
-          <h4 className="text-xs font-medium text-muted-foreground mb-3 uppercase tracking-widest">
-            Featured
-          </h4>
-          <div className="flex gap-4 overflow-x-auto pb-3 -mx-1 px-1 snap-x">
-            {featuredPipes.map((pipe) => (
-              <FeaturedCard
-                key={pipe.slug}
-                pipe={pipe}
-                isInstalled={installedNames.has(pipe.slug)}
-                onInstall={() => handleInstall(pipe.slug)}
-                installing={installing === pipe.slug}
-                onClick={() => openDetail(pipe.slug)}
-              />
-            ))}
-          </div>
-        </div>
-      )}
-
       {/* Pipe Grid */}
       {loading ? (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -564,7 +845,7 @@ function DiscoverView() {
             <Card key={i} className="overflow-hidden">
               <CardContent className="p-5 space-y-3">
                 <div className="flex items-center gap-3">
-                  <Skeleton className="h-10 w-10 rounded-xl" />
+                  <Skeleton className="h-10 w-10 rounded-none" />
                   <div className="space-y-1.5 flex-1">
                     <Skeleton className="h-4 w-2/3" />
                     <Skeleton className="h-3 w-1/3" />
@@ -587,11 +868,12 @@ function DiscoverView() {
         </Card>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {pipes.map((pipe) => (
+          {[...filteredPipes].sort((a, b) => (b.featured ? 1 : 0) - (a.featured ? 1 : 0)).map((pipe) => (
             <PipeCard
               key={pipe.slug}
               pipe={pipe}
               isInstalled={installedNames.has(pipe.slug)}
+              hasUpdate={!!availableUpdates[pipe.slug]}
               onInstall={() => handleInstall(pipe.slug)}
               installing={installing === pipe.slug}
               onClick={() => openDetail(pipe.slug)}
@@ -606,108 +888,29 @@ function DiscoverView() {
         onOpenChange={setPublishOpen}
         token={token}
         onPublished={() => {
+          apiCache.invalidatePrefix("pipes/store");
           fetchPipes();
           toast({ title: "pipe published to store" });
         }}
       />
+
     </div>
   );
 }
 
 // --- Sub-components ---
 
-function FeaturedCard({
-  pipe,
-  isInstalled,
-  onInstall,
-  installing,
-  onClick,
-}: {
-  pipe: StorePipe;
-  isInstalled: boolean;
-  onInstall: () => void;
-  installing: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <div
-      className="flex-shrink-0 w-[300px] snap-start group cursor-pointer"
-      onClick={onClick}
-    >
-      <div className="border border-border bg-card hover:bg-accent/50 transition-all duration-200 rounded-xl p-5 space-y-3 h-full">
-        <div className="flex items-start justify-between">
-          <div className="flex items-start gap-3">
-            <div className="text-3xl bg-muted rounded-xl h-12 w-12 flex items-center justify-center flex-shrink-0">
-              {pipe.icon || "🔧"}
-            </div>
-            <div className="min-w-0">
-              <div className="flex items-center gap-1.5">
-                <span className="text-sm font-semibold truncate">{pipe.title}</span>
-              </div>
-              <div className="flex items-center gap-1 text-xs text-muted-foreground mt-0.5">
-                <span className="truncate">{pipe.author}</span>
-                {pipe.author_verified && (
-                  <BadgeCheck className="h-3 w-3 text-blue-500 flex-shrink-0" />
-                )}
-              </div>
-            </div>
-          </div>
-          <Button
-            size="sm"
-            variant={isInstalled ? "outline" : "default"}
-            className={cn(
-              "h-7 px-3 text-xs font-semibold rounded-full flex-shrink-0",
-              isInstalled && "pointer-events-none"
-            )}
-            disabled={installing || isInstalled}
-            onClick={(e) => {
-              e.stopPropagation();
-              onInstall();
-            }}
-          >
-            {installing ? (
-              <Loader2 className="h-3 w-3 animate-spin" />
-            ) : isInstalled ? (
-              "Installed"
-            ) : (
-              "Get"
-            )}
-          </Button>
-        </div>
-
-        <p className="text-xs text-muted-foreground line-clamp-2 leading-relaxed">
-          {pipe.description}
-        </p>
-
-        <div className="flex items-center justify-between">
-          <Badge variant="secondary" className="text-[10px] px-2 py-0.5 font-normal rounded-full">
-            {pipe.category}
-          </Badge>
-          <div className="flex items-center gap-3 text-xs text-muted-foreground">
-            <span className="flex items-center gap-1">
-              <StarRating rating={pipe.rating} />
-              <span>{pipe.rating.toFixed(1)}</span>
-            </span>
-            <span className="flex items-center gap-1">
-              <Download className="h-3 w-3" />
-              {formatCount(pipe.install_count)}
-            </span>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function PipeCard({
   pipe,
   isInstalled,
+  hasUpdate,
   onInstall,
   installing,
   onClick,
 }: {
   pipe: StorePipe;
   isInstalled: boolean;
+  hasUpdate?: boolean;
   onInstall: () => void;
   installing: boolean;
   onClick: () => void;
@@ -719,81 +922,69 @@ function PipeCard({
 
   return (
     <div
+      data-testid={`pipe-card-${pipe.slug}`}
       onClick={onClick}
-      className="border border-border bg-card hover:bg-accent/50 transition-all duration-200 rounded-xl p-5 cursor-pointer group"
+      className="border border-border bg-card hover:bg-accent/50 transition-colors duration-150 rounded-none p-5 cursor-pointer group flex flex-col"
     >
-      <div className="flex items-start gap-3">
-        <div className="text-2xl bg-muted rounded-xl h-11 w-11 flex items-center justify-center flex-shrink-0">
+      {/* Header: icon + action */}
+      <div className="flex items-start justify-between gap-3">
+        <div className="text-2xl bg-muted rounded-none h-11 w-11 flex items-center justify-center flex-shrink-0">
           {pipe.icon || "🔧"}
         </div>
-        <div className="min-w-0 flex-1">
-          <div className="flex items-start justify-between gap-2">
-            <div className="min-w-0">
-              <div className="text-sm font-semibold truncate">{pipe.title}</div>
-              <div className="flex items-center gap-1 text-xs text-muted-foreground mt-0.5">
-                <span className="truncate">{pipe.author}</span>
-                {pipe.author_verified && (
-                  <BadgeCheck className="h-3 w-3 text-blue-500 flex-shrink-0" />
-                )}
-              </div>
-            </div>
-            <Button
-              size="sm"
-              variant={isInstalled ? "outline" : "default"}
-              className={cn(
-                "h-7 px-3 text-xs font-semibold rounded-full flex-shrink-0",
-                isInstalled && "pointer-events-none"
-              )}
-              disabled={installing || isInstalled}
-              onClick={(e) => {
-                e.stopPropagation();
-                onInstall();
-              }}
-            >
-              {installing ? (
-                <Loader2 className="h-3 w-3 animate-spin" />
-              ) : isInstalled ? (
-                "Installed"
-              ) : (
-                "Get"
-              )}
-            </Button>
-          </div>
-        </div>
+        <Button
+          size="sm"
+          data-testid="pipe-install-btn"
+          variant={isInstalled && !hasUpdate ? "outline" : "default"}
+          className={cn(
+            "h-7 px-3 text-xs font-semibold rounded-none uppercase tracking-wide flex-shrink-0",
+            isInstalled && !hasUpdate && "pointer-events-none",
+            hasUpdate && "bg-amber-500 hover:bg-amber-600 text-white"
+          )}
+          disabled={installing || (isInstalled && !hasUpdate)}
+          onClick={(e) => {
+            e.stopPropagation();
+            onInstall();
+          }}
+        >
+          {installing ? (
+            <Loader2 className="h-3 w-3 animate-spin" />
+          ) : hasUpdate ? (
+            "UPDATE"
+          ) : isInstalled ? (
+            "INSTALLED"
+          ) : (
+            "GET"
+          )}
+        </Button>
       </div>
 
-      <p className="text-xs text-muted-foreground line-clamp-2 mt-3 leading-relaxed">
+      {/* Title — full width, no truncation */}
+      <h4 className="text-sm font-semibold mt-3 line-clamp-2 leading-snug">{pipe.title}</h4>
+      <div className="flex items-center gap-1 text-xs text-muted-foreground mt-1">
+        <span className="truncate">{pipe.author}</span>
+        {pipe.author_verified && (
+          <BadgeCheck className="h-3 w-3 text-foreground flex-shrink-0" />
+        )}
+      </div>
+
+      {/* Description */}
+      <p className="text-xs text-muted-foreground line-clamp-2 mt-2 leading-relaxed flex-1">
         {pipe.description}
       </p>
 
-      {permissionPills.length > 0 && (
-        <div className="flex flex-wrap gap-1 mt-2.5">
-          {permissionPills.slice(0, 3).map((p) => (
-            <Badge
-              key={p.key}
-              variant="outline"
-              className="text-[10px] px-1.5 py-0 gap-0.5 font-normal rounded-full"
-            >
-              {p.icon}
-              {p.label}
-            </Badge>
-          ))}
-          {permissionPills.length > 3 && (
-            <Badge variant="outline" className="text-[10px] px-1.5 py-0 font-normal rounded-full">
-              +{permissionPills.length - 3}
-            </Badge>
+      {/* Footer: category + stats */}
+      <div className="flex items-center justify-between mt-3 pt-3 border-t border-border">
+        <div className="flex items-center gap-1.5">
+          {pipe.featured && (
+            <Star className="h-3 w-3 fill-amber-400 text-amber-400 flex-shrink-0" />
           )}
+          <Badge variant="secondary" className="text-[10px] px-2 py-0.5 font-normal rounded-none">
+            {pipe.category}
+          </Badge>
         </div>
-      )}
-
-      <div className="flex items-center gap-3 mt-3 text-xs text-muted-foreground">
-        <span className="flex items-center gap-1">
-          <StarRating rating={pipe.rating} />
-          <span>{pipe.rating.toFixed(1)}</span>
-        </span>
-        <span className="flex items-center gap-1">
+        <span className="flex items-center gap-1 text-xs text-muted-foreground">
           <Download className="h-3 w-3" />
-          {formatCount(pipe.install_count)}
+          {formatCount(pipe.install_count ?? 0)}
         </span>
       </div>
     </div>
@@ -809,17 +1000,12 @@ function PipeDetailPanel({
   onSourceReviewedChange,
   onInstall,
   isInstalled,
-  reviewExpanded,
-  onToggleReview,
-  reviewRating,
-  onReviewRatingChange,
-  reviewComment,
-  onReviewCommentChange,
-  submittingReview,
-  onSubmitReview,
+  hasUpdate,
   sourceExpanded,
   onToggleSource,
-  token,
+  currentUserId,
+  onUnpublish,
+  unpublishing,
 }: {
   pipe: PipeDetail;
   installing: string | null;
@@ -827,20 +1013,24 @@ function PipeDetailPanel({
   onSourceReviewedChange: (v: boolean) => void;
   onInstall: (slug: string) => void;
   isInstalled: boolean;
-  reviewExpanded: boolean;
-  onToggleReview: () => void;
-  reviewRating: number;
-  onReviewRatingChange: (r: number) => void;
-  reviewComment: string;
-  onReviewCommentChange: (c: string) => void;
-  submittingReview: boolean;
-  onSubmitReview: () => void;
+  hasUpdate?: boolean;
   sourceExpanded: boolean;
   onToggleSource: () => void;
-  token?: string | null;
+  currentUserId?: string | null;
+  onUnpublish?: (slug: string) => void;
+  unpublishing?: boolean;
+  onRefresh?: () => void;
 }) {
+  const { toast } = useToast();
   const unrestricted = isUnrestricted(pipe.permissions);
   const needsReview = unrestricted && !pipe.author_verified;
+  const isOwner = !!(currentUserId && pipe.author_id && currentUserId === pipe.author_id);
+
+  const [editing, setEditing] = useState(false);
+  const [editReadme, setEditReadme] = useState("");
+  const [editSource, setEditSource] = useState("");
+  const [publishing, setPublishing] = useState(false);
+  const [previewReadme, setPreviewReadme] = useState(false);
 
   const readmeContent = pipe.readme_md
     ? pipe.readme_md
@@ -848,42 +1038,125 @@ function PipeDetailPanel({
       ? getReadmeFromPipeMd(pipe.source)
       : (pipe.full_description || pipe.description);
 
+  const isDirty = editing && (
+    editReadme !== (readmeContent || "") ||
+    editSource !== (pipe.source || "")
+  );
+
+  const startEditing = () => {
+    setEditReadme(readmeContent || "");
+    setEditSource(pipe.source || "");
+    setPreviewReadme(false);
+    setEditing(true);
+  };
+
+  const cancelEditing = () => {
+    if (isDirty) {
+      if (!confirm("discard unsaved changes?")) return;
+    }
+    setEditing(false);
+    setEditReadme("");
+    setEditSource("");
+  };
+
+  const republish = async () => {
+    if (!isDirty) {
+      toast({ title: "no changes to publish" });
+      return;
+    }
+    setPublishing(true);
+    try {
+      const settingsRes = await localFetch("/settings");
+      const settingsData = await settingsRes.json();
+      const token = settingsData?.user?.token;
+      if (!token) throw new Error("not logged in — go to account settings");
+
+      const res = await localFetch("/pipes/store/publish", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          slug: pipe.slug,
+          title: pipe.title,
+          description: pipe.description,
+          icon: pipe.icon,
+          category: pipe.category,
+          source_md: editSource,
+          readme_md: editReadme || undefined,
+          permissions: pipe.permissions || {},
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: "unknown error" }));
+        throw new Error(err.error || `HTTP ${res.status}`);
+      }
+      toast({ title: "pipe updated and published" });
+      setEditing(false);
+    } catch (err) {
+      toast({
+        title: "failed to publish",
+        description: err instanceof Error ? err.message : String(err),
+        variant: "destructive",
+      });
+    } finally {
+      setPublishing(false);
+    }
+  };
+
+  // Cmd/Ctrl+S to save while editing
+  useEffect(() => {
+    if (!editing) return;
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "s") {
+        e.preventDefault();
+        republish();
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [editing, editReadme, editSource]); // eslint-disable-line react-hooks/exhaustive-deps
+
   return (
     <div className="space-y-8">
       {/* Hero header */}
       <div className="flex items-start gap-4">
-        <div className="text-4xl bg-muted rounded-2xl h-16 w-16 flex items-center justify-center flex-shrink-0">
+        <div className="text-4xl bg-muted rounded-none h-16 w-16 flex items-center justify-center flex-shrink-0">
           {pipe.icon || "🔧"}
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex items-start justify-between gap-3">
             <div>
-              <h2 className="text-xl font-semibold tracking-tight">{pipe.title}</h2>
+              <h2 className="text-xl font-semibold tracking-tight">{pipe.title || pipe.slug || "untitled pipe"}</h2>
               <div className="flex items-center gap-2 mt-1 flex-wrap">
-                <div className="flex items-center gap-1 text-sm text-muted-foreground">
-                  <span>{pipe.author}</span>
-                  {pipe.author_verified && (
-                    <BadgeCheck className="h-3.5 w-3.5 text-blue-500" />
-                  )}
-                </div>
-                <span className="text-xs text-muted-foreground/50">·</span>
-                <span className="text-xs text-muted-foreground">v{pipe.version}</span>
-                <span className="text-xs text-muted-foreground/50">·</span>
-                <Badge variant="secondary" className="text-[10px] px-2 py-0.5 font-normal rounded-full">
-                  {pipe.category}
-                </Badge>
+                {pipe.author ? (
+                  <div className="flex items-center gap-1 text-sm text-muted-foreground">
+                    <span>{pipe.author}</span>
+                    {pipe.author_verified && (
+                      <BadgeCheck className="h-3.5 w-3.5 text-foreground" />
+                    )}
+                  </div>
+                ) : null}
+                {pipe.version ? (
+                  <>
+                    {pipe.author && <span className="text-xs text-muted-foreground/50">·</span>}
+                    <span className="text-xs text-muted-foreground">v{pipe.version}</span>
+                  </>
+                ) : null}
+                {pipe.category ? (
+                  <>
+                    <span className="text-xs text-muted-foreground/50">·</span>
+                    <Badge variant="secondary" className="text-[10px] px-2 py-0.5 font-normal rounded-none">
+                      {pipe.category}
+                    </Badge>
+                  </>
+                ) : null}
               </div>
               <div className="flex items-center gap-4 mt-2 text-sm text-muted-foreground">
-                <span className="flex items-center gap-1.5">
-                  <StarRating rating={pipe.rating} size="md" />
-                  <span>
-                    {pipe.rating.toFixed(1)} ({pipe.review_count}{" "}
-                    {pipe.review_count === 1 ? "review" : "reviews"})
-                  </span>
-                </span>
                 <span className="flex items-center gap-1">
                   <Download className="h-3.5 w-3.5" />
-                  {formatCount(pipe.install_count)} installs
+                  {formatCount(pipe.install_count ?? 0)} installs
                 </span>
                 <span className="text-xs">
                   updated {relativeDate(pipe.updated_at)}
@@ -891,32 +1164,119 @@ function PipeDetailPanel({
               </div>
             </div>
 
-            <Button
-              size="sm"
-              variant={isInstalled ? "outline" : "default"}
-              className={cn(
-                "h-9 px-5 text-sm font-semibold rounded-full flex-shrink-0",
-                isInstalled && "pointer-events-none"
+            <div className="flex items-center gap-2 flex-shrink-0">
+              {/* Fork — open chat with pipe content to customize */}
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-9 px-4 text-sm font-semibold rounded-none uppercase tracking-wide"
+                onClick={() => {
+                  const pipeSource = pipe.source || "";
+                  navigateHomeAndPrefill({
+                    context: `the user wants to fork/customize an existing pipe from the store.
+
+here is the original pipe content (pipe.md):
+
+\`\`\`
+${pipeSource}
+\`\`\`
+
+IMPORTANT: first read the screenpipe skill file to understand how pipes work, then ask the user how they want to customize/improve this pipe for their specific needs. do NOT auto-send or auto-create — have a conversation first to understand what they want to change.`,
+                    prompt: `i want to fork the "${pipe.title}" pipe and adapt it to my needs. here is the original pipe.md:\n\n${pipeSource}`,
+                    autoSend: true,
+                  });
+                }}
+              >
+                <GitFork className="h-4 w-4 mr-1.5" />
+                FORK
+              </Button>
+              {isOwner && !editing && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-9 px-4 text-sm font-semibold rounded-none uppercase tracking-wide"
+                  onClick={startEditing}
+                >
+                  EDIT
+                </Button>
               )}
-              disabled={
-                installing === pipe.slug || isInstalled || (needsReview && !sourceReviewed)
-              }
-              onClick={() => onInstall(pipe.slug)}
-            >
-              {installing === pipe.slug ? (
+              {isOwner && editing && (
                 <>
-                  <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
-                  installing...
-                </>
-              ) : isInstalled ? (
-                "Installed"
-              ) : (
-                <>
-                  <Download className="h-4 w-4 mr-1.5" />
-                  Get
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-9 px-4 text-sm font-semibold rounded-none uppercase tracking-wide"
+                    onClick={cancelEditing}
+                    disabled={publishing}
+                  >
+                    CANCEL
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="default"
+                    className="h-9 px-4 text-sm font-semibold rounded-none uppercase tracking-wide"
+                    onClick={republish}
+                    disabled={publishing}
+                  >
+                    {publishing ? (
+                      <>
+                        <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
+                        PUBLISHING...
+                      </>
+                    ) : (
+                      "PUBLISH UPDATE"
+                    )}
+                  </Button>
                 </>
               )}
-            </Button>
+              {isOwner && onUnpublish && !editing && (
+                <Button
+                  size="sm"
+                  variant="destructive"
+                  className="h-9 px-4 text-sm font-semibold rounded-none uppercase tracking-wide"
+                  disabled={unpublishing}
+                  onClick={() => onUnpublish(pipe.slug)}
+                >
+                  {unpublishing ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
+                      UNPUBLISHING...
+                    </>
+                  ) : (
+                    "UNPUBLISH"
+                  )}
+                </Button>
+              )}
+              <Button
+                size="sm"
+                variant={isInstalled && !hasUpdate ? "outline" : "default"}
+                className={cn(
+                  "h-9 px-5 text-sm font-semibold rounded-none uppercase tracking-wide flex-shrink-0",
+                  isInstalled && !hasUpdate && "pointer-events-none",
+                  hasUpdate && "bg-amber-500 hover:bg-amber-600 text-white"
+                )}
+                disabled={
+                  installing === pipe.slug || (isInstalled && !hasUpdate) || (needsReview && !sourceReviewed)
+                }
+                onClick={() => onInstall(pipe.slug)}
+              >
+                {installing === pipe.slug ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
+                    {hasUpdate ? "UPDATING..." : "INSTALLING..."}
+                  </>
+                ) : hasUpdate ? (
+                  "UPDATE"
+                ) : isInstalled ? (
+                  "INSTALLED"
+                ) : (
+                  <>
+                    <Download className="h-4 w-4 mr-1.5" />
+                    GET
+                  </>
+                )}
+              </Button>
+            </div>
           </div>
         </div>
       </div>
@@ -924,46 +1284,77 @@ function PipeDetailPanel({
       {/* README section */}
       <div className="space-y-3">
         <h4 className="text-xs font-medium text-muted-foreground uppercase tracking-widest">
-          README
+          README {editing && <span className="text-foreground/50">(editing)</span>}
         </h4>
-        <div className="border border-border rounded-xl p-6">
-          {readmeContent ? (
-            <MemoizedReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              className="prose prose-sm dark:prose-invert max-w-none"
-              components={{
-                a: ({ href, children }) => (
-                  <a
-                    href={href}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-primary hover:underline"
-                  >
-                    {children}
-                  </a>
-                ),
-                code: ({ className, children, ...props }) => {
-                  const isInline = !className;
-                  return isInline ? (
-                    <code className="bg-muted px-1.5 py-0.5 rounded text-xs" {...props}>
-                      {children}
-                    </code>
-                  ) : (
-                    <pre className="bg-muted p-4 rounded-lg overflow-x-auto text-xs">
-                      <code className={className} {...props}>
+        {editing ? (
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setPreviewReadme(false)}
+                className={`text-[10px] uppercase tracking-wider px-2 py-1 transition-colors ${!previewReadme ? "text-foreground border-b border-foreground" : "text-muted-foreground hover:text-foreground"}`}
+              >
+                edit
+              </button>
+              <button
+                onClick={() => setPreviewReadme(true)}
+                className={`text-[10px] uppercase tracking-wider px-2 py-1 transition-colors ${previewReadme ? "text-foreground border-b border-foreground" : "text-muted-foreground hover:text-foreground"}`}
+              >
+                preview
+              </button>
+              <span className="text-[9px] text-muted-foreground/50 ml-auto">cmd+s to publish</span>
+            </div>
+            {previewReadme ? (
+              <div className="border border-border rounded-none p-6">
+                <MemoizedReactMarkdown
+                  remarkPlugins={[remarkGfm]}
+                  className="prose prose-sm dark:prose-invert max-w-none prose-pre:bg-muted prose-pre:text-foreground prose-pre:rounded-md prose-pre:border prose-pre:border-border prose-pre:text-xs prose-code:bg-muted prose-code:text-foreground prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded prose-code:text-xs prose-code:before:content-none prose-code:after:content-none"
+                  components={{
+                    a: ({ href, children }) => (
+                      <a href={href} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
                         {children}
-                      </code>
-                    </pre>
-                  );
-                },
-              }}
-            >
-              {readmeContent}
-            </MemoizedReactMarkdown>
-          ) : (
-            <p className="text-sm text-muted-foreground">no description available</p>
-          )}
-        </div>
+                      </a>
+                    ),
+                  }}
+                >
+                  {editReadme || "nothing to preview"}
+                </MemoizedReactMarkdown>
+              </div>
+            ) : (
+              <textarea
+                value={editReadme}
+                onChange={(e) => setEditReadme(e.target.value)}
+                className="w-full border border-border rounded-none p-4 text-sm font-mono bg-muted/30 resize-y focus:outline-none focus:border-foreground/40 min-h-[200px]"
+                rows={15}
+                placeholder="write your README in markdown..."
+              />
+            )}
+          </div>
+        ) : (
+          <div className="border border-border rounded-none p-6">
+            {readmeContent ? (
+              <MemoizedReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                className="prose prose-sm dark:prose-invert max-w-none prose-pre:bg-muted prose-pre:text-foreground prose-pre:rounded-md prose-pre:border prose-pre:border-border prose-pre:text-xs prose-code:bg-muted prose-code:text-foreground prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded prose-code:text-xs prose-code:before:content-none prose-code:after:content-none"
+                components={{
+                  a: ({ href, children }) => (
+                    <a
+                      href={href}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-primary hover:underline"
+                    >
+                      {children}
+                    </a>
+                  ),
+                }}
+              >
+                {readmeContent}
+              </MemoizedReactMarkdown>
+            ) : (
+              <p className="text-sm text-muted-foreground">no description available</p>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Permissions */}
@@ -971,7 +1362,7 @@ function PipeDetailPanel({
         <h4 className="text-xs font-medium text-muted-foreground uppercase tracking-widest">
           Permissions
         </h4>
-        <div className="border border-border rounded-xl p-5 space-y-3">
+        <div className="border border-border rounded-none p-5 space-y-3">
           <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
             {PERMISSION_LABELS.map((perm) => {
               const status = getPermissionStatus(pipe.permissions, perm.key);
@@ -981,9 +1372,9 @@ function PipeDetailPanel({
                   className="flex items-center gap-2 text-sm py-1.5"
                 >
                   {status === "allowed" ? (
-                    <CheckCircle2 className="h-4 w-4 text-green-500 flex-shrink-0" />
+                    <CheckCircle2 className="h-4 w-4 text-foreground flex-shrink-0" />
                   ) : status === "denied" ? (
-                    <XCircle className="h-4 w-4 text-red-500 flex-shrink-0" />
+                    <XCircle className="h-4 w-4 text-muted-foreground flex-shrink-0" />
                   ) : (
                     <div className="h-4 w-4 rounded-full border-2 border-muted-foreground/30 flex-shrink-0" />
                   )}
@@ -995,25 +1386,25 @@ function PipeDetailPanel({
               );
             })}
           </div>
-          {pipe.permissions.time_range && (
+          {pipe.permissions?.time_range && (
             <div className="flex items-center gap-1.5 text-xs text-muted-foreground pt-2 border-t border-border">
               <Clock className="h-3.5 w-3.5" />
-              time range: {pipe.permissions.time_range}
+              time range: {pipe.permissions?.time_range}
             </div>
           )}
-          {pipe.permissions.day_restrictions &&
+          {pipe.permissions?.day_restrictions &&
             pipe.permissions.day_restrictions.length > 0 && (
               <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
                 <Clock className="h-3.5 w-3.5" />
-                days: {pipe.permissions.day_restrictions.join(", ")}
+                days: {pipe.permissions?.day_restrictions?.join(", ")}
               </div>
             )}
         </div>
 
         {/* Unrestricted warning */}
         {unrestricted && (
-          <div className="border border-orange-500/50 bg-orange-500/5 rounded-xl p-4 space-y-2">
-            <div className="flex items-center gap-2 text-sm font-medium text-orange-600 dark:text-orange-400">
+          <div className="border border-foreground bg-muted/50 rounded-none p-4 space-y-2">
+            <div className="flex items-center gap-2 text-sm font-medium text-foreground">
               <AlertTriangle className="h-4 w-4" />
               unrestricted data access
             </div>
@@ -1037,112 +1428,34 @@ function PipeDetailPanel({
         )}
       </div>
 
-      {/* Reviews */}
-      <div className="space-y-3">
-        <h4 className="text-xs font-medium text-muted-foreground uppercase tracking-widest">
-          Reviews ({pipe.review_count})
-        </h4>
-        <div className="space-y-3">
-          {pipe.reviews && pipe.reviews.length > 0 ? (
-            pipe.reviews.map((review) => (
-              <div
-                key={review.id}
-                className="border border-border rounded-xl p-4 space-y-1.5"
-              >
-                <div className="flex items-center gap-2">
-                  <StarRating rating={review.rating} />
-                  <span className="text-xs font-medium">{review.author}</span>
-                  <span className="text-xs text-muted-foreground">
-                    {relativeDate(review.created_at)}
-                  </span>
-                </div>
-                {review.comment && (
-                  <p className="text-sm text-muted-foreground leading-relaxed">
-                    {review.comment}
-                  </p>
-                )}
-              </div>
-            ))
-          ) : (
-            <p className="text-sm text-muted-foreground">no reviews yet</p>
-          )}
-
-          {/* Write review */}
-          {token ? (
-            <div>
-              <button
-                onClick={onToggleReview}
-                className="text-sm text-muted-foreground hover:text-foreground transition-colors underline underline-offset-2"
-              >
-                {reviewExpanded ? "cancel review" : "write a review"}
-              </button>
-              {reviewExpanded && (
-                <div className="mt-3 space-y-3 border border-border rounded-xl p-4">
-                  <div>
-                    <Label className="text-xs">rating</Label>
-                    <div className="mt-1">
-                      <StarRating
-                        rating={reviewRating}
-                        size="md"
-                        interactive
-                        onChange={onReviewRatingChange}
-                      />
-                    </div>
-                  </div>
-                  <div>
-                    <Label className="text-xs">comment (optional)</Label>
-                    <Textarea
-                      value={reviewComment}
-                      onChange={(e) => onReviewCommentChange(e.target.value)}
-                      placeholder="your experience with this pipe..."
-                      className="text-sm min-h-[80px] mt-1"
-                    />
-                  </div>
-                  <Button
-                    size="sm"
-                    onClick={onSubmitReview}
-                    disabled={reviewRating === 0 || submittingReview}
-                  >
-                    {submittingReview ? (
-                      <>
-                        <Loader2 className="h-3 w-3 animate-spin mr-1.5" />
-                        submitting...
-                      </>
-                    ) : (
-                      "submit review"
-                    )}
-                  </Button>
-                </div>
-              )}
-            </div>
-          ) : (
-            <p className="text-sm text-muted-foreground">
-              sign in to write a review
-            </p>
-          )}
-        </div>
-      </div>
-
       {/* Source */}
       <div className="space-y-3">
         <button
-          onClick={onToggleSource}
+          onClick={editing ? undefined : onToggleSource}
           className="flex items-center gap-2 text-xs font-medium text-muted-foreground uppercase tracking-widest hover:text-foreground transition-colors"
         >
-          {sourceExpanded ? (
+          {editing || sourceExpanded ? (
             <ChevronDown className="h-3.5 w-3.5" />
           ) : (
             <ChevronRight className="h-3.5 w-3.5" />
           )}
-          Source (pipe.md)
+          Source (pipe.md) {editing && <span className="text-foreground/50">(editing)</span>}
         </button>
-        {sourceExpanded && pipe.source && (
-          <div className="border border-border rounded-xl overflow-hidden">
+        {editing ? (
+          <textarea
+            value={editSource}
+            onChange={(e) => setEditSource(e.target.value)}
+            className="w-full border border-border rounded-none p-4 text-xs font-mono bg-muted/30 resize-y focus:outline-none focus:border-foreground/40 min-h-[300px]"
+            rows={20}
+            placeholder="pipe.md source..."
+          />
+        ) : sourceExpanded && pipe.source ? (
+          <div className="border border-border rounded-none overflow-hidden">
             <pre className="p-4 text-xs leading-relaxed whitespace-pre-wrap font-mono max-h-80 overflow-y-auto bg-muted/50">
               {pipe.source}
             </pre>
           </div>
-        )}
+        ) : null}
       </div>
     </div>
   );
@@ -1150,31 +1463,61 @@ function PipeDetailPanel({
 
 // --- Publish Dialog ---
 
-function PublishDialog({
+// Redact secrets from pipe content before publishing
+function redactSecrets(text: string): { redacted: string; count: number } {
+  let count = 0;
+  const patterns: [RegExp, string][] = [
+    [/sk-ant-[a-zA-Z0-9_-]{20,}/g, "sk-ant-***REDACTED***"],
+    [/sk-[a-zA-Z0-9]{20,}/g, "sk-***REDACTED***"],
+    [/ghp_[a-zA-Z0-9]{36,}/g, "ghp_***REDACTED***"],
+    [/gho_[a-zA-Z0-9]{36,}/g, "gho_***REDACTED***"],
+    [/xoxb-[a-zA-Z0-9-]+/g, "xoxb-***REDACTED***"],
+    [/xoxp-[a-zA-Z0-9-]+/g, "xoxp-***REDACTED***"],
+    [/AIza[a-zA-Z0-9_-]{30,}/g, "AIza***REDACTED***"],
+    [/AKIA[A-Z0-9]{16,}/g, "AKIA***REDACTED***"],
+    [/Bearer\s+ey[a-zA-Z0-9._-]+/g, "Bearer ***REDACTED***"],
+    [/((?:API_KEY|SECRET|TOKEN|PASSWORD|CREDENTIALS)\s*[=:]\s*["']?)([a-zA-Z0-9_-]{8,})(["']?)/gi,
+      "$1***REDACTED***$3"],
+  ];
+  let result = text;
+  for (const [pattern, replacement] of patterns) {
+    const before = result;
+    result = result.replace(pattern, replacement);
+    if (result !== before) count++;
+    pattern.lastIndex = 0;
+  }
+  return { redacted: result, count };
+}
+
+export function PublishDialog({
   open,
   onOpenChange,
   token,
   onPublished,
+  defaultPipe,
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
   token?: string | null;
   onPublished: () => void;
+  defaultPipe?: string;
 }) {
   const { toast } = useToast();
   const [localPipes, setLocalPipes] = useState<LocalPipe[]>([]);
   const [loadingPipes, setLoadingPipes] = useState(false);
-  const [selectedPipe, setSelectedPipe] = useState("");
+  const [selectedPipe, setSelectedPipe] = useState(defaultPipe || "");
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [icon, setIcon] = useState("🔧");
   const [publishCategory, setPublishCategory] = useState("Other");
   const [publishing, setPublishing] = useState(false);
+  const [redactEnabled, setRedactEnabled] = useState(true);
 
   useEffect(() => {
     if (!open) return;
+    if (defaultPipe) setSelectedPipe(defaultPipe);
     setLoadingPipes(true);
-    fetch("http://localhost:3030/pipes")
+    localFetch("/pipes")
       .then((r) => r.json())
       .then((data) => {
         const list = Array.isArray(data) ? data : data.data || data.pipes || [];
@@ -1182,22 +1525,91 @@ function PublishDialog({
       })
       .catch(() => setLocalPipes([]))
       .finally(() => setLoadingPipes(false));
-  }, [open]);
+  }, [open, defaultPipe]);
+
+  const helpMePublish = () => {
+    const pipeName = selectedPipe || defaultPipe;
+    if (!pipeName) return;
+    const pipe = localPipes.find((p: any) => p.name === pipeName);
+    const sourceMd = pipe?.raw_content as string | undefined;
+    if (!sourceMd) {
+      toast({ title: "could not read pipe content", variant: "destructive" });
+      return;
+    }
+    onOpenChange(false);
+    navigateHomeAndPrefill({
+      context: `the user wants to publish their pipe "${pipeName}" to the screenpipe store. here is their current pipe.md:
+
+\`\`\`
+${sourceMd}
+\`\`\`
+
+IMPORTANT — follow these steps exactly:
+
+STEP 1: READ THE SKILL FILE
+- read the screenpipe pipe skill file first to understand how pipes, connections, permissions, and the store work
+
+STEP 2: CREATE A GENERIC VERSION
+- DO NOT modify the user's existing installed pipe
+- create the store-ready version as a separate output
+- review for personal/machine-specific content:
+  - hardcoded file paths (~/Documents/..., /Users/name/...) → replace with env vars or connection settings
+  - personal names in prompts → replace with "the user"
+  - hardcoded API keys or tokens → remove, use connections instead
+  - machine-specific config (specific ports, paths) → make configurable
+- set permissions preset appropriately (e.g. "reader", "writer", "none" — NOT left undefined)
+- if the pipe needs external services (Obsidian, Notion, Slack, etc.), use screenpipe connections properly
+- keep ALL original functionality intact
+
+STEP 3: PREPARE STORE METADATA
+generate all of these:
+- **title**: clear, concise name (e.g. "Daily Activity Summary")
+- **description**: 1-2 sentence explanation of what it does
+- **icon**: single emoji that represents the pipe
+- **category**: one of: Productivity, Dev, Health, Social, Other
+- **readme_md**: full markdown README with sections:
+  - what it does (bullet points)
+  - who it's for
+  - how to use (setup steps)
+  - configuration options (if any env vars or connections needed)
+
+STEP 4: SHOW THE USER AND ASK CONFIRMATION
+- show the complete final pipe.md source
+- show the title, description, icon, category, and README
+- explicitly ask: "does this look good? should I publish it?"
+- DO NOT publish until the user confirms
+
+STEP 5: PUBLISH (only after user says yes)
+- call POST http://localhost:3030/pipes/store/publish with JSON body:
+  { "source_md": "<the generic pipe.md>", "title": "<title>", "description": "<description>", "icon": "<emoji>", "category": "<category>", "readme_md": "<readme>" }
+- include Authorization header with Bearer token from settings (read settings first to get user.token)
+- tell the user the result`,
+      prompt: `help me publish my pipe "${pipeName}" to the store. make it generic and ready for anyone to use.`,
+      autoSend: true,
+    });
+  };
 
   const handlePublish = async () => {
     if (!selectedPipe || !title) return;
     setPublishing(true);
     try {
-      // Get pipe content from local pipes list
       const pipe = localPipes.find((p: any) => p.name === selectedPipe);
-      const sourceMd = pipe?.raw_content;
+      let sourceMd = pipe?.raw_content as string | undefined;
       if (!sourceMd) throw new Error("could not read pipe content");
+
+      if (redactEnabled) {
+        const { redacted, count } = redactSecrets(sourceMd);
+        if (count > 0) {
+          sourceMd = redacted;
+          toast({ title: `redacted ${count} secret(s) from pipe before publishing` });
+        }
+      }
 
       const headers: Record<string, string> = {
         "Content-Type": "application/json",
       };
       if (token) headers["Authorization"] = `Bearer ${token}`;
-      const res = await fetch("http://localhost:3030/pipes/store/publish", {
+      const res = await localFetch("/pipes/store/publish", {
         method: "POST",
         headers,
         body: JSON.stringify({
@@ -1247,6 +1659,27 @@ function PublishDialog({
           </p>
         ) : (
           <div className="space-y-3">
+            {/* AI help banner */}
+            <button
+              onClick={helpMePublish}
+              disabled={!selectedPipe && !defaultPipe}
+              className="w-full flex items-center gap-3 p-3 border-2 border-dashed border-foreground/20 hover:border-foreground/40 hover:bg-muted/30 transition-colors text-left disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              <span className="text-2xl">🤖</span>
+              <div>
+                <p className="text-sm font-medium">help me publish</p>
+                <p className="text-[11px] text-muted-foreground">
+                  ai will make your pipe generic, write a README, and publish it for you
+                </p>
+              </div>
+            </button>
+
+            <div className="flex items-center gap-3 text-xs text-muted-foreground">
+              <div className="flex-1 h-px bg-border" />
+              or publish manually
+              <div className="flex-1 h-px bg-border" />
+            </div>
+
             <div>
               <Label className="text-xs">pipe</Label>
               {loadingPipes ? (
@@ -1308,7 +1741,7 @@ function PublishDialog({
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent>
-                    {CATEGORIES.filter((c) => c !== "All").map((c) => (
+                    {PUBLISH_CATEGORIES.map((c) => (
                       <SelectItem key={c} value={c}>
                         {c}
                       </SelectItem>
@@ -1316,6 +1749,17 @@ function PublishDialog({
                   </SelectContent>
                 </Select>
               </div>
+            </div>
+
+            <div className="flex items-center gap-2 pt-1">
+              <Checkbox
+                id="redact-secrets"
+                checked={redactEnabled}
+                onCheckedChange={(v) => setRedactEnabled(v === true)}
+              />
+              <Label htmlFor="redact-secrets" className="text-xs text-muted-foreground">
+                redact API keys & secrets before publishing
+              </Label>
             </div>
           </div>
         )}
@@ -1327,7 +1771,7 @@ function PublishDialog({
             onClick={() => onOpenChange(false)}
             className="text-xs"
           >
-            cancel
+            CANCEL
           </Button>
           {token && (
             <Button
@@ -1339,10 +1783,10 @@ function PublishDialog({
               {publishing ? (
                 <>
                   <Loader2 className="h-3 w-3 animate-spin mr-1" />
-                  publishing...
+                  PUBLISHING...
                 </>
               ) : (
-                "publish"
+                "PUBLISH"
               )}
             </Button>
           )}
@@ -1358,14 +1802,14 @@ export function PermissionsReview({
   permissions,
   authorVerified,
 }: {
-  permissions: PipePermissions;
+  permissions?: PipePermissions;
   authorVerified: boolean;
 }) {
   const unrestricted = isUnrestricted(permissions);
 
   return (
     <div className="space-y-3">
-      <div className="border border-border rounded-xl p-4 space-y-2">
+      <div className="border border-border rounded-none p-4 space-y-2">
         <div className="flex items-center gap-1.5 text-sm font-medium">
           <Shield className="h-4 w-4" />
           data access
@@ -1379,9 +1823,9 @@ export function PermissionsReview({
                 className="flex items-center gap-2 text-xs py-1"
               >
                 {status === "allowed" ? (
-                  <CheckCircle2 className="h-3.5 w-3.5 text-green-500 flex-shrink-0" />
+                  <CheckCircle2 className="h-3.5 w-3.5 text-foreground flex-shrink-0" />
                 ) : status === "denied" ? (
-                  <XCircle className="h-3.5 w-3.5 text-red-500 flex-shrink-0" />
+                  <XCircle className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
                 ) : (
                   <div className="h-3.5 w-3.5 rounded-full border border-muted-foreground/30 flex-shrink-0" />
                 )}
@@ -1396,8 +1840,8 @@ export function PermissionsReview({
       </div>
 
       {unrestricted && (
-        <div className="border border-orange-500/50 bg-orange-500/5 rounded-xl p-4">
-          <div className="flex items-center gap-2 text-xs font-medium text-orange-600 dark:text-orange-400">
+        <div className="border border-foreground bg-muted/50 rounded-none p-4">
+          <div className="flex items-center gap-2 text-xs font-medium text-foreground">
             <AlertTriangle className="h-3.5 w-3.5" />
             unrestricted data access — this pipe can read all your data
           </div>

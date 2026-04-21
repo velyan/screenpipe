@@ -65,7 +65,7 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(true));
         let is_running_clone = Arc::clone(&is_running);
 
-        let audio_stream = AudioStream::from_device(device_spec, is_running_clone)
+        let audio_stream = AudioStream::from_device(device_spec, is_running_clone, false)
             .await
             .unwrap();
 
@@ -126,7 +126,7 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(true));
         let is_running_clone = Arc::clone(&is_running);
 
-        let audio_stream = AudioStream::from_device(device_spec, is_running_clone.clone())
+        let audio_stream = AudioStream::from_device(device_spec, is_running_clone.clone(), false)
             .await
             .unwrap();
 
@@ -258,9 +258,9 @@ mod tests {
         let (mut segments, _, _) = prepare_segments(
             &audio_input.data,
             vad_engine.clone(),
-            &segmentation_model_path,
+            Some(&segmentation_model_path),
             embedding_manager,
-            embedding_extractor,
+            Some(embedding_extractor),
             &audio_input.device.to_string(),
             false,
             false,
@@ -358,9 +358,9 @@ mod tests {
         let (mut segments, _, _) = prepare_segments(
             &audio_input.data,
             vad_engine.clone(),
-            &segmentation_model_path,
+            Some(&segmentation_model_path),
             embedding_manager,
-            embedding_extractor,
+            Some(embedding_extractor),
             &audio_input.device.to_string(),
             false,
             false,

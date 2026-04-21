@@ -351,6 +351,59 @@ pub(crate) async fn search(
         })
         .collect();
 
+    // Deduplicate OCR + UI results for the same frame/timestamp.
+    // The DB returns separate OCR and UI entries for the same screen moment.
+    // UI entries often have no frame_id (showing "unavailable" in the frontend).
+    // Merge them: keep the OCR entry (has frame_id + image) and prefer the longer
+    // text between OCR and UI (accessibility text is often cleaner).
+    {
+        use std::collections::HashMap;
+
+        // Build a map of timestamp (rounded to 1s) + app_name → index of the OCR entry
+        let mut ocr_by_moment: HashMap<(i64, String), usize> = HashMap::new();
+        for (i, item) in content_items.iter().enumerate() {
+            if let ContentItem::OCR(ocr) = item {
+                let ts_key = ocr.timestamp.timestamp(); // round to second
+                let app_key = ocr.app_name.clone();
+                ocr_by_moment.entry((ts_key, app_key)).or_insert(i);
+            }
+        }
+
+        // Find UI entries that match an OCR entry at the same moment
+        let mut ui_indices_to_remove: Vec<usize> = Vec::new();
+        let mut ocr_text_upgrades: Vec<(usize, String)> = Vec::new();
+
+        for (i, item) in content_items.iter().enumerate() {
+            if let ContentItem::UI(ui) = item {
+                let ts_key = ui.timestamp.timestamp();
+                let app_key = ui.app_name.clone();
+                if let Some(&ocr_idx) = ocr_by_moment.get(&(ts_key, app_key)) {
+                    // This UI entry has a matching OCR entry — mark for removal
+                    ui_indices_to_remove.push(i);
+                    // If UI text is longer/richer, upgrade the OCR text
+                    if let ContentItem::OCR(ocr) = &content_items[ocr_idx] {
+                        if ui.text.len() > ocr.text.len() {
+                            ocr_text_upgrades.push((ocr_idx, ui.text.clone()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply text upgrades to OCR entries
+        for (idx, text) in ocr_text_upgrades {
+            if let ContentItem::OCR(ref mut ocr) = content_items[idx] {
+                ocr.text = text;
+            }
+        }
+
+        // Remove duplicate UI entries (iterate in reverse to preserve indices)
+        ui_indices_to_remove.sort_unstable();
+        for idx in ui_indices_to_remove.into_iter().rev() {
+            content_items.remove(idx);
+        }
+    }
+
     if query.include_frames {
         debug!("extracting frames for ocr content");
         let frame_futures: Vec<_> = content_items

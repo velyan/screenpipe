@@ -5,6 +5,7 @@ import React, { FC, useState, useRef, useEffect, useCallback } from "react";
 import { toast } from "@/components/ui/use-toast";
 import { invoke } from "@tauri-apps/api/core";
 import { Loader2 } from "lucide-react";
+import { localFetch } from "@/lib/api";
 
 interface RegionOcrOverlayProps {
   /** Frame ID used to fetch a clean (non-tainted) copy for canvas cropping */
@@ -119,8 +120,8 @@ export const RegionOcrOverlay: FC<RegionOcrOverlayProps> = ({
 
         // Fetch frame from local HTTP server as blob to avoid cross-origin canvas tainting
         // (Tauri asset protocol URLs taint the canvas, blocking toDataURL)
-        const frameResp = await fetch(
-          `http://localhost:3030/frames/${frameId}`
+        const frameResp = await localFetch(
+          `/frames/${frameId}`
         );
         if (!frameResp.ok)
           throw new Error(`failed to fetch frame: ${frameResp.status}`);

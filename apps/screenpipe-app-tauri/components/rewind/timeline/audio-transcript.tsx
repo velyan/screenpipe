@@ -23,6 +23,7 @@ import { cn } from "@/lib/utils";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Meeting, deduplicateAudioItems } from "@/lib/hooks/use-meetings";
 import { usePipes } from "@/lib/hooks/use-pipes";
+import { localFetch } from "@/lib/api";
 
 // Extended audio item with timestamp for conversation view
 interface AudioItemWithTimestamp extends AudioData {
@@ -423,7 +424,7 @@ export function AudioTranscript({
 			for (const chunkId of chunks) {
 				const audio = data.items.find((item) => item.audio.audio_chunk_id === chunkId)?.audio;
 				if (!audio) continue;
-				fetch("http://localhost:3030/speakers/reassign", {
+				localFetch("/speakers/reassign", {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
 					body: JSON.stringify({

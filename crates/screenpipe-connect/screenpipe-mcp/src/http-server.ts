@@ -96,109 +96,103 @@ async function fetchAPI(endpoint: string, options: RequestInit = {}): Promise<Re
   });
 }
 
-// Create MCP server
-const server = new Server(
-  {
-    name: "screenpipe-http",
-    version: "0.8.2",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
-);
-
-// List tools handler
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return { tools: TOOLS };
-});
-
-// Call tool handler
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
-
-  if (!args) {
-    throw new Error("Missing arguments");
+// Tool handler for search_content
+async function handleSearchContent(args: Record<string, unknown>) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(args)) {
+    if (value !== null && value !== undefined) {
+      params.append(key, String(value));
+    }
   }
 
-  if (name === "search_content") {
-    const params = new URLSearchParams();
-    for (const [key, value] of Object.entries(args)) {
-      if (value !== null && value !== undefined) {
-        params.append(key, String(value));
-      }
-    }
+  const response = await fetchAPI(`/search?${params.toString()}`);
+  if (!response.ok) {
+    throw new Error(`HTTP error: ${response.status}`);
+  }
 
-    const response = await fetchAPI(`/search?${params.toString()}`);
-    if (!response.ok) {
-      throw new Error(`HTTP error: ${response.status}`);
-    }
+  const data = await response.json();
+  const results = data.data || [];
+  const pagination = data.pagination || {};
 
-    const data = await response.json();
-    const results = data.data || [];
-    const pagination = data.pagination || {};
-
-    if (results.length === 0) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: "No results found. Try: broader search terms, different content_type, or wider time range.",
-          },
-        ],
-      };
-    }
-
-    const formattedResults: string[] = [];
-    for (const result of results) {
-      const content = result.content;
-      if (!content) continue;
-
-      if (result.type === "OCR") {
-        formattedResults.push(
-          `[OCR] ${content.app_name || "?"} | ${content.window_name || "?"}\n` +
-          `${content.timestamp || ""}\n` +
-          `${content.text || ""}`
-        );
-      } else if (result.type === "Audio") {
-        formattedResults.push(
-          `[Audio] ${content.device_name || "?"}\n` +
-          `${content.timestamp || ""}\n` +
-          `${content.transcription || ""}`
-        );
-      } else if (result.type === "UI" || result.type === "Accessibility") {
-        formattedResults.push(
-          `[Accessibility] ${content.app_name || "?"} | ${content.window_name || "?"}\n` +
-          `${content.timestamp || ""}\n` +
-          `${content.text || ""}`
-        );
-      }
-    }
-
-    const header = `Results: ${results.length}/${pagination.total || "?"}` +
-      (pagination.total > results.length ? ` (use offset=${(pagination.offset || 0) + results.length} for more)` : "");
-
+  if (results.length === 0) {
     return {
       content: [
         {
           type: "text",
-          text: header + "\n\n" + formattedResults.join("\n---\n"),
+          text: "No results found. Try: broader search terms, different content_type, or wider time range.",
         },
       ],
     };
   }
 
-  throw new Error(`Unknown tool: ${name}`);
-});
+  const formattedResults: string[] = [];
+  for (const result of results) {
+    const content = result.content;
+    if (!content) continue;
 
-// Create HTTP server with MCP transport
-const transports = new Map<string, StreamableHTTPServerTransport>();
+    if (result.type === "OCR") {
+      formattedResults.push(
+        `[OCR] ${content.app_name || "?"} | ${content.window_name || "?"}\n` +
+        `${content.timestamp || ""}\n` +
+        `${content.text || ""}`
+      );
+    } else if (result.type === "Audio") {
+      formattedResults.push(
+        `[Audio] ${content.device_name || "?"}\n` +
+        `${content.timestamp || ""}\n` +
+        `${content.transcription || ""}`
+      );
+    } else if (result.type === "UI" || result.type === "Accessibility") {
+      formattedResults.push(
+        `[Accessibility] ${content.app_name || "?"} | ${content.window_name || "?"}\n` +
+        `${content.timestamp || ""}\n` +
+        `${content.text || ""}`
+      );
+    }
+  }
+
+  const header = `Results: ${results.length}/${pagination.total || "?"}` +
+    (pagination.total > results.length ? ` (use offset=${(pagination.offset || 0) + results.length} for more)` : "");
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: header + "\n\n" + formattedResults.join("\n---\n"),
+      },
+    ],
+  };
+}
+
+// Create a fresh MCP Server instance with handlers registered.
+// Each HTTP session gets its own Server — the MCP SDK requires a 1:1
+// mapping between Server and transport (reusing a Server across
+// transports throws "Already connected to a transport").
+function createMcpServer(): Server {
+  const s = new Server(
+    { name: "screenpipe-http", version: "0.14.0" },
+    { capabilities: { tools: {} } }
+  );
+
+  s.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+
+  s.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
+    if (!args) throw new Error("Missing arguments");
+    if (name === "search_content") return handleSearchContent(args);
+    throw new Error(`Unknown tool: ${name}`);
+  });
+
+  return s;
+}
+
+// Per-session state: each session gets its own Server + transport pair.
+const sessions = new Map<string, { server: Server; transport: StreamableHTTPServerTransport }>();
 
 const httpServer = createServer(async (req, res) => {
   // CORS headers
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, mcp-session-id");
 
   if (req.method === "OPTIONS") {
@@ -210,7 +204,7 @@ const httpServer = createServer(async (req, res) => {
   // Health check
   if (req.url === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok" }));
+    res.end(JSON.stringify({ status: "ok", sessions: sessions.size }));
     return;
   }
 
@@ -218,21 +212,23 @@ const httpServer = createServer(async (req, res) => {
   if (req.url === "/mcp" || req.url?.startsWith("/mcp?")) {
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
-    let transport = sessionId ? transports.get(sessionId) : undefined;
+    let session = sessionId ? sessions.get(sessionId) : undefined;
 
-    if (!transport) {
-      transport = new StreamableHTTPServerTransport({
+    if (!session) {
+      const server = createMcpServer();
+      const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => crypto.randomUUID(),
       });
 
       await server.connect(transport);
 
       if (transport.sessionId) {
-        transports.set(transport.sessionId, transport);
+        sessions.set(transport.sessionId, { server, transport });
       }
+      session = { server, transport };
     }
 
-    await transport.handleRequest(req, res);
+    await session.transport.handleRequest(req, res);
     return;
   }
 

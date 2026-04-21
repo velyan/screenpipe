@@ -4,6 +4,7 @@
 
 pub mod activity_summary;
 pub mod audio;
+pub mod browser;
 pub mod content;
 pub mod data;
 pub mod elements;
@@ -19,6 +20,7 @@ pub mod speakers;
 pub mod streaming;
 pub mod time;
 pub mod timezone;
+pub mod transcribe;
 pub mod vault;
 pub mod vision_compat;
 pub mod websocket;

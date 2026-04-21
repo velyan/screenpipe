@@ -23,19 +23,23 @@
         "groups": [
           {
             "group": "get started",
-            "pages": ["home", "getting-started", "architecture"]
+            "pages": ["home", "quickstart", "getting-started", "use-cases", "architecture"]
+          },
+          {
+            "group": "pipes",
+            "pages": ["pipe-store", "pipes", "pipe-permissions"]
+          },
+          {
+            "group": "connect",
+            "pages": ["mcp-server", "mcp-apps", "connections", "cloud-sync", "cloud-archive", "teams"]
           },
           {
             "group": "use cases",
             "pages": ["search-screen-history", "meeting-transcription", "ai-memory", "for-developers"]
           },
           {
-            "group": "guides",
-            "pages": ["pipes", "mcp-server", "mcp-apps", "cloud-sync", "cloud-archive", "teams"]
-          },
-          {
             "group": "integrations",
-            "pages": ["chatgpt", "apple-intelligence", "ollama", "claude-code", "opencode", "openclaw", "cline", "continue", "gemini-cli", "obsidian"]
+            "pages": ["chatgpt", "apple-intelligence", "ollama", "claude-code", "opencode", "openclaw", "cline", "continue", "gemini-cli", "obsidian", "msty"]
           },
           {
             "group": "reference",
@@ -44,11 +48,11 @@
 
           {
             "group": "compare",
-            "pages": ["vs-rewind", "vs-recall", "vs-limitless"]
+            "pages": ["vs-pieces", "vs-littlebird", "vs-omi", "vs-granola", "vs-rewind", "vs-recall", "vs-limitless", "vs-otter", "vs-fathom", "vs-fireflies"]
           },
           {
             "group": "resources",
-            "pages": ["faq", "contributing"]
+            "pages": ["troubleshooting", "faq", "contributing"]
           }
         ]
       },
@@ -90,7 +94,7 @@
   "footer": {
     "socials": {
       "github": "https://github.com/screenpipe/screenpipe",
-      "x": "https://x.com/screen_pipe",
+      "x": "https://x.com/screenpipe",
       "discord": "https://discord.gg/screenpipe"
     }
   },
@@ -100,7 +104,7 @@
   "metadata": {
     "og:site_name": "screenpipe docs",
     "og:image": "https://screenpi.pe/og-image.png",
-    "twitter:site": "@screen_pipe"
+    "twitter:site": "@screenpipe"
   },
   "integrations": {
     "posthog": {

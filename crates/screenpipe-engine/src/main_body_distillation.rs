@@ -1149,6 +1149,7 @@ mod tests {
                     width: 0.70,
                     height: 0.03,
                 }),
+                ..Default::default()
             },
             AccessibilityTreeNode {
                 role: "AXButton".to_string(),
@@ -1160,6 +1161,7 @@ mod tests {
                     width: 0.10,
                     height: 0.03,
                 }),
+                ..Default::default()
             },
             AccessibilityTreeNode {
                 role: "AXTextField".to_string(),
@@ -1171,6 +1173,7 @@ mod tests {
                     width: 0.50,
                     height: 0.03,
                 }),
+                ..Default::default()
             },
         ];
 
@@ -1205,6 +1208,7 @@ mod tests {
                     width: 0.45,
                     height: 0.03,
                 }),
+                ..Default::default()
             },
             AccessibilityTreeNode {
                 role: "AXStaticText".to_string(),
@@ -1216,6 +1220,7 @@ mod tests {
                     width: 0.22,
                     height: 0.03,
                 }),
+                ..Default::default()
             },
             AccessibilityTreeNode {
                 role: "AXStaticText".to_string(),
@@ -1227,6 +1232,7 @@ mod tests {
                     width: 0.24,
                     height: 0.03,
                 }),
+                ..Default::default()
             },
         ];
 
@@ -1278,6 +1284,7 @@ mod tests {
                     width: 0.30,
                     height: 0.03,
                 }),
+                ..Default::default()
             },
             AccessibilityTreeNode {
                 role: "AXStaticText".to_string(),
@@ -1289,6 +1296,7 @@ mod tests {
                     width: 0.30,
                     height: 0.03,
                 }),
+                ..Default::default()
             },
         ];
 
@@ -1325,12 +1333,14 @@ mod tests {
                     width: 0.36,
                     height: 0.03,
                 }),
+                ..Default::default()
             },
             AccessibilityTreeNode {
                 role: "AXStaticText".to_string(),
                 text: "Background hidden thread line".to_string(),
                 depth: 1,
                 bounds: None,
+                ..Default::default()
             },
         ];
 
@@ -1389,12 +1399,14 @@ mod tests {
                     width: 0.11,
                     height: 0.03,
                 }),
+                ..Default::default()
             },
             AccessibilityTreeNode {
                 role: "AXStaticText".to_string(),
                 text: "Contact A, Yeah let’s try maybe next Saturday, 12:49 pm".to_string(),
                 depth: 1,
                 bounds: None,
+                ..Default::default()
             },
         ];
 

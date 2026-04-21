@@ -1,23 +1,297 @@
 use super::get_base_dir;
+use super::secrets;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use specta::Type;
-use std::sync::Arc;
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::AppHandle;
 use tauri_plugin_store::StoreBuilder;
 use tracing::error;
+
+/// Process-lifetime cache for the resolved API auth key.
+///
+/// `to_recording_config` is a sync function called many times per second
+/// (frontend polls `local_api_context_from_app`). Resolving the key —
+/// which requires async I/O against `db.sqlite` — happens once in
+/// `recording::spawn_screenpipe` via `screenpipe_engine::auth_key::resolve_api_auth_key`,
+/// and the result is seeded here so every subsequent sync read is cheap and
+/// every caller agrees on the same value.
+static RESOLVED_API_AUTH_KEY: OnceLock<String> = OnceLock::new();
+
+/// Seed the resolved API auth key. No-op after the first call.
+pub fn seed_api_auth_key(key: String) {
+    let _ = RESOLVED_API_AUTH_KEY.set(key);
+}
+
+/// Read the resolved API auth key if it has been seeded.
+pub fn resolved_api_auth_key() -> Option<String> {
+    RESOLVED_API_AUTH_KEY.get().cloned()
+}
+
+/// Magic header for encrypted store.bin files.
+const STORE_MAGIC: &[u8; 8] = b"SPSTORE1";
+
+/// Decrypt store.bin in place if it's encrypted and keychain key is available.
+/// No-op if the file is already plain JSON or keychain is unavailable.
+fn decrypt_store_file(path: &Path) {
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    if data.len() < 8 || &data[..8] != STORE_MAGIC {
+        return; // already plain JSON (or empty)
+    }
+    let key = match secrets::get_key() {
+        secrets::KeyResult::Found(k) => k,
+        secrets::KeyResult::AccessDenied => {
+            tracing::warn!(
+                "store.bin is encrypted but keychain access was denied — \
+                 please grant keychain access and restart. \
+                 Your settings are preserved in the encrypted file."
+            );
+            // Don't overwrite — the file is still valid, user just needs to grant access
+            return;
+        }
+        secrets::KeyResult::NotFound | secrets::KeyResult::Unavailable => {
+            tracing::warn!(
+                "store.bin is encrypted but keychain key not found — \
+                 saving backup as store.bin.encrypted.bak and resetting to defaults"
+            );
+            let backup = path.with_extension("bin.encrypted.bak");
+            let _ = std::fs::copy(path, &backup);
+            let _ = std::fs::write(path, b"{}");
+            return;
+        }
+    };
+    match screenpipe_vault::crypto::decrypt_small(&data[8..], &key) {
+        Ok(plaintext) => {
+            let tmp = path.with_extension("bin.dec.tmp");
+            if std::fs::write(&tmp, &plaintext).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                "failed to decrypt store.bin: {} — saving backup as store.bin.encrypted.bak",
+                e
+            );
+            let backup = path.with_extension("bin.encrypted.bak");
+            let _ = std::fs::copy(path, &backup);
+            let _ = std::fs::write(path, b"{}");
+        }
+    }
+}
+
+/// Encrypt store.bin in place if keychain key is available AND encryption is opted-in.
+///
+/// DISABLED BY DEFAULT — the macOS keychain doesn't reliably persist keys across
+/// app updates (code signing identity changes), causing settings loss on every update.
+/// The 0o600 file permissions are sufficient protection for now.
+///
+/// To opt in: create ~/.screenpipe/.encrypt-store or set SCREENPIPE_ENCRYPT_STORE=1.
+fn encrypt_store_file(path: &Path) {
+    // Check opt-in flag
+    let opted_in = std::env::var("SCREENPIPE_ENCRYPT_STORE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+        || path
+            .parent()
+            .map(|p| p.join(".encrypt-store").exists())
+            .unwrap_or(false);
+    if !opted_in {
+        return;
+    }
+
+    let data = match std::fs::read(path) {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    if data.len() >= 8 && &data[..8] == STORE_MAGIC {
+        return; // already encrypted
+    }
+    let key = match secrets::get_or_create_key() {
+        Some(k) => k,
+        None => {
+            // Keychain access denied or unavailable — disable encryption
+            // and remove the opt-in flag so user isn't stuck in a broken state
+            if let Some(parent) = path.parent() {
+                let flag = parent.join(".encrypt-store");
+                if flag.exists() {
+                    let _ = std::fs::remove_file(&flag);
+                    tracing::warn!(
+                        "store encryption disabled — keychain access denied. \
+                         re-enable in Settings > Privacy after granting keychain access."
+                    );
+                }
+            }
+            return;
+        }
+    };
+    match screenpipe_vault::crypto::encrypt_small(&data, &key) {
+        Ok(ciphertext) => {
+            let mut out = Vec::with_capacity(8 + ciphertext.len());
+            out.extend_from_slice(STORE_MAGIC);
+            out.extend(ciphertext);
+            let tmp = path.with_extension("bin.enc.tmp");
+            if std::fs::write(&tmp, &out).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+        Err(e) => {
+            tracing::error!("failed to encrypt store.bin: {}", e);
+        }
+    }
+}
+
+/// Re-encrypt store.bin on disk. Called after the Tauri store plugin writes plain JSON.
+/// Also syncs the .encrypt-store flag file from the encryptStore setting.
+pub fn reencrypt_store_file(app: &AppHandle) {
+    if let Ok(base_dir) = get_base_dir(app, None) {
+        // Sync the flag file from the store's encryptStore setting
+        let flag_path = base_dir.join(".encrypt-store");
+        let store_path = base_dir.join("store.bin");
+
+        // Read the setting from the store JSON on disk
+        let encrypt_enabled = std::fs::read(&store_path)
+            .ok()
+            .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
+            .and_then(|json| {
+                json.get("settings")
+                    .and_then(|s| s.get("encryptStore"))
+                    .and_then(|v| v.as_bool())
+            })
+            .unwrap_or(false);
+
+        if encrypt_enabled && !flag_path.exists() {
+            let _ = std::fs::write(&flag_path, b"");
+        } else if !encrypt_enabled && flag_path.exists() {
+            let _ = std::fs::remove_file(&flag_path);
+        }
+
+        encrypt_store_file(&store_path);
+    }
+}
+
+/// Tauri command: re-encrypt store.bin after frontend saves.
+#[tauri::command]
+#[specta::specta]
+pub fn reencrypt_store(app: AppHandle) -> Result<(), String> {
+    reencrypt_store_file(&app);
+    Ok(())
+}
+
+/// Cached store instance — reusable across the process lifetime.
+/// Uses Mutex instead of OnceLock so the cache can be invalidated when the
+/// Tauri resource table drops the underlying store (e.g. after an in-place
+/// update restart on Windows where resource IDs become stale).
+static STORE_CACHE: Mutex<Option<Arc<tauri_plugin_store::Store<tauri::Wry>>>> = Mutex::new(None);
+
+/// Build (or rebuild) the store, retrying on TOCTOU races and stale resource IDs.
+fn build_store(app: &AppHandle) -> anyhow::Result<Arc<tauri_plugin_store::Store<tauri::Wry>>> {
+    let base_dir = get_base_dir(app, None)?;
+    let store_path = base_dir.join("store.bin");
+
+    // Decrypt store.bin before the plugin reads it (no-op if plain JSON or keychain unavailable)
+    if store_path.exists() {
+        decrypt_store_file(&store_path);
+    }
+
+    let mut last_err = None;
+    // Ensure store.bin has restrictive permissions (contains API keys)
+    #[cfg(unix)]
+    if store_path.exists() {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&store_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    for attempt in 0..3u32 {
+        match StoreBuilder::new(app, store_path.clone()).build() {
+            Ok(s) => {
+                // Re-encrypt immediately after the plugin loaded the file
+                encrypt_store_file(&store_path);
+                return Ok(s);
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("os error 17") || msg.contains("File exists") {
+                    tracing::warn!(
+                        "store build race (attempt {}): {}, retrying",
+                        attempt + 1,
+                        msg
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        100 * (attempt as u64 + 1),
+                    ));
+                    last_err = Some(e);
+                    continue;
+                }
+                // After cleanup_before_exit or in-place update on Windows, the
+                // resources_table is cleared but StoreState.stores still holds the
+                // old resource ID. Force a fresh store via create_new to evict it.
+                if msg.contains("resource id") && msg.contains("invalid") {
+                    tracing::warn!(
+                        "store resource stale (attempt {}): {}, rebuilding fresh",
+                        attempt + 1,
+                        msg
+                    );
+                    match StoreBuilder::new(app, store_path.clone())
+                        .create_new()
+                        .build()
+                    {
+                        Ok(s) => {
+                            encrypt_store_file(&store_path);
+                            return Ok(s);
+                        }
+                        Err(e2) => {
+                            tracing::warn!("fresh store build also failed: {}", e2);
+                            last_err = Some(e);
+                            continue;
+                        }
+                    }
+                }
+                return Err(anyhow::anyhow!(e));
+            }
+        }
+    }
+    Err(anyhow::anyhow!(last_err.unwrap()))
+}
 
 pub fn get_store(
     app: &AppHandle,
     _profile_name: Option<String>, // Keep parameter for API compatibility but ignore it
 ) -> anyhow::Result<Arc<tauri_plugin_store::Store<tauri::Wry>>> {
-    let base_dir = get_base_dir(app, None)?;
-    let store_path = base_dir.join("store.bin");
+    {
+        let guard = STORE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref cached) = *guard {
+            return Ok(cached.clone());
+        }
+    }
 
-    // Build and return the store wrapped in Arc
-    StoreBuilder::new(app, store_path)
-        .build()
-        .map_err(|e| anyhow::anyhow!(e))
+    let in_tokio = tokio::runtime::Handle::try_current().is_ok();
+    let store = if in_tokio {
+        tokio::task::block_in_place(|| build_store(app))?
+    } else {
+        build_store(app)?
+    };
+
+    let mut guard = STORE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(ref cached) = *guard {
+        return Ok(cached.clone());
+    }
+    *guard = Some(store.clone());
+    Ok(store)
+}
+
+/// Invalidate the cached store so the next `get_store` call rebuilds it.
+/// Called when a "resource id … is invalid" error is detected.
+pub fn invalidate_store_cache() {
+    if let Ok(mut guard) = STORE_CACHE.lock() {
+        if guard.is_some() {
+            tracing::warn!("store cache invalidated — will rebuild on next access");
+            *guard = None;
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Type, Clone)]
@@ -75,6 +349,7 @@ impl OnboardingStore {
         update(&mut onboarding);
         store.set("onboarding", json!(onboarding));
         store.save().map_err(|e| e.to_string())?;
+        reencrypt_store_file(app);
         Ok(())
     }
 
@@ -84,7 +359,9 @@ impl OnboardingStore {
         };
 
         store.set("onboarding", json!(self));
-        store.save().map_err(|e| e.to_string())
+        store.save().map_err(|e| e.to_string())?;
+        reencrypt_store_file(app);
+        Ok(())
     }
 
     pub fn complete(&mut self) {
@@ -99,76 +376,52 @@ impl OnboardingStore {
     }
 }
 
+fn deserialize_null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
 #[derive(Serialize, Deserialize, Type, Clone)]
 #[serde(default)]
 pub struct SettingsStore {
-    #[serde(rename = "aiPresets")]
+    // ── Recording settings (shared source of truth) ──────────────────────
+    /// All recording/capture config lives here. Flattened so the JSON shape
+    /// is unchanged — `disableAudio`, `port`, `fps`, etc. stay at the top level.
+    #[serde(flatten)]
+    pub recording: screenpipe_config::RecordingSettings,
+
+    // ── App-only fields (UI, shortcuts, metadata) ────────────────────────
+    #[serde(rename = "aiPresets", deserialize_with = "deserialize_null_as_default")]
     pub ai_presets: Vec<AIPreset>,
 
-    #[serde(rename = "deepgramApiKey")]
-    pub deepgram_api_key: String,
     #[serde(rename = "isLoading")]
     pub is_loading: bool,
 
-    #[serde(rename = "userId")]
-    pub user_id: String,
-
-    /// Persistent analytics ID used for PostHog tracking (both frontend and backend)
-    #[serde(rename = "analyticsId")]
-    pub analytics_id: String,
-
     #[serde(rename = "devMode")]
     pub dev_mode: bool,
-    #[serde(rename = "audioTranscriptionEngine")]
-    pub audio_transcription_engine: String,
     #[serde(rename = "ocrEngine")]
     pub ocr_engine: String,
-    #[serde(rename = "monitorIds")]
-    pub monitor_ids: Vec<String>,
-    #[serde(rename = "audioDevices")]
-    pub audio_devices: Vec<String>,
-    /// When true, automatically follow system default audio devices
-    #[serde(rename = "useSystemDefaultAudio", default = "default_true")]
-    pub use_system_default_audio: bool,
-    #[serde(rename = "usePiiRemoval")]
-    pub use_pii_removal: bool,
-    /// Filter music-dominant audio before transcription using spectral analysis
-    #[serde(rename = "filterMusic", default)]
-    pub filter_music: bool,
-    #[serde(rename = "port")]
-    pub port: u16,
     #[serde(rename = "dataDir")]
     pub data_dir: String,
-    #[serde(rename = "disableAudio")]
-    pub disable_audio: bool,
-    #[serde(rename = "ignoredWindows")]
-    pub ignored_windows: Vec<String>,
-    #[serde(rename = "includedWindows")]
-    pub included_windows: Vec<String>,
-    #[serde(rename = "ignoredUrls", default)]
-    pub ignored_urls: Vec<String>,
-
-    #[serde(rename = "fps")]
-    pub fps: f32,
-    #[serde(rename = "vadSensitivity")]
-    pub vad_sensitivity: String,
-    #[serde(rename = "analyticsEnabled")]
-    pub analytics_enabled: bool,
-    #[serde(rename = "audioChunkDuration")]
-    pub audio_chunk_duration: i32,
-    #[serde(rename = "useChineseMirror")]
-    pub use_chinese_mirror: bool,
-    #[serde(rename = "languages")]
-    pub languages: Vec<String>,
-    #[serde(rename = "embeddedLLM")]
+    #[serde(
+        rename = "embeddedLLM",
+        deserialize_with = "deserialize_null_as_default"
+    )]
     pub embedded_llm: EmbeddedLLM,
     #[serde(rename = "autoStartEnabled")]
     pub auto_start_enabled: bool,
     #[serde(rename = "platform")]
     pub platform: String,
-    #[serde(rename = "disabledShortcuts")]
+    #[serde(
+        rename = "disabledShortcuts",
+        deserialize_with = "deserialize_null_as_default"
+    )]
     pub disabled_shortcuts: Vec<String>,
-    #[serde(rename = "user")]
+    #[serde(rename = "user", deserialize_with = "deserialize_null_as_default")]
     pub user: User,
     #[serde(rename = "showScreenpipeShortcut")]
     pub show_screenpipe_shortcut: String,
@@ -186,39 +439,29 @@ pub struct SettingsStore {
     pub search_shortcut: String,
     #[serde(rename = "lockVaultShortcut", default)]
     pub lock_vault_shortcut: String,
-    #[serde(rename = "realtimeAudioTranscriptionEngine")]
-    pub realtime_audio_transcription_engine: String,
-    #[serde(rename = "disableVision")]
-    pub disable_vision: bool,
     /// When true, screen capture continues but OCR text extraction is skipped.
     /// Reduces CPU usage significantly while still recording video.
     #[serde(rename = "disableOcr", default)]
     pub disable_ocr: bool,
-    #[serde(rename = "useAllMonitors")]
-    pub use_all_monitors: bool,
-    #[serde(rename = "adaptiveFps", default)]
-    pub adaptive_fps: bool,
     #[serde(rename = "showShortcutOverlay", default = "default_true")]
     pub show_shortcut_overlay: bool,
+    /// Overlay size: "small" (default), "medium" (1.5x), "large" (2x)
+    #[serde(rename = "shortcutOverlaySize", default = "default_overlay_size")]
+    pub shortcut_overlay_size: String,
     /// Unique device ID for AI usage tracking (generated on first launch)
     #[serde(rename = "deviceId", default = "generate_device_id")]
     pub device_id: String,
-    /// Enable input event capture (keyboard, mouse, clipboard).
-    /// Requires input monitoring permission on macOS.
-    #[serde(rename = "enableInputCapture", default)]
-    pub enable_input_capture: bool,
-    /// Enable accessibility text capture (AX tree walker).
-    /// Requires accessibility permission on macOS.
-    #[serde(
-        rename = "enableAccessibility",
-        alias = "enableUiEvents",
-        default = "default_true"
-    )]
-    pub enable_accessibility: bool,
     /// Auto-install updates and restart when a new version is available.
     /// When disabled, users must click "update now" in the tray menu.
     #[serde(rename = "autoUpdate", default = "default_true")]
     pub auto_update: bool,
+    /// Auto-update store-installed pipes that haven't been locally modified.
+    #[serde(rename = "autoUpdatePipes", default = "default_true")]
+    pub auto_update_pipes: bool,
+    /// Use screenpipe cloud for AI-powered features like suggestions.
+    /// Better quality but sends activity context to the cloud (zero data retention).
+    #[serde(rename = "enhancedAI", default)]
+    pub enhanced_ai: bool,
     /// Timeline overlay mode: "fullscreen" (floating panel above everything) or
     /// "window" (normal resizable window with title bar).
     #[serde(rename = "overlayMode", default = "default_overlay_mode")]
@@ -227,31 +470,29 @@ pub struct SettingsStore {
     /// Disabled by default so the overlay doesn't appear in screenpipe's own recordings.
     #[serde(rename = "showOverlayInScreenRecording", default)]
     pub show_overlay_in_screen_recording: bool,
-    /// Video quality preset controlling storage vs quality tradeoff.
-    /// Affects H.265 CRF during recording and JPEG quality during frame extraction.
-    /// Values: "low", "balanced", "high", "max". Default: "balanced".
-    #[serde(rename = "videoQuality", default = "default_video_quality")]
-    pub video_quality: String,
 
     /// When true, the chat window stays above all other windows (default: true).
     #[serde(rename = "chatAlwaysOnTop", default = "default_true")]
     pub chat_always_on_top: bool,
 
-    /// Automatically detect and skip incognito / private browsing windows.
-    /// Uses localized title matching (20+ languages) and on macOS, native
-    /// AppleScript detection for Chromium browsers.
-    #[serde(rename = "ignoreIncognitoWindows", default = "default_true")]
-    pub ignore_incognito_windows: bool,
+    /// Show restart notifications when audio/vision capture stalls.
+    /// Disabled by default for now until the stall detector is more reliable.
+    #[serde(rename = "showRestartNotifications", default)]
+    pub show_restart_notifications: bool,
 
-    /// Catch-all for fields added by the frontend (e.g. chatHistory, deviceId)
+    /// When true, apply macOS vibrancy effect to the sidebar for a translucent look.
+    #[serde(rename = "translucentSidebar", default)]
+    pub translucent_sidebar: bool,
+
+    /// UI theme: "light", "dark", or "system".
+    #[serde(rename = "uiTheme", default = "default_ui_theme")]
+    pub ui_theme: String,
+
+    /// Catch-all for fields added by the frontend (e.g. chatHistory)
     /// that the Rust struct doesn't know about. Without this, `save()` would
     /// serialize only known fields and silently wipe frontend-only data.
     #[serde(flatten)]
     pub extra: std::collections::HashMap<String, serde_json::Value>,
-}
-
-fn default_video_quality() -> String {
-    "balanced".to_string()
 }
 
 fn generate_device_id() -> String {
@@ -260,6 +501,14 @@ fn generate_device_id() -> String {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_overlay_size() -> String {
+    "small".to_string()
+}
+
+fn default_ui_theme() -> String {
+    "system".to_string()
 }
 
 fn default_overlay_mode() -> String {
@@ -284,7 +533,7 @@ pub enum AIProviderType {
     NativeOllama,
     #[serde(rename = "custom")]
     Custom,
-    #[serde(rename = "screenpipe-cloud")]
+    #[serde(rename = "screenpipe-cloud", alias = "claude-code")]
     ScreenpipeCloud,
     #[serde(rename = "pi", alias = "opencode")]
     Pi,
@@ -323,7 +572,7 @@ impl Default for AIPreset {
             prompt: String::new(),
             provider: AIProviderType::ScreenpipeCloud,
             url: "https://api.screenpi.pe/v1".to_string(),
-            model: "claude-haiku-4-5".to_string(),
+            model: "qwen/qwen3.5-flash-02-23".to_string(),
             default_preset: false,
             api_key: None,
             max_context_chars: 512000,
@@ -419,14 +668,11 @@ impl Default for SettingsStore {
             "Settings".to_string(),
             "Keepass".to_string(),
             "Recorder".to_string(),
-            "Vaults".to_string(),
+            "vault".to_string(),
             "OBS Studio".to_string(),
             "screenpipe".to_string(),
         ];
 
-        // Add platform-specific ignored windows
-        // Note: In a real implementation, you'd detect the actual platform
-        // For now, we'll include common ones or you can detect platform here
         #[cfg(target_os = "macos")]
         ignored_windows.extend([
             ".env".to_string(),
@@ -462,18 +708,17 @@ impl Default for SettingsStore {
             "Parted".to_string(),
         ]);
 
-        // Default free AI preset - works without login
+        // Default AI preset - works without login
         let default_free_preset = AIPreset {
-            id: "screenpipe-free".to_string(),
-            prompt: r#"Rules:
-- You can analyze/view/show/access videos to the user by putting .mp4 files in a code block (we'll render it) like this: `/users/video.mp4`, use the exact, absolute, file path from file_path property
-- Do not try to embed video in links (e.g. [](.mp4) or https://.mp4) instead put the file_path in a code block using backticks
-- Do not put video in multiline code block it will not render the video (e.g. ```bash\n.mp4```) instead using inline code block with single backtick
+            id: "screenpipe-cloud".to_string(),
+            prompt: r#"IMPORTANT: At the start of every conversation, read the files in .pi/skills/ directory (e.g. .pi/skills/screenpipe-api/SKILL.md and .pi/skills/screenpipe-cli/SKILL.md) before responding.
+Rules:
+- Media: use standard markdown ![description](/path/to/file.mp4) for videos and ![description](/path/to/image.jpg) for images
 - Always answer my question/intent, do not make up things
 "#.to_string(),
             provider: AIProviderType::ScreenpipeCloud,
             url: "https://api.screenpi.pe/v1".to_string(),
-            model: "claude-haiku-4-5".to_string(),
+            model: "auto".to_string(),
             default_preset: true,
             api_key: None,
             max_context_chars: 128000,
@@ -481,60 +726,32 @@ impl Default for SettingsStore {
         };
 
         Self {
+            // App-specific defaults override RecordingSettings::default() where needed
+            recording: screenpipe_config::RecordingSettings {
+                audio_transcription_engine: "whisper-large-v3-turbo-quantized".to_string(),
+                monitor_ids: vec!["default".to_string()],
+                audio_devices: vec!["default".to_string()],
+                use_pii_removal: true,
+                vad_sensitivity: "medium".to_string(),
+                analytics_id: uuid::Uuid::new_v4().to_string(),
+                ignored_windows,
+                ..screenpipe_config::RecordingSettings::default()
+            },
             ai_presets: vec![default_free_preset],
-            deepgram_api_key: "".to_string(),
             is_loading: false,
-            user_id: "".to_string(),
-            analytics_id: uuid::Uuid::new_v4().to_string(),
-
             dev_mode: false,
-            audio_transcription_engine: "whisper-large-v3-turbo-quantized".to_string(),
             #[cfg(target_os = "macos")]
             ocr_engine: "apple-native".to_string(),
             #[cfg(target_os = "windows")]
             ocr_engine: "windows-native".to_string(),
             #[cfg(target_os = "linux")]
             ocr_engine: "tesseract".to_string(),
-            monitor_ids: vec!["default".to_string()],
-            audio_devices: vec!["default".to_string()],
-            use_system_default_audio: true,
-            use_pii_removal: true,
-            filter_music: false,
-            port: 3030,
             data_dir: "default".to_string(),
-            disable_audio: false,
-            ignored_windows,
-            included_windows: vec![],
-            ignored_urls: vec![],
-
-            fps: 0.5,
-            vad_sensitivity: "medium".to_string(),
-            analytics_enabled: true,
-            audio_chunk_duration: 30,
-            use_chinese_mirror: false,
-            languages: vec![],
             embedded_llm: EmbeddedLLM::default(),
             auto_start_enabled: true,
             platform: "unknown".to_string(),
             disabled_shortcuts: vec![],
-            user: User {
-                id: None,
-                name: None,
-                email: None,
-                image: None,
-                token: None,
-                clerk_id: None,
-                api_key: None,
-                credits: None,
-                stripe_connected: None,
-                stripe_account_status: None,
-                github_username: None,
-                bio: None,
-                website: None,
-                contact: None,
-                cloud_subscribed: None,
-                credits_balance: None,
-            },
+            user: User::default(),
             #[cfg(target_os = "windows")]
             show_screenpipe_shortcut: "Alt+S".to_string(),
             #[cfg(not(target_os = "windows"))]
@@ -567,24 +784,25 @@ impl Default for SettingsStore {
             lock_vault_shortcut: "Ctrl+Shift+L".to_string(),
             #[cfg(not(target_os = "windows"))]
             lock_vault_shortcut: "Super+Shift+L".to_string(),
-            realtime_audio_transcription_engine: "deepgram".to_string(),
-            disable_vision: false,
             disable_ocr: false,
-            use_all_monitors: true, // Match CLI default - dynamic monitor detection
             show_shortcut_overlay: true,
+            shortcut_overlay_size: "small".to_string(),
             device_id: uuid::Uuid::new_v4().to_string(),
-            adaptive_fps: false,
-            enable_input_capture: true,
-            enable_accessibility: true,
             auto_update: true,
+            auto_update_pipes: true,
+            enhanced_ai: false,
             #[cfg(target_os = "macos")]
             overlay_mode: "fullscreen".to_string(),
             #[cfg(not(target_os = "macos"))]
             overlay_mode: "window".to_string(),
             show_overlay_in_screen_recording: false,
-            video_quality: "balanced".to_string(),
             chat_always_on_top: true,
-            ignore_incognito_windows: true,
+            show_restart_notifications: false,
+            #[cfg(target_os = "macos")]
+            translucent_sidebar: true,
+            #[cfg(not(target_os = "macos"))]
+            translucent_sidebar: false,
+            ui_theme: "system".to_string(),
             extra: std::collections::HashMap::new(),
         }
     }
@@ -602,6 +820,18 @@ impl SettingsStore {
                 obj.remove("enableUiEvents");
             } else if let Some(v) = obj.remove("enableUiEvents") {
                 obj.insert("enableAccessibility".to_string(), v);
+            }
+
+            // Temporary one-time migration: disable restart notifications for all
+            // existing users until the stall detector is more reliable. Users can
+            // still opt back in manually from Settings; once they've seen this
+            // version, we stop overriding their choice.
+            if !obj.contains_key("restartNotificationsDefaultedOff") {
+                obj.insert("showRestartNotifications".to_string(), Value::Bool(false));
+                obj.insert(
+                    "restartNotificationsDefaultedOff".to_string(),
+                    Value::Bool(true),
+                );
             }
 
             // Sanitize unknown provider types in aiPresets to prevent deserialization failures
@@ -624,10 +854,12 @@ impl SettingsStore {
                                     "unknown AI provider '{}' in preset, falling back to 'custom'",
                                     provider
                                 );
-                                preset.as_object_mut().unwrap().insert(
-                                    "provider".to_string(),
-                                    Value::String("custom".to_string()),
-                                );
+                                if let Some(obj) = preset.as_object_mut() {
+                                    obj.insert(
+                                        "provider".to_string(),
+                                        Value::String("custom".to_string()),
+                                    );
+                                }
                             }
                         }
                     }
@@ -644,7 +876,13 @@ impl SettingsStore {
             true => Ok(None),
             false => {
                 let raw = store.get("settings").unwrap_or(Value::Null);
-                let sanitized = Self::sanitize_legacy_fields(raw);
+                let sanitized = Self::sanitize_legacy_fields(raw.clone());
+                // Persist sanitized fields back to store so the migration only warns once
+                if sanitized != raw {
+                    store.set("settings", sanitized.clone());
+                    let _ = store.save();
+                    reencrypt_store_file(app);
+                }
                 let settings = serde_json::from_value(sanitized);
                 match settings {
                     Ok(settings) => Ok(settings),
@@ -657,117 +895,87 @@ impl SettingsStore {
         }
     }
 
+    /// Build a `RecordingSettings` from this settings store.
+    ///
+    /// Since RecordingSettings is now embedded via flatten, this is mostly a
+    /// clone with overrides for fields that need special handling (e.g. user_id
+    /// comes from the User auth object, user_name has a fallback chain).
+    pub fn to_recording_settings(&self) -> screenpipe_config::RecordingSettings {
+        let mut settings = self.recording.clone();
+        // Override user_id with the Clerk JWT token from the auth user object.
+        // This token is used as the Bearer credential for screenpipe cloud
+        // (transcription proxy, Pi agent, etc.), not as a database ID.
+        // Fallback to user.id if token is unavailable.
+        settings.user_id = self
+            .user
+            .token
+            .as_ref()
+            .filter(|t| !t.is_empty())
+            .or(self.user.id.as_ref().filter(|id| !id.is_empty()))
+            .cloned()
+            .unwrap_or_default();
+        // Fallback chain: userName setting → cloud name → cloud email
+        settings.user_name = settings
+            .user_name
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| self.user.name.clone().filter(|s| !s.trim().is_empty()))
+            .or_else(|| self.user.email.clone().filter(|s| !s.trim().is_empty()));
+        // Legacy fields — always true, no-op but kept for serde compat
+        #[allow(deprecated)]
+        {
+            settings.enable_input_capture = true;
+            settings.enable_accessibility = true;
+        }
+        settings
+    }
+
     /// Build a unified `RecordingConfig` from this settings store.
     pub fn to_recording_config(
         &self,
         data_dir: std::path::PathBuf,
     ) -> screenpipe_engine::RecordingConfig {
-        use screenpipe_audio::audio_manager::builder::TranscriptionMode;
-        use screenpipe_audio::core::engine::AudioTranscriptionEngine;
-        let audio_engine_str = self.resolve_audio_engine();
-
-        screenpipe_engine::RecordingConfig {
-            audio_chunk_duration: self.audio_chunk_duration as u64,
-            port: self.port,
+        let resolved_engine = self.resolve_audio_engine();
+        let settings = self.to_recording_settings();
+        let mut config = screenpipe_engine::RecordingConfig::from_settings(
+            &settings,
             data_dir,
-            disable_audio: self.disable_audio,
-            disable_vision: self.disable_vision,
-            use_pii_removal: self.use_pii_removal,
-            filter_music: self.filter_music,
-            enable_main_body_distillation: false,
-            main_body_distillation_threshold: 0.60,
-            enable_input_capture: true, // always enabled, setting removed from UI
-            enable_accessibility: true, // always enabled, setting removed from UI
-            audio_transcription_engine: audio_engine_str
-                .parse()
-                .unwrap_or(AudioTranscriptionEngine::WhisperLargeV3Turbo),
-            transcription_mode: match self.extra.get("transcriptionMode").and_then(|v| v.as_str()) {
-                Some("smart") | Some("batch") => TranscriptionMode::Batch,
-                _ => TranscriptionMode::Realtime,
-            },
-            audio_devices: self.audio_devices.clone(),
-            use_system_default_audio: self.use_system_default_audio,
-            monitor_ids: self.monitor_ids.clone(),
-            use_all_monitors: self.use_all_monitors,
-            ignored_windows: self.ignored_windows.clone(),
-            included_windows: self.included_windows.clone(),
-            blocked_apps: screenpipe_a11y::tree::default_blocked_apps(),
-            blocked_title_keywords: screenpipe_a11y::tree::default_blocked_title_keywords(),
-            ignored_urls: self.ignored_urls.clone(),
-            ignore_incognito_windows: self.ignore_incognito_windows,
-            languages: self
-                .languages
-                .iter()
-                .filter(|s| s != &"default")
-                .filter_map(|s| s.parse().ok())
-                .collect(),
-            user_identities: vec![],
-            deepgram_api_key: if self.deepgram_api_key.is_empty()
-                || self.deepgram_api_key == "default"
-            {
-                None
-            } else {
-                Some(self.deepgram_api_key.clone())
-            },
-            user_id: self.user.id.as_ref().filter(|id| !id.is_empty()).cloned(),
-            // OpenAI Compatible transcription
-            openai_compatible_endpoint: self
-                .extra
-                .get("openaiCompatibleEndpoint")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            openai_compatible_api_key: self
-                .extra
-                .get("openaiCompatibleApiKey")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            openai_compatible_model: self
-                .extra
-                .get("openaiCompatibleModel")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
-            // Fallback chain for speaker identification: userName setting → cloud name → cloud email
-            user_name: self
-                .extra
-                .get("userName")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| self.user.name.clone().filter(|s| !s.trim().is_empty()))
-                .or_else(|| self.user.email.clone().filter(|s| !s.trim().is_empty())),
-            video_quality: self.video_quality.clone(),
-            use_chinese_mirror: self.use_chinese_mirror,
-            analytics_enabled: self.analytics_enabled,
-            analytics_id: self.analytics_id.clone(),
-            vocabulary: self
-                .extra
-                .get("vocabularyWords")
-                .and_then(|v| {
-                    serde_json::from_value::<Vec<screenpipe_audio::transcription::VocabularyEntry>>(
-                        v.clone(),
-                    )
-                    .ok()
-                })
-                .unwrap_or_default(),
-            batch_max_duration_secs: self
-                .extra
-                .get("batchMaxDurationSecs")
-                .and_then(|v| v.as_u64())
-                .filter(|&v| v > 0),
-            power_mode: self
-                .extra
-                .get("powerMode")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
+            Some(&resolved_engine),
+        );
+        config.enable_input_capture = true;
+        config.enable_accessibility = true;
+        config.enable_main_body_distillation = false;
+        config.main_body_distillation_threshold = 0.60;
+        config.blocked_apps = screenpipe_a11y::tree::default_blocked_apps();
+        config.blocked_title_keywords = screenpipe_a11y::tree::default_blocked_title_keywords();
+        config.user_identities = Vec::new();
+        // Resolve the API auth key from the seeded cache. The cache is populated
+        // asynchronously by `recording::spawn_screenpipe` via the shared helper
+        // (`screenpipe_engine::auth_key::resolve_api_auth_key`) — which is the
+        // single source of truth used by the CLI path, the auth CLI, and MCP.
+        // If this function is called before the server has spawned (e.g. an
+        // early frontend poll), fall back to the settings value if present;
+        // otherwise leave `api_auth_key` as `None` so the caller knows the
+        // key hasn't been resolved yet rather than receiving a fresh UUID
+        // that would drift from every other reader.
+        if config.api_auth {
+            let settings_key = settings.api_key.as_str();
+            config.api_auth_key = resolved_api_auth_key().or_else(|| {
+                if settings_key.is_empty() {
+                    None
+                } else {
+                    Some(settings_key.to_string())
+                }
+            });
         }
+        config
     }
 
     fn resolve_audio_engine(&self) -> String {
-        let engine = self.audio_transcription_engine.clone();
+        let engine = self.recording.audio_transcription_engine.clone();
         let has_user_id = self.user.id.as_ref().map_or(false, |id| !id.is_empty());
         let is_subscribed = self.user.cloud_subscribed == Some(true);
-        let has_deepgram_key =
-            !self.deepgram_api_key.is_empty() && self.deepgram_api_key != "default";
+        let has_deepgram_key = !self.recording.deepgram_api_key.is_empty()
+            && self.recording.deepgram_api_key != "default";
         match engine.as_str() {
             "screenpipe-cloud" if !has_user_id => {
                 tracing::warn!("screenpipe-cloud selected but user not logged in, falling back to whisper-large-v3-turbo-quantized");
@@ -791,17 +999,37 @@ impl SettingsStore {
         };
 
         store.set("settings", json!(self));
-        store.save().map_err(|e| e.to_string())
+        store.save().map_err(|e| e.to_string())?;
+        reencrypt_store_file(app);
+        Ok(())
     }
 }
 
 pub fn init_store(app: &AppHandle) -> Result<SettingsStore, String> {
     println!("Initializing settings store");
 
-    let (store, should_save) = match SettingsStore::get(app) {
-        Ok(Some(store)) => (store, false), // Loaded successfully, don't overwrite
-        Ok(None) => (SettingsStore::default(), true), // New store, save defaults
+    let raw_obj = get_store(app, None)
+        .ok()
+        .and_then(|store| store.get("settings"))
+        .and_then(|raw| raw.as_object().cloned());
+
+    let should_persist_restart_notification_migration = raw_obj
+        .as_ref()
+        .map(|obj| !obj.contains_key("restartNotificationsDefaultedOff"))
+        .unwrap_or(false);
+
+    let is_new_store;
+    let (mut store, mut should_save) = match SettingsStore::get(app) {
+        Ok(Some(store)) => {
+            is_new_store = false;
+            (store, should_persist_restart_notification_migration)
+        }
+        Ok(None) => {
+            is_new_store = true;
+            (SettingsStore::default(), true) // New store, save defaults
+        }
         Err(e) => {
+            is_new_store = false;
             // Fallback to defaults when deserialization fails (e.g., corrupted store)
             // DON'T save - preserve original store in case it can be manually recovered
             // This prevents crashes from invalid values like negative integers in u32 fields
@@ -813,8 +1041,51 @@ pub fn init_store(app: &AppHandle) -> Result<SettingsStore, String> {
         }
     };
 
+    // Tier detection. Two cases:
+    // - New install: detect tier AND apply tier defaults (video_quality, power_mode, etc.)
+    // - Existing user upgrading: detect tier for DB/channel config but do NOT override
+    //   their existing capture settings (they may have customized video_quality etc.)
+    // Also re-detect if the stored tier doesn't match current hardware classification
+    // (e.g. tier boundaries changed in an update).
+    {
+        let detected = screenpipe_config::detect_tier();
+        let stored_tier = store
+            .recording
+            .device_tier
+            .as_deref()
+            .and_then(screenpipe_config::DeviceTier::from_str_loose);
+        if stored_tier != Some(detected) {
+            tracing::info!("hardware tier changed: {:?} -> {:?}", stored_tier, detected);
+            if is_new_store || store.recording.device_tier.is_none() {
+                screenpipe_config::apply_tier_defaults(&mut store.recording, detected);
+            }
+            store.recording.device_tier = Some(detected.as_str().to_string());
+            should_save = true;
+        }
+
+        // Unconditional safety guard: prevent parakeet/parakeet-mlx on platforms
+        // where it will crash (Low tier = OOM, macOS < 26 = MLX segfault).
+        if screenpipe_config::is_engine_unsafe(
+            &store.recording.audio_transcription_engine,
+            detected,
+        ) {
+            let safe = screenpipe_config::best_engine_for_platform(detected);
+            tracing::warn!(
+                "engine {} is unsafe on this platform (tier={:?}, macOS={:?}) — switching to {}",
+                store.recording.audio_transcription_engine,
+                detected,
+                screenpipe_config::macos_major_version(),
+                safe,
+            );
+            store.recording.audio_transcription_engine = safe.to_string();
+            should_save = true;
+        }
+    }
+
     if should_save {
-        store.save(app).unwrap();
+        if let Err(e) = store.save(app) {
+            error!("Failed to save initial settings store (non-fatal): {}", e);
+        }
     }
     Ok(store)
 }
@@ -837,7 +1108,9 @@ pub fn init_onboarding_store(app: &AppHandle) -> Result<OnboardingStore, String>
     };
 
     if should_save {
-        onboarding.save(app).unwrap();
+        if let Err(e) = onboarding.save(app) {
+            error!("Failed to save initial onboarding store (non-fatal): {}", e);
+        }
     }
     Ok(onboarding)
 }
@@ -869,7 +1142,9 @@ impl CloudSyncSettingsStore {
     pub fn save(&self, app: &AppHandle) -> Result<(), String> {
         let store = get_store(app, None).map_err(|e| e.to_string())?;
         store.set("cloud_sync", json!(self));
-        store.save().map_err(|e| e.to_string())
+        store.save().map_err(|e| e.to_string())?;
+        reencrypt_store_file(app);
+        Ok(())
     }
 }
 
@@ -902,7 +1177,9 @@ impl CloudArchiveSettingsStore {
     pub fn save(&self, app: &AppHandle) -> Result<(), String> {
         let store = get_store(app, None).map_err(|e| e.to_string())?;
         store.set("cloud_archive", json!(self));
-        store.save().map_err(|e| e.to_string())
+        store.save().map_err(|e| e.to_string())?;
+        reencrypt_store_file(app);
+        Ok(())
     }
 }
 
@@ -936,7 +1213,9 @@ impl IcsCalendarSettingsStore {
     pub fn save(&self, app: &AppHandle) -> Result<(), String> {
         let store = get_store(app, None).map_err(|e| e.to_string())?;
         store.set("ics_calendars", json!(self));
-        store.save().map_err(|e| e.to_string())
+        store.save().map_err(|e| e.to_string())?;
+        reencrypt_store_file(app);
+        Ok(())
     }
 }
 
@@ -971,8 +1250,7 @@ impl PipeSuggestionsSettingsStore {
         if store.is_empty() {
             return Ok(None);
         }
-        let settings =
-            serde_json::from_value(store.get("pipe_suggestions").unwrap_or(Value::Null));
+        let settings = serde_json::from_value(store.get("pipe_suggestions").unwrap_or(Value::Null));
         match settings {
             Ok(settings) => Ok(settings),
             Err(_) => Ok(None),
@@ -982,6 +1260,61 @@ impl PipeSuggestionsSettingsStore {
     pub fn save(&self, app: &AppHandle) -> Result<(), String> {
         let store = get_store(app, None).map_err(|e| e.to_string())?;
         store.set("pipe_suggestions", json!(self));
-        store.save().map_err(|e| e.to_string())
+        store.save().map_err(|e| e.to_string())?;
+        reencrypt_store_file(app);
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_sanitize_legacy_fields_does_not_panic() {
+        let corrupted = json!({
+            "aiPresets": ["corrupted_string_not_an_object"]
+        });
+
+        let _sanitized = SettingsStore::sanitize_legacy_fields(corrupted);
+
+        // And let's test a valid object with missing/unknown provider to prove it works
+        let valid = json!({
+            "aiPresets": [{"provider": "unknown_provider"}]
+        });
+        let sanitized2 = SettingsStore::sanitize_legacy_fields(valid);
+
+        let presets = sanitized2.get("aiPresets").unwrap().as_array().unwrap();
+        assert_eq!(
+            presets[0].get("provider").unwrap().as_str().unwrap(),
+            "custom"
+        );
+    }
+
+    #[test]
+    fn test_deserialize_settings_with_null_fields() {
+        let json_data = json!({
+            "recording": {
+                "audio": true,
+                "video": true
+            },
+            "user": null,
+            "embeddedLLM": null,
+            "aiPresets": null
+        });
+
+        let settings: Result<SettingsStore, _> = serde_json::from_value(json_data);
+        if let Err(e) = &settings {
+            println!("Deser error: {:?}", e);
+        }
+        assert!(
+            settings.is_ok(),
+            "Failed to deserialize settings with null fields"
+        );
+        let settings = settings.unwrap();
+
+        assert_eq!(settings.user.token, None);
+        assert_eq!(settings.embedded_llm.enabled, false);
+        assert_eq!(settings.ai_presets.len(), 0);
     }
 }

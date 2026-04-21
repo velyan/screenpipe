@@ -14,18 +14,22 @@ use anyhow::{anyhow, Result};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 
-use crate::{
-    core::{device::DeviceType, update_device_capture_time},
-    metrics::AudioPipelineMetrics,
-    AudioInput,
-};
+use crate::{core::update_device_capture_time, metrics::AudioPipelineMetrics, AudioInput};
 
+use super::source_buffer::SourceBuffer;
 use super::AudioStream;
 
 /// Timeout for receiving audio data before considering the stream dead.
-/// If no audio is received for this duration, the stream is likely hijacked
-/// by another app (e.g., Wispr Flow taking over the microphone).
+/// For input: another app may have hijacked the mic (e.g., Wispr Flow).
+/// For output on macOS: ScreenCaptureKit delivers callbacks continuously even
+/// during silence, so a 30s timeout means the OS stream genuinely stopped.
+/// For output on Windows: WASAPI loopback produces NO callbacks when nothing is
+/// playing, so timeouts are expected and non-fatal (see recv_audio_chunk).
 const AUDIO_RECEIVE_TIMEOUT_SECS: u64 = 30;
+
+/// Grace period after stream start before treating timeouts as fatal.
+/// ScreenCaptureKit may take a moment to begin delivering callbacks.
+const STREAM_STARTUP_GRACE_SECS: u64 = 10;
 
 /// Recording always uses 30s segments. Both batch and realtime modes record identically.
 /// The batch vs realtime distinction is in the processing layer (manager.rs):
@@ -45,24 +49,86 @@ pub async fn run_record_and_transcribe(
     const OVERLAP_SECONDS: usize = 2;
     let overlap_samples = OVERLAP_SECONDS * sample_rate;
 
+    // Per-device source buffer: detects Bluetooth packet-drop gaps and inserts
+    // digital silence in place of crackle/noise. Silence is filtered by VAD before
+    // reaching Whisper, so it has no transcription impact.
+    let mut source_buffer = SourceBuffer::new(device_name.as_str(), sample_rate as u32);
+
     info!(
-        "starting continuous recording for {} ({}s segments)",
+        "starting continuous recording for {} ({} / {}s segments)",
         device_name,
+        source_buffer.device_kind().label(),
         duration.as_secs()
     );
     let audio_samples_len = sample_rate * duration.as_secs() as usize;
     let max_samples = audio_samples_len + overlap_samples;
     let mut collected_audio = Vec::new();
     let mut segment_start_time = now_epoch_secs();
+    let stream_start = std::time::Instant::now();
+    let mut segment_count: u64 = 0;
+
+    let mut was_paused_for_lock = false;
 
     while is_running.load(Ordering::Relaxed)
         && !audio_stream.is_disconnected.load(Ordering::Relaxed)
     {
+        // Skip recording while the screen is locked (unless record_while_locked is enabled).
+        // This avoids wasting CPU/disk on audio captured during lock screen.
+        if screenpipe_config::should_pause_audio_for_lock() {
+            if !was_paused_for_lock {
+                info!("screen locked, pausing audio recording for {}", device_name);
+                was_paused_for_lock = true;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        // Transitioning from locked → unlocked: discard stale audio and reset segment timing.
+        // The broadcast channel accumulated data while we were paused — drain it to avoid
+        // transcribing audio from the lock screen period.
+        if was_paused_for_lock {
+            info!(
+                "screen unlocked, resuming audio recording for {}",
+                device_name
+            );
+            was_paused_for_lock = false;
+            collected_audio.clear();
+            segment_start_time = now_epoch_secs();
+            // Drain stale audio from the broadcast channel.
+            // Lagged means messages were dropped (channel full) — also fine, keep draining.
+            loop {
+                match receiver.try_recv() {
+                    Ok(_) => continue,
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(_) => break, // Empty or Closed
+                }
+            }
+        }
+
         while collected_audio.len() < max_samples && is_running.load(Ordering::Relaxed) {
-            match recv_audio_chunk(&mut receiver, &audio_stream, &device_name, &metrics).await? {
-                Some(chunk) => collected_audio.extend(chunk),
+            match recv_audio_chunk(
+                &mut receiver,
+                &audio_stream,
+                &device_name,
+                &metrics,
+                &stream_start,
+            )
+            .await?
+            {
+                Some(chunk) => {
+                    // Route through the source buffer so Bluetooth packet-drop gaps
+                    // are converted to silence instead of crackle.
+                    source_buffer.push(chunk);
+                    collected_audio.extend(source_buffer.drain_all());
+                }
                 None => continue,
             }
+        }
+
+        segment_count += 1;
+        // Log per-device stats every 10 segments (~5 min at 30 s/segment).
+        if segment_count % 10 == 0 {
+            source_buffer.log_stats();
         }
 
         flush_audio(
@@ -93,8 +159,13 @@ pub async fn run_record_and_transcribe(
         warn!("final flush failed for {}: {}", device_name, e);
     }
 
-    info!("stopped recording for {}", device_name);
-    Ok(())
+    if audio_stream.is_disconnected.load(Ordering::Relaxed) {
+        info!("stopped recording for {} (disconnected)", device_name);
+        Err(anyhow::anyhow!("device {} disconnected", device_name))
+    } else {
+        info!("stopped recording for {}", device_name);
+        Ok(())
+    }
 }
 
 /// Receive one audio chunk from the broadcast channel, handling timeouts and device type logic.
@@ -105,6 +176,7 @@ async fn recv_audio_chunk(
     audio_stream: &Arc<AudioStream>,
     device_name: &str,
     metrics: &Arc<AudioPipelineMetrics>,
+    stream_start: &std::time::Instant,
 ) -> Result<Option<Vec<f32>>> {
     let recv_result = tokio::time::timeout(
         Duration::from_secs(AUDIO_RECEIVE_TIMEOUT_SECS),
@@ -131,21 +203,48 @@ async fn recv_audio_chunk(
             Err(anyhow!("Audio stream error: {}", e))
         }
         Err(_timeout) => {
-            if audio_stream.device.device_type == DeviceType::Output {
+            // During startup grace period, tolerate timeouts while the OS
+            // stream initializes (ScreenCaptureKit may take a moment).
+            if stream_start.elapsed().as_secs()
+                < STREAM_STARTUP_GRACE_SECS + AUDIO_RECEIVE_TIMEOUT_SECS
+            {
                 debug!(
-                    "no audio from output device {} for {}s - idle (normal), continuing",
+                    "no audio from {} for {}s during startup grace, continuing",
                     device_name, AUDIO_RECEIVE_TIMEOUT_SECS
                 );
                 return Ok(None);
             }
-            debug!(
-                "no audio received from {} for {}s - stream may be hijacked, triggering reconnect",
+
+            // Output devices may produce no callbacks when the system is silent:
+            // - Windows WASAPI loopback: silent = no callbacks (always has been).
+            // - macOS ScreenCaptureKit: observed on Sequoia 24.3+ that SCK may
+            //   also stop firing callbacks during prolonged silence with no
+            //   audio source, contrary to the earlier assumption of continuous
+            //   callbacks. Treat silence as non-fatal on both — the separate
+            //   device_monitor watchdog detects genuine device removal via the
+            //   OS device list.
+            #[cfg(any(target_os = "windows", target_os = "macos"))]
+            {
+                use crate::core::device::DeviceType;
+                if audio_stream.device.device_type == DeviceType::Output {
+                    debug!(
+                        "no audio from output device {} for {}s (nothing playing), continuing",
+                        device_name, AUDIO_RECEIVE_TIMEOUT_SECS
+                    );
+                    return Ok(None);
+                }
+            }
+
+            // For input devices (all platforms) and output devices (Linux):
+            // a 30s timeout means the OS stream genuinely stopped producing data.
+            warn!(
+                "no audio received from {} for {}s - stream dead, triggering reconnect",
                 device_name, AUDIO_RECEIVE_TIMEOUT_SECS
             );
             metrics.record_stream_timeout();
             audio_stream.is_disconnected.store(true, Ordering::Relaxed);
             Err(anyhow!(
-                "Audio stream timeout - no data received for {}s (possible audio hijack)",
+                "Audio stream timeout - no data received for {}s (stream dead)",
                 AUDIO_RECEIVE_TIMEOUT_SECS
             ))
         }
@@ -176,9 +275,18 @@ async fn flush_audio(
 
     debug!("sending audio segment to audio model");
 
+    // Split off the overlap tail *before* sending to avoid cloning the entire buffer.
+    // The send gets everything except the tail; collected_audio retains only the overlap.
+    let overlap_tail = if collected_audio.len() > overlap_samples {
+        collected_audio.split_off(collected_audio.len() - overlap_samples)
+    } else {
+        collected_audio.clone()
+    };
+    let send_data = std::mem::replace(collected_audio, overlap_tail);
+
     match whisper_sender.send_timeout(
         AudioInput {
-            data: Arc::new(collected_audio.clone()),
+            data: Arc::new(send_data),
             device: audio_stream.device.clone(),
             sample_rate: audio_stream.device_config.sample_rate().0,
             channels: audio_stream.device_config.channels(),
@@ -189,10 +297,6 @@ async fn flush_audio(
         Ok(_) => {
             debug!("sent audio segment to audio model");
             metrics.record_chunk_sent();
-            if collected_audio.len() > overlap_samples {
-                *collected_audio =
-                    collected_audio.split_off(collected_audio.len() - overlap_samples);
-            }
         }
         Err(e) => {
             if e.is_disconnected() {

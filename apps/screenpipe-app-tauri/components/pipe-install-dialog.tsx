@@ -5,6 +5,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import { useQueryState } from "nuqs";
 import {
   AlertDialog,
   AlertDialogContent,
@@ -20,6 +21,7 @@ import { useToast } from "@/components/ui/use-toast";
 import { listen } from "@tauri-apps/api/event";
 import posthog from "posthog-js";
 import { PermissionsReview } from "@/components/pipe-store";
+import { localFetch } from "@/lib/api";
 
 interface PipeInstallRequest {
   url: string;
@@ -48,6 +50,7 @@ export function PipeInstallDialog() {
   const [loading, setLoading] = useState(false);
   const [installing, setInstalling] = useState(false);
   const [registryDetail, setRegistryDetail] = useState<RegistryPipeDetail | null>(null);
+  const [, setSection] = useQueryState("section");
   const { toast } = useToast();
 
   // Listen for install-pipe events from deep link handler
@@ -63,7 +66,7 @@ export function PipeInstallDialog() {
       if (isRegistrySource(url)) {
         // Fetch registry pipe details for permissions review
         const slug = getRegistrySlug(url);
-        fetch(`http://localhost:3030/pipes/store/${slug}`)
+        localFetch(`/pipes/store/${slug}`)
           .then((res) => {
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             return res.json();
@@ -105,14 +108,14 @@ export function PipeInstallDialog() {
       if (isRegistrySource(url)) {
         // Install via store endpoint
         const slug = getRegistrySlug(url);
-        res = await fetch("http://localhost:3030/pipes/store/install", {
+        res = await localFetch("/pipes/store/install", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ slug }),
         });
       } else {
         // Install via regular endpoint
-        res = await fetch("http://localhost:3030/pipes/install", {
+        res = await localFetch("/pipes/install", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ source: url }),
@@ -128,11 +131,21 @@ export function PipeInstallDialog() {
         source: isRegistrySource(url) ? "registry" : "url",
       });
 
-      toast({
-        title: `pipe "${data.name}" installed`,
-        description: "go to settings > pipes to enable it",
-      });
+      const pipeConnections: string[] = data.connections || [];
+      if (pipeConnections.length > 0) {
+        // sessionStorage fallback for when PipesSection isn't mounted yet
+        sessionStorage.setItem(`justInstalled:${data.name}`, "1");
+        // Also fire event in case PipesSection is already mounted
+        window.dispatchEvent(
+          new CustomEvent("screenpipe:pipeInstalled", {
+            detail: { pipeName: data.name, connections: pipeConnections },
+          })
+        );
+      }
+
       setRequest(null);
+      // Navigate to pipes tab so user sees installed pipe + connection modal
+      setSection("pipes");
     } catch (err: any) {
       toast({
         title: "failed to install pipe",
@@ -156,79 +169,82 @@ export function PipeInstallDialog() {
   const isRegistry = request ? isRegistrySource(request.url) : false;
 
   return (
-    <AlertDialog open={!!request} onOpenChange={(open) => !open && handleCancel()}>
-      <AlertDialogContent className="max-w-lg max-h-[80vh] overflow-y-auto">
-        <AlertDialogHeader>
-          <AlertDialogTitle className="text-sm">install pipe?</AlertDialogTitle>
-          <AlertDialogDescription className="text-xs">
-            {isRegistry
-              ? "a pipe from the store wants to install. review the permissions below before installing."
-              : "a pipe from an external link wants to install. pipes are AI agents that run on your screen data — review the prompt below before installing."}
-          </AlertDialogDescription>
-        </AlertDialogHeader>
+    <>
+      <AlertDialog open={!!request} onOpenChange={(open) => !open && handleCancel()}>
+        <AlertDialogContent className="max-w-lg max-h-[80vh] overflow-y-auto">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-sm">install pipe?</AlertDialogTitle>
+            <AlertDialogDescription className="text-xs">
+              {isRegistry
+                ? "a pipe from the store wants to install. review the permissions below before installing."
+                : "a pipe from an external link wants to install. pipes are AI agents that run on your screen data — review the prompt below before installing."}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
 
-        <div className="my-2 text-xs font-mono text-muted-foreground break-all bg-muted rounded px-3 py-2">
-          {request?.url}
-        </div>
+          <div className="my-2 text-xs font-mono text-muted-foreground break-all bg-muted rounded px-3 py-2">
+            {request?.url}
+          </div>
 
-        {loading ? (
-          <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
-            <Loader2 className="h-3 w-3 animate-spin" />
-            {isRegistry ? "loading pipe details..." : "loading pipe content..."}
-          </div>
-        ) : isRegistry && registryDetail ? (
-          <div className="space-y-3">
-            <div className="text-sm font-medium">
-              {registryDetail.title}
-              <span className="text-xs text-muted-foreground ml-2">
-                by {registryDetail.author}
-              </span>
+          {loading ? (
+            <div className="flex items-center gap-2 py-4 text-xs text-muted-foreground">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              {isRegistry ? "loading pipe details..." : "loading pipe content..."}
             </div>
-            <PermissionsReview
-              permissions={registryDetail.permissions as any}
-              authorVerified={registryDetail.author_verified}
-            />
-          </div>
-        ) : preview ? (
-          <div className="border rounded overflow-hidden">
-            <div className="px-3 py-1.5 bg-muted text-[10px] uppercase tracking-wider text-muted-foreground border-b">
-              pipe.md preview
-            </div>
-            <pre className="p-3 text-[11px] leading-relaxed whitespace-pre-wrap max-h-48 overflow-y-auto">
-              {previewLines}
-              {body.split("\n").length > 15 && (
-                <span className="text-muted-foreground">
-                  {"\n"}... {body.split("\n").length - 15} more lines
+          ) : isRegistry && registryDetail ? (
+            <div className="space-y-3">
+              <div className="text-sm font-medium">
+                {registryDetail.title}
+                <span className="text-xs text-muted-foreground ml-2">
+                  by {registryDetail.author}
                 </span>
-              )}
-            </pre>
-          </div>
-        ) : (
-          <p className="text-xs text-muted-foreground py-2">
-            could not preview pipe content. you can still install it.
-          </p>
-        )}
+              </div>
+              <PermissionsReview
+                permissions={registryDetail.permissions as any}
+                authorVerified={registryDetail.author_verified}
+              />
+            </div>
+          ) : preview ? (
+            <div className="border rounded overflow-hidden">
+              <div className="px-3 py-1.5 bg-muted text-[10px] uppercase tracking-wider text-muted-foreground border-b">
+                pipe.md preview
+              </div>
+              <pre className="p-3 text-[11px] leading-relaxed whitespace-pre-wrap max-h-48 overflow-y-auto">
+                {previewLines}
+                {body.split("\n").length > 15 && (
+                  <span className="text-muted-foreground">
+                    {"\n"}... {body.split("\n").length - 15} more lines
+                  </span>
+                )}
+              </pre>
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground py-2">
+              could not preview pipe content. you can still install it.
+            </p>
+          )}
 
-        <AlertDialogFooter>
-          <AlertDialogCancel className="text-xs" onClick={handleCancel}>
-            cancel
-          </AlertDialogCancel>
-          <AlertDialogAction
-            className="text-xs"
-            onClick={handleInstall}
-            disabled={installing}
-          >
-            {installing ? (
-              <>
-                <Loader2 className="h-3 w-3 animate-spin mr-1" />
-                installing...
-              </>
-            ) : (
-              "install"
-            )}
-          </AlertDialogAction>
-        </AlertDialogFooter>
-      </AlertDialogContent>
-    </AlertDialog>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="text-xs" onClick={handleCancel}>
+              cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="text-xs"
+              onClick={handleInstall}
+              disabled={installing}
+            >
+              {installing ? (
+                <>
+                  <Loader2 className="h-3 w-3 animate-spin mr-1" />
+                  installing...
+                </>
+              ) : (
+                "install"
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+    </>
   );
 }

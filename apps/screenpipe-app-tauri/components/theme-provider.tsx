@@ -2,6 +2,8 @@
 
 import React, { createContext, useContext, useEffect, useState } from "react";
 import { type ColorTheme } from "@/lib/constants/colors";
+import { useSettings } from "@/lib/hooks/use-settings";
+import { invoke } from "@tauri-apps/api/core";
 
 interface ThemeProviderProps {
   children: React.ReactNode;
@@ -29,22 +31,34 @@ export function ThemeProvider({
   storageKey = "screenpipe-ui-theme",
   ...props
 }: ThemeProviderProps) {
-  const [theme, setTheme] = useState<ColorTheme | undefined>(undefined);
-  const [isLoaded, setIsLoaded] = useState(false);
+  const [theme, setThemeState] = useState<ColorTheme | undefined>(() => {
+    // Read theme synchronously on first render to avoid flash
+    if (typeof window === "undefined") return undefined;
+    try {
+      const stored = localStorage?.getItem(storageKey) as ColorTheme;
+      return stored || "system";
+    } catch {
+      return "system";
+    }
+  });
+  const [isLoaded, setIsLoaded] = useState(() => typeof window !== "undefined");
+  const { updateSettings } = useSettings();
 
   useEffect(() => {
+    // Fallback for SSR or edge cases where initializer didn't run
+    if (theme && isLoaded) return;
     try {
       const storedTheme = localStorage?.getItem(storageKey) as ColorTheme;
       if (storedTheme) {
-        setTheme(storedTheme);
+        setThemeState(storedTheme);
       } else {
-        setTheme("system");
+        setThemeState("system");
       }
     } catch {
-      setTheme("system");
+      setThemeState("system");
     }
     setIsLoaded(true);
-  }, [storageKey]);
+  }, [storageKey, theme, isLoaded]);
 
   useEffect(() => {
     if (!theme || !isLoaded) return;
@@ -85,14 +99,22 @@ export function ThemeProvider({
   const value = {
     theme: theme || defaultTheme,
     setTheme: (theme: ColorTheme) => {
-      try { localStorage?.setItem(storageKey, theme); } catch {}
-      setTheme(theme);
+      try {
+        localStorage?.setItem(storageKey, theme);
+      } catch {}
+      setThemeState(theme);
+      updateSettings({ uiTheme: theme });
+      invoke("set_native_theme", { theme }).catch(() => {});
     },
     toggleTheme: () => {
       const currentTheme = theme || defaultTheme;
       const newTheme = currentTheme === "light" ? "dark" : "light";
-      try { localStorage?.setItem(storageKey, newTheme); } catch {}
-      setTheme(newTheme);
+      try {
+        localStorage?.setItem(storageKey, newTheme);
+      } catch {}
+      setThemeState(newTheme);
+      updateSettings({ uiTheme: newTheme });
+      invoke("set_native_theme", { theme: newTheme }).catch(() => {});
     },
   };
 

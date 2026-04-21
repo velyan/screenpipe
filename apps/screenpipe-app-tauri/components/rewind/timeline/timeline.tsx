@@ -4,7 +4,7 @@
 import { StreamTimeSeriesResponse, TimeRange } from "@/components/rewind/timeline";
 import { useTimelineSelection } from "@/lib/hooks/use-timeline-selection";
 import { getStore, type ChatConversation } from "@/lib/hooks/use-settings";
-import { isAfter, subDays, addDays, startOfDay, format } from "date-fns";
+import { isAfter, subDays, addDays, startOfDay, format, formatDistanceToNow } from "date-fns";
 import { motion } from "framer-motion";
 import { ZoomIn, ZoomOut, Mic, Monitor, AppWindow, Globe, Hash, RotateCcw, Phone, PanelBottomClose, PanelBottomOpen } from "lucide-react";
 import type { Meeting } from "@/lib/hooks/use-meetings";
@@ -19,6 +19,7 @@ import { type TemplatePipe } from "@/lib/hooks/use-pipes";
 import { AppContextPopover } from "./app-context-popover";
 import { TimelineTagToolbar } from "./timeline-tag-toolbar";
 import { extractDomain, FaviconImg } from "./favicon-utils";
+import { localFetch } from "@/lib/api";
 
 // Global cache: preloads app-icon images so they render instantly on scroll.
 // Maps app name → "loaded" | "error" | Promise (in-flight).
@@ -228,15 +229,15 @@ export function stringToColor(str: string): string {
 export function getFrameAppName(frame: StreamTimeSeriesResponse | undefined): string {
 	if (!frame?.devices?.length) return 'Unknown';
 	// Find first device with a non-empty app_name
-	const deviceWithApp = frame.devices.find(d => d.metadata?.app_name);
-	return deviceWithApp?.metadata?.app_name || 'Unknown';
+	const deviceWithApp = frame.devices.find(d => d.metadata?.app_name?.trim());
+	return deviceWithApp?.metadata?.app_name?.trim() || 'Unknown';
 }
 
 // Get ALL app names from a frame (for multi-app display)
 export function getFrameAppNames(frame: StreamTimeSeriesResponse | undefined): string[] {
 	if (!frame?.devices?.length) return ['Unknown'];
 	const appNames = frame.devices
-		.map(d => d.metadata?.app_name)
+		.map(d => d.metadata?.app_name?.trim())
 		.filter((name): name is string => Boolean(name));
 	return appNames.length > 0 ? [...new Set(appNames)] : ['Unknown'];
 }
@@ -328,7 +329,7 @@ export const TimelineSlider = ({
 		// Always use timestamp-based query: frame_id is never populated in ui_events
 		const query = `SELECT event_type, text_content, app_name, window_title, timestamp FROM ui_events WHERE timestamp BETWEEN datetime('${timestamp}', '-15 seconds') AND datetime('${timestamp}', '+15 seconds') ORDER BY timestamp ASC LIMIT 10`;
 
-		fetch("http://localhost:3030/raw_sql", {
+		localFetch("/raw_sql", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ query }),
@@ -344,6 +345,12 @@ export const TimelineSlider = ({
 				uiEventsFetchingRef.current.delete(cacheKey);
 			});
 	}, []);
+
+	// Memory markers — diamonds above frame bars
+	const [memories, setMemories] = useState<{ id: number; content: string; tags: string[]; created_at: string }[]>([]);
+	const [hoveredMemoryId, setHoveredMemoryId] = useState<number | null>(null);
+	const [hoveredMemoryRect, setHoveredMemoryRect] = useState<{ x: number; y: number } | null>(null);
+	const memoriesFetchedRangeRef = useRef<string>("");
 
 	// Chat history overlay — show PipeAI icon on timeline where chats occurred
 	const [chatConversations, setChatConversations] = useState<ChatConversation[]>([]);
@@ -479,17 +486,19 @@ export const TimelineSlider = ({
 	// recomputing groups and killing the popover / selection.
 	const isUserInteracting = isDragging || activePopoverGroup !== null || selectionRange !== null;
 
-	// Adjust visible frames based on zoom - zoomed out shows more frames
-	// Use a stable window size to prevent jumpy behavior
+	// Visible frames window: sized to what actually fits on screen.
+	// Uses container width + frame size so filters (speakers, apps, etc.)
+	// only show items from the actual viewport, not a fixed 800-frame window.
 	const latestVisibleFrames = useMemo(() => {
 		if (!frames || frames.length === 0) return [];
-		// Fixed window centered on current index - zoom affects frame SIZE, not count
-		// This prevents jumpy behavior when zooming
-		const visibleCount = 400; // Fixed window
-		const start = Math.max(0, currentIndex - visibleCount);
-		const end = Math.min(frames.length, currentIndex + visibleCount);
+		const containerWidth = containerRef.current?.clientWidth ?? 1200;
+		const framesPerScreen = Math.ceil(containerWidth / Math.max(1, frameWidth + frameMargin));
+		// Small buffer (20%) to avoid pop-in at edges, but not the old 400-frame over-fetch
+		const halfWindow = Math.ceil(framesPerScreen * 0.6);
+		const start = Math.max(0, currentIndex - halfWindow);
+		const end = Math.min(frames.length, currentIndex + halfWindow);
 		return frames.slice(start, end);
-	}, [frames, currentIndex]);
+	}, [frames, currentIndex, frameWidth, frameMargin]);
 
 	// Freeze visible frames while user is interacting to prevent
 	// WebSocket pushes from recomputing appGroups and losing popover/selection
@@ -498,6 +507,28 @@ export const TimelineSlider = ({
 		frozenFramesRef.current = latestVisibleFrames;
 	}
 	const visibleFrames = isUserInteracting ? frozenFramesRef.current : latestVisibleFrames;
+
+	// Fetch memories for the visible time range
+	useEffect(() => {
+		if (!visibleFrames || visibleFrames.length === 0) return;
+		const firstTs = visibleFrames[visibleFrames.length - 1]?.timestamp;
+		const lastTs = visibleFrames[0]?.timestamp;
+		if (!firstTs || !lastTs) return;
+
+		const rangeKey = `${firstTs.slice(0, 13)}|${lastTs.slice(0, 13)}`;
+		if (memoriesFetchedRangeRef.current === rangeKey) return;
+		memoriesFetchedRangeRef.current = rangeKey;
+
+		const params = new URLSearchParams({
+			start_time: firstTs,
+			end_time: lastTs,
+			limit: "50",
+		});
+		localFetch(`/memories?${params}`)
+			.then((r) => (r.ok ? r.json() : { data: [] }))
+			.then((res) => setMemories(res.data || []))
+			.catch(() => {});
+	}, [visibleFrames]);
 
 	// Dynamically compute app names from the current viewport, sorted by frequency
 	const viewportAppNames = useMemo(() => {
@@ -1300,8 +1331,8 @@ export const TimelineSlider = ({
 				{/* Collapse/expand filters toggle */}
 				<button
 					className={cn(
-						"p-1.5 rounded-md transition-colors shrink-0",
-						"bg-background/80 backdrop-blur-sm border border-border",
+						"p-1.5 rounded-md transition-colors shrink-0 cursor-pointer",
+						"bg-background/80 backdrop-blur-sm border border-border hover:bg-accent",
 					)}
 					onClick={() => setFiltersCollapsed((prev) => !prev)}
 					title={filtersCollapsed ? "Show filters" : "Hide filters"}
@@ -1319,8 +1350,9 @@ export const TimelineSlider = ({
 					(containerRef as React.MutableRefObject<HTMLDivElement | null>).current = el;
 					if (scrubberRef) (scrubberRef as React.MutableRefObject<HTMLDivElement | null>).current = el;
 				}}
+				data-testid="timeline-slider"
 				tabIndex={0}
-				className="w-full overflow-x-auto overflow-y-visible scrollbar-hide bg-gradient-to-t from-black/50 to-black/0 outline-none"
+				className="w-full overflow-x-auto overflow-y-visible scrollbar-hide bg-gradient-to-t from-foreground/5 to-transparent outline-none"
 				style={{
 					paddingTop: "60px", // Space for tooltips above
 					paddingBottom: "24px", // Space for time axis below
@@ -1331,6 +1363,98 @@ export const TimelineSlider = ({
 					onMouseUp={handleDragEnd}
 					onMouseLeave={handleDragEnd}
 				>
+					{/* Memory markers — diamonds above frame bars */}
+					{memories.length > 0 && (() => {
+						const stepPx = frameWidth + frameMargin * 2;
+						// Build flat list of all frame timestamps in render order
+						const allFrameTimestamps: string[] = [];
+						for (const g of appGroups) {
+							if (g.dayBoundaryDate) allFrameTimestamps.push("__boundary__");
+							for (const f of g.frames) allFrameTimestamps.push(f.timestamp);
+						}
+						return (
+							<div className="absolute top-0 left-0 right-0 h-5 pointer-events-auto" style={{ direction: "ltr", zIndex: 40 }}>
+								{memories.map((mem) => {
+									const memTime = new Date(mem.created_at).getTime();
+									let bestIdx = -1;
+									let bestDist = Infinity;
+									let boundaryOffset = 0;
+									for (let i = 0; i < allFrameTimestamps.length; i++) {
+										if (allFrameTimestamps[i] === "__boundary__") {
+											boundaryOffset += 16; // day boundary divider width
+											continue;
+										}
+										const dist = Math.abs(new Date(allFrameTimestamps[i]).getTime() - memTime);
+										if (dist < bestDist) {
+											bestDist = dist;
+											bestIdx = i;
+										}
+									}
+									if (bestIdx < 0) return null;
+									// Count actual frames before this index (exclude boundaries)
+									let frameCount = 0;
+									for (let i = 0; i < bestIdx; i++) {
+										if (allFrameTimestamps[i] !== "__boundary__") frameCount++;
+									}
+									// 50vw padding + 1px forward observer + boundary offsets + frame positions
+									const xOffset = frameCount * stepPx + stepPx / 2 + boundaryOffset;
+									return (
+										<div
+											key={mem.id}
+											className="absolute pointer-events-auto cursor-default"
+											style={{ left: `calc(50vw + ${xOffset}px)`, top: "2px" }}
+											onMouseEnter={(e) => {
+												const rect = e.currentTarget.getBoundingClientRect();
+												setHoveredMemoryId(mem.id);
+												setHoveredMemoryRect({ x: rect.left + rect.width / 2, y: rect.top - 8 });
+											}}
+											onMouseLeave={() => {
+												setHoveredMemoryId(null);
+												setHoveredMemoryRect(null);
+											}}
+										>
+											<div
+												className="w-2 h-2 bg-foreground/50 rotate-45 hover:bg-foreground hover:scale-150 transition-all duration-150"
+												title={mem.content.slice(0, 60)}
+											/>
+										</div>
+									);
+								})}
+							</div>
+						);
+					})()}
+
+					{/* Memory tooltip portal */}
+					{hoveredMemoryId !== null && hoveredMemoryRect && createPortal(
+						<div
+							className="fixed z-[9999] max-w-[240px] bg-popover border border-border rounded-lg px-3 py-2 text-xs shadow-2xl pointer-events-none"
+							style={{
+								left: `${hoveredMemoryRect.x}px`,
+								top: `${hoveredMemoryRect.y}px`,
+								transform: "translate(-50%, -100%)",
+							}}
+						>
+							{(() => {
+								const mem = memories.find((m) => m.id === hoveredMemoryId);
+								if (!mem) return null;
+								const truncated = mem.content.length > 120 ? mem.content.slice(0, 120) + "…" : mem.content;
+								const usefulTags = mem.tags.filter((t) => !/^\d{4}-\d{2}-\d{2}/.test(t));
+								return (
+									<>
+										<p className="text-foreground mb-1 line-clamp-3">{truncated}</p>
+										<div className="flex items-center gap-1.5 text-muted-foreground flex-wrap">
+											<span>{formatDistanceToNow(new Date(mem.created_at), { addSuffix: true })}</span>
+											{usefulTags.slice(0, 3).map((t) => (
+												<span key={t} className="px-1 py-0.5 bg-foreground/10 rounded text-[9px]">{t}</span>
+											))}
+										</div>
+									</>
+								);
+							})()}
+						</div>,
+						document.body
+					)}
+
 					<div ref={forwardObserverTargetRef} className="h-full w-1" />
 					{appGroups.map((group, groupIndex) => {
 						const groupWidth = getGroupWidth(group);

@@ -37,6 +37,7 @@ import { useTimelineFilters } from "@/components/rewind/hooks/use-timeline-filte
 import { useScrollZoom } from "@/components/rewind/hooks/use-scroll-zoom";
 import { useDateNavigation } from "@/components/rewind/hooks/use-date-navigation";
 import { useTimelineKeyboard } from "@/components/rewind/hooks/use-timeline-keyboard";
+import { localFetch } from "@/lib/api";
 
 export interface StreamTimeSeriesResponse {
 	timestamp: string;
@@ -100,6 +101,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 	const scrubberRef = useRef<HTMLDivElement | null>(null);
 	// Stable guardRefs object for Live Text click guards — refs are stable, so useMemo with empty deps is fine
 	const guardRefs = useMemo(() => ({ filters: filtersRef, scrubber: scrubberRef }), []);
+
 	const [startAndEndDates, setStartAndEndDates] = useState<TimeRange>(() => {
 		// Lazy init to avoid SSR/client hydration mismatch from new Date()
 		const now = new Date();
@@ -180,6 +182,13 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 
 	const { meetings } = useMeetings(frames);
 
+	// Force guard rect refresh when inner timeline mounts/unmounts
+	useEffect(() => {
+		const timer = setTimeout(() => {
+			window.dispatchEvent(new Event("resize"));
+		}, 500);
+		return () => clearTimeout(timer);
+	}, [frames.length]);
 
 	// --- Extracted hooks ---
 
@@ -471,7 +480,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 		const fetchFrameMetadata = async (id: string, retries = 3): Promise<{ timestamp?: string } | null> => {
 			for (let i = 0; i < retries; i++) {
 				try {
-					const resp = await fetch(`http://localhost:3030/frames/${id}/metadata`);
+					const resp = await localFetch(`/frames/${id}/metadata`);
 					if (resp.ok) {
 						const data = await resp.json();
 						return data;
@@ -980,6 +989,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 			<div
 				ref={containerRef}
 				className="inset-0 flex flex-col text-foreground relative"
+				data-testid="section-timeline"
 				onWheel={onContainerWheel}
 				style={{
 					height: embedded ? "100%" : "100vh",
@@ -1032,8 +1042,8 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 
 								try {
 									// Query the server for the next valid frame
-									const response = await fetch(
-										`http://localhost:3030/frames/next-valid?frame_id=${failedFrameId}&direction=forward&limit=50`
+									const response = await localFetch(
+										`/frames/next-valid?frame_id=${failedFrameId}&direction=forward&limit=50`
 									);
 
 									if (response.ok) {
@@ -1183,7 +1193,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 					const browserUrl = currentFrame?.devices?.[0]?.metadata?.browser_url;
 					if (!browserUrl) return null;
 					return (
-						<div className={`absolute ${embedded ? "top-1" : "top-[calc(env(safe-area-inset-top)+4px)]"} left-0 right-0 z-[45] flex justify-center pointer-events-none`}>
+						<div className={`absolute ${embedded ? "top-[56px]" : "top-[calc(env(safe-area-inset-top)+4px)]"} left-0 right-0 z-[45] flex justify-center pointer-events-none`}>
 							<button
 								type="button"
 								className="flex items-center gap-1.5 max-w-lg min-w-0 px-3 py-1 rounded-full bg-black/70 backdrop-blur-sm border border-white/10 hover:bg-black/80 hover:border-white/20 transition-colors cursor-pointer pointer-events-auto"

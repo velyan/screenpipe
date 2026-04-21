@@ -112,17 +112,36 @@ async function getCreditBalance(env: Env, userId: string): Promise<number> {
 
 // Per-model query weights — expensive models cost more daily queries
 const MODEL_WEIGHTS: Record<string, number> = {
-  'claude-opus': 5,
+  // Auto — smart routing, free
+  'auto': 0,
+  // Vertex MaaS — free for users (GCP credits), weight=0 so they don't eat daily quota
+  'glm-4.7': 0,
+  'glm-5': 0,
+  'kimi-k2.5': 0,
+  // Opus 4.7 is ~3× cheaper per token than 4.5/4.6 ($5/$25 vs $15/$75 per 1M),
+  // so it consumes proportionally less daily quota. Longest-prefix match in
+  // getModelWeight ensures this override beats the generic 'claude-opus' entry.
+  'claude-opus-4-7': 5,
+  'claude-opus': 15,
   'claude-sonnet': 3,
   'claude-haiku': 1,
   'gemini-3-pro': 3,
   'gemini-3.1-pro': 3,
   'gemini-2.5-pro': 3,
-  'gemini-3-flash': 1,
-  'gemini-2.5-flash': 1,
-  'gpt-4o-mini': 1,
-  'gpt-4o': 3,
-  'gpt-4': 3,
+  'gemini-3-flash': 0,
+  'gemini-3.1-flash-lite': 0,
+  'gemini-2.5-flash': 0,
+  // OpenRouter models
+  'qwen3.5-flash': 0,
+  'qwen3.5-397b': 3,
+  'deepseek-chat': 1,
+  'deepseek-v3.2-speciale': 3,
+  'llama-4-maverick': 1,
+  'llama-4-scout': 1,
+  'qwen3-coder:free': 0,
+  'qwen3-coder': 1,
+  'step-3.5-flash:free': 0,
+  'step-3.5-flash': 0,
 };
 
 export function getModelWeight(model?: string): number {
@@ -146,26 +165,43 @@ const DEFAULT_TIER_CONFIG: Record<UserTier, TierLimits> = {
     dailyQueries: 25,
     rpm: 15,
     allowedModels: [
+      'auto',
       'claude-haiku-4-5',
       'gemini-3-flash',
-      'gemini-2.5-flash',
+      'gemini-3.1-flash-lite',
+      'glm-4.7',
+      'glm-5',
+      'kimi-k2.5',
+      'deepseek/deepseek-chat',
+      'qwen/qwen3.5-flash',
+      'meta-llama/llama-4-scout',
     ],
   },
   logged_in: {
     dailyQueries: 50,
     rpm: 25,
     allowedModels: [
+      'auto',
       'claude-haiku-4-5',
       'claude-sonnet-4-5',
-      'gpt-4o-mini',
       'gemini-3-flash',
-      'gemini-2.5-flash',
+      'gemini-3.1-flash-lite',
       'gemini-3-pro',
       'gemini-3.1-pro',
+      'glm-4.7',
+      'glm-5',
+      'kimi-k2.5',
+      'deepseek/deepseek-chat',
+      'deepseek/deepseek-v3.2-speciale',
+      'qwen/qwen3.5-flash',
+      'qwen/qwen3.5-397b',
+      'meta-llama/llama-4-scout',
+      'meta-llama/llama-4-maverick',
+      'gemma4-31b',
     ],
   },
   subscribed: {
-    dailyQueries: 1000,
+    dailyQueries: 1500,
     rpm: 60,
     allowedModels: ['*'], // all models
   },
@@ -287,7 +323,8 @@ export async function trackUsage(
         dailyCount = weight;
       } else {
         // Check limit BEFORE incrementing — don't inflate counter on rejected requests
-        if (existing.daily_count >= limits.dailyQueries) {
+        // Skip limit check for free models (weight=0) — they never count toward quota
+        if (weight > 0 && existing.daily_count >= limits.dailyQueries) {
           // Daily free quota exhausted — try credit fallback
           if (userId) {
             const credit = await tryDeductCredit(env, userId, 'ai_query');

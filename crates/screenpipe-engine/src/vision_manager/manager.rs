@@ -17,6 +17,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::event_driven_capture::{CaptureTrigger, TriggerSender};
+use crate::focus_aware_controller::FocusAwareController;
 use crate::hot_frame_cache::HotFrameCache;
 use crate::power::PowerProfile;
 
@@ -35,6 +36,12 @@ pub struct VisionManagerConfig {
     pub use_all_monitors: bool,
     /// Automatically detect and skip incognito / private browsing windows.
     pub ignore_incognito_windows: bool,
+    /// Pause all screen capture when a DRM streaming app (Netflix, etc.) is focused.
+    pub pause_on_drm_content: bool,
+    /// Languages for OCR recognition.
+    pub languages: Vec<screenpipe_core::Language>,
+    /// Maximum width for stored snapshots (0 = no limit, store at native res).
+    pub max_snapshot_width: u32,
 }
 
 /// Status of the VisionManager
@@ -60,6 +67,12 @@ pub struct VisionManager {
     hot_frame_cache: Option<Arc<HotFrameCache>>,
     /// Power profile receiver — each monitor gets a clone.
     power_profile_rx: Option<watch::Receiver<PowerProfile>>,
+    /// Focus-aware capture controller — always constructed.
+    /// If focus resolution fails on a given platform (Linux Wayland, permission
+    /// denied, etc.) the NullFocusTracker + Unknown event path makes the
+    /// controller report Active for all monitors, preserving the pre-feature
+    /// behaviour for those users.
+    focus_controller: Arc<FocusAwareController>,
 }
 
 impl VisionManager {
@@ -71,6 +84,18 @@ impl VisionManager {
     ) -> Self {
         // Single broadcast channel shared across all monitors + UI recorder.
         let (trigger_tx, _rx) = tokio::sync::broadcast::channel::<CaptureTrigger>(64);
+
+        // Focus-aware capture is always on. `new_tracker()` always succeeds —
+        // returns a null tracker on platforms without a native impl. Controller
+        // fallback handles `Unknown` events by treating all monitors as Active,
+        // so users whose systems can't report focus still get the pre-feature
+        // behaviour (every monitor captured at full rate).
+        let focus_controller = {
+            let _guard = vision_handle.enter();
+            let tracker = crate::focus_tracker::new_tracker();
+            FocusAwareController::new(tracker)
+        };
+
         Self {
             config,
             db,
@@ -80,6 +105,7 @@ impl VisionManager {
             trigger_tx,
             hot_frame_cache: None,
             power_profile_rx: None,
+            focus_controller,
         }
     }
 
@@ -118,14 +144,14 @@ impl VisionManager {
             return monitor.is_primary();
         }
         let stable_id = monitor.stable_id();
+        let numeric_id = monitor.id().to_string();
         fn prefix(sid: &str) -> &str {
             sid.rsplitn(2, '_').last().unwrap_or(sid)
         }
         let monitor_prefix = prefix(&stable_id);
-        self.config
-            .monitor_ids
-            .iter()
-            .any(|allowed| *allowed == stable_id || prefix(allowed) == monitor_prefix)
+        self.config.monitor_ids.iter().any(|allowed| {
+            *allowed == stable_id || *allowed == numeric_id || prefix(allowed) == monitor_prefix
+        })
     }
 
     /// Start recording on all currently connected monitors
@@ -142,6 +168,7 @@ impl VisionManager {
 
         // Get all monitors and start recording on each (filtered by user selection)
         let monitors = list_monitors().await;
+        let total_monitors = monitors.len();
         for monitor in monitors {
             if !self.is_monitor_allowed(&monitor) {
                 info!(
@@ -160,6 +187,27 @@ impl VisionManager {
             }
         }
 
+        let task_count = self.recording_tasks.len();
+        if task_count == 0 {
+            // Roll status back so the next .start() attempt isn't blocked by the
+            // idempotency guard above.
+            *self.status.write().await = VisionManagerStatus::Stopped;
+            warn!(
+                "VisionManager: no monitors matched the allowed list \
+                 ({} enumerated, 0 started) — stale monitor_ids?",
+                total_monitors
+            );
+            return Err(anyhow::anyhow!(
+                "no monitors matched the allowed list (monitorIds may be stale: \
+                 {} enumerated, 0 started)",
+                total_monitors
+            ));
+        }
+
+        info!(
+            "VisionManager started with {}/{} monitor(s)",
+            task_count, total_monitors
+        );
         Ok(())
     }
 
@@ -189,6 +237,20 @@ impl VisionManager {
                 );
             }
         }
+
+        // Aborting capture tasks does NOT release sck_rs's global SCStream handles.
+        // Explicitly tear them down so macOS sees no active ScreenCaptureKit usage.
+        #[cfg(target_os = "macos")]
+        {
+            screenpipe_screen::stream_invalidation::invalidate_streams();
+            // MonitorStream::drop spawns a detached thread to call stream.stop().
+            // Give those threads time to complete so the OS tears down the SCK session
+            // and the purple recording dot disappears.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+
+        // Shut down the focus controller.
+        self.focus_controller.shutdown();
 
         let mut status = self.status.write().await;
         *status = VisionManagerStatus::Stopped;
@@ -238,10 +300,17 @@ impl VisionManager {
         let output_path = self.config.output_path.clone();
         let device_name = format!("monitor_{}", monitor_id);
 
-        // Create snapshot writer for this monitor's data directory
+        // Create snapshot writer for this monitor's data directory.
+        // Use current power profile's JPEG quality instead of hardcoded 80.
+        let initial_jpeg_quality = self
+            .power_profile_rx
+            .as_ref()
+            .map(|rx| rx.borrow().jpeg_quality)
+            .unwrap_or(80);
         let snapshot_writer = Arc::new(SnapshotWriter::new(
             format!("{}/data", output_path),
-            80, // JPEG quality
+            initial_jpeg_quality,
+            self.config.max_snapshot_width,
         ));
 
         // Create activity feed for this monitor
@@ -274,7 +343,10 @@ impl VisionManager {
         let vision_metrics = self.config.vision_metrics.clone();
         let hot_frame_cache = self.hot_frame_cache.clone();
         let use_pii_removal = self.config.use_pii_removal;
+        let pause_on_drm_content = self.config.pause_on_drm_content;
+        let languages = self.config.languages.clone();
         let power_profile_rx = self.power_profile_rx.clone();
+        let focus_controller = self.focus_controller.clone();
 
         info!(
             "Starting event-driven capture for monitor {} (device: {})",
@@ -298,7 +370,10 @@ impl VisionManager {
                 vision_metrics,
                 hot_frame_cache,
                 use_pii_removal,
+                pause_on_drm_content,
+                languages,
                 power_profile_rx,
+                focus_controller,
             )
             .await
             {
@@ -321,8 +396,17 @@ impl VisionManager {
             // Abort the task
             handle.abort();
 
-            // Wait for it to finish
-            let _ = handle.await;
+            // Wait for it to finish with a timeout — if the capture task is stuck
+            // in a spawn_blocking AX tree walk, cancellation can be delayed.
+            match tokio::time::timeout(std::time::Duration::from_secs(3), handle).await {
+                Ok(_) => {}
+                Err(_) => {
+                    warn!(
+                        "monitor {} capture task did not finish within 3s after abort, moving on",
+                        monitor_id
+                    );
+                }
+            }
 
             Ok(())
         } else {
@@ -331,8 +415,40 @@ impl VisionManager {
         }
     }
 
-    /// Get list of currently recording monitor IDs
+    /// Get list of currently recording monitor IDs.
+    /// Removes dead tasks (finished JoinHandles) so MonitorWatcher can restart them.
     pub async fn active_monitors(&self) -> Vec<u32> {
+        // Collect dead task IDs first to avoid holding DashMap refs during removal
+        let dead: Vec<u32> = self
+            .recording_tasks
+            .iter()
+            .filter(|entry| entry.value().is_finished())
+            .map(|entry| *entry.key())
+            .collect();
+
+        for id in &dead {
+            if let Some((_, handle)) = self.recording_tasks.remove(id) {
+                // Await to clean up the JoinHandle and capture exit reason
+                match handle.await {
+                    Ok(()) => {
+                        warn!(
+                            "monitor {} capture task exited (see prior error log for cause), will be restarted by monitor watcher",
+                            id
+                        );
+                    }
+                    Err(e) if e.is_cancelled() => {
+                        info!("monitor {} capture task was cancelled", id);
+                    }
+                    Err(e) => {
+                        error!(
+                            "monitor {} capture task panicked: {}, will be restarted by monitor watcher",
+                            id, e
+                        );
+                    }
+                }
+            }
+        }
+
         self.recording_tasks
             .iter()
             .map(|entry| *entry.key())
@@ -343,5 +459,143 @@ impl VisionManager {
     pub async fn shutdown(&self) -> Result<()> {
         info!("Shutting down VisionManager");
         self.stop().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use screenpipe_core::Language;
+    use screenpipe_db::DatabaseManager;
+    use screenpipe_screen::PipelineMetrics;
+
+    async fn make_vm_with_monitor_ids(monitor_ids: Vec<String>) -> VisionManager {
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .expect("in-memory db"),
+        );
+        let config = VisionManagerConfig {
+            output_path: std::env::temp_dir().to_string_lossy().into_owned(),
+            ignored_windows: vec![],
+            included_windows: vec![],
+            vision_metrics: Arc::new(PipelineMetrics::default()),
+            use_pii_removal: false,
+            monitor_ids,
+            use_all_monitors: false,
+            ignore_incognito_windows: false,
+            pause_on_drm_content: false,
+            languages: vec![Language::English],
+            max_snapshot_width: 0,
+        };
+        VisionManager::new(config, db, Handle::current())
+    }
+
+    /// Regression: with an allowlist that matches zero physical monitors,
+    /// `start()` must return `Err` and leave status as `Stopped`, so the
+    /// outer `CaptureSession::start` stays None and the tray can retry.
+    ///
+    /// Before the fix: `start()` returned `Ok(())` silently with zero tasks,
+    /// and the outer detached spawn swallowed the no-op — leaving a "dead"
+    /// `CaptureSession` parked in `RecordingState.capture`. Every subsequent
+    /// tray click then hit the `is_some()` short-circuit in `recording.rs`.
+    #[tokio::test]
+    async fn start_with_no_allowed_monitors_returns_err() {
+        // A stable_id prefix that cannot exist on any real host.
+        let stale = vec!["Display 999_9999x9999_0,0".to_string()];
+        let vm = make_vm_with_monitor_ids(stale).await;
+
+        let result = vm.start().await;
+        assert!(
+            result.is_err(),
+            "expected Err when allowlist matches zero monitors, got: {:?}",
+            result
+        );
+
+        // Status must be rolled back to Stopped so a subsequent retry
+        // (with a corrected allowlist) isn't blocked by the idempotency guard.
+        assert_eq!(
+            vm.status().await,
+            VisionManagerStatus::Stopped,
+            "status must be rolled back to Stopped on Err, otherwise retry is blocked"
+        );
+
+        // Recording tasks map must stay empty — nothing was spawned.
+        assert_eq!(
+            vm.recording_tasks.len(),
+            0,
+            "no tasks should exist after failed start"
+        );
+    }
+
+    /// Verify that stop_monitor completes promptly when the task finishes normally.
+    #[tokio::test]
+    async fn test_stop_monitor_normal_task() {
+        let tasks: Arc<DashMap<u32, JoinHandle<()>>> = Arc::new(DashMap::new());
+        let handle = tokio::spawn(async {
+            // Task that finishes quickly
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        });
+        tasks.insert(1, handle);
+
+        // Simulate stop_monitor logic
+        if let Some((_, handle)) = tasks.remove(&1) {
+            handle.abort();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
+            // Should complete well before 3s
+            assert!(result.is_ok(), "normal task should finish within timeout");
+        }
+    }
+
+    /// Verify that stop_monitor doesn't hang on a slow task — the 3s timeout fires.
+    #[tokio::test]
+    async fn test_stop_monitor_timeout_on_slow_task() {
+        let tasks: Arc<DashMap<u32, JoinHandle<()>>> = Arc::new(DashMap::new());
+        let handle = tokio::spawn(async {
+            // Simulate a task stuck in spawn_blocking-like work.
+            // We use a long sleep; abort won't cancel it instantly in all cases.
+            tokio::task::spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+            })
+            .await
+            .ok();
+        });
+        tasks.insert(1, handle);
+
+        if let Some((_, handle)) = tasks.remove(&1) {
+            handle.abort();
+            let start = std::time::Instant::now();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
+            let elapsed = start.elapsed();
+
+            // The timeout should fire around 3s, not 30s
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "should not wait for the full 30s task, elapsed: {:?}",
+                elapsed
+            );
+            // The result is either Ok (abort completed) or Err (timeout). Either is acceptable —
+            // the important thing is we didn't hang.
+            let _ = result;
+        }
+    }
+
+    /// Verify that an already-finished task completes instantly on stop_monitor.
+    #[tokio::test]
+    async fn test_stop_monitor_already_finished() {
+        let tasks: Arc<DashMap<u32, JoinHandle<()>>> = Arc::new(DashMap::new());
+        let handle = tokio::spawn(async {});
+        // Let it finish
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tasks.insert(1, handle);
+
+        if let Some((_, handle)) = tasks.remove(&1) {
+            handle.abort();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
+            assert!(
+                result.is_ok(),
+                "already-finished task should resolve instantly"
+            );
+        }
     }
 }

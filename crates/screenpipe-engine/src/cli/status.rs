@@ -1,4 +1,4 @@
-use dirs::home_dir;
+use screenpipe_core::paths;
 use serde_json::json;
 use sqlx::Row;
 use std::path::PathBuf;
@@ -19,7 +19,9 @@ pub async fn handle_status_command(
 
     // Get DB stats
     let (frame_count, audio_count, last_timestamp) = if db_path.exists() {
-        match screenpipe_db::DatabaseManager::new(&db_path.to_string_lossy()).await {
+        match screenpipe_db::DatabaseManager::new(&db_path.to_string_lossy(), Default::default())
+            .await
+        {
             Ok(db) => {
                 let frames: i64 = sqlx::query("SELECT COUNT(*) as cnt FROM frames")
                     .fetch_one(&db.pool)
@@ -83,9 +85,7 @@ pub async fn handle_status_command(
 }
 
 fn get_base_dir(custom_path: &Option<String>) -> anyhow::Result<PathBuf> {
-    let default_path = home_dir()
-        .ok_or_else(|| anyhow::anyhow!("failed to get home directory"))?
-        .join(".screenpipe");
+    let default_path = paths::default_screenpipe_data_dir();
 
     Ok(custom_path
         .as_ref()

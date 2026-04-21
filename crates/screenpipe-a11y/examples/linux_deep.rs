@@ -4,14 +4,21 @@
 
 //! Deep dump of all nodes in the focused window's accessibility tree.
 
+#[cfg(target_os = "linux")]
 use zbus::blocking::Connection;
+#[cfg(target_os = "linux")]
 use zbus::names::{BusName, InterfaceName};
+#[cfg(target_os = "linux")]
 use zbus::zvariant::{ObjectPath, OwnedValue};
 
+#[cfg(target_os = "linux")]
 const ATSPI_ACCESSIBLE: &str = "org.a11y.atspi.Accessible";
+#[cfg(target_os = "linux")]
 const ATSPI_TEXT: &str = "org.a11y.atspi.Text";
+#[cfg(target_os = "linux")]
 const DBUS_PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 
+#[cfg(target_os = "linux")]
 fn dbus_call<B: serde::ser::Serialize + zbus::zvariant::DynamicType>(
     conn: &Connection,
     dest: &str,
@@ -26,6 +33,7 @@ fn dbus_call<B: serde::ser::Serialize + zbus::zvariant::DynamicType>(
     conn.call_method(Some(dest), obj_path, Some(iface_name), method, body)
 }
 
+#[cfg(target_os = "linux")]
 fn get_prop(
     conn: &Connection,
     dest: &str,
@@ -47,12 +55,14 @@ fn get_prop(
     .and_then(|r| r.body().deserialize::<OwnedValue>().ok())
 }
 
+#[cfg(target_os = "linux")]
 fn get_name(conn: &Connection, dest: &str, path: &str) -> String {
     get_prop(conn, dest, path, ATSPI_ACCESSIBLE, "Name")
         .and_then(|v| v.try_into().ok())
         .unwrap_or_default()
 }
 
+#[cfg(target_os = "linux")]
 fn get_role(conn: &Connection, dest: &str, path: &str) -> u32 {
     dbus_call(conn, dest, path, ATSPI_ACCESSIBLE, "GetRole", &())
         .ok()
@@ -60,6 +70,7 @@ fn get_role(conn: &Connection, dest: &str, path: &str) -> u32 {
         .unwrap_or(0)
 }
 
+#[cfg(target_os = "linux")]
 fn get_children(conn: &Connection, dest: &str, path: &str) -> Vec<(String, String)> {
     let child_count: i32 = get_prop(conn, dest, path, ATSPI_ACCESSIBLE, "ChildCount")
         .and_then(|v| v.try_into().ok())
@@ -77,6 +88,7 @@ fn get_children(conn: &Connection, dest: &str, path: &str) -> Vec<(String, Strin
     children
 }
 
+#[cfg(target_os = "linux")]
 fn get_text(conn: &Connection, dest: &str, path: &str) -> Option<String> {
     let char_count: i32 = dbus_call(conn, dest, path, ATSPI_TEXT, "GetCharacterCount", &())
         .ok()
@@ -97,12 +109,14 @@ fn get_text(conn: &Connection, dest: &str, path: &str) -> Option<String> {
     .filter(|s| !s.trim().is_empty())
 }
 
+#[cfg(target_os = "linux")]
 fn get_interfaces(conn: &Connection, dest: &str, path: &str) -> Vec<String> {
     get_prop(conn, dest, path, ATSPI_ACCESSIBLE, "GetInterfaces")
         .and_then(|v| v.try_into().ok())
         .unwrap_or_default()
 }
 
+#[cfg(target_os = "linux")]
 fn dump_tree(conn: &Connection, dest: &str, path: &str, depth: usize, max_depth: usize) {
     if depth > max_depth {
         return;
@@ -130,6 +144,7 @@ fn dump_tree(conn: &Connection, dest: &str, path: &str, depth: usize, max_depth:
     }
 }
 
+#[cfg(target_os = "linux")]
 fn main() {
     println!("=== AT-SPI2 Deep Tree Dump ===\n");
     let session = Connection::session().unwrap();
@@ -168,4 +183,9 @@ fn main() {
         }
     }
     println!("No Test Window found");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("linux_deep is only supported on Linux");
 }

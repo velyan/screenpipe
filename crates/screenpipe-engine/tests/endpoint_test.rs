@@ -32,7 +32,11 @@ mod tests {
     }
 
     async fn setup_test_app() -> (Router, Arc<DatabaseManager>) {
-        let db = Arc::new(DatabaseManager::new("sqlite::memory:").await.unwrap());
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
 
         let audio_manager = Arc::new(
             AudioManagerBuilder::new()
@@ -493,6 +497,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -505,6 +511,8 @@ mod tests {
                 10,
                 0,
                 Some(now - Duration::minutes(1)),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -538,6 +546,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -556,6 +566,8 @@ mod tests {
                 0,
                 None,
                 Some(now - Duration::minutes(10)),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -698,6 +710,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -729,6 +743,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -748,7 +764,7 @@ mod tests {
 
         // Open database in read-only mode for safety
         let db = Arc::new(
-            DatabaseManager::new(&format!("sqlite:{}?mode=ro", db_path))
+            DatabaseManager::new(&format!("sqlite:{}?mode=ro", db_path), Default::default())
                 .await
                 .unwrap(),
         );
@@ -776,6 +792,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -791,6 +809,8 @@ mod tests {
                 0,
                 Some(four_hours_ago - Duration::minutes(5)),
                 Some(four_hours_ago + Duration::minutes(5)),
+                None,
+                None,
                 None,
                 None,
                 None,

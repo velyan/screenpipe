@@ -13,6 +13,7 @@ import { Check, Ghost, Loader2, Plus, Volume2 } from "lucide-react";
 import { VideoComponent } from "@/components/rewind/video";
 import { ToastAction } from "@/components/ui/toast";
 import { cn } from "@/lib/utils";
+import { localFetch } from "@/lib/api";
 
 interface Speaker {
 	id: number;
@@ -57,8 +58,8 @@ export function SpeakerAssignPopover({
 		const searchSpeakers = async () => {
 			setIsSearching(true);
 			try {
-				const response = await fetch(
-					`http://localhost:3030/speakers/search?name=${encodeURIComponent(searchTerm)}`,
+				const response = await localFetch(
+					`/speakers/search?name=${encodeURIComponent(searchTerm)}`,
 					{ signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]) }
 				);
 				if (response.ok) {
@@ -90,7 +91,7 @@ export function SpeakerAssignPopover({
 
 			try {
 				// Phase 1: Assign just this chunk (instant, no propagation)
-				const response = await fetch("http://localhost:3030/speakers/reassign", {
+				const response = await localFetch("/speakers/reassign", {
 					method: "POST",
 					headers: { "Content-Type": "application/json" },
 					body: JSON.stringify({
@@ -119,7 +120,7 @@ export function SpeakerAssignPopover({
 
 				// Phase 2: Propagate in background (non-blocking)
 				try {
-					const propagateResponse = await fetch("http://localhost:3030/speakers/reassign", {
+					const propagateResponse = await localFetch("/speakers/reassign", {
 						method: "POST",
 						headers: { "Content-Type": "application/json" },
 						body: JSON.stringify({
@@ -143,7 +144,7 @@ export function SpeakerAssignPopover({
 										altText="Undo speaker assignment"
 										onClick={async () => {
 											try {
-												const undoResp = await fetch("http://localhost:3030/speakers/undo-reassign", {
+												const undoResp = await localFetch("/speakers/undo-reassign", {
 													method: "POST",
 													headers: { "Content-Type": "application/json" },
 													body: JSON.stringify({ old_assignments: oldAssignments }),
@@ -193,7 +194,7 @@ export function SpeakerAssignPopover({
 
 		setIsAssigning(true);
 		try {
-			const response = await fetch("http://localhost:3030/speakers/hallucination", {
+			const response = await localFetch("/speakers/hallucination", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({ speaker_id: speakerId }),

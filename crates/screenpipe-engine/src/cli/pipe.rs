@@ -12,10 +12,7 @@ use std::sync::Arc;
 
 /// Handle pipe subcommands (standalone — does NOT require a running server).
 pub async fn handle_pipe_command(command: &PipeCommand) -> anyhow::Result<()> {
-    let pipes_dir = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("could not find home directory"))?
-        .join(".screenpipe")
-        .join("pipes");
+    let pipes_dir = screenpipe_core::paths::default_screenpipe_data_dir().join("pipes");
     std::fs::create_dir_all(&pipes_dir)?;
 
     let user_token = std::env::var("SCREENPIPE_API_KEY").ok();
@@ -61,7 +58,7 @@ pub async fn handle_pipe_command(command: &PipeCommand) -> anyhow::Result<()> {
         }
         PipeCommand::Install { source } => match manager.install_pipe(source).await {
             Ok(name) => println!("installed pipe: {}", name),
-            Err(e) => eprintln!("error: {}", e),
+            Err(e) => anyhow::bail!("failed to install pipe: {}", e),
         },
         PipeCommand::Enable { name } => {
             manager.enable_pipe(name, true).await?;
@@ -84,19 +81,31 @@ pub async fn handle_pipe_command(command: &PipeCommand) -> anyhow::Result<()> {
                             println!("\n{}", log.stdout);
                         }
                     } else {
-                        eprintln!("✗ failed");
+                        let mut msg = format!("pipe '{}' execution failed", name);
                         if !log.stderr.is_empty() {
-                            eprintln!("{}", log.stderr);
+                            msg.push_str(&format!(":\n{}", log.stderr));
                         }
+                        anyhow::bail!(msg);
                     }
                 }
-                Err(e) => eprintln!("error: {}", e),
+                Err(e) => return Err(e),
             }
         }
         PipeCommand::Logs { name, follow: _ } => {
+            // Verify the pipe exists before showing logs
+            if manager.get_pipe(name).await.is_none() {
+                let pipe_dir = pipes_dir.join(name);
+                if !pipe_dir.exists() {
+                    anyhow::bail!(
+                        "pipe '{}' not found — directory does not exist: {}\nhint: install it first with `screenpipe pipe install <source>`",
+                        name,
+                        pipe_dir.display()
+                    );
+                }
+            }
             let logs = manager.get_logs(name).await;
             if logs.is_empty() {
-                println!("no logs for pipe '{}'", name);
+                println!("no logs for pipe '{}' (it hasn't been run yet)", name);
             } else {
                 for log in &logs {
                     let status = if log.success { "✓" } else { "✗" };
@@ -140,27 +149,33 @@ pub async fn handle_pipe_command(command: &PipeCommand) -> anyhow::Result<()> {
 }
 
 /// Get the API base URL from env or default.
-fn api_base_url() -> String {
+pub fn api_base_url() -> String {
     std::env::var("SCREENPIPE_API_BASE_URL").unwrap_or_else(|_| "https://screenpi.pe".to_string())
 }
 
-/// Get the auth token from SCREENPIPE_API_KEY env var or ~/.screenpipe/auth.json.
-fn get_auth_token() -> Option<String> {
+/// Get the auth token, checking in order:
+/// 1. SCREENPIPE_API_KEY env var
+/// 2. ~/.screenpipe/store.bin (settings.user.token — written by desktop app or `screenpipe login`)
+pub fn get_auth_token() -> Option<String> {
     if let Ok(key) = std::env::var("SCREENPIPE_API_KEY") {
         return Some(key);
     }
-    let auth_path = dirs::home_dir()?.join(".screenpipe").join("auth.json");
-    if auth_path.exists() {
-        let content = std::fs::read_to_string(&auth_path).ok()?;
-        let parsed: Value = serde_json::from_str(&content).ok()?;
-        parsed
-            .get("token")
-            .or_else(|| parsed.get("api_key"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    } else {
-        None
+
+    let store_path = screenpipe_core::paths::default_screenpipe_data_dir().join("store.bin");
+    if store_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&store_path) {
+            if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
+                return parsed
+                    .pointer("/state/settings/user/token")
+                    .or_else(|| parsed.pointer("/settings/user/token"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+            }
+        }
     }
+
+    None
 }
 
 /// Publish a local pipe to the registry.
@@ -484,10 +499,7 @@ async fn handle_status_command(slug: &str) -> anyhow::Result<()> {
 
 /// Handle model subcommands — reads presets from store.bin.
 pub fn handle_model_command(command: &ModelCommand) -> anyhow::Result<()> {
-    let store_path = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("could not find home directory"))?
-        .join(".screenpipe")
-        .join("store.bin");
+    let store_path = screenpipe_core::paths::default_screenpipe_data_dir().join("store.bin");
 
     let presets = if store_path.exists() {
         let content = std::fs::read_to_string(&store_path)?;

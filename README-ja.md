@@ -37,8 +37,8 @@
     <a href="https://discord.gg/screenpipe">
         <img src="https://img.shields.io/discord/823813159592001537?color=5865F2&logo=discord&logoColor=white&style=flat-square" alt="discord">
     </a>
-    <a href="https://twitter.com/screen_pipe">
-        <img alt="x" src="https://img.shields.io/twitter/url/https/twitter.com/diffuserslib.svg?style=social&label=フォロー%20%40screen_pipe">
+    <a href="https://twitter.com/screenpipe">
+        <img alt="x" src="https://img.shields.io/twitter/url/https/twitter.com/diffuserslib.svg?style=social&label=フォロー%20%40screenpipe">
     </a>
 </p>
 
@@ -81,5 +81,5 @@ screenpipeは画面と音声を24時間365日録画し、すべてをローカ�
 <p align="center">
     <a href="https://docs.screenpi.pe">ドキュメント</a> ·
     <a href="https://discord.gg/screenpipe">discord</a> ·
-    <a href="https://twitter.com/screen_pipe">x</a>
+    <a href="https://twitter.com/screenpipe">x</a>
 </p>

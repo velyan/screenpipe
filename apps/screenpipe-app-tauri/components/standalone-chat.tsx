@@ -10,7 +10,7 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { useSettings, ChatMessage, ChatConversation } from "@/lib/hooks/use-settings";
 import { cn } from "@/lib/utils";
-import { Loader2, Send, Square, User, Settings, ExternalLink, X, ImageIcon, Zap, History, Search, Trash2, ChevronLeft, ChevronDown, ChevronUp, Plus, Copy, Check, Clock, Paperclip, Filter } from "lucide-react";
+import { Loader2, Send, Square, User, Settings, ExternalLink, X, ImageIcon, History, Search, Trash2, ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Plus, Copy, Check, Clock, Paperclip, Filter, RefreshCw, GitBranch, MoreHorizontal, Pencil } from "lucide-react";
 import { SchedulePromptDialog } from "@/components/chat/schedule-prompt-dialog";
 import { toast } from "@/components/ui/use-toast";
 import { motion, AnimatePresence } from "framer-motion";
@@ -19,9 +19,11 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
 import { MemoizedReactMarkdown } from "@/components/markdown";
 import { VideoComponent } from "@/components/rewind/video";
 import { MermaidDiagram } from "@/components/rewind/mermaid-diagram";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { AIPresetsSelector } from "@/components/rewind/ai-presets-selector";
 import { AIPreset } from "@/lib/utils/tauri";
 import remarkGfm from "remark-gfm";
+import rehypeRaw from "rehype-raw";
 // OpenAI SDK no longer used directly — all providers route through Pi agent
 import posthog from "posthog-js";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
@@ -36,7 +38,7 @@ import { usePlatform } from "@/lib/hooks/use-platform";
 import { useSqlAutocomplete } from "@/lib/hooks/use-sql-autocomplete";
 import { homeDir, join } from "@tauri-apps/api/path";
 import { useTimelineStore } from "@/lib/hooks/use-timeline-store";
-import { UpgradeDialog } from "@/components/upgrade-dialog";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from "@/components/ui/dialog";
 import {
   parseMentions,
   buildAppMentionSuggestions,
@@ -47,9 +49,9 @@ import { useAutoSuggestions } from "@/lib/hooks/use-auto-suggestions";
 import { SummaryCards } from "@/components/chat/summary-cards";
 import { type CustomTemplate } from "@/lib/summary-templates";
 import { usePipes } from "@/lib/hooks/use-pipes";
-
-const SCREENPIPE_API = "http://localhost:3030";
-const PI_CHAT_SESSION = "chat";
+import { localFetch, getApiBaseUrl } from "@/lib/api";
+// Session ID is per-conversation — set on mount (new conv) and updated on load/new.
+// Stored as a ref so event listeners always see the current value without stale closures.
 
 interface MentionSuggestion {
   tag: string;
@@ -78,6 +80,67 @@ const STATIC_MENTION_SUGGESTIONS: MentionSuggestion[] = [
 
 // TOOLS definition removed — search is now handled by Pi's screenpipe-search skill
 
+/**
+ * Extract tier info from gateway error JSON embedded in error strings and
+ * return a user-facing message appropriate to their actual subscription tier.
+ */
+function buildDailyLimitMessage(errorStr: string): string {
+  try {
+    const isCostLimit = errorStr.includes("daily_cost_limit_exceeded");
+    const isRateLimit = errorStr.includes("rate limit") || errorStr.includes("Rate limit");
+
+    if (isRateLimit) {
+      return "This model is temporarily rate-limited. Try again in a few seconds, or switch to a different model.";
+    }
+
+    if (isCostLimit) {
+      return "Daily usage limit reached for this model. Try a lighter model or wait until tomorrow.";
+    }
+
+    const tierMatch = errorStr.match(/"tier":\s*"([^"]+)"/);
+    const tier = tierMatch?.[1];
+
+    if (tier === "subscribed") {
+      return "You've hit your daily limit. Switch to a free model (Qwen3 Coder, Gemini Flash) for unlimited usage.";
+    } else if (tier === "logged_in") {
+      return "You've used your free queries for today. Switch to a free model (Qwen3 Coder, Gemini Flash) for unlimited usage, or upgrade to Pro.";
+    } else {
+      return "You've used your free queries for today. Sign in for more, or switch to a free model (Qwen3 Coder, Gemini Flash).";
+    }
+  } catch {
+    return "You've reached your daily limit. Try a free model like Qwen3 Coder or Gemini Flash.";
+  }
+}
+
+function classifyQuotaError(errorStr: string): "daily" | "rate" | "none" {
+  const normalized = errorStr.toLowerCase();
+  const isDailyLimit =
+    normalized.includes("credits_exhausted") ||
+    normalized.includes("daily_limit_exceeded") ||
+    normalized.includes("daily_cost_limit_exceeded");
+  if (isDailyLimit) {
+    return "daily";
+  }
+
+  const isRateLimit =
+    normalized.includes("429") ||
+    normalized.includes("rate limit") ||
+    normalized.includes("rate_limit") ||
+    normalized.includes("requests per minute") ||
+    normalized.includes("too many requests");
+  return isRateLimit ? "rate" : "none";
+}
+
+function buildRateLimitMessage(errorStr: string): string {
+  const waitMatch = errorStr.match(/wait (\d+) seconds/i);
+  const waitTime = waitMatch ? waitMatch[1] : "a moment";
+  const isPerMinuteRate = /rate limit exceeded|requests per minute/i.test(errorStr);
+  return isPerMinuteRate
+    ? `Rate limited — please wait ${waitTime} seconds and try again.`
+    : "Rate limited — try again in a moment or switch to a different model.";
+}
+
+/** Extract the gateway-reported tier from an error string, if present. */
 // Helper to get timezone offset string (e.g., "+1" or "-5")
 function getTimezoneOffsetString(): string {
   const offsetMinutes = new Date().getTimezoneOffset();
@@ -97,12 +160,17 @@ BEHAVIOR RULES:
 - Act immediately on clear requests. NEVER ask for confirmation when the user's intent is obvious.
 - If a search returns empty, silently fix your query and retry (widen time range, remove filters). Do NOT list "possibilities" or ask the user what to do.
 - Be concise. Cite timestamps when relevant. Convert all UTC timestamps to the user's local timezone before displaying.
+- Never show raw process names (.exe) to the user. Translate to human-readable app names — strip the .exe suffix and title-case if unknown.
+- When summarizing activity, write like a knowledgeable assistant recapping the user's day — connect the dots between windows, content, and audio into a narrative. Name specific projects, files, people, and URLs. Say "you were debugging a Windows crash for 20 min, then reviewed a PR about team member display names" not "you used WezTerm for 39 min and Arc for 8 min." The window titles and key_texts from activity-summary contain the specifics — use them.
 
 TOOL SELECTION (use the right tool for the job):
 - "meeting", "call", "conversation", "what did I/they say" → search with content_type: "audio", NO q param
 - "how long", "time spent", "which apps", "most used" → use activity-summary (NOT raw frame counts or SQL)
 - "what was on screen", "what was I reading/looking at" → search with content_type: "all" or "accessibility"
-- Broad overview ("what was I doing?") → activity-summary FIRST, then drill into search-content
+- Broad overview ("what was I doing?") → activity-summary FIRST. The windows field shows exactly what the user was working on (window titles, URLs, time per tab). Usually sufficient without further searches.
+
+LOCAL SERVER AUTH:
+The local screenpipe server (localhost:3030) requires a bearer token. It is exposed to you as the env var SCREENPIPE_API_AUTH_KEY. EVERY curl against localhost:3030 MUST include the header: -H "Authorization: Bearer $SCREENPIPE_API_AUTH_KEY". Do NOT ask the user for an API key — you already have it. If a call returns 401, the env var may be empty (auth disabled on this install) — retry without the header.
 
 CRITICAL SEARCH RULES (database has 600k+ entries):
 1. ALWAYS include start_time in EVERY search - NEVER search without a time range
@@ -120,9 +188,10 @@ EXAMPLES OF GOOD SEARCHES:
 - User: "what apps did I use today" → call activity-summary with start_time: today_start, end_time: now → report active_minutes per app
 - User: "what was I reading about X" → search q:"X", start_time:"3h ago" → show text with deep links
 
-Rules for showing videos/audio:
-- Show videos by putting .mp4 file paths in inline code blocks: \`/path/to/video.mp4\`
-- Use the exact, absolute file_path from search results
+Rules for showing media:
+- Show videos/images using standard markdown: ![description](/path/to/file.mp4) or ![description](/path/to/image.jpg)
+- ONLY use the exact, unmodified file_path or audio_file_path from search results. NEVER construct or guess paths.
+- Before showing a video, verify the file exists by checking it with the shell (e.g. ls or Test-Path). If missing, tell the user and retry search with a different time range instead of showing a broken player.
 
 SPEAKER MANAGEMENT (localhost:3030):
 - GET /speakers/unnamed?limit=10 — list unnamed speakers
@@ -136,14 +205,18 @@ FULL API REFERENCE:
 For the complete list of 60+ screenpipe API endpoints (frames, audio, pipes, tags, etc.), fetch: https://docs.screenpi.pe/llms-full.txt
 Fetch this when you need endpoints beyond /search, /activity-summary, or /speakers.
 
-VISUALIZATION:
-When the user asks for diagrams, flowcharts, or visualizations, generate Mermaid diagrams using fenced code blocks with the "mermaid" language tag.
-
 DEEP LINKS & MEDIA:
-- Frame (PREFERRED): [10:30 AM — Chrome](screenpipe://frame/12345) — use frame_id from OCR search results. NEVER invent frame IDs.
+- Frame (PREFERRED): [10:30 AM — Chrome](screenpipe://frame/12345) — use frame_id from screen text search results. NEVER invent frame IDs.
 - Timeline (audio only): [meeting at 3pm](screenpipe://timeline?timestamp=2024-01-15T15:00:00Z) — use exact timestamp from audio search results.
-- Video: show .mp4 paths in inline code: \`/path/to/video.mp4\`
+- Video/Image: use markdown ![description](/path/to/file.mp4)
 NEVER fabricate frame IDs or timestamps — only use values from actual search results.
+
+RENDERING COMPONENTS:
+You can embed these in your response when they genuinely add value. Don't force them into simple answers.
+
+- Mermaid diagrams: \`\`\`mermaid fenced blocks for flowcharts, sequence diagrams, timelines.
+- App usage breakdown: \`\`\`app-stats fenced blocks, one row per app, format "App Name|minutes_as_decimal". Deduplicate — merge variants like "discord.exe" and "Discord" into one row with summed minutes.
+- Collapsible sections: <details><summary>label</summary> content </details> for optional / secondary info the user can expand.
 
 Current time: ${now.toISOString()}
 User's timezone: ${timezone} (UTC${offsetStr})
@@ -186,6 +259,9 @@ interface Message {
   images?: string[]; // base64 data URLs of attached images
   timestamp: number;
   contentBlocks?: ContentBlock[];
+  model?: string;
+  provider?: string;
+  retryPrompt?: string; // when set, renders a retry CTA on error messages
 }
 
 // Tool icons by name
@@ -209,13 +285,11 @@ function GridDissolveLoader({
   label,
   toolName,
   thinkingSecs,
-  tokenCount,
 }: {
   phase?: LoaderPhase;
   label?: string;
   toolName?: string;
   thinkingSecs?: number;
-  tokenCount?: number;
 }) {
   const ROWS = 3;
   const COLS = 5;
@@ -265,12 +339,6 @@ function GridDissolveLoader({
     "analyzing..."
   );
 
-  const tokenLabel = tokenCount != null && tokenCount > 0
-    ? tokenCount >= 1000
-      ? `${(tokenCount / 1000).toFixed(1)}k tokens`
-      : `${tokenCount} tokens`
-    : null;
-
   return (
     <div className="flex items-center gap-2">
       <div
@@ -297,7 +365,7 @@ function GridDissolveLoader({
         ))}
       </div>
       <span className="text-[11px] font-mono text-muted-foreground tracking-wide">
-        {displayLabel}{tokenLabel && <span className="ml-1.5 opacity-60">· {tokenLabel}</span>}
+        {displayLabel}
       </span>
     </div>
   );
@@ -478,6 +546,98 @@ function ThinkingBlock({ text, isThinking, durationMs }: { text: string; isThink
   );
 }
 
+// --- App stats helpers ---
+
+const APP_STAT_COLORS = [
+  "#3b82f6", "#8b5cf6", "#ec4899", "#f97316", "#14b8a6",
+  "#06b6d4", "#84cc16", "#f59e0b", "#6366f1", "#ef4444",
+];
+
+function nameToColor(name: string): string {
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {
+    hash = (hash * 31 + name.charCodeAt(i)) & 0xffffffff;
+  }
+  return APP_STAT_COLORS[Math.abs(hash) % APP_STAT_COLORS.length];
+}
+
+function formatMinutes(minutes: number): string {
+  if (minutes < 1) return "<1m";
+  if (minutes < 60) return `${Math.round(minutes)}m`;
+  const h = Math.floor(minutes / 60);
+  const m = Math.round(minutes % 60);
+  return m > 0 ? `${h}h ${m}m` : `${h}h`;
+}
+
+function AppIcon({ name }: { name: string }) {
+  const color = nameToColor(name);
+  const [iconFailed, setIconFailed] = React.useState(false);
+  const iconUrl = `http://localhost:11435/app-icon?name=${encodeURIComponent(name)}`;
+  return (
+    <div className="w-5 h-5 rounded-sm flex-shrink-0 flex items-center justify-center overflow-hidden">
+      {iconFailed ? (
+        <span
+          className="w-full h-full flex items-center justify-center text-[10px] font-semibold text-white rounded-sm"
+          style={{ backgroundColor: color }}
+        >
+          {name.charAt(0).toUpperCase()}
+        </span>
+      ) : (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={iconUrl}
+          alt={name}
+          className="w-full h-full object-contain"
+          onError={() => setIconFailed(true)}
+        />
+      )}
+    </div>
+  );
+}
+
+function AppStatsBlock({ content }: { content: string }) {
+  const items = content
+    .trim()
+    .split("\n")
+    .map((line) => {
+      const [app, mins] = line.split("|");
+      return { app: app?.trim() ?? "", minutes: parseFloat(mins?.trim() ?? "0") };
+    })
+    .filter((item) => item.app && !isNaN(item.minutes) && item.minutes > 0);
+
+  if (items.length === 0) return null;
+
+  const maxMinutes = Math.max(...items.map((i) => i.minutes));
+
+  return (
+    <div className="space-y-2 px-3 pt-1 pb-3">
+      {items.map(({ app, minutes }) => {
+        const color = nameToColor(app);
+        const pct = maxMinutes > 0 ? (minutes / maxMinutes) * 100 : 0;
+        return (
+          <div key={app} className="flex items-center gap-2.5">
+            <AppIcon name={app} />
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-xs text-foreground truncate">{app}</span>
+                <span className="text-xs tabular-nums text-muted-foreground ml-2 shrink-0">
+                  {formatMinutes(minutes)}
+                </span>
+              </div>
+              <div className="h-[2px] bg-border rounded-full overflow-hidden">
+                <div
+                  className="h-full rounded-full transition-all"
+                  style={{ width: `${pct}%`, backgroundColor: color, opacity: 0.6 }}
+                />
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // Markdown renderer for text blocks
 function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
   return (
@@ -489,9 +649,37 @@ function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
           : "dark:prose-invert"
       )}
       remarkPlugins={[remarkGfm]}
+      rehypePlugins={[rehypeRaw]}
       components={{
         p({ children }) {
           return <p className="mb-2 last:mb-0 leading-relaxed">{children}</p>;
+        },
+        details({ children, ...props }) {
+          return (
+            <details
+              className="mt-4 border border-border rounded-md overflow-hidden not-prose"
+              {...(props as React.HTMLAttributes<HTMLDetailsElement>)}
+            >
+              {children}
+            </details>
+          );
+        },
+        summary({ children, ...props }) {
+          return (
+            <summary
+              className="px-3 py-2 text-xs font-medium text-muted-foreground cursor-pointer select-none list-none flex items-center gap-2 hover:bg-muted/50 hover:text-foreground transition-colors"
+              {...(props as React.HTMLAttributes<HTMLElement>)}
+            >
+              <svg
+                className="w-2.5 h-2.5 transition-transform [[open]_&]:rotate-90"
+                viewBox="0 0 6 10"
+                fill="currentColor"
+              >
+                <path d="M1 1l4 4-4 4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" fill="none" />
+              </svg>
+              {children}
+            </summary>
+          );
         },
         a({ href, children, ...props }) {
           const isMediaLink = href?.toLowerCase().match(/\.(mp4|mp3|wav|webm)$/);
@@ -545,9 +733,42 @@ function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
             </a>
           );
         },
+        img({ src, alt, ...props }) {
+          if (!src) return null;
+          if (src.toLowerCase().endsWith(".mp4")) {
+            return <VideoComponent filePath={src} className="my-2" />;
+          }
+          // try asset protocol for local paths, fall back to http serve
+          let imgSrc = src;
+          if (src.startsWith("/")) {
+            try {
+              imgSrc = convertFileSrc(src);
+            } catch {
+              imgSrc = `${getApiBaseUrl()}/experimental/frames/from-file?path=${encodeURIComponent(src)}`;
+            }
+          }
+          return (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={imgSrc}
+              alt={alt || ""}
+              className="max-w-full h-auto rounded-md my-2 border border-border"
+              loading="lazy"
+              onError={(e) => {
+                // fallback: if asset protocol fails, try convertFileSrc or raw path
+                const target = e.currentTarget;
+                if (src.startsWith("/") && !target.dataset.retried) {
+                  target.dataset.retried = "1";
+                  target.src = convertFileSrc(src);
+                }
+              }}
+              {...props}
+            />
+          );
+        },
         pre({ children, ...props }) {
           return (
-            <pre className="overflow-x-auto rounded-lg bg-muted text-foreground p-3 my-2 text-xs max-w-full" {...props}>
+            <pre className="overflow-x-auto rounded-lg bg-neutral-900 dark:bg-neutral-950 p-3 my-2 text-xs max-w-full not-prose" {...props}>
               {children}
             </pre>
           );
@@ -563,20 +784,24 @@ function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
             return <MermaidDiagram chart={content} />;
           }
 
+          if (language === "app-stats") {
+            return <AppStatsBlock content={content} />;
+          }
+
           if (isMedia) {
             return <VideoComponent filePath={content.trim()} className="my-2" />;
           }
 
           if (isCodeBlock) {
             return (
-              <code className="font-mono text-xs block whitespace-pre-wrap break-all text-neutral-100" {...props}>
+              <code className="font-mono text-xs block whitespace-pre-wrap break-all text-neutral-200" {...props}>
                 {content}
               </code>
             );
           }
 
           return (
-            <code className="px-1.5 py-0.5 rounded bg-neutral-800 dark:bg-neutral-900 text-neutral-100 font-mono text-xs" {...props}>
+            <code className="px-1.5 py-0.5 rounded bg-neutral-800 dark:bg-neutral-900 text-neutral-200 font-mono text-xs not-prose" {...props}>
               {content}
             </code>
           );
@@ -723,8 +948,23 @@ function ToolCallGroup({ toolCalls }: { toolCalls: ToolCall[] }) {
 }
 
 // Renders message content with interleaved text and tool call blocks
-function MessageContent({ message }: { message: Message }) {
+function MessageContent({ message, onImageClick, onRetry }: { message: Message; onImageClick?: (images: string[], index: number) => void; onRetry?: (prompt: string) => void }) {
   const isUser = message.role === "user";
+
+  // Retry CTA — shown at the bottom of error messages that have a retryPrompt
+  const retryCta = !isUser && message.retryPrompt ? (
+    <div className="mt-3 pt-3 border-t border-border/40 flex items-center gap-3">
+      <button
+        type="button"
+        onClick={() => onRetry?.(message.retryPrompt!)}
+        className="flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-lg bg-foreground text-background hover:bg-foreground/80 transition-colors"
+      >
+        <RefreshCw className="h-3 w-3" />
+        Try again
+      </button>
+      <span className="text-xs text-muted-foreground">or edit your message above</span>
+    </div>
+  ) : null;
 
   // If we have content blocks (Pi messages with tool calls), render them in order
   // Group consecutive tool blocks into collapsible containers
@@ -744,16 +984,24 @@ function MessageContent({ message }: { message: Message }) {
           }
           return null;
         })}
+        {retryCta}
       </div>
     );
   }
 
-  // Render attached image thumbnails for user messages
+  // Render attached image thumbnails for user messages — larger, ChatGPT-style; click to open viewer
   const imageThumbs = isUser && message.images && message.images.length > 0 ? (
-    <div className="flex gap-1.5 flex-wrap">
+    <div className="flex gap-2 flex-wrap">
       {message.images.map((img, i) => (
-        // eslint-disable-next-line @next/next/no-img-element
-        <img key={i} src={img} alt={`Attached ${i + 1}`} className="max-w-[120px] max-h-[80px] rounded border border-background/20 object-cover" />
+        <button
+          key={i}
+          type="button"
+          onClick={() => onImageClick?.(message.images ?? [], i)}
+          className="rounded-lg border border-border/50 shadow-sm overflow-hidden p-0 block text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={img} alt={`Attached ${i + 1}`} className="max-w-[200px] max-h-[160px] min-h-[80px] w-full object-cover cursor-pointer" />
+        </button>
       ))}
     </div>
   ) : null;
@@ -772,6 +1020,7 @@ function MessageContent({ message }: { message: Message }) {
     <div className="space-y-2">
       {imageThumbs}
       <MarkdownBlock text={message.content} isUser={isUser} />
+      {retryCta}
     </div>
   );
 }
@@ -803,8 +1052,35 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const { settings, updateSettings, isSettingsLoaded, reloadStore } = useSettings();
   const { isMac } = usePlatform();
   const { items: appItems } = useSqlAutocomplete("app");
-  const { suggestions: autoSuggestions } = useAutoSuggestions();
+  const { suggestions: autoSuggestions, refreshing: suggestionsRefreshing, forceRefresh: refreshSuggestions } = useAutoSuggestions();
   const { templatePipes, loading: pipesLoading } = usePipes();
+  // Connected integrations (gmail, google-sheets, slack, etc.) surfaced in the
+  // filter popover so users can mention them directly with @id — helps the
+  // agent pick the right connection for a query instead of having to guess.
+  const [connections, setConnections] = useState<
+    Array<{ id: string; name: string; category?: string }>
+  >([]);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await localFetch("/connections");
+        if (!res.ok) return;
+        const json = (await res.json()) as {
+          data?: Array<{ id: string; name: string; connected: boolean; category?: string }>;
+        };
+        const list = (json.data ?? [])
+          .filter((c) => c.connected)
+          .map((c) => ({ id: c.id, name: c.name, category: c.category }));
+        if (!cancelled) setConnections(list);
+      } catch {
+        // silent — filter just won't surface connections, no UI regression
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Custom summary templates (persisted in settings)
   const [customTemplates, setCustomTemplates] = useState<CustomTemplate[]>([]);
@@ -839,8 +1115,14 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamedCharCount, setStreamedCharCount] = useState(0);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [openMessageMenuId, setOpenMessageMenuId] = useState<string | null>(null);
+  const [openConvMenuId, setOpenConvMenuId] = useState<string | null>(null);
+  const [renamingConvId, setRenamingConvId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
+  const [deletingConvId, setDeletingConvId] = useState<string | null>(null);
   const [activePreset, setActivePreset] = useState<AIPreset | undefined>();
   const [showMentionDropdown, setShowMentionDropdown] = useState(false);
+  const [isComposing, setIsComposing] = useState(false);
   const [mentionFilter, setMentionFilter] = useState("");
   const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
   const [speakerSuggestions, setSpeakerSuggestions] = useState<MentionSuggestion[]>([]);
@@ -854,14 +1136,12 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
-  const [showUpgradeDialog, setShowUpgradeDialog] = useState(false);
-  const [upgradeReason, setUpgradeReason] = useState<"daily_limit" | "model_not_allowed" | "rate_limit">("daily_limit");
-  const [upgradeResetsAt, setUpgradeResetsAt] = useState<string | undefined>();
   const [scheduleDialogMessage, setScheduleDialogMessage] = useState<{ prompt: string; response: string } | null>(null);
   const [prefillContext, setPrefillContext] = useState<string | null>(null);
   const [prefillSource, setPrefillSource] = useState<string>("search");
   const [prefillFrameId, setPrefillFrameId] = useState<number | null>(null);
   const [pastedImages, setPastedImages] = useState<string[]>([]); // Base64 data URLs
+  const [imageViewer, setImageViewer] = useState<{ images: string[]; index: number } | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const isEmbedded = !!className; // embedded in settings vs overlay panel
 
@@ -873,11 +1153,25 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   const piMessageIdRef = useRef<string | null>(null);
   const piContentBlocksRef = useRef<ContentBlock[]>([]);
   const piStartInFlightRef = useRef(false);
+  const piFirstCallRetried = useRef(false);
   const piStoppedIntentionallyRef = useRef(false);
   const piCrashCountRef = useRef(0);
   const piLastCrashRef = useRef(0);
   const piThinkingStartRef = useRef<number | null>(null);
   const piSessionSyncedRef = useRef(false);
+  const piSessionIdRef = useRef<string>(crypto.randomUUID());
+  // Tracks the config Pi is currently running with so `handlePiRestart` can
+  // decide between a hot-swap (`pi_set_model`) and a full respawn. Update
+  // this ref on every Pi start/restart/swap.
+  const piRunningConfigRef = useRef<{
+    provider: string;
+    model: string;
+    url: string;
+    apiKey: string | null;
+    maxTokens: number;
+    systemPrompt: string | null;
+    token: string | null;
+  } | null>(null);
 
   // Active pipe execution (when watching a running pipe)
   const [activePipeExecution, setActivePipeExecution] = useState<{
@@ -946,7 +1240,9 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     saveConversation,
     loadConversation,
     deleteConversation,
+    renameConversation,
     startNewConversation,
+    branchConversation,
   } = useChatConversations({
     messages,
     setMessages,
@@ -961,6 +1257,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     piMessageIdRef,
     piContentBlocksRef,
     piSessionSyncedRef,
+    piSessionIdRef,
     setIsLoading,
     setIsStreaming,
     setPastedImages,
@@ -1090,8 +1387,77 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         setTimeout(() => emit("chat-prefill", data), 500);
       } catch {}
     }
+    // Clean up stale pipe-generation markers (>30 min old) so they don't
+    // leak into a future unrelated chat session.
+    try {
+      const raw = sessionStorage.getItem("pipeGenerationContext");
+      if (raw) {
+        const ctx = JSON.parse(raw);
+        if (!ctx?.started_at || Date.now() - ctx.started_at > 30 * 60 * 1000) {
+          sessionStorage.removeItem("pipeGenerationContext");
+          if (ctx?.generation_id) {
+            posthog.capture("pipe_generation_abandoned", {
+              generation_id: ctx.generation_id,
+              age_ms: Date.now() - (ctx.started_at ?? Date.now()),
+            });
+          }
+        }
+      }
+    } catch {}
     return () => { unlisten.then((fn) => fn()); };
   }, []);
+
+  // Pipe-generation funnel completion detector.
+  // Fires `pipe_generation_completed` the first time Pi's message stream
+  // ends (isLoading: true → false) AFTER we see a new pipe installed
+  // compared to the baseline captured when the user submitted the
+  // "describe a pipe to create" form. Single-shot per generation_id.
+  const prevIsLoadingRef = useRef(isLoading);
+  useEffect(() => {
+    const wasLoading = prevIsLoadingRef.current;
+    prevIsLoadingRef.current = isLoading;
+    if (!wasLoading || isLoading) return; // only fire on true → false edge
+
+    let cancelled = false;
+    (async () => {
+      let ctx: { generation_id: string; started_at: number; baseline_pipes: string[] } | null = null;
+      try {
+        const raw = sessionStorage.getItem("pipeGenerationContext");
+        if (!raw) return;
+        ctx = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      if (!ctx?.generation_id) return;
+
+      try {
+        const res = await localFetch("/pipes");
+        if (!res.ok) return;
+        const data = await res.json();
+        if (cancelled) return;
+        const installedNames: string[] = (data?.data ?? [])
+          .map((p: any) => p?.config?.name ?? p?.name)
+          .filter((n: unknown): n is string => typeof n === "string");
+        const baseline = new Set(ctx.baseline_pipes ?? []);
+        const newPipes = installedNames.filter((n) => !baseline.has(n));
+        if (newPipes.length === 0) return;
+
+        posthog.capture("pipe_generation_completed", {
+          generation_id: ctx.generation_id,
+          pipe_name: newPipes[0],
+          new_pipes_count: newPipes.length,
+          duration_ms: Date.now() - ctx.started_at,
+        });
+        sessionStorage.removeItem("pipeGenerationContext");
+      } catch {
+        // Leave context in place — maybe the next assistant turn installs the pipe.
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isLoading]);
 
   // Guard against duplicate chat-prefill processing. The listener below
   // re-subscribes when piInfo changes; during the brief overlap window
@@ -1116,58 +1482,37 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         const fullMessage = `${context}\n\n${prompt}`;
         // Start a new conversation then send
         (async () => {
-          // Clear all streaming state so sendPiMessage doesn't think a message is in-flight
-          piStreamingTextRef.current = "";
-          piMessageIdRef.current = null;
-          piContentBlocksRef.current = [];
-          setIsLoading(false);
-          setIsStreaming(false);
-          setMessages([]);
-          setConversationId(null);
-          setPrefillContext(null);
-          setPrefillFrameId(null);
-          // Set input as fallback in case auto-send fails (pi not ready)
-          setInput(fullMessage);
-          // Wait for Pi to be ready before sending (poll up to 10s)
-          const waitForPi = async (maxMs: number): Promise<boolean> => {
-            const start = Date.now();
-            while (Date.now() - start < maxMs) {
-              try {
-                const info = await commands.piInfo(PI_CHAT_SESSION);
-                if (info.status === "ok" && info.data.running) {
-                  setPiInfo(info.data);
-                  return true;
-                }
-              } catch {}
-              await new Promise(r => setTimeout(r, 500));
-            }
-            return false;
-          };
-          const ready = piInfo?.running || await waitForPi(10000);
-          if (ready) {
-            // Reset Pi session AFTER confirming it's running to clear any
-            // stale isStreaming state from a previous conversation.
-            // This must happen here, not earlier — on fresh page loads
-            // (e.g. navigateHomeAndPrefill), piInfo is null at mount time
-            // so gating on piInfo?.running would skip this entirely.
-            try {
-              await commands.piNewSession(PI_CHAT_SESSION);
-            } catch (e) {
-              console.warn("[Pi] Failed to reset session before auto-send:", e);
-            }
-            // Signal that the next sendPiMessage call should bypass the piInfo guard
-            // (we just confirmed Pi is running via waitForPi but React state may be stale)
+          try {
+            // Clear all streaming state so sendPiMessage doesn't think a message is in-flight
+            piStreamingTextRef.current = "";
+            piMessageIdRef.current = null;
+            piContentBlocksRef.current = [];
+            setIsLoading(false);
+            setIsStreaming(false);
+            setMessages([]);
+            setConversationId(null);
+            setPrefillContext(null);
+            setPrefillFrameId(null);
+            // Set input as fallback in case auto-send fails
+            setInput(fullMessage);
+            // Assign a fresh session ID — this is a brand-new conversation.
+            // Without this, the prefill would send to the previous conversation's
+            // Pi process which still has old context baked in.
+            piSessionIdRef.current = crypto.randomUUID();
+            piSessionSyncedRef.current = true; // fresh session, no history to inject
+            // With multi-session, Pi starts fresh per conversation — sendPiMessage
+            // handles auto-starting it. Just bypass the canChat guard and send.
             autoSendBypassRef.current = true;
-            // Give React a tick to re-render with updated piInfo
             await new Promise(r => setTimeout(r, 200));
             if (sendMessageRef.current) {
               await sendMessageRef.current(fullMessage);
               setInput("");
               if (inputRef.current) inputRef.current.style.height = "auto";
             }
+          } finally {
             autoSendBypassRef.current = false;
+            prefillInFlightRef.current = false;
           }
-          prefillInFlightRef.current = false;
         })();
         return;
       }
@@ -1201,6 +1546,23 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       }
     });
     return () => { unlisten.then((fn) => fn()); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Pick up pending conversation from pipe execution history (set via localStorage
+  // because the emit event is lost during page navigation/remount)
+  useEffect(() => {
+    const pendingId = localStorage.getItem("pending-chat-conversation");
+    if (pendingId) {
+      localStorage.removeItem("pending-chat-conversation");
+      (async () => {
+        const { loadConversationFile } = await import("@/lib/chat-storage");
+        const conv = await loadConversationFile(pendingId);
+        if (conv) {
+          loadConversation(conv);
+        }
+      })();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1295,8 +1657,8 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     const searchSpeakers = async () => {
       setIsLoadingSpeakers(true);
       try {
-        const response = await fetch(
-          `${SCREENPIPE_API}/speakers/search?name=${encodeURIComponent(mentionFilter)}`
+        const response = await localFetch(
+          `/speakers/search?name=${encodeURIComponent(mentionFilter)}`
         );
         if (response.ok) {
           const speakers: Speaker[] = await response.json();
@@ -1342,7 +1704,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
     const cursorPos = e.target.selectionStart || 0;
     const textBeforeCursor = value.slice(0, cursorPos);
-    const atMatch = textBeforeCursor.match(/@(\w*)$/);
+    const atMatch = textBeforeCursor.match(/@([\w-]*)$/);
 
     if (atMatch) {
       setShowMentionDropdown(true);
@@ -1376,6 +1738,14 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       e.stopPropagation();
     }
 
+    const nativeEvent = e.nativeEvent as KeyboardEvent & { isComposing?: boolean; keyCode?: number };
+    const nativeIsComposing = nativeEvent.isComposing || nativeEvent.keyCode === 229;
+
+    // Ignore Enter while an IME composition is active so confirmation does not submit the message.
+    if (isComposing || nativeIsComposing) {
+      return;
+    }
+
     // Enter without shift submits the form
     if (e.key === "Enter" && !e.shiftKey && !showMentionDropdown) {
       e.preventDefault();
@@ -1405,6 +1775,10 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   };
 
   useEffect(() => {
+    // Don't resolve preset until settings are loaded from the store —
+    // before that, settings.aiPresets contains only the hardcoded default,
+    // which would cause Pi to start with the wrong model then immediately restart.
+    if (!isSettingsLoaded) return;
     // Don't overwrite pipe-specific preset when watching a pipe execution
     if (activePipeExecution) return;
     const defaultPreset = settings.aiPresets?.find((p) => p.defaultPreset);
@@ -1416,13 +1790,13 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       }
       return next;
     });
-  }, [settings.aiPresets]);
+  }, [settings.aiPresets, isSettingsLoaded]);
 
   const hasPresets = settings.aiPresets && settings.aiPresets.length > 0;
   // All providers now route through Pi — isPi is always true when we have a preset
   const isPi = true;
   const hasValidModel = activePreset?.model && activePreset.model.trim() !== "";
-  const needsLogin = (activePreset?.provider === "screenpipe-cloud" || activePreset?.provider === "pi") && !settings.user?.token;
+  const needsLogin = activePreset?.provider === "screenpipe-cloud" && !settings.user?.token;
   // Pi auto-starts on first message, so don't block chat when Pi is not running
   const canChat = hasPresets && hasValidModel && !needsLogin && !piStarting;
 
@@ -1441,16 +1815,27 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     setTimeout(() => inputRef.current?.focus(), 100);
   }, []);
 
-  // Escape key to close window
+  // Escape key: abort agent if running, otherwise close window
   useEffect(() => {
-    const handleEscape = (e: KeyboardEvent) => {
+    const handleEscape = async (e: KeyboardEvent) => {
       if (e.key === "Escape" && !showMentionDropdown) {
-        commands.closeWindow("Chat");
+        if (isLoading || isStreaming) {
+          // Stop the agent
+          try {
+            await commands.piAbort(piSessionIdRef.current);
+          } catch (err) {
+            console.warn("[Pi] Failed to abort on Escape:", err);
+          }
+          setIsLoading(false);
+          setIsStreaming(false);
+        } else {
+          commands.closeWindow("Chat");
+        }
       }
     };
     window.addEventListener("keydown", handleEscape);
     return () => window.removeEventListener("keydown", handleEscape);
-  }, [showMentionDropdown]);
+  }, [showMentionDropdown, isLoading, isStreaming]);
 
   // Smart auto-scroll: only scroll to bottom if user is near the bottom.
   // If user scrolled up to read, don't interrupt them.
@@ -1478,7 +1863,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     if (!appFilterOpen || recentSpeakers.length > 0) return;
     (async () => {
       try {
-        const response = await fetch(`${SCREENPIPE_API}/speakers/search?name=`);
+        const response = await localFetch("/speakers/search?name=");
         if (response.ok) {
           const speakers: Speaker[] = await response.json();
           setRecentSpeakers(
@@ -1501,23 +1886,30 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   // Pi project dir is managed Rust-side at boot
 
   // Build Pi provider config from active preset
-  const buildProviderConfig = useCallback(() => {
-    if (!activePreset) return null;
+  const buildProviderConfig = useCallback((preset?: AIPreset | null) => {
+    const p = preset || activePreset;
+    if (!p) return null;
+    // Combine the screenpipe search instructions with the user's preset prompt.
+    // This is passed via --append-system-prompt to Pi, enabling Anthropic prompt
+    // caching (90% input cost reduction on subsequent messages).
+    const presetPrompt = p.prompt || "";
+    const systemPrompt = `${buildSystemPrompt()}\n\n${presetPrompt}`.trim() || null;
     return {
-      provider: activePreset.provider,
-      url: activePreset.url || "",
-      model: activePreset.model || "",
-      apiKey: ("apiKey" in activePreset ? (activePreset.apiKey as string) : null) || null,
-      maxTokens: (activePreset as any).maxTokens ?? 4096,
+      provider: p.provider,
+      url: p.url || "",
+      model: p.model || "",
+      apiKey: ("apiKey" in p ? (p.apiKey as string) : null) || null,
+      maxTokens: (p as any).maxTokens ?? 4096,
+      systemPrompt,
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePreset?.provider, activePreset?.url, activePreset?.model, activePreset?.apiKey, (activePreset as any)?.maxTokens]);
+  }, [activePreset?.provider, activePreset?.url, activePreset?.model, activePreset?.apiKey, (activePreset as any)?.maxTokens, activePreset?.prompt]);
 
   // Check Pi status on mount — Pi is auto-started at app boot by Rust
   useEffect(() => {
     const checkPi = async () => {
       try {
-        const result = await commands.piInfo(PI_CHAT_SESSION);
+        const result = await commands.piInfo(piSessionIdRef.current);
         if (result.status === "ok") {
           setPiInfo(result.data);
         }
@@ -1529,7 +1921,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     // Keep polling Pi status — recovers from stale termination events and transient failures
     const interval = setInterval(async () => {
       try {
-        const result = await commands.piInfo(PI_CHAT_SESSION);
+        const result = await commands.piInfo(piSessionIdRef.current);
         if (result.status === "ok") {
           setPiInfo(result.data);
         }
@@ -1538,46 +1930,75 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     return () => clearInterval(interval);
   }, []);
 
-  // Track what provider+model Pi is actually running with (survives remounts via ref)
-  const piRunningConfigRef = useRef<{ provider?: string; model?: string; token?: string | null }>({});
-  const piRestartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Apply a preset change to the running Pi process.
+  //
+  // - If ONLY provider/model changed: `pi_set_model` — keeps the subprocess
+  //   alive and preserves the full conversation, so the user can switch
+  //   haiku ↔ sonnet ↔ opus mid-session without losing context.
+  // - If any other spawn-time field changed (url, apiKey, maxTokens, systemPrompt):
+  //   full restart via `pi_update_config` — those are baked into Pi's CLI args
+  //   and models.json, so the subprocess has to be respawned to see them.
+  //
+  // Called directly from the AIPresetsSelector onPresetSaved callback.
+  const handlePiRestart = useCallback((preset: AIPreset) => {
+    const providerConfig = buildProviderConfig(preset);
+    if (!providerConfig) return;
 
-  // Restart Pi when user switches preset so the new model takes effect immediately.
-  // Pi uses CLI args from startup, so config-only updates don't change the running model.
-  // Debounced to collapse rapid settings saves into a single restart.
-  useEffect(() => {
-    if (!activePreset) return;
+    // Compare against the currently-running config. If we only know
+    // provider+model (older ref shape), we can still decide on the hot-swap
+    // path as long as the non-tracked fields are unchanged from the last
+    // full restart — which is exactly the invariant we maintain here by
+    // updating the ref on every hot-swap/restart.
     const running = piRunningConfigRef.current;
-    const currentToken = settings.user?.token ?? null;
-    const configChanged = running.provider !== undefined &&
-      (running.provider !== activePreset.provider || running.model !== activePreset.model);
-    const tokenChanged = running.token !== undefined && running.token !== currentToken;
+    const providerChanged = !running || running.provider !== providerConfig.provider;
+    const modelChanged = !running || running.model !== providerConfig.model;
+    const spawnTimeFieldsChanged =
+      !running ||
+      running.url !== providerConfig.url ||
+      running.apiKey !== providerConfig.apiKey ||
+      running.maxTokens !== providerConfig.maxTokens ||
+      running.systemPrompt !== providerConfig.systemPrompt ||
+      running.token !== (settings.user?.token ?? null);
 
-    if (!configChanged && !tokenChanged) {
-      // First mount or same config — just record what we expect Pi to be running
-      if (running.provider === undefined) {
-        piRunningConfigRef.current = { provider: activePreset.provider, model: activePreset.model, token: currentToken };
-      }
+    if (!providerChanged && !modelChanged && !spawnTimeFieldsChanged) {
+      // Preset save that didn't actually change anything Pi cares about.
       return;
     }
 
-    // Debounce: cancel any pending restart, schedule new one
-    if (piRestartTimerRef.current) clearTimeout(piRestartTimerRef.current);
-    piRestartTimerRef.current = setTimeout(() => {
-      piRestartTimerRef.current = null;
-      const providerConfig = buildProviderConfig();
-      console.log("[Pi] Preset changed, restarting:", providerConfig?.provider, providerConfig?.model);
-      piRunningConfigRef.current = { provider: activePreset.provider, model: activePreset.model, token: currentToken };
-      commands.piUpdateConfig(settings.user?.token ?? null, providerConfig).catch((e) => {
-        console.error("[Pi] Preset switch failed:", e);
-      });
-    }, 400);
+    if (!spawnTimeFieldsChanged && (providerChanged || modelChanged)) {
+      // Hot-swap path — preserves conversation state.
+      console.log("[Pi] Hot-swap model:", providerConfig.provider, providerConfig.model);
+      commands
+        .piSetModel(piSessionIdRef.current, providerConfig)
+        .then(() => {
+          piRunningConfigRef.current = {
+            provider: providerConfig.provider,
+            model: providerConfig.model,
+            url: providerConfig.url,
+            apiKey: providerConfig.apiKey,
+            maxTokens: providerConfig.maxTokens,
+            systemPrompt: providerConfig.systemPrompt,
+            token: settings.user?.token ?? null,
+          };
+        })
+        .catch((e) => {
+          console.error("[Pi] Hot-swap failed, falling back to full restart:", e);
+          piSessionSyncedRef.current = false;
+          commands.piUpdateConfig(settings.user?.token ?? null, providerConfig).catch((err) => {
+            console.error("[Pi] Fallback restart also failed:", err);
+          });
+        });
+      return;
+    }
 
-    return () => {
-      if (piRestartTimerRef.current) clearTimeout(piRestartTimerRef.current);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePreset?.provider, activePreset?.model, settings.user?.token]);
+    // Full restart — spawn-time field changed.
+    console.log("[Pi] Full restart (spawn-time field changed):", providerConfig.provider, providerConfig.model);
+    piSessionSyncedRef.current = false;
+    commands.piUpdateConfig(settings.user?.token ?? null, providerConfig).catch((e) => {
+      console.error("[Pi] Preset switch failed:", e);
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.user?.token]);
 
   // Listen for Pi events (all providers route through Pi) and pipe events
   useEffect(() => {
@@ -1585,6 +2006,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     let unlistenPipeEvent: UnlistenFn | null = null;
     let unlistenTerminated: UnlistenFn | null = null;
     let unlistenLog: UnlistenFn | null = null;
+    let unlistenReauth: UnlistenFn | null = null;
     let mounted = true;
 
     // Shared handler for Pi event data — used by both pi_event and pipe_event
@@ -1711,46 +2133,23 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           console.error("[Pi] Auto-retry failed:", errorStr);
 
           // Detect rate limit or daily limit from the error
-          if (errorStr.includes("daily_limit_exceeded") || errorStr.includes("429") || errorStr.includes("rate limit")) {
-            // Distinguish between daily limit and per-minute rate limit
-            const isDailyLimit = errorStr.includes("daily_limit_exceeded");
-            const isPerMinuteRate = errorStr.includes("rate limit exceeded") || errorStr.includes("requests per minute");
-
-            // Extract reset time if available
-            try {
-              const resetMatch = errorStr.match(/"reset_in":\s*(\d+)/);
-              const resetsAtMatch = errorStr.match(/"resets_at":\s*"([^"]+)"/);
-              if (resetsAtMatch) setUpgradeResetsAt(resetsAtMatch[1]);
-              else if (resetMatch) setUpgradeResetsAt(`${resetMatch[1]} seconds`);
-            } catch {}
-
-            if (isDailyLimit) {
-              setUpgradeReason("daily_limit");
+          const quotaErrorType = classifyQuotaError(errorStr);
+          if (quotaErrorType === "daily" || quotaErrorType === "rate") {
+            if (quotaErrorType === "daily") {
               posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
-            } else {
-              setUpgradeReason("rate_limit");
             }
 
             if (piMessageIdRef.current) {
               const msgId = piMessageIdRef.current;
-              let content: string;
-              if (isDailyLimit) {
-                content = "You've used all your free queries for today.";
-              } else if (isPerMinuteRate) {
-                // Extract wait time from error
-                const waitMatch = errorStr.match(/wait (\d+) seconds/i);
-                const waitTime = waitMatch ? waitMatch[1] : "a moment";
-                content = `Rate limited — please wait ${waitTime} seconds and try again.`;
-              } else {
-                content = "Rate limited — try again in a moment or switch to a different model.";
-              }
+              const content = quotaErrorType === "daily"
+                ? buildDailyLimitMessage(errorStr)
+                : buildRateLimitMessage(errorStr);
               setMessages((prev) =>
                 prev.map((m) => m.id === msgId ? { ...m, content } : m)
               );
             }
             // Don't clear refs yet — agent_end will follow
           } else if (errorStr.includes("model_not_allowed")) {
-            setUpgradeReason("model_not_allowed");
             if (piMessageIdRef.current) {
               const msgId = piMessageIdRef.current;
               setMessages((prev) =>
@@ -1768,32 +2167,23 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             const msgId = piMessageIdRef.current;
             const fullError = `${reason} ${errorDetail}`.trim();
 
-            if (fullError.includes("daily_limit_exceeded") || fullError.includes("429") || fullError.includes("rate limit")) {
-              const isDailyLimit = fullError.includes("daily_limit_exceeded");
-              const isPerMinuteRate = fullError.includes("rate limit exceeded") || fullError.includes("requests per minute");
-              if (isDailyLimit) {
+            const quotaErrorType = classifyQuotaError(fullError);
+            if (quotaErrorType === "daily" || quotaErrorType === "rate") {
+              if (quotaErrorType === "daily") {
                 try {
                   const match = fullError.match(/"resets_at":\s*"([^"]+)"/);
-                  if (match) setUpgradeResetsAt(match[1]);
                 } catch {}
-                setUpgradeReason("daily_limit");
-                setMessages((prev) =>
-                  prev.map((m) => m.id === msgId ? { ...m, content: "You've used all your free queries for today." } : m)
+                                  setMessages((prev) =>
+                  prev.map((m) => m.id === msgId ? { ...m, content: buildDailyLimitMessage(fullError) } : m)
                 );
               } else {
-                setUpgradeReason("rate_limit");
-                const waitMatch = fullError.match(/wait (\d+) seconds/i);
-                const waitTime = waitMatch ? waitMatch[1] : "a moment";
-                const content = isPerMinuteRate
-                  ? `Rate limited — please wait ${waitTime} seconds and try again.`
-                  : "Rate limited — try again in a moment or switch to a different model.";
+                const content = buildRateLimitMessage(fullError);
                 setMessages((prev) =>
                   prev.map((m) => m.id === msgId ? { ...m, content } : m)
                 );
               }
             } else if (fullError.includes("model_not_allowed")) {
-              setUpgradeReason("model_not_allowed");
-              setMessages((prev) =>
+                setMessages((prev) =>
                 prev.map((m) => m.id === msgId ? { ...m, content: "This model requires an upgrade." } : m)
               );
             } else if (fullError.includes("already processing")) {
@@ -1815,20 +2205,18 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
 
-            if (errMsg.includes("credits_exhausted") || errMsg.includes("daily_limit_exceeded") || errMsg.includes("429")) {
+            const quotaErrorType = classifyQuotaError(errMsg);
+            if (quotaErrorType === "daily") {
               try {
                 const resetsAtMatch = errMsg.match(/"resets_at":\s*"([^"]+)"/);
-                if (resetsAtMatch) setUpgradeResetsAt(resetsAtMatch[1]);
-              } catch {}
-              setUpgradeReason("daily_limit");
-              posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
+                } catch {}
+                            posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
               setMessages((prev) =>
-                prev.map((m) => m.id === msgId ? { ...m, content: "You've used all your free queries for today." } : m)
+                prev.map((m) => m.id === msgId ? { ...m, content: buildDailyLimitMessage(errMsg) } : m)
               );
-            } else if (errMsg.includes("rate limit") || errMsg.includes("rate_limit")) {
-              setUpgradeReason("rate_limit");
+            } else if (quotaErrorType === "rate") {
               setMessages((prev) =>
-                prev.map((m) => m.id === msgId ? { ...m, content: "Rate limited — try again in a moment." } : m)
+                prev.map((m) => m.id === msgId ? { ...m, content: buildRateLimitMessage(errMsg) } : m)
               );
             } else {
               setMessages((prev) =>
@@ -1873,16 +2261,14 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             // Surface credits_exhausted / rate limit errors from agent_end
             if (agentEndError && !content) {
               const errStr = agentEndError;
-              if (errStr.includes("credits_exhausted") || errStr.includes("daily_limit_exceeded") || errStr.includes("429")) {
+              const quotaErrorType = classifyQuotaError(errStr);
+              if (quotaErrorType === "daily") {
                 try {
                   const resetsAtMatch = errStr.match(/"resets_at":\s*"([^"]+)"/);
-                  if (resetsAtMatch) setUpgradeResetsAt(resetsAtMatch[1]);
-                } catch {}
-                setUpgradeReason("daily_limit");
-                content = "You've used all your free queries for today.";
-              } else if (errStr.includes("rate limit")) {
-                setUpgradeReason("rate_limit");
-                content = "Rate limited — try again in a moment.";
+                    } catch {}
+                                  content = buildDailyLimitMessage(errStr);
+              } else if (quotaErrorType === "rate") {
+                  content = buildRateLimitMessage(errStr);
               } else {
                 content = `Error: ${errStr}`;
               }
@@ -1897,7 +2283,10 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             setMessages((prev) => {
               const existing = prev.find((m) => m.id === msgId);
               // Don't overwrite error messages with "Done" or empty content
-              const isErrorMessage = existing?.content?.includes("used all your free queries") ||
+              const isErrorMessage = existing?.content?.includes("daily") && existing?.content?.includes("limit") ||
+                existing?.content?.includes("free queries") ||
+                existing?.content?.includes("daily Pro limit") ||
+                existing?.content?.includes("daily query limit") ||
                 existing?.content?.includes("requires an upgrade") ||
                 existing?.content?.includes("Rate limited") ||
                 existing?.content?.includes("rate limit") ||
@@ -1950,36 +2339,59 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           }
         } else if (data.type === "response" && data.success === false) {
           const errorStr = data.error || "Unknown error";
+          // Pi agent first-call bug (pi-mono#2461) — first RPC prompt crashes.
+          // Auto-retry the same prompt once. The second call works.
+          if (errorStr.includes("startsWith") || errorStr.includes("text.startsWith")) {
+            console.warn("[Pi] first-call bug hit, auto-retrying prompt:", errorStr);
+            if (piMessageIdRef.current && !piFirstCallRetried.current) {
+              piFirstCallRetried.current = true;
+              // Re-send the last prompt
+              const lastUserMsg = messages.findLast(m => m.role === "user");
+              if (lastUserMsg?.content) {
+                commands.piPrompt(piSessionIdRef.current, lastUserMsg.content, null).catch(() => {});
+              }
+            }
+            return;
+          }
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
 
-            if (errorStr.includes("daily_limit_exceeded") || errorStr.includes("429") || errorStr.includes("rate limit")) {
-              const isDailyLimit = errorStr.includes("daily_limit_exceeded");
-              const isPerMinuteRate = errorStr.includes("rate limit exceeded") || errorStr.includes("requests per minute");
-              if (isDailyLimit) {
+            const quotaErrorType = classifyQuotaError(errorStr);
+            if (quotaErrorType === "daily" || quotaErrorType === "rate") {
+              if (quotaErrorType === "daily") {
                 try {
                   const match = errorStr.match(/"resets_at":\s*"([^"]+)"/);
-                  if (match) setUpgradeResetsAt(match[1]);
                 } catch {}
-                setUpgradeReason("daily_limit");
-                setMessages((prev) =>
-                  prev.map((m) => m.id === msgId ? { ...m, content: "You've used all your free queries for today." } : m)
+                                  setMessages((prev) =>
+                  prev.map((m) => m.id === msgId ? { ...m, content: buildDailyLimitMessage(errorStr) } : m)
                 );
               } else {
-                setUpgradeReason("rate_limit");
-                const waitMatch = errorStr.match(/wait (\d+) seconds/i);
-                const waitTime = waitMatch ? waitMatch[1] : "a moment";
-                const content = isPerMinuteRate
-                  ? `Rate limited — please wait ${waitTime} seconds and try again.`
-                  : "Rate limited — try again in a moment or switch to a different model.";
+                const content = buildRateLimitMessage(errorStr);
                 setMessages((prev) =>
                   prev.map((m) => m.id === msgId ? { ...m, content } : m)
                 );
               }
             } else if (errorStr.includes("model_not_allowed")) {
-              setUpgradeReason("model_not_allowed");
-              setMessages((prev) =>
+                setMessages((prev) =>
                 prev.map((m) => m.id === msgId ? { ...m, content: "This model requires an upgrade." } : m)
+              );
+            } else if (errorStr.includes("already processing")) {
+              console.warn("[Pi] already-processing race in response event:", errorStr);
+              setMessages((prev) =>
+                prev.map((m) => m.id === msgId ? {
+                  ...m,
+                  content: "The AI was mid-response when your message arrived.",
+                  retryPrompt: lastUserMessageRef.current || undefined,
+                } : m)
+              );
+            } else if (errorStr.includes("api_error") || errorStr.includes("Internal server error") || /\b5\d\d\b/.test(errorStr)) {
+              // Upstream API 5xx — SDK already exhausted its auto-retry attempts
+              setMessages((prev) =>
+                prev.map((m) => m.id === msgId ? {
+                  ...m,
+                  content: "Something went wrong on the server.",
+                  retryPrompt: lastUserMessageRef.current || undefined,
+                } : m)
               );
             } else {
               setMessages((prev) =>
@@ -1987,8 +2399,9 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
               );
             }
           }
-          const errorCategory = errorStr.includes("daily_limit") ? "daily_limit"
-            : errorStr.includes("rate limit") || errorStr.includes("429") ? "rate_limit"
+          const quotaErrorType = classifyQuotaError(errorStr);
+          const errorCategory = quotaErrorType === "daily" ? "daily_limit"
+            : quotaErrorType === "rate" ? "rate_limit"
             : errorStr.includes("model_not_allowed") ? "model_not_allowed"
             : "other";
           posthog.capture("chat_response_error", {
@@ -2026,7 +2439,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       unlistenEvent = await listen<any>("pi_event", (event) => {
         if (!mounted) return;
         const { sessionId, event: piEvent } = event.payload;
-        if (sessionId !== PI_CHAT_SESSION) return;
+        if (sessionId !== piSessionIdRef.current) return;
         handlePiEventData(piEvent);
       });
 
@@ -2045,22 +2458,24 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       unlistenTerminated = await listen<any>("pi_terminated", (event) => {
         if (!mounted) return;
         const { sessionId, pid: terminatedPid } = event.payload;
-        if (sessionId !== PI_CHAT_SESSION) return;
+        if (sessionId !== piSessionIdRef.current) return;
         if (piStoppedIntentionallyRef.current) {
           piStoppedIntentionallyRef.current = false;
           return;
         }
         console.log("[Pi] Process terminated, pid:", terminatedPid);
 
-        // If a message was in flight, mark it as errored so the UI doesn't stay stuck
+        // If a message was in flight, append error to the message so the user
+        // knows the agent stopped unexpectedly (not just "completed").
         if (piMessageIdRef.current) {
           const msgId = piMessageIdRef.current;
           setMessages((prev) =>
-            prev.map((m) =>
-              m.id === msgId && (m.content === "Processing..." || !m.content)
-                ? { ...m, content: "AI agent crashed — restarting automatically..." }
-                : m
-            )
+            prev.map((m) => {
+              if (m.id !== msgId) return m;
+              const existing = m.content && m.content !== "Processing..." ? m.content : "";
+              const errorSuffix = "\n\n---\n\n⚠️ agent stopped unexpectedly — restarting automatically...";
+              return { ...m, content: existing + errorSuffix };
+            })
           );
           piStreamingTextRef.current = "";
           piMessageIdRef.current = null;
@@ -2095,7 +2510,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           if (!mounted) return;
           // Check if a newer Pi process is already running (race: stop → start → terminated)
           try {
-            const result = await commands.piInfo(PI_CHAT_SESSION);
+            const result = await commands.piInfo(piSessionIdRef.current);
             if (result.status === "ok" && result.data.running && result.data.pid !== terminatedPid) {
               console.log("[Pi] Stale termination for pid", terminatedPid, "— newer pid", result.data.pid, "is running");
               setPiInfo(result.data);
@@ -2109,13 +2524,21 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
               const providerConfig = buildProviderConfig();
               const home = await homeDir();
               const dir = await join(home, ".screenpipe", "pi-chat");
-              const result = await commands.piStart(PI_CHAT_SESSION, dir, settings.user?.token ?? null, providerConfig);
+              const result = await commands.piStart(piSessionIdRef.current, dir, settings.user?.token ?? null, providerConfig);
               if (result.status === "ok") {
                 setPiInfo(result.data);
                 piSessionSyncedRef.current = false;
                 // Keep running-config ref in sync so preset watcher doesn't re-trigger
                 if (providerConfig) {
-                  piRunningConfigRef.current = { provider: providerConfig.provider, model: providerConfig.model, token: settings.user?.token ?? null };
+                  piRunningConfigRef.current = {
+                    provider: providerConfig.provider,
+                    model: providerConfig.model,
+                    url: providerConfig.url,
+                    apiKey: providerConfig.apiKey,
+                    maxTokens: providerConfig.maxTokens,
+                    systemPrompt: providerConfig.systemPrompt,
+                    token: settings.user?.token ?? null,
+                  };
                 }
               } else {
                 console.error("[Pi] Auto-restart failed:", result.error);
@@ -2136,7 +2559,6 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         const line = event.payload;
         if (line.includes("model_not_allowed") || line.includes("403")) {
           const msgId = piMessageIdRef.current;
-          setUpgradeReason("model_not_allowed");
           if (msgId) {
             setMessages((prev) =>
               prev.map((m) => m.id === msgId ? { ...m, content: "This model requires an upgrade — try a different model in your AI preset." } : m)
@@ -2170,12 +2592,33 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
     setup();
 
+    // Restart the current session when a new auth token arrives (deeplink login).
+    listen<{ apiKey: string }>("pi-reauth", async (event) => {
+      if (!mounted) return;
+      try {
+        const home = await homeDir();
+        const dir = await join(home, ".screenpipe", "pi-chat");
+        const result = await commands.piStart(piSessionIdRef.current, dir, event.payload.apiKey, buildProviderConfig());
+        if (result.status === "ok") {
+          setPiInfo(result.data);
+          piSessionSyncedRef.current = false;
+        }
+      } catch (e) {
+        console.warn("[Pi] reauth restart skipped:", e);
+      }
+    }).then(fn => { unlistenReauth = fn; });
+
     return () => {
       mounted = false;
       unlistenEvent?.();
       unlistenPipeEvent?.();
       unlistenTerminated?.();
       unlistenLog?.();
+      unlistenReauth?.();
+      // Abort any in-flight Pi request when navigating away from chat.
+      // Without this, Pi keeps streaming in the background and rejects
+      // new messages with "already processing" when the user returns.
+      commands.piAbort(piSessionIdRef.current).catch(() => {});
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -2187,7 +2630,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     // Poll execution API to check if pipe already finished (race condition fix)
     const pollExecutionStatus = async (pipeName: string, executionId: number, msgId: string) => {
       try {
-        const res = await fetch(`http://localhost:3030/pipes/${pipeName}/executions?limit=20`);
+        const res = await localFetch(`/pipes/${pipeName}/executions?limit=20`);
         if (!res.ok) return;
         const data = await res.json();
         const exec = (data.data || []).find((e: any) => e.id === executionId);
@@ -2344,7 +2787,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   async function generateFollowUps(userMsg: string, partialResponse: string) {
     try {
       // Check if Apple Intelligence is available
-      const statusResp = await fetch("http://localhost:3030/ai/status");
+      const statusResp = await localFetch("/ai/status");
       if (!statusResp.ok) return;
       const statusData = await statusResp.json();
       if (!statusData.available) return;
@@ -2352,7 +2795,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       const controller = new AbortController();
       followUpAbortRef.current = controller;
 
-      const resp = await fetch("http://localhost:3030/ai/chat/completions", {
+      const resp = await localFetch("/ai/chat/completions", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         signal: controller.signal,
@@ -2403,38 +2846,57 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
   // Send message using Pi agent
   async function sendPiMessage(userMessage: string, displayLabel?: string) {
-    // Auto-start Pi if it's dead (singleton recovery)
-    if (!piInfo?.running && !autoSendBypassRef.current) {
+    // Auto-start Pi if it's not running yet (new session or crash recovery)
+    if (!piInfo?.running) {
       if (piStartInFlightRef.current) {
-        toast({ title: "Pi starting", description: "Please wait a moment", variant: "destructive" });
-        return;
-      }
-      console.log("[Pi] Not running, auto-starting before sending message");
-      piStartInFlightRef.current = true;
-      setPiStarting(true);
-      try {
-        const providerConfig = buildProviderConfig();
-        const home = await homeDir();
-        const dir = await join(home, ".screenpipe", "pi-chat");
-        const result = await commands.piStart(PI_CHAT_SESSION, dir, settings.user?.token ?? null, providerConfig);
-        if (result.status === "ok" && result.data.running) {
-          setPiInfo(result.data);
-          piSessionSyncedRef.current = false;
-          piCrashCountRef.current = 0; // reset crash loop counter on manual start
-          // Keep running-config ref in sync so preset watcher doesn't re-trigger
-          if (providerConfig) {
-            piRunningConfigRef.current = { provider: providerConfig.provider, model: providerConfig.model, token: settings.user?.token ?? null };
-          }
-        } else {
-          toast({ title: "Failed to start Pi", description: result.status === "error" ? result.error : "Unknown error", variant: "destructive" });
+        if (!autoSendBypassRef.current) {
+          toast({ title: "Pi starting", description: "Please wait a moment", variant: "destructive" });
           return;
         }
-      } catch (e) {
-        toast({ title: "Failed to start Pi", description: String(e), variant: "destructive" });
-        return;
-      } finally {
-        setPiStarting(false);
-        piStartInFlightRef.current = false;
+        // Prefill auto-send: wait for in-flight start to complete
+        const startWait = Date.now();
+        while (piStartInFlightRef.current && Date.now() - startWait < 10000) {
+          await new Promise(r => setTimeout(r, 300));
+        }
+        if (piStartInFlightRef.current) return; // timed out
+      } else {
+        console.log("[Pi] Not running, auto-starting before sending message");
+        piStartInFlightRef.current = true;
+        setPiStarting(true);
+        const providerConfig = buildProviderConfig();
+        try {
+          const home = await homeDir();
+          const dir = await join(home, ".screenpipe", "pi-chat");
+          const result = await commands.piStart(piSessionIdRef.current, dir, settings.user?.token ?? null, providerConfig);
+          if (result.status === "ok" && result.data.running) {
+            setPiInfo(result.data);
+            piSessionSyncedRef.current = false;
+            piCrashCountRef.current = 0; // reset crash loop counter on manual start
+            // Keep running-config ref in sync so preset watcher doesn't re-trigger
+            if (providerConfig) {
+              piRunningConfigRef.current = {
+                provider: providerConfig.provider,
+                model: providerConfig.model,
+                url: providerConfig.url,
+                apiKey: providerConfig.apiKey,
+                maxTokens: providerConfig.maxTokens,
+                systemPrompt: providerConfig.systemPrompt,
+                token: settings.user?.token ?? null,
+              };
+            }
+          } else {
+            const providerLabel = providerConfig?.provider || "AI";
+            toast({ title: `failed to start ${providerLabel}`, description: result.status === "error" ? result.error : "Unknown error", variant: "destructive" });
+            return;
+          }
+        } catch (e) {
+          const providerLabel = providerConfig?.provider || "AI";
+          toast({ title: `failed to start ${providerLabel}`, description: String(e), variant: "destructive" });
+          return;
+        } finally {
+          setPiStarting(false);
+          piStartInFlightRef.current = false;
+        }
       }
     }
 
@@ -2443,7 +2905,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
     if (piMessageIdRef.current) {
       console.warn("[Pi] Aborting previous message before sending new one");
       try {
-        await commands.piAbort(PI_CHAT_SESSION);
+        await commands.piAbort(piSessionIdRef.current);
       } catch (e) {
         console.warn("[Pi] Failed to abort previous:", e);
       }
@@ -2504,7 +2966,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
       if (prefillFrameId) {
         try {
-          const response = await fetch(`http://localhost:3030/frames/${prefillFrameId}`);
+          const response = await localFetch(`/frames/${prefillFrameId}`);
           if (response.ok) {
             const blob = await response.blob();
             const arrayBuffer = await blob.arrayBuffer();
@@ -2546,7 +3008,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
       setMessages((prev) => [
         ...prev,
-        { id: assistantMessageId, role: "assistant", content: "Processing...", timestamp: Date.now() },
+        { id: assistantMessageId, role: "assistant", content: "Processing...", timestamp: Date.now(), model: activePreset?.model, provider: activePreset?.provider },
       ]);
 
       // If Pi's session is out of sync (restart, conversation load), inject history
@@ -2554,7 +3016,25 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       if (!piSessionSyncedRef.current && messages.length > 0) {
         const historyLines = messages
           .slice(-40)
-          .map(m => `${m.role}: ${m.content}`)
+          .map(m => {
+            let text = m.content || "";
+            // Include contentBlocks info (tool calls, results) for richer context
+            if (m.contentBlocks?.length) {
+              const blockTexts = m.contentBlocks.map((b: any) => {
+                if (b.type === "text" && b.text) return b.text;
+                if (b.type === "tool" && b.toolCall) {
+                  const tc = b.toolCall;
+                  let s = `[tool: ${tc.toolName}](${JSON.stringify(tc.args)})`;
+                  if (tc.result) s += ` → ${tc.result.slice(0, 500)}`;
+                  return s;
+                }
+                return "";
+              }).filter(Boolean).join("\n");
+              if (blockTexts && !text) text = blockTexts;
+              else if (blockTexts) text += "\n" + blockTexts;
+            }
+            return `${m.role}: ${text}`;
+          })
           .join("\n");
         promptMessage = `<conversation_history>\n${historyLines}\n</conversation_history>\n\n${userMessage}`;
         piSessionSyncedRef.current = true;
@@ -2564,7 +3044,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
       // Send prompt — abort/new_session now await completion, so no retry needed
       const result = await commands.piPrompt(
-        PI_CHAT_SESSION,
+        piSessionIdRef.current,
         promptMessage,
         piImages.length > 0 ? piImages : null,
       );
@@ -2573,23 +3053,28 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         if (timeoutId) clearTimeout(timeoutId);
         piMessageIdRef.current = null;
         // Provide helpful error messages for common failures
-        let errorMsg = result.error;
-        if (errorMsg.includes("already processing")) {
-          errorMsg = "AI is busy — please wait a moment and try again.";
-        } else if (errorMsg.includes("Broken pipe") || errorMsg.includes("not running") || errorMsg.includes("has died")) {
+        const rawError = result.error;
+        let errorMsg: string;
+        let retryPrompt: string | undefined;
+
+        if (rawError.includes("already processing")) {
+          errorMsg = "The AI was mid-response when your message arrived.";
+          retryPrompt = userMessage;
+        } else if (rawError.includes("Broken pipe") || rawError.includes("not running") || rawError.includes("has died")) {
           const provider = activePreset?.provider;
-          if (provider === "native-ollama") {
-            errorMsg = "Ollama is not running. Start it with: `ollama serve`";
-          } else {
-            errorMsg = "AI agent crashed — restarting automatically...";
-          }
-        } else if (errorMsg.includes("not found")) {
+          errorMsg = provider === "native-ollama"
+            ? "Ollama is not running. Start it with: `ollama serve`"
+            : "AI agent crashed — restarting automatically...";
+        } else if (rawError.includes("not found")) {
           errorMsg = `Model "${activePreset?.model}" not found. Check your AI preset in settings.`;
+        } else {
+          errorMsg = rawError;
+          retryPrompt = userMessage;
         }
         setMessages((prev) =>
           prev.map((m) =>
             m.id === assistantMessageId
-              ? { ...m, content: `Error: ${errorMsg}` }
+              ? { ...m, content: errorMsg, ...(retryPrompt ? { retryPrompt } : {}) }
               : m
           )
         );
@@ -2636,7 +3121,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       const controller = new AbortController();
       const searchTimeoutId = setTimeout(() => controller.abort(), 120000);
 
-      const response = await fetch(`${SCREENPIPE_API}/search?${params.toString()}`, {
+      const response = await localFetch(`/search?${params.toString()}`, {
         signal: controller.signal,
       });
       clearTimeout(searchTimeoutId);
@@ -2705,28 +3190,46 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   // Keep ref in sync so useEffect callbacks can call sendMessage
   sendMessageRef.current = sendMessage;
 
+  const formatMessageAsMarkdown = (m: Message) => {
+    const role = m.role === "user" ? "**User**" : "**Assistant**";
+    const ts = new Date(m.timestamp).toLocaleString();
+    let body = m.content || "";
+
+    if (m.contentBlocks && m.contentBlocks.length > 0) {
+      const sections: string[] = [];
+      for (const block of m.contentBlocks) {
+        if (block.type === "text" && block.text) {
+          sections.push(block.text);
+        } else if (block.type === "tool") {
+          const tc = block.toolCall;
+          const argsStr = tc.args ? JSON.stringify(tc.args, null, 2) : "";
+          let section = `\n**Tool: ${tc.toolName}**\n\`\`\`json\n${argsStr}\n\`\`\``;
+          if (tc.result !== undefined) {
+            section += `\n**Result:**\n\`\`\`\n${tc.result}\n\`\`\``;
+          }
+          sections.push(section);
+        } else if (block.type === "thinking" && block.text) {
+          sections.push(`<details><summary>Thinking${block.durationMs ? ` (${(block.durationMs / 1000).toFixed(1)}s)` : ""}</summary>\n\n${block.text}\n\n</details>`);
+        }
+      }
+      if (sections.length > 0) {
+        body = sections.join("\n\n");
+      }
+    }
+
+    return `### ${role} — ${ts}\n\n${body}`;
+  };
+
   const copyFullChatAsMarkdown = async () => {
     if (messages.length === 0) return;
-    const md = messages
-      .map((m) => {
-        const role = m.role === "user" ? "**User**" : "**Assistant**";
-        const ts = new Date(m.timestamp).toLocaleString();
-        return `### ${role} — ${ts}\n\n${m.content}`;
-      })
-      .join("\n\n---\n\n");
+    const md = messages.map(formatMessageAsMarkdown).join("\n\n---\n\n");
     await navigator.clipboard.writeText(md);
     toast({ title: "copied full chat as markdown" });
   };
 
   const exportChatAsMarkdownFile = async () => {
     if (messages.length === 0) return;
-    const md = messages
-      .map((m) => {
-        const role = m.role === "user" ? "**User**" : "**Assistant**";
-        const ts = new Date(m.timestamp).toLocaleString();
-        return `### ${role} — ${ts}\n\n${m.content}`;
-      })
-      .join("\n\n---\n\n");
+    const md = messages.map(formatMessageAsMarkdown).join("\n\n---\n\n");
     try {
       const filePath = await saveDialog({
         filters: [{ name: "Markdown", extensions: ["md"] }],
@@ -2750,7 +3253,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
 
   const handleStop = async () => {
     try {
-      await commands.piAbort(PI_CHAT_SESSION);
+      await commands.piAbort(piSessionIdRef.current);
     } catch (e) {
       console.warn("[Pi] Failed to abort:", e);
     }
@@ -2765,7 +3268,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
   };
 
   return (
-    <div className={cn("flex flex-col bg-background", className ?? "h-screen")}>
+    <div className={cn("flex flex-col bg-background", className ?? "h-screen")} data-testid="section-home">
       {/* Header - draggable only in standalone mode */}
       {/* Add left padding on macOS to avoid traffic light overlap (standalone only) */}
       <div
@@ -2789,61 +3292,34 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
         {!isMac && !className && (
           <div className="absolute top-0 left-0 w-8 h-8 border-l-2 border-t-2 border-foreground/10 rounded-tl-lg" />
         )}
-        <div className="relative z-10 p-1.5 rounded-lg bg-foreground/5 border border-border/50">
-          <PipeAIIcon size={18} animated={false} className="text-foreground" />
-        </div>
-        <div className="flex-1">
-          <h2 className="font-semibold text-sm tracking-tight">Pipe AI</h2>
-          <p className="text-[10px] text-muted-foreground font-mono uppercase tracking-wider">Screen Activity Assistant</p>
-        </div>
         <Button
           variant={showHistory ? "secondary" : "ghost"}
-          size="sm"
+          size="icon"
+          onMouseDown={(e) => e.stopPropagation()}
           onClick={async (e) => {
             e.stopPropagation();
             if (!showHistory) {
-              // Refresh settings from store to ensure we have latest conversations
               await reloadStore();
             }
             setShowHistory(!showHistory);
           }}
-          className="h-7 px-2 gap-1 text-xs"
+          className="relative z-10 h-7 w-7"
           title="Chat history"
         >
           <History size={14} />
-          <span className="hidden sm:inline">History</span>
         </Button>
+        <div className="flex-1" />
         <Button
           variant="default"
           size="sm"
+          onMouseDown={(e) => e.stopPropagation()}
           onClick={async (e) => {
             e.stopPropagation();
-            // Kill Pi process if busy, then restart fresh
-            if (piInfo?.running && (isLoading || isStreaming)) {
-              piStoppedIntentionallyRef.current = true;
-              try { await commands.piStop(PI_CHAT_SESSION); } catch {}
-              piStreamingTextRef.current = "";
-              piMessageIdRef.current = null;
-              piContentBlocksRef.current = [];
-              setIsLoading(false);
-              setIsStreaming(false);
-              // Restart Pi fresh
-              try {
-                const providerConfig = buildProviderConfig();
-                const home = await homeDir();
-                const dir = await join(home, ".screenpipe", "pi-chat");
-                const result = await commands.piStart(PI_CHAT_SESSION, dir, settings.user?.token ?? null, providerConfig);
-                if (result.status === "ok") {
-                  setPiInfo(result.data);
-                  piSessionSyncedRef.current = true;
-                }
-              } catch (err) {
-                console.warn("[Pi] Failed to restart after new chat:", err);
-              }
-            }
-            startNewConversation();
+            piStoppedIntentionallyRef.current = true;
+            await startNewConversation();
+            // Pi will auto-restart on the next message via the sendPiMessage flow
           }}
-          className="h-7 px-3 gap-1.5 text-xs bg-foreground text-background hover:bg-background hover:text-foreground transition-colors duration-150"
+          className="relative z-10 h-7 px-3 gap-1.5 text-xs bg-foreground text-background hover:bg-background hover:text-foreground transition-colors duration-150"
           title="New chat"
         >
           <Plus size={14} />
@@ -2925,17 +3401,47 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                               {conv.messages.length} messages
                             </p>
                           </div>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              deleteConversation(conv.id);
-                            }}
-                            className="h-6 w-6 p-0 opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground hover:text-destructive"
+                          <Popover
+                            open={openConvMenuId === conv.id}
+                            onOpenChange={(open) => setOpenConvMenuId(open ? conv.id : null)}
                           >
-                            <Trash2 size={12} />
-                          </Button>
+                            <PopoverTrigger asChild>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={(e) => e.stopPropagation()}
+                                className="h-6 w-6 p-0 opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground hover:text-foreground"
+                              >
+                                <MoreHorizontal size={12} />
+                              </Button>
+                            </PopoverTrigger>
+                            <PopoverContent className="w-40 p-1" align="end" side="right">
+                              <button
+                                className="w-full flex items-center gap-2 px-2 py-1.5 text-sm rounded-md hover:bg-muted text-left"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setOpenConvMenuId(null);
+                                  setRenameValue(conv.title);
+                                  setRenamingConvId(conv.id);
+                                }}
+                              >
+                                <Pencil className="h-3.5 w-3.5 shrink-0" />
+                                Rename
+                              </button>
+                              <div className="my-1 border-t border-border" />
+                              <button
+                                className="w-full flex items-center gap-2 px-2 py-1.5 text-sm rounded-md hover:bg-muted text-destructive text-left"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setOpenConvMenuId(null);
+                                  setDeletingConvId(conv.id);
+                                }}
+                              >
+                                <Trash2 className="h-3.5 w-3.5 shrink-0" />
+                                Delete
+                              </button>
+                            </PopoverContent>
+                          </Popover>
                         </div>
                       ))}
                     </div>
@@ -3033,6 +3539,8 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           <SummaryCards
             onSendMessage={sendMessage}
             autoSuggestions={autoSuggestions}
+            suggestionsRefreshing={suggestionsRefreshing}
+            onRefreshSuggestions={refreshSuggestions}
             customTemplates={customTemplates}
             onSaveCustomTemplate={saveCustomTemplate}
             onDeleteCustomTemplate={deleteCustomTemplate}
@@ -3086,19 +3594,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                     : "bg-muted/30 border-border/50"
                 )}
               >
-                <MessageContent message={message} />
-                {/* Upgrade button for daily limit errors */}
-                {message.role === "assistant" &&
-                 (message.content.includes("used all your free queries") ||
-                  message.content.includes("requires an upgrade")) && (
-                  <button
-                    onClick={() => setShowUpgradeDialog(true)}
-                    className="mt-3 inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-foreground text-background text-sm font-medium hover:bg-background hover:text-foreground transition-colors duration-150"
-                  >
-                    <Zap className="h-4 w-4" />
-                    upgrade now
-                  </button>
-                )}
+                <MessageContent message={message} onImageClick={(images, index) => setImageViewer({ images, index })} onRetry={(prompt) => sendMessage(prompt)} />
               </div>
                 {/* Action buttons - appear on hover, outside the message box */}
                 <div className="flex items-center gap-0.5 self-end mt-1 opacity-0 group-hover/message:opacity-100 transition-all duration-200">
@@ -3117,24 +3613,80 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                       <Copy className="h-3 w-3" />
                     )}
                   </button>
-                  {message.role === "assistant" && !message.content.includes("used all your free queries") && !message.content.startsWith("Error") && message.content !== "Processing..." && (
+                  {message.role === "assistant" && !isLoading && (
                     <button
                       onClick={() => {
-                        // Find the user message that triggered this response
                         const msgIndex = messages.findIndex((m) => m.id === message.id);
-                        const userMsg = messages.slice(0, msgIndex).reverse().find((m) => m.role === "user");
-                        if (userMsg) {
-                          setScheduleDialogMessage({
-                            prompt: userMsg.content,
-                            response: message.content,
-                          });
+                        // Find the preceding user message index
+                        let userMsgIndex = -1;
+                        for (let i = msgIndex - 1; i >= 0; i--) {
+                          if (messages[i].role === "user") { userMsgIndex = i; break; }
                         }
+                        if (userMsgIndex === -1) return;
+                        const userMsg = messages[userMsgIndex];
+                        // Remove user message and everything after it, then resend
+                        setMessages((prev) => prev.slice(0, userMsgIndex));
+                        sendMessage(userMsg.content, userMsg.displayContent);
                       }}
                       className="p-1 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground"
-                      title="Run on schedule"
+                      title="Retry"
                     >
-                      <Clock className="h-3 w-3" />
+                      <RefreshCw className="h-3 w-3" />
                     </button>
+                  )}
+                  {message.role === "assistant" && (
+                    <Popover
+                      open={openMessageMenuId === message.id}
+                      onOpenChange={(open) => setOpenMessageMenuId(open ? message.id : null)}
+                    >
+                      <PopoverTrigger asChild>
+                        <button
+                          className="p-1 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground"
+                          title="More options"
+                        >
+                          <MoreHorizontal className="h-3 w-3" />
+                        </button>
+                      </PopoverTrigger>
+                      <PopoverContent className="w-48 p-1" align="end" side="top">
+                        <div className="text-xs text-muted-foreground px-2 py-1 mb-1">
+                          {new Date(message.timestamp).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                        </div>
+                        {!message.content.includes("used all your free queries") &&
+                          !message.content.startsWith("Error") &&
+                          message.content !== "Processing..." && (
+                          <button
+                            onClick={() => {
+                              setOpenMessageMenuId(null);
+                              const msgIndex = messages.findIndex((m) => m.id === message.id);
+                              const userMsg = messages
+                                .slice(0, msgIndex)
+                                .reverse()
+                                .find((m) => m.role === "user");
+                              if (userMsg) {
+                                setScheduleDialogMessage({
+                                  prompt: userMsg.content,
+                                  response: message.content,
+                                });
+                              }
+                            }}
+                            className="w-full flex items-center gap-2 px-2 py-1.5 text-sm rounded-md hover:bg-muted text-left"
+                          >
+                            <Clock className="h-3.5 w-3.5 shrink-0" />
+                            Run on schedule
+                          </button>
+                        )}
+                        <button
+                          onClick={() => {
+                            setOpenMessageMenuId(null);
+                            branchConversation(message.id);
+                          }}
+                          className="w-full flex items-center gap-2 px-2 py-1.5 text-sm rounded-md hover:bg-muted text-left"
+                        >
+                          <GitBranch className="h-3.5 w-3.5 shrink-0" />
+                          Branch in new chat
+                        </button>
+                      </PopoverContent>
+                    </Popover>
                   )}
                 </div>
               </div>
@@ -3179,7 +3731,6 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                   phase={loaderPhase}
                   toolName={toolName}
                   thinkingSecs={thinkingSecs}
-                  tokenCount={Math.round(streamedCharCount / 4)}
                 />
               </motion.div>
             );
@@ -3204,6 +3755,186 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
       {/* Input */}
       <div className="relative border-t border-border/50 bg-gradient-to-t from-muted/20 to-transparent">
         <div className="max-w-4xl mx-auto w-full">
+        {/* Prefill, filters, suggestions first; then attached images in gap; then agent bar; then form */}
+        {/* Prefill context indicator from search */}
+        {(prefillContext || prefillFrameId) && (
+          <div className="px-3 py-2 border-b border-border/30 bg-muted/30">
+            <div className="flex items-start justify-between gap-2">
+              {prefillFrameId && (
+                <div className="flex-shrink-0">
+                  <div className="relative group">
+                    {/* eslint-disable-next-line @next/next/no-img-element */}
+                    <img
+                      src={`${getApiBaseUrl()}/frames/${prefillFrameId}`}
+                      alt="Attached frame"
+                      className="w-16 h-12 object-cover rounded border border-border/50"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setPrefillFrameId(null)}
+                      className="absolute -top-1 -right-1 p-0.5 bg-background rounded-full border border-border shadow-sm opacity-0 group-hover:opacity-100 transition-opacity"
+                    >
+                      <X className="w-2.5 h-2.5 text-muted-foreground" />
+                    </button>
+                  </div>
+                </div>
+              )}
+              {prefillContext && (
+                <div className="flex-1 min-w-0">
+                  <div className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider mb-1">
+                    context from {prefillSource === "timeline" ? "timeline selection" : "search"}
+                  </div>
+                  <p className="text-xs text-foreground font-mono line-clamp-2">
+                    {prefillContext.slice(0, 150)}{prefillContext.length > 150 ? "..." : ""}
+                  </p>
+                </div>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  setPrefillContext(null);
+                  setPrefillFrameId(null);
+                }}
+                className="p-1 hover:bg-muted rounded text-muted-foreground"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Active filters chips */}
+        {hasActiveFilters && (
+          <div className="px-3 py-2 border-b border-border/30 flex flex-wrap gap-1.5">
+            {activeFilters.timeRanges.map((range, idx) => (
+              <button
+                key={`time-${idx}`}
+                type="button"
+                onClick={() => removeFilter("time", range.label)}
+                className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-medium bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20 rounded-full hover:bg-blue-500/20 transition-colors"
+              >
+                <span>🕐</span>
+                <span>{range.label}</span>
+                <X className="w-2.5 h-2.5 ml-0.5" />
+              </button>
+            ))}
+            {activeFilters.contentType && (
+              <button
+                type="button"
+                onClick={() => removeFilter("content")}
+                className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-medium bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20 rounded-full hover:bg-purple-500/20 transition-colors"
+              >
+                <span>{activeFilters.contentType === "audio" ? "🎤" : "🖥️"}</span>
+                <span>{activeFilters.contentType}</span>
+                <X className="w-2.5 h-2.5 ml-0.5" />
+              </button>
+            )}
+            {activeFilters.appName && (
+              <button
+                type="button"
+                onClick={() => removeFilter("app")}
+                className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-medium bg-green-500/10 text-green-600 dark:text-green-400 border border-green-500/20 rounded-full hover:bg-green-500/20 transition-colors"
+              >
+                <span>📱</span>
+                <span>{activeFilters.appName}</span>
+                <X className="w-2.5 h-2.5 ml-0.5" />
+              </button>
+            )}
+            {activeFilters.speakerName && (
+              <button
+                type="button"
+                onClick={() => removeFilter("speaker")}
+                className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-medium bg-orange-500/10 text-orange-600 dark:text-orange-400 border border-orange-500/20 rounded-full hover:bg-orange-500/20 transition-colors"
+              >
+                <span>👤</span>
+                <span>{activeFilters.speakerName}</span>
+                <X className="w-2.5 h-2.5 ml-0.5" />
+              </button>
+            )}
+          </div>
+        )}
+
+        {/* Follow-up suggestions (TikTok-style) */}
+        <AnimatePresence>
+          {!isLoading && followUpSuggestions.length > 0 && messages.length > 0 && (
+            <motion.div
+              initial={{ opacity: 0, y: 8 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 8 }}
+              transition={{ duration: 0.2 }}
+              className="px-3 pt-2 flex flex-col gap-1"
+            >
+              <span className="text-[10px] text-muted-foreground/60 uppercase tracking-wider font-medium">follow up</span>
+              <div className="flex flex-wrap gap-1.5">
+                {followUpSuggestions.map((q, i) => (
+                  <button
+                    key={i}
+                    type="button"
+                    onClick={() => sendMessage(q)}
+                    className="px-2.5 py-1 text-[11px] bg-primary/10 hover:bg-primary/20 rounded-full border border-primary/20 hover:border-primary/40 text-primary hover:text-primary transition-colors cursor-pointer"
+                  >
+                    {q}
+                  </button>
+                ))}
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Persistent auto-suggestions above input */}
+        {messages.length > 0 && !isLoading && autoSuggestions.length > 0 && (
+          <div className="px-3 pt-2 flex flex-wrap gap-1.5 items-center">
+            {autoSuggestions.slice(0, 4).map((s, i) => (
+              <button
+                key={i}
+                type="button"
+                onClick={() => sendMessage(s.text)}
+                className="px-2.5 py-1 text-[11px] font-mono bg-muted/20 hover:bg-foreground hover:text-background border border-border/20 hover:border-foreground text-muted-foreground transition-all duration-150 cursor-pointer max-w-[280px] truncate"
+                title={s.preview ? `${s.text} — ${s.preview}` : s.text}
+              >
+                {s.text}
+              </button>
+            ))}
+            <button
+              onClick={refreshSuggestions}
+              disabled={suggestionsRefreshing}
+              className="p-0.5 text-muted-foreground/30 hover:text-foreground transition-colors duration-150 disabled:opacity-30 cursor-pointer"
+              title="refresh suggestions"
+            >
+              <RefreshCw className={`w-3 h-3 ${suggestionsRefreshing ? 'animate-spin' : ''}`} strokeWidth={1.5} />
+            </button>
+          </div>
+        )}
+
+        {/* Attached images in the gap (above agent bar, like reference); click to open full-screen viewer */}
+        {pastedImages.length > 0 && (
+          <div className="px-3 py-2 border-b border-border/30 flex flex-wrap items-center gap-2">
+            {pastedImages.map((img, i) => (
+              <div key={i} className="relative group shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setImageViewer({ images: pastedImages, index: i })}
+                  className="block rounded-lg border border-border/50 shadow-sm overflow-hidden focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img
+                    src={img}
+                    alt={`Attached ${i + 1}`}
+                    className="h-20 w-20 min-h-20 min-w-20 object-cover cursor-pointer"
+                  />
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => { e.stopPropagation(); setPastedImages(prev => prev.filter((_, idx) => idx !== i)); }}
+                  className="absolute -top-1.5 -right-1.5 w-6 h-6 bg-destructive text-destructive-foreground rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity shadow-md hover:bg-destructive/90"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
         <div className="p-2 border-b border-border/30 flex items-center gap-2">
           <Popover open={appFilterOpen} onOpenChange={setAppFilterOpen}>
             <PopoverTrigger asChild>
@@ -3325,6 +4056,34 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                 })
               )}
 
+              {/* Connections — lets users mention their own integrations (gmail, slack, etc.) */}
+              {connections.length > 0 && (
+                <>
+                  <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted/30 border-b border-border/50 border-t">
+                    connections
+                  </div>
+                  {connections.map((c) => {
+                    const tag = `@${c.id}`;
+                    return (
+                      <button
+                        key={`conn-${c.id}`}
+                        type="button"
+                        onClick={() => {
+                          setInput((prev) => `${tag} ${prev.trim()}`.trim() + " ");
+                          setAppFilterOpen(false);
+                        }}
+                        className="w-full px-3 py-1.5 text-left text-xs font-mono hover:bg-muted/50 transition-colors flex items-center justify-between gap-2"
+                      >
+                        <span>{tag}</span>
+                        <span className="text-[10px] text-muted-foreground truncate">
+                          {c.name}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </>
+              )}
+
               {/* Speakers */}
               {recentSpeakers.length > 0 && (
                 <>
@@ -3364,6 +4123,7 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           <div className="flex-1 min-w-0">
             <AIPresetsSelector
               onPresetChange={setActivePreset}
+              onPresetSaved={handlePiRestart}
               controlledPresetId={activePipeExecution ? activePreset?.id : undefined}
               onControlledSelect={activePipeExecution ? (id) => {
                 const match = settings.aiPresets?.find((p) => p.id === id);
@@ -3373,147 +4133,6 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
             />
           </div>
         </div>
-
-        {/* Prefill context indicator from search */}
-        {(prefillContext || prefillFrameId) && (
-          <div className="px-3 py-2 border-b border-border/30 bg-muted/30">
-            <div className="flex items-start justify-between gap-2">
-              {prefillFrameId && (
-                <div className="flex-shrink-0">
-                  <div className="relative group">
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={`http://localhost:3030/frames/${prefillFrameId}`}
-                      alt="Attached frame"
-                      className="w-16 h-12 object-cover rounded border border-border/50"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setPrefillFrameId(null)}
-                      className="absolute -top-1 -right-1 p-0.5 bg-background rounded-full border border-border shadow-sm opacity-0 group-hover:opacity-100 transition-opacity"
-                    >
-                      <X className="w-2.5 h-2.5 text-muted-foreground" />
-                    </button>
-                  </div>
-                </div>
-              )}
-              {prefillContext && (
-                <div className="flex-1 min-w-0">
-                  <div className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider mb-1">
-                    context from {prefillSource === "timeline" ? "timeline selection" : "search"}
-                  </div>
-                  <p className="text-xs text-foreground font-mono line-clamp-2">
-                    {prefillContext.slice(0, 150)}{prefillContext.length > 150 ? "..." : ""}
-                  </p>
-                </div>
-              )}
-              <button
-                type="button"
-                onClick={() => {
-                  setPrefillContext(null);
-                  setPrefillFrameId(null);
-                }}
-                className="p-1 hover:bg-muted rounded text-muted-foreground"
-              >
-                <X className="w-3 h-3" />
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* Active filters chips */}
-        {hasActiveFilters && (
-          <div className="px-3 py-2 border-b border-border/30 flex flex-wrap gap-1.5">
-            {activeFilters.timeRanges.map((range, idx) => (
-              <button
-                key={`time-${idx}`}
-                type="button"
-                onClick={() => removeFilter("time", range.label)}
-                className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-medium bg-blue-500/10 text-blue-600 dark:text-blue-400 border border-blue-500/20 rounded-full hover:bg-blue-500/20 transition-colors"
-              >
-                <span>🕐</span>
-                <span>{range.label}</span>
-                <X className="w-2.5 h-2.5 ml-0.5" />
-              </button>
-            ))}
-            {activeFilters.contentType && (
-              <button
-                type="button"
-                onClick={() => removeFilter("content")}
-                className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-medium bg-purple-500/10 text-purple-600 dark:text-purple-400 border border-purple-500/20 rounded-full hover:bg-purple-500/20 transition-colors"
-              >
-                <span>{activeFilters.contentType === "audio" ? "🎤" : "🖥️"}</span>
-                <span>{activeFilters.contentType}</span>
-                <X className="w-2.5 h-2.5 ml-0.5" />
-              </button>
-            )}
-            {activeFilters.appName && (
-              <button
-                type="button"
-                onClick={() => removeFilter("app")}
-                className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-medium bg-green-500/10 text-green-600 dark:text-green-400 border border-green-500/20 rounded-full hover:bg-green-500/20 transition-colors"
-              >
-                <span>📱</span>
-                <span>{activeFilters.appName}</span>
-                <X className="w-2.5 h-2.5 ml-0.5" />
-              </button>
-            )}
-            {activeFilters.speakerName && (
-              <button
-                type="button"
-                onClick={() => removeFilter("speaker")}
-                className="inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-medium bg-orange-500/10 text-orange-600 dark:text-orange-400 border border-orange-500/20 rounded-full hover:bg-orange-500/20 transition-colors"
-              >
-                <span>👤</span>
-                <span>{activeFilters.speakerName}</span>
-                <X className="w-2.5 h-2.5 ml-0.5" />
-              </button>
-            )}
-          </div>
-        )}
-
-        {/* Follow-up suggestions (TikTok-style) */}
-        <AnimatePresence>
-          {!isLoading && followUpSuggestions.length > 0 && messages.length > 0 && (
-            <motion.div
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 8 }}
-              transition={{ duration: 0.2 }}
-              className="px-3 pt-2 flex flex-col gap-1"
-            >
-              <span className="text-[10px] text-muted-foreground/60 uppercase tracking-wider font-medium">follow up</span>
-              <div className="flex flex-wrap gap-1.5">
-                {followUpSuggestions.map((q, i) => (
-                  <button
-                    key={i}
-                    type="button"
-                    onClick={() => sendMessage(q)}
-                    className="px-2.5 py-1 text-[11px] bg-primary/10 hover:bg-primary/20 rounded-full border border-primary/20 hover:border-primary/40 text-primary hover:text-primary transition-colors cursor-pointer"
-                  >
-                    {q}
-                  </button>
-                ))}
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-
-        {/* Auto-suggestions above input */}
-        {messages.length > 0 && !isLoading && autoSuggestions.length > 0 && (
-          <div className="px-3 pt-2 flex flex-wrap gap-1.5">
-            {autoSuggestions.slice(0, 3).map((s, i) => (
-              <button
-                key={i}
-                type="button"
-                onClick={() => sendMessage(s.text)}
-                className="px-2.5 py-1 text-[11px] bg-muted/20 hover:bg-muted/50 rounded-full border border-border/20 hover:border-border/50 text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
-              >
-                {s.text}
-              </button>
-            ))}
-          </div>
-        )}
 
         <form
           onSubmit={handleSubmit}
@@ -3539,12 +4158,21 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
               )}
             </AnimatePresence>
           )}
-          <div className="flex gap-2 items-end">
-            <div className="relative flex-1">
+          <div
+            className={cn(
+              "flex flex-col rounded-lg border bg-input ring-offset-background transition-colors focus-within:border-foreground focus-within:ring-foreground/10 focus-within:ring-1",
+              "bg-background/50 border-border/50",
+              disabledReason && "border-muted-foreground/30"
+            )}
+          >
+            {/* Textarea row: full width so scrollbar is above the buttons and no dead zone */}
+            <div className="relative flex-1 min-w-0">
               <textarea
                 ref={inputRef}
                 value={input}
                 onChange={handleInputChange}
+                onCompositionStart={() => setIsComposing(true)}
+                onCompositionEnd={() => setIsComposing(false)}
                 onKeyDown={handleKeyDown}
                 placeholder={
                   disabledReason
@@ -3552,38 +4180,12 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                     : "Ask about your screen... (type @ for filters, paste images)"
                 }
                 disabled={!canChat}
+                spellCheck={false}
+                autoCorrect="off"
                 rows={1}
-                className={cn(
-                  "flex w-full border border-border bg-input px-3 py-2 text-sm font-mono ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:border-foreground disabled:cursor-not-allowed disabled:opacity-50 caret-foreground resize-none overflow-y-auto",
-                  "flex-1 bg-background/50 border-border/50 focus:border-foreground/30 focus:ring-foreground/10 transition-colors",
-                  disabledReason && "border-muted-foreground/30",
-                  pastedImages.length > 0 && "pb-12" // Make room for image previews below
-                )}
+                className="w-full min-h-[44px] border-0 bg-transparent px-3 py-2.5 pr-3 text-sm font-mono placeholder:text-muted-foreground focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50 caret-foreground resize-none overflow-y-auto scrollbar-minimal"
                 style={{ maxHeight: "150px" }}
               />
-
-              {/* Attached image previews below textarea */}
-              {pastedImages.length > 0 && (
-                <div className="absolute bottom-1 left-2 right-2 flex items-center gap-1.5 overflow-x-auto py-1">
-                  {pastedImages.map((img, i) => (
-                    <div key={i} className="relative group shrink-0">
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img
-                        src={img}
-                        alt={`Attached ${i + 1}`}
-                        className="h-8 w-8 object-cover rounded border border-border/50"
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setPastedImages(prev => prev.filter((_, idx) => idx !== i))}
-                        className="absolute -top-1.5 -right-1.5 w-4 h-4 bg-destructive text-destructive-foreground rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
-                      >
-                        <X className="w-2.5 h-2.5" />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
 
               <AnimatePresence>
                 {showMentionDropdown && filteredMentions.length > 0 && (
@@ -3635,47 +4237,43 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
                 )}
               </AnimatePresence>
             </div>
-            <Button
-              type="button"
-              size="icon"
-              variant="ghost"
-              onClick={handleFilePicker}
-              disabled={isLoading || !canChat}
-              className="shrink-0 text-muted-foreground hover:text-foreground"
-              title="Attach image"
-            >
-              <Paperclip className="h-4 w-4" />
-            </Button>
-            <Button
-              type={isStreaming ? "button" : "submit"}
-              size="icon"
-              disabled={(!input.trim() && !isStreaming && pastedImages.length === 0) || !canChat}
-              onClick={isStreaming ? handleStop : undefined}
-              className={cn(
-                "shrink-0 transition-all duration-200",
-                isStreaming
-                  ? "bg-foreground text-background hover:bg-foreground/80"
-                  : "bg-foreground text-background hover:bg-background hover:text-foreground"
-              )}
-            >
-              {isStreaming ? (
-                <Square className="h-4 w-4" />
-              ) : (
-                <Send className="h-4 w-4" />
-              )}
-            </Button>
+            {/* Buttons row below textarea so scrollbar is above and full width is typeable */}
+            <div className="flex items-center justify-end gap-0.5 shrink-0 px-2 pb-2 pt-1">
+              <Button
+                type="button"
+                size="icon"
+                variant="ghost"
+                onClick={handleFilePicker}
+                disabled={isLoading || !canChat}
+                className="h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-muted/50"
+                title="Attach image"
+              >
+                <Paperclip className="h-4 w-4" />
+              </Button>
+              <Button
+                type={isStreaming ? "button" : "submit"}
+                size="icon"
+                disabled={(!input.trim() && !isStreaming && pastedImages.length === 0) || !canChat}
+                onClick={isStreaming ? handleStop : undefined}
+                className={cn(
+                  "h-8 w-8 transition-all duration-200",
+                  isStreaming
+                    ? "bg-foreground text-background hover:bg-foreground/80"
+                    : "bg-foreground text-background hover:bg-background hover:text-foreground"
+                )}
+              >
+                {isStreaming ? (
+                  <Square className="h-4 w-4" />
+                ) : (
+                  <Send className="h-4 w-4" />
+                )}
+              </Button>
+            </div>
           </div>
         </form>
       </div> {/* End of max-w-4xl input wrapper */}
       </div>
 
-      <UpgradeDialog
-        open={showUpgradeDialog}
-        onOpenChange={setShowUpgradeDialog}
-        reason={upgradeReason}
-        resetsAt={upgradeResetsAt}
-        source="chat"
-      />
 
       {scheduleDialogMessage && (
         <SchedulePromptDialog
@@ -3691,6 +4289,132 @@ export function StandaloneChat({ className }: { className?: string } = {}) {
           responsePreview={scheduleDialogMessage.response}
         />
       )}
+
+      {/* Full-screen image viewer (like reference): click any attached photo to open */}
+      <Dialog open={!!imageViewer} onOpenChange={(open) => !open && setImageViewer(null)}>
+        <DialogContent
+          hideCloseButton
+          className="fixed inset-0 z-50 max-w-none w-full h-full !left-0 !top-0 !translate-x-0 !translate-y-0 rounded-none border-0 bg-muted/95 p-0 flex flex-col gap-0"
+        >
+          {imageViewer && (
+            <>
+              <div className="flex items-center justify-between px-4 py-3 border-b border-border/50 shrink-0">
+                <span className="text-sm font-medium text-muted-foreground">
+                  {imageViewer.index + 1}/{imageViewer.images.length} Attached image {imageViewer.index + 1}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setImageViewer(null)}
+                  className="p-2 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
+                  aria-label="Close"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+              <div className="flex-1 flex items-center justify-center min-h-0 p-4 bg-background/50">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={imageViewer.images[imageViewer.index]}
+                  alt={`Attached image ${imageViewer.index + 1}`}
+                  className="max-w-full max-h-full object-contain rounded-lg"
+                />
+              </div>
+              <div className="flex items-center justify-center gap-4 py-3 border-t border-border/50 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => setImageViewer((v) => v && v.index > 0 ? { ...v, index: v.index - 1 } : v)}
+                  disabled={imageViewer.index === 0}
+                  className="p-2 rounded-md hover:bg-muted disabled:opacity-40 disabled:pointer-events-none text-foreground"
+                  aria-label="Previous image"
+                >
+                  <ChevronLeft className="h-5 w-5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setImageViewer((v) => v && v.index < v.images.length - 1 ? { ...v, index: v.index + 1 } : v)}
+                  disabled={imageViewer.index === imageViewer.images.length - 1}
+                  className="p-2 rounded-md hover:bg-muted disabled:opacity-40 disabled:pointer-events-none text-foreground"
+                  aria-label="Next image"
+                >
+                  <ChevronRight className="h-5 w-5" />
+                </button>
+              </div>
+              <div className="flex justify-center gap-1.5 pb-3">
+                {imageViewer.images.map((_, i) => (
+                  <div
+                    key={i}
+                    className={cn(
+                      "w-2 h-2 rounded-full transition-colors",
+                      i === imageViewer.index ? "bg-foreground" : "bg-muted-foreground/40"
+                    )}
+                    aria-hidden
+                  />
+                ))}
+              </div>
+            </>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      {/* Delete chat confirmation dialog */}
+      <Dialog open={!!deletingConvId} onOpenChange={(open) => !open && setDeletingConvId(null)}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Delete chat</DialogTitle>
+            <p className="text-sm text-muted-foreground">Are you sure you want to delete this chat?</p>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeletingConvId(null)}>
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => {
+                deleteConversation(deletingConvId!);
+                setDeletingConvId(null);
+              }}
+            >
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Rename chat dialog */}
+      <Dialog open={!!renamingConvId} onOpenChange={(open) => !open && setRenamingConvId(null)}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Rename chat</DialogTitle>
+          </DialogHeader>
+          <input
+            autoFocus
+            className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-ring"
+            value={renameValue}
+            onChange={(e) => setRenameValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                renameConversation(renamingConvId!, renameValue);
+                setRenamingConvId(null);
+              } else if (e.key === "Escape") {
+                setRenamingConvId(null);
+              }
+            }}
+          />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRenamingConvId(null)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() => {
+                renameConversation(renamingConvId!, renameValue);
+                setRenamingConvId(null);
+              }}
+            >
+              Save
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

@@ -4,7 +4,6 @@
 
 import { useSettings } from "@/lib/hooks/use-settings";
 import { useMemo, useState, useEffect, useCallback } from "react";
-import { open as openUrl } from "@tauri-apps/plugin-shell";
 import {
   Command,
   CommandEmpty,
@@ -58,6 +57,8 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { AIPreset, commands } from "@/lib/utils/tauri";
+import { ensureChatGptPreset } from "@/lib/utils/chatgpt-preset";
+import { useIsEnterpriseBuild } from "@/lib/hooks/use-is-enterprise-build";
 
 // Helper to detect UUID-like strings and format preset names nicely
 const formatPresetName = (name: string): string => {
@@ -115,15 +116,15 @@ interface OpenAIModel {
 }
 
 export const DEFAULT_PROMPT = `Rules:
-- You can analyze/view/show/access videos to the user by putting .mp4 files in a code block (we'll render it) like this: \`/users/video.mp4\`, use the exact, absolute, file path from file_path property
-- Do not try to embed video in links (e.g. [](.mp4) or https://.mp4) instead put the file_path in a code block using backticks
-- Do not put video in multiline code block it will not render the video (e.g. \`\`\`bash\n.mp4\`\`\` IS WRONG) instead using inline code block with single backtick
+- Media: use standard markdown ![description](/path/to/file.mp4) for videos and ![description](/path/to/image.jpg) for images
+- Use the exact absolute file_path from search results, do not modify it
 - Always answer my question/intent, do not make up things
 `;
 
 function ChatGptSignInButton() {
   const [loggedIn, setLoggedIn] = useState(false);
   const [loading, setLoading] = useState(false);
+  const { settings, updateSettings } = useSettings();
 
   useEffect(() => {
     commands.chatgptOauthStatus().then((res) => {
@@ -147,7 +148,14 @@ function ChatGptSignInButton() {
           setLoading(true);
           try {
             const res = await commands.chatgptOauthLogin();
-            if (res.status === "ok" && res.data) setLoggedIn(true);
+            if (res.status === "ok" && res.data) {
+              setLoggedIn(true);
+              // auto-create a ChatGPT preset on first connection
+              await ensureChatGptPreset(
+                settings.aiPresets || [],
+                (presets) => updateSettings({ aiPresets: presets })
+              );
+            }
           } catch (e) {
             console.error("chatgpt oauth failed:", e);
           }
@@ -181,7 +189,38 @@ export function AIProviderConfig({
   const [isLoadingModels, setIsLoadingModels] = useState(false);
   const [idError, setIdError] = useState<string | null>(null);
   const [showApiKey, setShowApiKey] = useState(false);
+  const isEnterprise = useIsEnterpriseBuild();
   const [piAvailable, setPiAvailable] = useState(false);
+  const [piModels, setPiModels] = useState<{ id: string; name: string; free?: boolean; cost_tier?: string; recommended_for?: string[]; warning?: string; health?: { status: string; error_rate_5m: number } }[]>([]);
+
+  // Fetch PI models from gateway (single source of truth)
+  useEffect(() => {
+    if (selectedProvider !== "screenpipe-cloud") return;
+    const fetchPiModels = async () => {
+      try {
+        const token = settings?.user?.token || "";
+        const resp = await fetch("https://api.screenpi.pe/v1/models", {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          const models = (data.data || []).map((m: any) => ({
+            id: m.id,
+            name: m.name || m.id,
+            free: m.free,
+            cost_tier: m.cost_tier,
+            recommended_for: m.recommended_for,
+            warning: m.warning,
+            health: m.health,
+          }));
+          setPiModels(models);
+        }
+      } catch {
+        // gateway down — model list stays empty, user sees empty dropdown
+      }
+    };
+    fetchPiModels();
+  }, [selectedProvider, settings?.user?.token]);
 
   // Check Pi availability (installed at app startup by Rust background thread)
   useEffect(() => {
@@ -195,11 +234,13 @@ export function AIProviderConfig({
         console.error("Failed to check pi:", e);
       }
     };
-    checkPi();
+    if (!isEnterprise) {
+      checkPi();
+    }
     // Re-check periodically in case background install finishes
-    const interval = setInterval(checkPi, 5000);
-    return () => clearInterval(interval);
-  }, []);
+    const interval = isEnterprise ? null : setInterval(checkPi, 5000);
+    return () => { if (interval) clearInterval(interval); };
+  }, [isEnterprise]);
   const [formData, setFormData] = useState<AIPreset>({
     provider: defaultPreset?.provider || "openai",
     apiKey: defaultPreset?.apiKey || "",
@@ -361,19 +402,19 @@ export function AIProviderConfig({
   const [showAdvanced, setShowAdvanced] = useState(false);
 
   return (
-    <div className="w-full space-y-2 rounded-lg bg-card p-2.5">
+    <div className="w-full space-y-3 rounded-lg bg-card p-4">
       <div>
-        <h2 className="text-sm font-semibold">
+        <h2 className="text-base font-semibold">
           {defaultPreset?.id ? "edit ai provider" : "ai provider"}
         </h2>
       </div>
 
-      <form onSubmit={handleSubmit} className="space-y-1.5">
-        <div className="space-y-0.5">
+      <form onSubmit={handleSubmit} className="space-y-3">
+        <div className="space-y-1">
           <Label htmlFor="name" className="flex items-center gap-2 text-xs">
             name
             {idError && (
-              <span className="text-[10px] text-destructive font-normal">
+              <span className="text-xs text-destructive font-normal">
                 {idError}
               </span>
             )}
@@ -385,34 +426,61 @@ export function AIProviderConfig({
             value={formData.id || undefined}
             onChange={(e) => handleIdChange(e.target.value)}
             className={cn(
-              "font-mono h-7 text-xs",
+              "font-mono h-8 text-sm",
               idError && "border-destructive focus-visible:ring-destructive",
             )}
             autoComplete="off"
             autoCorrect="off"
             autoCapitalize="off"
+            spellCheck={false}
             disabled={
               Boolean(defaultPreset?.id) &&
-              !defaultPreset?.id?.endsWith("-copy")
+              settings.aiPresets.some((p) => p.id === defaultPreset?.id)
             }
           />
         </div>
 
         <div className={cn(
-          "grid gap-1",
-          piAvailable ? "grid-cols-5" : "grid-cols-4"
+          "grid gap-2",
+          piAvailable ? "grid-cols-3" : "grid-cols-4"
         )}>
+          {piAvailable && (
+            <Button
+              type="button"
+              disabled={!settings?.user?.token}
+              variant={selectedProvider === "screenpipe-cloud" ? "default" : "outline"}
+              className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
+              onClick={() => {
+                setSelectedProvider("screenpipe-cloud");
+                setFormData({
+                  ...formData,
+                  provider: "screenpipe-cloud",
+                  url: "",
+                  model: "auto",
+                });
+              }}
+            >
+              <Icons.terminal className="h-3.5 w-3.5" />
+              <span>screenpipe cloud</span>
+            </Button>
+          )}
+
           <Button
             type="button"
-            variant={selectedProvider === "openai" ? "default" : "outline"}
-            className="flex h-7 items-center justify-center gap-1 text-[10px] px-2"
+            variant={selectedProvider === "openai-chatgpt" ? "default" : "outline"}
+            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
             onClick={() => {
-              setSelectedProvider("openai");
-              setFormData({ ...formData, provider: "openai" });
+              setSelectedProvider("openai-chatgpt");
+              setFormData({
+                ...formData,
+                provider: "openai-chatgpt",
+                url: "https://api.openai.com/v1",
+                model: "gpt-5.4",
+              });
             }}
           >
-            <Icons.openai className="h-3 w-3" />
-            <span>openai</span>
+            <Icons.openai className="h-3.5 w-3.5" />
+            <span>chatgpt</span>
           </Button>
 
           <Button
@@ -420,7 +488,7 @@ export function AIProviderConfig({
             variant={
               selectedProvider === "native-ollama" ? "default" : "outline"
             }
-            className="flex h-7 items-center justify-center gap-1 text-[10px] px-2"
+            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
             onClick={() => {
               setSelectedProvider("native-ollama");
               setFormData({
@@ -430,14 +498,14 @@ export function AIProviderConfig({
               });
             }}
           >
-            <Icons.terminal className="h-3 w-3" />
+            <Icons.terminal className="h-3.5 w-3.5" />
             <span>ollama</span>
           </Button>
 
           <Button
             type="button"
             variant={selectedProvider === "custom" ? "default" : "outline"}
-            className="flex h-7 items-center justify-center gap-1 text-[10px] px-2"
+            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
             onClick={() => {
               setSelectedProvider("custom");
               setFormData({
@@ -447,53 +515,35 @@ export function AIProviderConfig({
               });
             }}
           >
-            <Icons.settings className="h-3 w-3" />
+            <Icons.settings className="h-3.5 w-3.5" />
             <span>custom</span>
           </Button>
 
           <Button
             type="button"
-            variant={selectedProvider === "openai-chatgpt" ? "default" : "outline"}
-            className="flex h-7 items-center justify-center gap-1 text-[10px] px-2"
+            variant={(selectedProvider as string) === "anthropic" ? "default" : "outline"}
+            className="flex h-8 items-center justify-center gap-1.5 text-xs px-3"
             onClick={() => {
-              setSelectedProvider("openai-chatgpt");
-              setFormData({
-                ...formData,
-                provider: "openai-chatgpt",
-                url: "https://api.openai.com/v1",
-                model: "gpt-4o",
-              });
-            }}
-          >
-            <Icons.openai className="h-3 w-3" />
-            <span>chatgpt</span>
-          </Button>
-
-          {piAvailable && (
-            <Button
-              type="button"
-              disabled={!settings?.user?.token}
-              variant={selectedProvider === "pi" ? "default" : "outline"}
-              className="flex h-7 items-center justify-center gap-1 text-[10px] px-2"
-              onClick={() => {
-                setSelectedProvider("pi");
+              if ((selectedProvider as string) !== "anthropic") {
+                setSelectedProvider("anthropic");
                 setFormData({
                   ...formData,
-                  provider: "pi",
-                  url: "", // Pi uses RPC mode
-                  model: "claude-haiku-4-5",
+                  provider: "anthropic",
+                  url: "",
+                  model: "claude-sonnet-4-6",
                 });
-              }}
-            >
-              <Icons.terminal className="h-3 w-3" />
-              <span>pi</span>
-            </Button>
-          )}
+              }
+            }}
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/images/claude-ai.svg" alt="Claude API" className="h-3.5 w-3.5 rounded-sm" />
+            <span>claude api</span>
+          </Button>
         </div>
 
         {selectedProvider === "openai" && (
           <div className="space-y-1">
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               <Label htmlFor="apiKey" className="text-xs">api key</Label>
               <div className="relative">
                 <Input
@@ -504,7 +554,7 @@ export function AIProviderConfig({
                   onChange={(e) =>
                     setFormData({ ...formData, apiKey: e.target.value })
                   }
-                  className="pr-10 h-7 text-xs"
+                  className="pr-10 h-8 text-sm"
                 />
                 <Button
                   type="button"
@@ -521,7 +571,7 @@ export function AIProviderConfig({
                 </Button>
               </div>
             </div>
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               <Label htmlFor="model" className="text-xs">model</Label>
               <Select
                 value={formData.model}
@@ -529,7 +579,7 @@ export function AIProviderConfig({
                   setFormData({ ...formData, model: value })
                 }
               >
-                <SelectTrigger className="h-7 text-xs">
+                <SelectTrigger className="h-8 text-sm">
                   <SelectValue
                     placeholder={
                       isLoadingModels ? "loading models..." : "select model"
@@ -556,7 +606,7 @@ export function AIProviderConfig({
 
         {selectedProvider === "native-ollama" && (
           <div className="space-y-1">
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               <Label htmlFor="baseUrl" className="text-xs">base url</Label>
               <Input
                 id="baseUrl"
@@ -566,10 +616,10 @@ export function AIProviderConfig({
                 onChange={(e) =>
                   setFormData({ ...formData, url: e.target.value })
                 }
-                className="h-7 text-xs"
+                className="h-8 text-sm"
               />
             </div>
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               <Label htmlFor="model" className="text-xs">model</Label>
               <div className="relative">
                 <Input
@@ -581,7 +631,7 @@ export function AIProviderConfig({
                   onChange={(e) =>
                     setFormData({ ...formData, model: e.target.value })
                   }
-                  className="h-7 text-xs"
+                  className="h-8 text-sm"
                 />
                 {openaiModels.length > 0 && (
                   <datalist id="ollama-models">
@@ -605,7 +655,7 @@ export function AIProviderConfig({
 
         {selectedProvider === "custom" && (
           <div className="space-y-1">
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               <Label htmlFor="baseUrl" className="text-xs">base url</Label>
               <Input
                 id="baseUrl"
@@ -615,10 +665,10 @@ export function AIProviderConfig({
                 onChange={(e) =>
                   setFormData({ ...formData, url: e.target.value })
                 }
-                className="h-7 text-xs"
+                className="h-8 text-sm"
               />
             </div>
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               <Label htmlFor="apiKey" className="text-xs">api key</Label>
               <div className="relative">
                 <Input
@@ -629,7 +679,7 @@ export function AIProviderConfig({
                   onChange={(e) =>
                     setFormData({ ...formData, apiKey: e.target.value })
                   }
-                  className="pr-10 h-7 text-xs"
+                  className="pr-10 h-8 text-sm"
                 />
                 <Button
                   type="button"
@@ -639,14 +689,14 @@ export function AIProviderConfig({
                   onClick={() => setShowApiKey(!showApiKey)}
                 >
                   {showApiKey ? (
-                    <EyeOff className="h-3 w-3" />
+                    <EyeOff className="h-3.5 w-3.5" />
                   ) : (
-                    <Eye className="h-3 w-3" />
+                    <Eye className="h-3.5 w-3.5" />
                   )}
                 </Button>
               </div>
             </div>
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               <Label htmlFor="model" className="text-xs">model</Label>
               <div className="relative">
                 <Input
@@ -658,7 +708,7 @@ export function AIProviderConfig({
                   onChange={(e) =>
                     setFormData({ ...formData, model: e.target.value })
                   }
-                  className="h-7 text-xs"
+                  className="h-8 text-sm"
                 />
                 {openaiModels.length > 0 && (
                   <datalist id="custom-models">
@@ -674,22 +724,22 @@ export function AIProviderConfig({
 
         {selectedProvider === "openai-chatgpt" && (
           <div className="space-y-1">
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               <Label className="text-xs">chatgpt account</Label>
               <ChatGptSignInButton />
             </div>
-            <div className="space-y-0.5">
+            <div className="space-y-1">
               <Label htmlFor="model" className="text-xs">model</Label>
               <Input
                 id="model"
                 type="text"
                 list="chatgpt-models"
-                placeholder="gpt-4o"
+                placeholder="gpt-5.4"
                 value={formData.model || ""}
                 onChange={(e) =>
                   setFormData({ ...formData, model: e.target.value })
                 }
-                className="h-7 text-xs"
+                className="h-8 text-sm"
               />
               {openaiModels.length > 0 && (
                 <datalist id="chatgpt-models">
@@ -702,50 +752,99 @@ export function AIProviderConfig({
           </div>
         )}
 
-        {selectedProvider === "pi" && (
-          <div className="space-y-0.5">
+        {selectedProvider === "anthropic" && (
+          <div className="space-y-1">
+            {selectedProvider === "anthropic" && (
+              <div className="space-y-1 pt-1">
+                <Label htmlFor="anthropicApiKey" className="text-xs">api key</Label>
+                <div className="relative">
+                  <Input
+                    id="anthropicApiKey"
+                    type={showApiKey ? "text" : "password"}
+                    placeholder="sk-ant-..."
+                    value={formData.apiKey || ""}
+                    onChange={(e) => setFormData({ ...formData, apiKey: e.target.value })}
+                    className="pr-10 h-8 text-sm"
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="absolute right-0 top-0 h-full px-2 py-1 hover:bg-transparent"
+                    onClick={() => setShowApiKey(!showApiKey)}
+                  >
+                    {showApiKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            <div className="space-y-1">
+              <Label htmlFor="model" className="text-xs">model</Label>
+              <Select
+                value={formData.model}
+                onValueChange={(value) => setFormData({ ...formData, model: value })}
+              >
+                <SelectTrigger className="h-8 text-sm">
+                  <SelectValue placeholder="select model" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="claude-opus-4-6">claude opus 4.6</SelectItem>
+                  <SelectItem value="claude-sonnet-4-6">claude sonnet 4.5</SelectItem>
+                  <SelectItem value="claude-haiku-4-5-20251001">claude haiku 4.5</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+        )}
+
+        {selectedProvider === "screenpipe-cloud" && (
+          <div className="space-y-1">
             <Label htmlFor="model" className="text-xs">model</Label>
             <Select
               value={formData.model}
               onValueChange={async (value) => {
-                if (value === "claude-opus-4-6" && !settings.user?.cloud_subscribed) {
-                  if (!settings.user?.token) {
-                    await commands.openLoginWindow();
-                  } else {
-                    try {
-                      const res = await fetch("https://screenpi.pe/api/cloud-sync/checkout", {
-                        method: "POST",
-                        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${settings.user.token}` },
-                        body: JSON.stringify({ tier: "pro", billingPeriod: "monthly", userId: settings.user.id, email: settings.user.email }),
-                      });
-                      const data = await res.json();
-                      if (data.url) await openUrl(data.url);
-                    } catch (e) {
-                      console.error("checkout failed:", e);
-                    }
-                  }
-                  return;
-                }
                 setFormData({ ...formData, model: value });
               }}
             >
-              <SelectTrigger className="h-7 text-xs">
+              <SelectTrigger className="h-8 text-sm">
                 <SelectValue placeholder="select model" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="claude-haiku-4-5">Haiku 4.5 (fast)</SelectItem>
-                <SelectItem value="claude-sonnet-4-5">Sonnet 4.5 (balanced)</SelectItem>
-                <SelectItem value="claude-opus-4-6">
-                  Opus 4.6 {settings.user?.cloud_subscribed ? "(powerful)" : "(pro)"}
-                </SelectItem>
+                {piModels.map((m) => {
+                  const costLabel = m.cost_tier === 'low' ? '$' : m.cost_tier === 'medium' ? '$$' : m.cost_tier === 'high' ? '$$$' : m.cost_tier === 'very_high' ? '$$$$' : '';
+                  return (
+                  <SelectItem key={m.id} value={m.id}>
+                    <span className="flex items-center gap-1.5">
+                      {m.health?.status === 'down' && <span className="inline-block w-1.5 h-1.5 rounded-full bg-red-500" title="overloaded" />}
+                      {m.health?.status === 'degraded' && <span className="inline-block w-1.5 h-1.5 rounded-full bg-yellow-500" title="degraded" />}
+                      {m.name}{m.free ? " (free)" : ""}
+                      {costLabel && <span className="text-[9px] font-medium text-muted-foreground">{costLabel}</span>}
+                      {m.recommended_for?.includes('pipes') && <span className="text-[9px] text-muted-foreground bg-muted rounded px-1">pipes</span>}
+                      {m.health?.status === 'down' && <span className="text-[9px] text-red-400 ml-1">overloaded</span>}
+                    </span>
+                  </SelectItem>
+                  );
+                })}
               </SelectContent>
             </Select>
+            {(() => {
+              const selectedModel = piModels.find((m) => m.id === formData.model);
+              if (selectedModel?.warning) {
+                return (
+                  <p className="text-[10px] text-muted-foreground mt-1">
+                    ! {selectedModel.warning}
+                  </p>
+                );
+              }
+              return null;
+            })()}
           </div>
         )}
 
         <button
           type="button"
-          className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors"
+          className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
           onClick={() => setShowAdvanced(!showAdvanced)}
         >
           <span>{showAdvanced ? "▾" : "▸"}</span>
@@ -754,8 +853,9 @@ export function AIProviderConfig({
 
         {showAdvanced && (
           <div className="space-y-1.5">
-            <div className="space-y-0.5">
-              <Label htmlFor="maxTokens" className="text-[10px]">max output tokens</Label>
+            {selectedProvider !== "screenpipe-cloud" && (
+            <div className="space-y-1">
+              <Label htmlFor="maxTokens" className="text-xs">max output tokens</Label>
               <Input
                 id="maxTokens"
                 type="number"
@@ -769,8 +869,9 @@ export function AIProviderConfig({
                 className="h-6 text-[10px]"
               />
             </div>
-            <div className="space-y-0.5">
-              <Label htmlFor="prompt" className="text-[10px]">prompt</Label>
+            )}
+            <div className="space-y-1">
+              <Label htmlFor="prompt" className="text-xs">prompt</Label>
               <Textarea
                 id="prompt"
                 value={formData.prompt || DEFAULT_PROMPT}
@@ -778,7 +879,7 @@ export function AIProviderConfig({
                   setFormData({ ...formData, prompt: e.target.value })
                 }
                 placeholder="enter your custom prompt here"
-                className="min-h-[40px] max-h-[60px] text-[10px] resize-none"
+                className="min-h-[60px] max-h-[100px] text-xs resize-none"
               />
             </div>
           </div>
@@ -814,6 +915,8 @@ interface AIPresetsSelectorProps {
   recommendedPresets?: RecommendedPreset[];
   shortcutKey?: string;
   onPresetChange?: (preset: AIPreset) => void;
+  /** Called when user saves a preset (explicit action) — use to restart Pi deterministically */
+  onPresetSaved?: (preset: AIPreset) => void;
   showLoginCta?: boolean;
   /** Controlled mode: override which preset id is shown as selected */
   controlledPresetId?: string | null;
@@ -842,14 +945,20 @@ export const AIPresetDialog = ({
       model: providerData.model,  // Fixed: was providerData.modelName
       id: providerData.id,
       maxContextChars: providerData.maxContextChars,
-      maxTokens: (providerData as any).maxTokens ?? 4096,
       prompt: providerData.prompt,
     };
 
-    // Only add apiKey if provider is openai or custom
+    // Screenpipe Cloud: max output is defined per model in the gateway catalog (see screenpipe_cloud_models in Rust).
+    // Do not persist or override maxTokens from this dialog — avoids defaulting to 4096 and matches Settings.
+    if (providerData.provider !== "screenpipe-cloud") {
+      (newPreset as any).maxTokens = (providerData as any).maxTokens ?? 4096;
+    }
+
+    // Add apiKey for providers that require it
     if (
       providerData.provider === "openai" ||
-      providerData.provider === "custom"
+      providerData.provider === "custom" ||
+      providerData.provider === "anthropic"
     ) {
       (newPreset as any).apiKey = providerData.apiKey;
     }
@@ -864,7 +973,9 @@ export const AIPresetDialog = ({
         url: preset.url,
         model: preset.model,
         maxContextChars: preset.maxContextChars,
-        maxTokens: (preset as any).maxTokens ?? 4096,
+        ...(preset.provider !== "screenpipe-cloud"
+          ? { maxTokens: (preset as any).maxTokens ?? 4096 }
+          : {}),
         prompt: preset.prompt,
         defaultPreset: preset.defaultPreset,
         apiKey: preset.apiKey || null,
@@ -898,6 +1009,7 @@ export const AIPresetsSelector = ({
   recommendedPresets,
   shortcutKey = "/",
   onPresetChange,
+  onPresetSaved,
   showLoginCta = true,
   controlledPresetId,
   onControlledSelect,
@@ -913,9 +1025,13 @@ export const AIPresetsSelector = ({
   >();
 
   const isControlled = onControlledSelect !== undefined;
+  const isEnterprise = useIsEnterpriseBuild();
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const aiPresets = (settings?.aiPresets || []) as AIPreset[];
+  const aiPresets = useMemo(() => {
+    const presets = (settings?.aiPresets || []) as AIPreset[];
+    return isEnterprise ? presets.filter((p) => p.provider !== "screenpipe-cloud") : presets;
+  }, [settings?.aiPresets, isEnterprise]);
 
   const selectedPreset = useMemo(() => {
     if (isControlled) return controlledPresetId ?? undefined;
@@ -929,7 +1045,7 @@ export const AIPresetsSelector = ({
   // Check if selected preset requires login
   const selectedPresetRequiresLogin = useMemo(() => {
     const preset = aiPresets.find((p) => p.id === selectedPreset);
-    return preset?.provider === "pi" && !settings?.user?.token;
+    return preset?.provider === "screenpipe-cloud" && !settings?.user?.token;
   }, [aiPresets, selectedPreset, settings?.user?.token]);
 
   useEffect(() => {
@@ -989,10 +1105,10 @@ export const AIPresetsSelector = ({
 
     // If we're editing an existing preset
     if (selectedPresetToEdit) {
-      // If this is a copy operation, treat it as a new preset
+      // If this is a copy/duplicate operation, treat it as a new preset
       if (
         preset.id !== selectedPresetToEdit.id ||
-        preset.id.endsWith("-copy")
+        !settings.aiPresets.some((p) => p.id === preset.id)
       ) {
         // Check for duplicate ID
         const existingPreset = settings.aiPresets.find(
@@ -1086,14 +1202,31 @@ export const AIPresetsSelector = ({
       });
     }
 
+    // Notify parent to restart Pi if the saved preset is the active/default one
+    if (onPresetSaved) {
+      const savedFull = { ...preset } as AIPreset;
+      const isDefault = selectedPresetToEdit?.defaultPreset ||
+        (!selectedPresetToEdit && settings.aiPresets.length === 0);
+      if (isDefault) {
+        onPresetSaved(savedFull);
+      }
+    }
+
     setDialogOpen(false);
     setSelectedPresetToEdit(undefined);
   };
 
   const handleDuplicatePreset = (preset: AIPreset) => {
+    const baseName = preset.id.replace(/ \d+$/, "");
+    let counter = 2;
+    let newName = `${baseName} ${counter}`;
+    while (settings.aiPresets.some((p) => p.id.toLowerCase() === newName.toLowerCase())) {
+      counter++;
+      newName = `${baseName} ${counter}`;
+    }
     setSelectedPresetToEdit({
       ...preset,
-      id: `${preset.id}-copy`,
+      id: newName,
       defaultPreset: false,
     });
     setDialogOpen(true);
@@ -1117,6 +1250,11 @@ export const AIPresetsSelector = ({
       aiPresets: updatedPresets,
     });
 
+    // Restart Pi with the new default preset
+    if (onPresetSaved) {
+      onPresetSaved(preset);
+    }
+
     toast.success("Default preset updated", {
       description: `${preset.id} is now the default preset`,
     });
@@ -1124,8 +1262,8 @@ export const AIPresetsSelector = ({
 
   const handleRemovePreset = (preset: AIPreset) => {
     if (!settings?.aiPresets) return;
-    // Prevent deletion of pi-agent preset for Pro subscribers (pi = screenpipe cloud)
-    if (preset.provider === "pi" && settings.user?.cloud_subscribed) {
+    // Prevent deletion of screenpipe-cloud preset for Pro subscribers
+    if (preset.provider === "screenpipe-cloud" && settings.user?.cloud_subscribed) {
       toast.error("Cannot delete cloud preset", {
         description: "This preset is included with your Pro subscription",
       });
@@ -1188,8 +1326,8 @@ export const AIPresetsSelector = ({
                   )}
                 >
                   {selectedPreset ? (
-                    <div className="flex w-full items-center justify-between gap-2 overflow-hidden">
-                      <div className="flex items-center gap-2 min-w-[80px] max-w-[30%]">
+                    <div className="flex w-full items-center justify-between gap-2 overflow-hidden min-w-0">
+                      <div className="flex items-center gap-2 min-w-0 flex-shrink overflow-hidden">
                         {selectedPresetRequiresLogin && (
                           <AlertTriangle className="h-4 w-4 text-amber-500 shrink-0" />
                         )}
@@ -1201,15 +1339,15 @@ export const AIPresetsSelector = ({
                           )}
                         </span>
                       </div>
-                      <div className="flex items-center gap-2 text-xs text-muted-foreground overflow-hidden">
-                        <span className="rounded bg-muted px-1.5 py-0.5 whitespace-nowrap">
+                      <div className="flex items-center gap-2 text-xs text-muted-foreground min-w-0 flex-1 justify-end overflow-hidden">
+                        <span className="rounded bg-muted px-1.5 py-0.5 whitespace-nowrap shrink-0">
                           {
                             aiPresets.find(
                               (preset) => preset.id === selectedPreset,
                             )?.provider
                           }
                         </span>
-                        <span className="hidden sm:block truncate max-w-[30%]">
+                        <span className="hidden sm:block truncate min-w-0" title={aiPresets.find((p) => p.id === selectedPreset)?.model}>
                           {
                             aiPresets.find(
                               (preset) => preset.id === selectedPreset,
@@ -1243,7 +1381,7 @@ export const AIPresetsSelector = ({
               </TooltipContent>
             </Tooltip>
           </TooltipProvider>
-          <PopoverContent className="min-w-[500px] w-[--radix-popover-trigger-width] p-0">
+          <PopoverContent side="top" sideOffset={6} className="min-w-[500px] w-[--radix-popover-trigger-width] p-0">
             <Command>
               <CommandInput placeholder="search presets..." />
               <CommandList>
@@ -1326,7 +1464,7 @@ export const AIPresetsSelector = ({
                                   setDialogOpen(true);
                                 }}
                               >
-                                <Copy className="h-3 w-3" />
+                                <Copy className="h-3.5 w-3.5" />
                               </Button>
                             </div>
                           </div>
@@ -1401,7 +1539,7 @@ export const AIPresetsSelector = ({
                                 handleEditPreset(preset);
                               }}
                             >
-                              <Edit2 className="h-3 w-3" />
+                              <Edit2 className="h-3.5 w-3.5" />
                             </Button>
                             <Button
                               variant="ghost"
@@ -1412,7 +1550,7 @@ export const AIPresetsSelector = ({
                                 handleDuplicatePreset(preset);
                               }}
                             >
-                              <Copy className="h-3 w-3" />
+                              <Copy className="h-3.5 w-3.5" />
                             </Button>
                             {!preset.defaultPreset && (
                               <>
@@ -1425,7 +1563,7 @@ export const AIPresetsSelector = ({
                                     handleSetDefaultPreset(preset);
                                   }}
                                 >
-                                  <Star className="h-3 w-3" />
+                                  <Star className="h-3.5 w-3.5" />
                                 </Button>
                                 <Button
                                   variant="ghost"
@@ -1436,7 +1574,7 @@ export const AIPresetsSelector = ({
                                     handleRemovePreset(preset);
                                   }}
                                 >
-                                  <Trash2 className="h-3 w-3" />
+                                  <Trash2 className="h-3.5 w-3.5" />
                                 </Button>
                               </>
                             )}

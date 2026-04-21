@@ -4,20 +4,39 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
+import { LockedSetting } from "@/components/enterprise-locked-setting";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { Switch } from "@/components/ui/switch";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
-import { Rocket, Moon, Sun, Monitor, FlaskConical, Shield, ExternalLink, Layers, RefreshCw, Undo2, MessageSquare, Lightbulb } from "lucide-react";
+import { Rocket, Moon, Sun, Monitor, FlaskConical, Shield, ExternalLink, Layers, RefreshCw, Undo2, MessageSquare, Trash2, Sparkles } from "lucide-react";
 import { HelpTooltip } from "@/components/ui/help-tooltip";
 import { useToast } from "@/components/ui/use-toast";
 import { Button } from "@/components/ui/button";
 import { Settings } from "@/lib/hooks/use-settings";
 import { getVersion } from "@tauri-apps/api/app";
-import { commands } from "@/lib/utils/tauri";
+import { commands, CacheFile } from "@/lib/utils/tauri";
 import { UpdateBanner } from "@/components/update-banner";
 import { useIsEnterpriseBuild } from "@/lib/hooks/use-is-enterprise-build";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+}
 
 export default function GeneralSettings() {
   const isEnterprise = useIsEnterpriseBuild();
@@ -27,6 +46,9 @@ export default function GeneralSettings() {
   const [availableVersions, setAvailableVersions] = useState<string[]>([]);
   const [isRollingBack, setIsRollingBack] = useState(false);
   const [showVersions, setShowVersions] = useState(false);
+  const [cacheFiles, setCacheFiles] = useState<CacheFile[]>([]);
+  const [showCacheDialog, setShowCacheDialog] = useState(false);
+  const [isClearing, setIsClearing] = useState(false);
 
   useEffect(() => {
     getVersion().then(setCurrentVersion).catch(() => {});
@@ -83,20 +105,17 @@ export default function GeneralSettings() {
   };
 
   return (
-    <div className="space-y-5">
-      <div className="space-y-1">
-        <div className="flex items-center justify-between">
-          <h1 className="text-xl font-bold tracking-tight text-foreground">
-            General
-          </h1>
+    <div className="space-y-5" data-testid="section-settings-general">
+      <p className="text-muted-foreground text-sm mb-4">
+        Startup, updates, and notifications
+      </p>
+
+      <div className="flex items-center justify-end">
           <UpdateBanner compact />
-        </div>
-        <p className="text-muted-foreground text-sm">
-          Startup, updates, and notifications
-        </p>
       </div>
 
       <div className="space-y-2">
+        <LockedSetting settingKey="auto_start">
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5">
             <div className="flex items-center justify-between">
@@ -118,6 +137,7 @@ export default function GeneralSettings() {
             </div>
           </CardContent>
         </Card>
+        </LockedSetting>
 
         {!isEnterprise && (
           <Card className="border-border bg-card">
@@ -143,6 +163,59 @@ export default function GeneralSettings() {
           </Card>
         )}
 
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <RefreshCw className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground">Auto-Update Pipes</h3>
+                  <p className="text-xs text-muted-foreground">Update store pipes you haven&apos;t modified</p>
+                </div>
+              </div>
+              <Switch
+                id="auto-update-pipes-toggle"
+                checked={settings?.autoUpdatePipes ?? true}
+                onCheckedChange={(checked) =>
+                  handleSettingsChange({ autoUpdatePipes: checked })
+                }
+                className="ml-4"
+              />
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <Sparkles className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground">Enhanced AI</h3>
+                  <p className="text-xs text-muted-foreground">
+                    Use Screenpipe Cloud for smarter suggestions
+                  </p>
+                  <p className="text-[10px] text-muted-foreground/60 mt-0.5">
+                    sends recent activity to screenpipe cloud for processing. we don&apos;t store your data (zero retention).
+                  </p>
+                </div>
+              </div>
+              <Switch
+                id="enhanced-ai-toggle"
+                checked={settings?.enhancedAI ?? false}
+                onCheckedChange={async (checked) => {
+                  handleSettingsChange({ enhancedAI: checked });
+                  const token = settings?.user?.token || "";
+                  try {
+                    await commands.setEnhancedAiSuggestions(checked, token);
+                  } catch {}
+                }}
+                className="ml-4"
+              />
+            </div>
+          </CardContent>
+        </Card>
+
         {!isEnterprise && (
           <Card className="border-border bg-card">
             <CardContent className="px-3 py-2.5">
@@ -154,7 +227,7 @@ export default function GeneralSettings() {
                       Version{currentVersion ? ` ${currentVersion}` : ""}
                     </h3>
                     <p className="text-xs text-muted-foreground">
-                      install a previous version (at your own risk)
+                      Install a previous version (at your own risk)
                     </p>
                   </div>
                 </div>
@@ -193,58 +266,127 @@ export default function GeneralSettings() {
           </Card>
         )}
 
+      </div>
+
+      <Separator />
+
+      <div className="space-y-2">
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5">
             <div className="flex items-center justify-between">
               <div className="flex items-center space-x-2.5">
-                <Lightbulb className="h-4 w-4 text-muted-foreground shrink-0" />
+                <Trash2 className="h-4 w-4 text-muted-foreground shrink-0" />
                 <div>
-                  <h3 className="text-sm font-medium text-foreground">Pipe suggestions</h3>
-                  <p className="text-xs text-muted-foreground">Get periodic notifications with automation ideas based on your data</p>
+                  <h3 className="text-sm font-medium text-foreground">Clear Cache</h3>
+                  <p className="text-xs text-muted-foreground">
+                    Remove AI agent cache, old logs, and recovery artifacts
+                  </p>
                 </div>
               </div>
-              <div className="flex items-center gap-3">
-                <Select
-                  value={String(settings?.pipeSuggestionFrequencyHours ?? 24)}
-                  onValueChange={(value) => {
-                    const freq = parseInt(value, 10);
-                    handleSettingsChange({ pipeSuggestionFrequencyHours: freq });
-                    commands.pipeSuggestionsUpdateSettings(
-                      settings?.pipeSuggestionsEnabled !== false,
-                      freq
-                    ).catch(() => {});
-                  }}
-                  disabled={settings?.pipeSuggestionsEnabled === false}
-                >
-                  <SelectTrigger className="h-7 w-[110px] text-xs">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="1">every 1h</SelectItem>
-                    <SelectItem value="2">every 2h</SelectItem>
-                    <SelectItem value="3">every 3h</SelectItem>
-                    <SelectItem value="6">every 6h</SelectItem>
-                    <SelectItem value="12">every 12h</SelectItem>
-                    <SelectItem value="24">daily</SelectItem>
-                    <SelectItem value="72">every 3 days</SelectItem>
-                    <SelectItem value="168">weekly</SelectItem>
-                  </SelectContent>
-                </Select>
-                <Switch
-                  checked={settings?.pipeSuggestionsEnabled !== false}
-                  onCheckedChange={(checked) => {
-                    handleSettingsChange({ pipeSuggestionsEnabled: checked });
-                    commands.pipeSuggestionsUpdateSettings(
-                      checked,
-                      settings?.pipeSuggestionFrequencyHours ?? 24
-                    ).catch(() => {});
-                  }}
-                />
-              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="ml-4 h-7 text-xs"
+                disabled={isClearing}
+                onClick={async () => {
+                  try {
+                    const result = await commands.listCacheFiles();
+                    if (result.status === "error") throw new Error(result.error);
+                    if (result.data.length === 0) {
+                      toast({ title: "nothing to clean up" });
+                      return;
+                    }
+                    setCacheFiles(result.data);
+                    setShowCacheDialog(true);
+                  } catch (e: any) {
+                    toast({ title: "failed to scan cache", description: e?.toString(), variant: "destructive" });
+                  }
+                }}
+              >
+                {isClearing ? "clearing..." : "scan"}
+              </Button>
             </div>
           </CardContent>
         </Card>
       </div>
+
+      <AlertDialog open={showCacheDialog} onOpenChange={setShowCacheDialog}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>clear cache?</AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-2">
+                <p>the following files will be deleted ({formatBytes(cacheFiles.reduce((s, f) => s + Number(f.size_bytes), 0))} total):</p>
+                <ul className="text-xs space-y-1 max-h-48 overflow-y-auto">
+                  {cacheFiles.map((f) => (
+                    <li key={f.path} className="flex justify-between gap-2">
+                      <span className="truncate">{f.label}</span>
+                      <span className="text-muted-foreground shrink-0">{formatBytes(Number(f.size_bytes))}</span>
+                    </li>
+                  ))}
+                </ul>
+                <p className="text-xs text-muted-foreground">
+                  AI agent will reinstall automatically on next use.
+                </p>
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={async () => {
+                setIsClearing(true);
+                setShowCacheDialog(false);
+                try {
+                  const paths = cacheFiles.map((f) => f.path);
+                  const result = await commands.deleteCacheFiles(paths);
+                  if (result.status === "error") throw new Error(result.error);
+                  toast({
+                    title: "cache cleared",
+                    description: `freed ${formatBytes(Number(result.data))}`,
+                  });
+                } catch (e: any) {
+                  toast({ title: "failed to clear cache", description: e?.toString(), variant: "destructive" });
+                } finally {
+                  setIsClearing(false);
+                  setCacheFiles([]);
+                }
+              }}
+            >
+              delete all
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <Card className="border-border bg-card">
+        <CardContent className="px-3 py-2.5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-2.5">
+              <RefreshCw className="h-4 w-4 text-muted-foreground shrink-0" />
+              <div>
+                <h3 className="text-sm font-medium text-foreground">Reset Onboarding</h3>
+                <p className="text-xs text-muted-foreground">Run the setup wizard again</p>
+              </div>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              className="ml-4 h-7 text-xs"
+              onClick={async () => {
+                try {
+                  await commands.resetOnboarding();
+                  await commands.showOnboardingWindow();
+                } catch (e) {
+                  console.error("failed to open onboarding:", e);
+                }
+              }}
+            >
+              reset
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
 
     </div>
   );

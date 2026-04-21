@@ -224,7 +224,22 @@ async fn compact_chunk(
                 break;
             }
         }
-        dims.ok_or_else(|| anyhow::anyhow!("no readable JPEG found in chunk"))?
+        match dims {
+            Some(d) => d,
+            None => {
+                // All JPEGs gone/unreadable — clear stale DB pointers so we don't retry
+                let ids: Vec<i64> = frames.iter().map(|(id, _, _)| *id).collect();
+                debug!(
+                    "snapshot compaction: clearing {} stale snapshot_path entries for {} (files missing)",
+                    ids.len(),
+                    device_name
+                );
+                for batch in ids.chunks(100) {
+                    let _ = db.clear_snapshot_paths_queued(batch.to_vec()).await;
+                }
+                return Ok(None);
+            }
+        }
     };
 
     debug!(
@@ -253,7 +268,13 @@ async fn compact_chunk(
     for (frame_id, snapshot_path, _) in frames {
         let jpeg_path = Path::new(snapshot_path);
         if !jpeg_path.exists() {
-            warn!("snapshot file missing, skipping: {}", snapshot_path);
+            debug!(
+                "snapshot file missing, clearing DB pointer: {}",
+                snapshot_path
+            );
+            // Route through write queue instead of read pool to avoid
+            // unserialized writes that cause WAL contention and pool exhaustion.
+            let _ = db.clear_snapshot_paths_queued(vec![*frame_id]).await;
             continue;
         }
 
@@ -306,30 +327,11 @@ async fn compact_chunk(
     // semaphore for too long, which starves audio/frame insertion and causes
     // PoolTimedOut errors (data loss).
     for batch in encoded_frames.chunks(100) {
-        let ids: Vec<i64> = batch.iter().map(|(id, _)| *id).collect();
-        let placeholders: Vec<String> = ids.iter().map(|_| "?".to_string()).collect();
-        let case_clauses: Vec<String> = batch
-            .iter()
-            .map(|(id, pos)| format!("WHEN {} THEN {}", id, pos))
-            .collect();
-
-        let sql = format!(
-            "UPDATE frames SET video_chunk_id = ?1, \
-             offset_index = CASE id {} END, \
-             snapshot_path = NULL \
-             WHERE id IN ({}) AND snapshot_path IS NOT NULL",
-            case_clauses.join(" "),
-            placeholders.join(",")
-        );
-
-        let mut tx = db.begin_immediate_with_retry().await?;
-        let mut query = sqlx::query(&sql).bind(chunk_id);
-        for id in &ids {
-            query = query.bind(id);
+        let batch_vec: Vec<(i64, u32)> = batch.to_vec();
+        if let Err(e) = db.compact_snapshots_queued(chunk_id, batch_vec).await {
+            warn!("snapshot compaction: queue submit failed for batch: {}", e);
         }
-        query.execute(&mut **tx.conn()).await?;
-        tx.commit().await?;
-        // Yield briefly between batches so audio/frame insertions can acquire the write semaphore
+        // Yield briefly between batches
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
@@ -394,7 +396,7 @@ async fn start_ffmpeg_lowpri(
         cmd
     };
     #[cfg(not(unix))]
-    let mut command = tokio::process::Command::new(ffmpeg_path);
+    let mut command = screenpipe_core::ffmpeg_cmd_async(ffmpeg_path);
 
     command
         .args([

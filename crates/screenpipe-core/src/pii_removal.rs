@@ -1,5 +1,5 @@
 use lazy_static::lazy_static;
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -135,6 +135,12 @@ lazy_static! {
     static ref PASSWORD_CONTEXT_PATTERN: Regex = Regex::new(
         r"(?i)((?:master\s+)?(?:password|passcode|passphrase|pin|secret\s*key|unlock\s*code|security\s*code)[\s]*[:=][\s]*)(\S+)"
     ).unwrap();
+
+    // RegexSet for fast "any PII present?" check — single DFA pass over the text.
+    // Most captures have zero PII so this avoids running 27 individual replace_all calls.
+    static ref PII_REGEX_SET: RegexSet = RegexSet::new(
+        PII_PATTERNS.iter().map(|(re, _)| re.as_str())
+    ).unwrap();
 }
 
 /// Represents a region in an image that contains PII and should be redacted
@@ -153,15 +159,21 @@ pub struct PiiRegion {
 }
 
 pub fn remove_pii(text: &str) -> String {
-    let mut sanitized = text.to_string();
+    // Fast path: single RegexSet DFA pass checks all patterns at once.
+    // Most captured text has zero PII, so we avoid 27 individual replace_all calls.
+    let matches: Vec<usize> = PII_REGEX_SET.matches(text).into_iter().collect();
+    if matches.is_empty() {
+        return text.to_string();
+    }
 
     // First, handle password context specially - preserve the keyword, redact only the value
-    sanitized = PASSWORD_CONTEXT_PATTERN
-        .replace_all(&sanitized, "$1[PASSWORD]")
+    let mut sanitized = PASSWORD_CONTEXT_PATTERN
+        .replace_all(text, "$1[PASSWORD]")
         .to_string();
 
-    // Then apply other PII patterns (skip PASSWORD_CONTEXT as it's already handled)
-    for (pattern, replacement) in PII_PATTERNS.iter() {
+    // Only run replace_all for patterns that actually matched
+    for idx in matches {
+        let (pattern, replacement) = &PII_PATTERNS[idx];
         if *replacement == "PASSWORD_CONTEXT" {
             continue; // Already handled above
         }
@@ -194,12 +206,7 @@ pub fn remove_pii_from_text_json(
 
 /// Check if a given text contains PII
 pub fn contains_pii(text: &str) -> bool {
-    for (pattern, _) in PII_PATTERNS.iter() {
-        if pattern.is_match(text) {
-            return true;
-        }
-    }
-    false
+    PII_REGEX_SET.is_match(text)
 }
 
 /// Get the PII type for a given text, if any
@@ -479,6 +486,56 @@ mod tests {
             remove_pii("Reach me at +1-800-555-1234"),
             "Reach me at [PHONE]"
         );
+    }
+
+    #[test]
+    fn test_phone_no_false_positive_on_accessibility_bounds() {
+        // Accessibility tree bounding box coordinates must NOT be redacted as phone numbers.
+        // Real bug: the TS redactPii() in share-logs-button.tsx was mangling these values
+        // e.g. "left": 47692 became "left": [PHONE]7692
+        let bounds_json = r#"{"left": 47692, "top": 111658, "width": 44767, "height": 39496}"#;
+        assert_eq!(remove_pii(bounds_json), bounds_json);
+
+        // Individual coordinate values should not match
+        assert!(!contains_pii("47692"));
+        assert!(!contains_pii("111658"));
+        assert!(!contains_pii("44767"));
+        assert!(!contains_pii("39496"));
+        assert!(!contains_pii("62796"));
+        assert!(!contains_pii("16272"));
+
+        // Coordinates in structured text (Pi chat output)
+        let structured = r#""left_bound": 47692, "top_bound": 111658, "width_bound": 44767"#;
+        assert_eq!(remove_pii(structured), structured);
+    }
+
+    #[test]
+    fn test_phone_no_false_positive_on_numeric_ids_and_hashes() {
+        // Frame IDs, hash values, monitor IDs from logs
+        assert!(!contains_pii("frame_id: 549130407"));
+        assert!(!contains_pii("monitor 605818409"));
+        assert!(!contains_pii("hash=5542957767813040527"));
+        assert!(!contains_pii("pid: 25616"));
+        assert!(!contains_pii("elapsed=100.4287155s"));
+        assert!(!contains_pii("rows_returned=1434"));
+
+        // Timestamps and durations should not match
+        assert!(!contains_pii("age: 2624s"));
+        assert!(!contains_pii("poll=300s"));
+
+        // Meeting IDs
+        assert!(!contains_pii("meeting started (id=68)"));
+    }
+
+    #[test]
+    fn test_phone_no_false_positive_on_pixel_dimensions() {
+        // Monitor resolution strings
+        assert!(!contains_pii("2880x1800"));
+        assert!(!contains_pii("1920x1080"));
+
+        // Size/compression stats from snapshot compaction
+        let compaction = "snapshot compaction: 59 frames, 22.2MB to 8.9MB (2.5x), 59 JPEGs deleted";
+        assert_eq!(remove_pii(compaction), compaction);
     }
 
     #[test]

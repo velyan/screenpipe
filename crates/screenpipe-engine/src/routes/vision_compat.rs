@@ -19,8 +19,9 @@ use screenpipe_a11y::tree::{
 };
 use screenpipe_a11y::{UiCaptureConfig, UiRecorder};
 use screenpipe_screen::capture_screenshot_by_window::{
-    capture_all_visible_windows, capture_focused_window, get_frontmost_pid,
-    list_visible_windows_metadata, FocusedWindowTarget, Rect, VisibleWindowMetadata, WindowFilters,
+    capture_all_visible_windows, capture_focused_window, get_excluded_sck_window_ids,
+    get_frontmost_pid, list_visible_windows_metadata, FocusedWindowTarget, Rect,
+    VisibleWindowMetadata, WindowFilters,
 };
 use screenpipe_screen::monitor::{
     get_monitor_by_id, list_monitors, list_monitors_detailed, MonitorListError, SafeMonitor,
@@ -690,7 +691,8 @@ pub(crate) async fn capture_active_window(
         })?;
 
     let captured_at = Utc::now();
-    let snapshot_writer = SnapshotWriter::new(state.screenpipe_dir.join("data"), 80);
+    let snapshot_writer = SnapshotWriter::new(state.screenpipe_dir.join("data"), 80, 1920);
+    let excluded_window_ids = get_excluded_sck_window_ids(&window_filters);
 
     let (
         image,
@@ -799,7 +801,9 @@ pub(crate) async fn capture_active_window(
                         monitor.id()
                     );
 
-                    let (image, _) = capture_monitor_image(&monitor).await.map_err(|error| {
+                    let (image, _) = capture_monitor_image(&monitor, &excluded_window_ids)
+                        .await
+                        .map_err(|error| {
                         (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             JsonResponse(json!({
@@ -838,7 +842,9 @@ pub(crate) async fn capture_active_window(
                     monitor.id()
                 );
 
-                let (image, _) = capture_monitor_image(&monitor).await.map_err(|error| {
+                let (image, _) = capture_monitor_image(&monitor, &excluded_window_ids)
+                    .await
+                    .map_err(|error| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         JsonResponse(json!({
@@ -880,6 +886,8 @@ pub(crate) async fn capture_active_window(
         use_pii_removal: state.use_pii_removal,
         enable_main_body_distillation: state.enable_main_body_distillation,
         main_body_distillation_threshold: state.main_body_distillation_threshold,
+        languages: Vec::new(),
+        elements_ref_frame_id: None,
     };
 
     let result = paired_capture(&ctx, tree_snapshot.as_ref())

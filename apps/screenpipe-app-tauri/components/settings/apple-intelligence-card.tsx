@@ -9,8 +9,7 @@ import {
 } from "lucide-react";
 import { platform } from "@tauri-apps/plugin-os";
 import posthog from "posthog-js";
-
-const API = "http://localhost:3030";
+import { localFetch } from "@/lib/api";
 
 export function AppleIntelligenceCard() {
   const [os, setOs] = useState<string>("");
@@ -80,7 +79,7 @@ export function AppleIntelligenceCard() {
   // Check AI availability (with retry on failure)
   const checkStatus = useCallback(async () => {
     const attempt = async (): Promise<{ available: boolean; status: string } | null> => {
-      const resp = await fetch(`${API}/ai/status`, {
+      const resp = await localFetch("/ai/status", {
         signal: AbortSignal.timeout(10000),
       });
       if (resp.ok) {

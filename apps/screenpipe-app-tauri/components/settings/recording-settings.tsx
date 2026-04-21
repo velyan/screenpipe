@@ -7,6 +7,7 @@
 const DEFAULT_OPENAI_COMPATIBLE_ENDPOINT = "http://127.0.0.1:8080";
 
 import React, { useEffect, useState, useMemo, useCallback } from "react";
+import { LockedSetting, ManagedSwitch } from "@/components/enterprise-locked-setting";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -32,7 +33,6 @@ import {
   Monitor,
   Volume2,
   Headphones,
-  Folder,
   AppWindowMac,
   EyeOff,
   Key,
@@ -86,6 +86,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { ToastAction } from "@/components/ui/toast";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { Progress } from "@/components/ui/progress";
 import { Card, CardContent } from "@/components/ui/card";
@@ -96,6 +97,7 @@ import * as Sentry from "@sentry/react";
 import { defaultOptions } from "tauri-plugin-sentry-api";
 import { useLoginDialog } from "../login-dialog";
 import { BatterySaverSection } from "./battery-saver-section";
+// ScheduleSettings moved to privacy-section
 import { ValidatedInput } from "../ui/validated-input";
 import {
   validateField,
@@ -289,7 +291,7 @@ function TranscriptionDictionary({
           <Languages className="h-4 w-4 text-muted-foreground shrink-0" />
           <div className="flex-1 min-w-0">
             <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-              custom vocabulary
+              Custom Vocabulary
               <HelpTooltip text="Add custom words (names, brands, jargon) to improve transcription accuracy. You can also add replacements to auto-correct common mistranscriptions." />
               {vocabularyWords.length > 0 && (
                 <Badge variant="secondary" className="text-[10px] px-1.5 py-0">
@@ -499,6 +501,18 @@ export function RecordingSettings() {
   const [availableAudioDevices, setAvailableAudioDevices] = useState<
     AudioDeviceInfo[]
   >([]);
+
+  // Gate for the experimental CoreAudio Process Tap toggle — we only show
+  // the switch on macOS 14.4+ where the API exists. Probed once via a
+  // Tauri command that proxies to
+  // `screenpipe_audio::core::process_tap::is_process_tap_available()`.
+  const [coreaudioTapAvailable, setCoreaudioTapAvailable] = useState<boolean | null>(null);
+  useEffect(() => {
+    invoke<boolean>("check_coreaudio_process_tap_available")
+      .then(setCoreaudioTapAvailable)
+      .catch(() => setCoreaudioTapAvailable(false));
+  }, []);
+
   const { toast } = useToast();
   const [isUpdating, setIsUpdating] = useState(false);
   const { health } = useHealthCheck();
@@ -636,6 +650,10 @@ export function RecordingSettings() {
     const checkPlatform = async () => {
       const currentPlatform = platform();
       setIsMacOS(currentPlatform === "macos");
+      // Auto-migrate macOS users off qwen3-asr (CPU-only, no Metal support)
+      if (currentPlatform === "macos" && settings.audioTranscriptionEngine === "qwen3-asr") {
+        handleSettingsChange({ audioTranscriptionEngine: "whisper-large-v3-turbo-quantized" }, true);
+      }
     };
     checkPlatform();
   }, []);
@@ -817,14 +835,14 @@ export function RecordingSettings() {
         }
       }
 
-      await commands.stopScreenpipe();
+      await commands.stopCapture();
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      await commands.startCapture();
       await new Promise((resolve) => setTimeout(resolve, 1000));
-      await commands.spawnScreenpipe(null);
-      await new Promise((resolve) => setTimeout(resolve, 2000));
 
       toast({
         title: "Settings updated successfully",
-        description: "Screenpipe has been restarted with new settings",
+        description: "Recording restarted with new settings",
       });
     } catch (error) {
       console.error("Failed to update settings:", error);
@@ -860,7 +878,7 @@ export function RecordingSettings() {
     };
   };
 
-  const handleAudioTranscriptionModelChange = (
+  const handleAudioTranscriptionModelChange = async (
     value: string,
     realtime = false
   ) => {
@@ -872,12 +890,25 @@ export function RecordingSettings() {
 
     // If trying to use cloud but not subscribed
     if (value === "screenpipe-cloud" && !settings.user?.cloud_subscribed) {
-      const clientRefId = `${
-        settings.user?.id
-      }&customer_email=${encodeURIComponent(settings.user?.email ?? "")}`;
-      openUrl(
-        `https://buy.stripe.com/9B63cv1cD1oG2Vjg097ss0G?client_reference_id=${clientRefId}`
-      );
+      try {
+        const response = await fetch("https://screenpi.pe/api/cloud-sync/checkout", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${settings.user?.token}`,
+          },
+          body: JSON.stringify({
+            tier: "pro",
+            billingPeriod: "monthly",
+            userId: settings.user?.id,
+            email: settings.user?.email,
+          }),
+        });
+        const data = await response.json();
+        openUrl(data.url || "https://screenpi.pe/billing");
+      } catch {
+        openUrl("https://screenpi.pe/billing");
+      }
       // Revert back to previous value in the Select component
       return;
     }
@@ -944,42 +975,6 @@ Screenpipe works on a similar philosophy. It watches everything that flows throu
 The average knowledge worker switches between four hundred different windows per day and types roughly forty words per minute across dozens of applications. Without a system to capture and organize this firehose of information, most of it simply evaporates.
 
 Your screen is a pipe. Everything you see, hear, and type flows through it. Screenpipe just makes sure nothing valuable leaks away.`;
-
-  const handleDataDirChange = async () => {
-    try {
-      const dataDir = await getDataDir();
-      const selected = await open({
-        directory: true,
-        multiple: false,
-        defaultPath: dataDir,
-      });
-      if (!selected) return;
-
-      const result = await commands.validateDataDir(selected);
-      if (result.status === "error") {
-        toast({
-          title: "invalid directory",
-          description: String(result.error),
-          variant: "destructive",
-          duration: 5000,
-        });
-        return;
-      }
-      handleSettingsChange({ dataDir: selected }, true);
-    } catch (error) {
-      console.error("failed to change data directory:", error);
-      toast({
-        title: "error",
-        description: "failed to change data directory",
-        variant: "destructive",
-        duration: 5000,
-      });
-    }
-  };
-
-  const handleDataDirReset = () => {
-    handleSettingsChange({ dataDir: "default" }, true);
-  };
 
   const handleIgnoredWindowsChange = (values: string[]) => {
     // Convert all values to lowercase for comparison
@@ -1102,11 +1097,11 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
 
   return (
     <div className="space-y-5">
-      <div className="space-y-1">
-        <div className="flex items-center justify-between">
-          <h1 className="text-xl font-bold tracking-tight text-foreground">
-            Recording
-          </h1>
+      <p className="text-muted-foreground text-sm mb-4">
+        Screen and audio recording preferences
+      </p>
+
+      <div className="flex items-center justify-end">
           {hasUnsavedChanges && (
             <Button
               onClick={handleUpdate}
@@ -1122,10 +1117,6 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
               Apply & Restart
             </Button>
           )}
-        </div>
-        <p className="text-muted-foreground text-sm">
-          Screen and audio recording preferences
-        </p>
       </div>
 
       {/* Battery Saver / Power Mode */}
@@ -1135,57 +1126,8 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         </CardContent>
       </Card>
 
-      {/* Data Directory */}
-      <div className="space-y-2">
-        <Card className="border-border bg-card">
-          <CardContent className="px-3 py-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-2.5">
-                <Folder className="h-4 w-4 text-muted-foreground shrink-0" />
-                <div>
-                  <h3 className="text-sm font-medium text-foreground">
-                    Data directory
-                  </h3>
-                  <p className="text-xs text-muted-foreground truncate max-w-[250px]">
-                    {!settings.dataDir || settings.dataDir === "default"
-                      ? "~/.screenpipe (default)"
-                      : settings.dataDir}
-                  </p>
-                  <p className="text-[10px] text-muted-foreground/70 mt-0.5">
-                    changing directory starts fresh recordings
-                  </p>
-                </div>
-              </div>
-              <div className="flex items-center gap-1.5">
-                {settings.dataDir &&
-                  settings.dataDir !== "default" &&
-                  settings.dataDir !== "" && (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={handleDataDirReset}
-                      className="h-7 text-xs shrink-0"
-                    >
-                      Reset
-                    </Button>
-                  )}
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleDataDirChange}
-                  className="h-7 text-xs shrink-0"
-                >
-                  Change
-                </Button>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      
-
       {/* Audio */}
+      <LockedSetting settingKey="audio_recording">
       <div className="space-y-2 pt-2">
         <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">Audio</h2>
 
@@ -1196,11 +1138,11 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
               <div className="flex items-center space-x-2.5">
                 <Mic className="h-4 w-4 text-muted-foreground shrink-0" />
                 <div>
-                  <h3 className="text-sm font-medium text-foreground">Audio recording</h3>
+                  <h3 className="text-sm font-medium text-foreground">Audio Recording</h3>
                   <p className="text-xs text-muted-foreground">Capture audio from microphone and system</p>
                 </div>
               </div>
-              <Switch id="disableAudio" checked={!settings.disableAudio} onCheckedChange={(checked) => handleDisableAudioChange(!checked)} />
+              <ManagedSwitch settingKey="disableAudio" id="disableAudio" checked={!settings.disableAudio} onCheckedChange={(checked) => handleDisableAudioChange(!checked)} />
             </div>
           </CardContent>
         </Card>
@@ -1294,7 +1236,8 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                     <SelectItem value="whisper-large-v3-turbo-quantized">Whisper Turbo (fast)</SelectItem>
                     <SelectItem value="whisper-tiny">Whisper Tiny</SelectItem>
                     <SelectItem value="whisper-tiny-quantized">Whisper Tiny (fast)</SelectItem>
-                    <SelectItem value="qwen3-asr">Qwen3-ASR</SelectItem>
+                    {!isMacOS && <SelectItem value="qwen3-asr">Qwen3-ASR</SelectItem>}
+                    <SelectItem value="parakeet">Parakeet{isMacOS ? " (experimental)" : ""}</SelectItem>
                   </SelectGroup>
                   <SelectGroup>
                     <SelectLabel className="text-[10px] text-muted-foreground/70 uppercase tracking-wider">other</SelectLabel>
@@ -1304,17 +1247,6 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 </SelectContent>
               </Select>
             </div>
-            {hwCapability?.isWeakForLargeModel && settings.audioTranscriptionEngine.includes("large") && (
-              <div className="mt-2 ml-[26px] p-2 rounded-md bg-yellow-500/10 border border-yellow-500/30">
-                <p className="text-xs text-yellow-600 dark:text-yellow-400">
-                  <AlertCircle className="h-3 w-3 inline mr-1" />
-                  {hwCapability.reason}
-                  {settings.user?.cloud_subscribed
-                    ? " Consider switching to Screenpipe Cloud for better performance."
-                    : ` Consider switching to ${hwCapability.recommendedEngine} to avoid high CPU usage.`}
-                </p>
-              </div>
-            )}
             {settings.audioTranscriptionEngine === "deepgram" && (
               <div className="mt-2 ml-[26px] relative">
                 <ValidatedInput
@@ -1421,6 +1353,42 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   {allOpenAIModels.length === 0 && !openAIModels.includes('!API_Error') && !isLoadingModels && (
                     <p className="text-xs text-muted-foreground">No models listed by the API — type the model name manually.</p>
                   )}
+                </div>
+
+                {/* Raw Audio Toggle */}
+                <label className="flex items-center gap-2 text-xs cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={settings.openaiCompatibleRawAudio || false}
+                    onChange={(e) => handleSettingsChange({ openaiCompatibleRawAudio: e.target.checked }, true)}
+                    className="rounded border-border"
+                  />
+                  <span>send raw WAV audio (instead of MP3)</span>
+                </label>
+
+                {/* Custom Headers */}
+                <div className="space-y-1">
+                  <label className="text-xs text-muted-foreground">custom headers (JSON)</label>
+                  <Input
+                    defaultValue={settings.openaiCompatibleHeaders ? JSON.stringify(settings.openaiCompatibleHeaders) : ""}
+                    onBlur={(e) => {
+                      const val = e.target.value.trim();
+                      if (!val) {
+                        handleSettingsChange({ openaiCompatibleHeaders: undefined }, true);
+                        return;
+                      }
+                      try {
+                        const parsed = JSON.parse(val);
+                        if (typeof parsed === "object" && !Array.isArray(parsed)) {
+                          handleSettingsChange({ openaiCompatibleHeaders: parsed }, true);
+                        }
+                      } catch {
+                        // Invalid JSON — don't save
+                      }
+                    }}
+                    placeholder='{"X-Custom-Header": "value"}'
+                    className="h-7 text-xs font-mono"
+                  />
                 </div>
 
                 {/* Connection Test Panel */}
@@ -1546,7 +1514,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <Zap className="h-4 w-4 text-muted-foreground shrink-0" />
                   <div>
                     <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                      Batch transcription
+                      Batch Transcription
                       <HelpTooltip text="Accumulates longer audio chunks (30s-5min) using silence-gap detection before sending to Whisper. Gives the model more context for better transcription quality and speaker diarization." />
                     </h3>
                     <p className="text-xs text-muted-foreground">Longer audio chunks for better transcription quality</p>
@@ -1560,12 +1528,13 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   }
                 />
               </div>
-              {["smart", "batch"].includes(settings.transcriptionMode ?? "realtime") && (
+              {["smart", "batch"].includes(settings.transcriptionMode ?? "realtime") &&
+                settings.audioTranscriptionEngine === "openai-compatible" && (
                 <div className="mt-2.5 pt-2.5 border-t border-border/50">
                   <div className="flex items-center justify-between mb-1.5">
                     <span className="text-xs text-muted-foreground flex items-center gap-1.5">
                       Max batch duration
-                      <HelpTooltip text="Maximum duration of audio to batch before transcribing. Longer batches give better context. 0 = auto (recommended). Audio is compressed to MP3 before upload." />
+                      <HelpTooltip text="Maximum audio to batch before transcribing. Depends on your endpoint's file size limit. 0 = auto (~50min). Audio is compressed to MP3 before upload." />
                     </span>
                     <span className="text-xs font-mono text-foreground">
                       {(settings.batchMaxDurationSecs ?? 0) === 0
@@ -1576,16 +1545,16 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <Slider
                     value={[settings.batchMaxDurationSecs ?? 0]}
                     onValueChange={([value]) =>
-                      handleSettingsChange({ batchMaxDurationSecs: value }, true)
+                      handleSettingsChange({ batchMaxDurationSecs: value ?? 0 } as any, true)
                     }
                     min={0}
-                    max={1800}
-                    step={30}
+                    max={5400}
+                    step={60}
                     className="w-full"
                   />
                   <div className="flex justify-between text-[10px] text-muted-foreground mt-0.5">
                     <span>auto</span>
-                    <span>30min</span>
+                    <span>90min</span>
                   </div>
                 </div>
               )}
@@ -1602,7 +1571,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <Music className="h-4 w-4 text-muted-foreground shrink-0" />
                   <div>
                     <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                      Filter music
+                      Filter Music
                       <HelpTooltip text="Detect and filter out music-dominant audio (e.g. Spotify, YouTube) before transcription using spectral analysis. Reduces garbage transcriptions from background music." />
                     </h3>
                     <p className="text-xs text-muted-foreground">Remove background music from transcriptions</p>
@@ -1628,14 +1597,40 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
               <div className="flex items-center space-x-2.5">
                 <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
                 <div>
-                  <h3 className="text-sm font-medium text-foreground">Follow system default</h3>
-                  <p className="text-xs text-muted-foreground">Auto-switch when you change default device</p>
+                  <h3 className="text-sm font-medium text-foreground">Auto-select audio devices</h3>
+                  <p className="text-xs text-muted-foreground">Records all default devices. Turn off to exclude bluetooth headphones or pick specific devices.</p>
                 </div>
               </div>
               <Switch
                 id="useSystemDefaultAudio"
                 checked={settings.useSystemDefaultAudio ?? true}
                 onCheckedChange={(checked) => handleSettingsChange({ useSystemDefaultAudio: checked }, true)}
+              />
+            </div>
+          </CardContent>
+        </Card>
+        )}
+
+        {/* Experimental: CoreAudio System Audio (macOS 14.4+ only) */}
+        {!settings.disableAudio && coreaudioTapAvailable && (
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground">
+                    Experimental: CoreAudio System Audio
+                  </h3>
+                  <p className="text-xs text-muted-foreground">
+                    Use the CoreAudio Process Tap API (macOS 14.4+) for System Audio. Avoids ScreenCaptureKit — lighter permission, no GPU wake, survives sleep/wake. Restart recording after changing.
+                  </p>
+                </div>
+              </div>
+              <Switch
+                id="experimentalCoreaudioSystemAudio"
+                checked={Boolean(settings.experimentalCoreaudioSystemAudio ?? false)}
+                onCheckedChange={(checked) => handleSettingsChange({ experimentalCoreaudioSystemAudio: checked }, true)}
               />
             </div>
           </CardContent>
@@ -1809,10 +1804,10 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         )}
 
       </div>
-
-      
+      </LockedSetting>
 
       {/* Screen */}
+      <LockedSetting settingKey="screen_recording">
       <div className="space-y-2 pt-2">
         <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">Screen</h2>
 
@@ -1827,7 +1822,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                   <p className="text-xs text-muted-foreground">Capture screenshots from your monitors</p>
                 </div>
               </div>
-              <Switch id="disableVision" checked={!settings.disableVision} onCheckedChange={(checked) => handleSettingsChange({ disableVision: !checked }, true)} />
+              <ManagedSwitch settingKey="disableVision" id="disableVision" checked={!settings.disableVision} onCheckedChange={(checked) => handleSettingsChange({ disableVision: !checked }, true)} />
             </div>
           </CardContent>
         </Card>
@@ -1920,37 +1915,13 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
           </Card>
         )}
 
-        {/* Text extraction — accessibility and input capture are always enabled (defaults in store.rs) */}
-
       </div>
+      </LockedSetting>
+
 
       {/* System */}
       <div className="space-y-2 pt-2">
         <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">System</h2>
-
-        <Card className="border-border bg-card">
-          <CardContent className="px-3 py-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-2.5">
-                <Terminal className="h-4 w-4 text-muted-foreground shrink-0" />
-                <div>
-                  <h3 className="text-sm font-medium text-foreground">Server port</h3>
-                  <p className="text-xs text-muted-foreground">Requires restart</p>
-                </div>
-              </div>
-              <Input
-                id="port"
-                type="number"
-                value={settings.port}
-                onChange={(e) => {
-                  const portValue = parseInt(e.target.value) || 3030;
-                  handleSettingsChange({ port: portValue }, true);
-                }}
-                className="w-20 h-7 text-xs text-right"
-              />
-            </div>
-          </CardContent>
-        </Card>
 
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5">

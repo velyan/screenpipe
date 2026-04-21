@@ -16,15 +16,33 @@ use chrono::Utc;
 use screenpipe_a11y::tree::TreeWalkerConfig;
 use screenpipe_a11y::ActivityFeed;
 use screenpipe_db::DatabaseManager;
+use screenpipe_screen::capture_screenshot_by_window::{get_excluded_sck_window_ids, WindowFilters};
 use screenpipe_screen::frame_comparison::{FrameComparer, FrameComparisonConfig};
 use screenpipe_screen::monitor::SafeMonitor;
 use screenpipe_screen::snapshot_writer::SnapshotWriter;
 use screenpipe_screen::utils::capture_monitor_image;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch};
 use tracing::{debug, error, info, warn};
+
+/// Stable configuration for a single capture invocation.
+///
+/// Groups parameters that don't change between captures on the same monitor,
+/// keeping `do_capture`'s argument list manageable.
+pub struct CaptureParams<'a> {
+    pub db: &'a DatabaseManager,
+    pub monitor: &'a SafeMonitor,
+    pub monitor_id: u32,
+    pub device_name: &'a str,
+    pub snapshot_writer: &'a SnapshotWriter,
+    pub tree_walker_config: &'a TreeWalkerConfig,
+    pub use_pii_removal: bool,
+    pub pause_on_drm_content: bool,
+    pub languages: &'a [screenpipe_core::Language],
+}
 
 /// Types of events that trigger a capture.
 #[derive(Debug, Clone, PartialEq)]
@@ -214,7 +232,10 @@ pub async fn event_driven_capture_loop(
     vision_metrics: Arc<screenpipe_screen::PipelineMetrics>,
     hot_frame_cache: Option<Arc<HotFrameCache>>,
     use_pii_removal: bool,
+    pause_on_drm_content: bool,
+    languages: Vec<screenpipe_core::Language>,
     power_profile_rx: Option<watch::Receiver<PowerProfile>>,
+    focus_controller: Arc<crate::focus_aware_controller::FocusAwareController>,
 ) -> Result<()> {
     info!(
         "event-driven capture started for monitor {} (device: {})",
@@ -228,6 +249,11 @@ pub async fn event_driven_capture_loop(
     let mut state = EventDrivenCapture::new(config);
     let mut power_profile_rx = power_profile_rx;
     let poll_interval = Duration::from_millis(50);
+    let mut trigger_channel_closed = false;
+
+    // Adaptive accessibility throttle: tracks per-app walk cost and backs off
+    // for expensive apps (e.g., Electron apps whose UIA providers block the UI thread).
+    let mut walk_budget = screenpipe_a11y::budget::AppWalkBudget::new();
 
     // Frame comparer for visual change detection
     let mut frame_comparer = if visual_check_enabled {
@@ -236,35 +262,60 @@ pub async fn event_driven_capture_loop(
         None
     };
     let mut last_visual_check = Instant::now();
+    // Focus-aware Warm cadence: cheap visual-diff only every 5s. Tracked
+    // separately from `last_visual_check` to avoid colliding with the Active
+    // visual-change detector semantics below.
+    let mut last_warm_visual_check = Instant::now()
+        .checked_sub(Duration::from_secs(10))
+        .unwrap_or_else(Instant::now);
 
     // Track content hash for dedup across captures
     let mut last_content_hash: Option<i64> = None;
     // Track last successful DB write time — dedup is bypassed after 30s
     // to guarantee the timeline always has periodic entries
     let mut last_db_write = Instant::now();
+    // Per-device elements dedup cache: device_name → (last_frame_id, last_content_hash)
+    // When consecutive frames have the same content_hash, we skip inserting elements
+    // and reference the previous frame's elements instead.
+    let mut last_elements_cache: HashMap<String, (i64, i64)> = HashMap::new();
     // Debounce consecutive capture errors — log error! once on first failure,
     // then suppress until success. Prevents monitor disconnect from flooding
     // Sentry with 100k+ identical events.
     let mut consecutive_capture_errors: u32 = 0;
 
+    let capture_params = CaptureParams {
+        db: &db,
+        monitor: &monitor,
+        monitor_id,
+        device_name: &device_name,
+        snapshot_writer: &snapshot_writer,
+        tree_walker_config: &tree_walker_config,
+        use_pii_removal,
+        pause_on_drm_content,
+        languages: &languages,
+    };
+
     // Capture immediately on startup so the timeline has a frame right away.
     // Also seeds the frame comparer so subsequent visual-change checks work.
     // Skip if screen is locked — avoids storing black frames from sleep/lock.
-    if !crate::sleep_monitor::screen_is_locked() {
+    // Pre-capture DRM gate: skip if DRM content is focused (AX-only, no SCK).
+    // Skip if outside work-hours schedule.
+    if !crate::sleep_monitor::screen_is_locked()
+        && !crate::drm_detector::pre_capture_drm_check(pause_on_drm_content, None)
+        && !crate::schedule_monitor::schedule_paused()
+    {
         // Small delay to let the monitor settle after startup
         tokio::time::sleep(Duration::from_millis(500)).await;
-        state.last_capture = Instant::now() - Duration::from_millis(500); // allow capture
+        state.last_capture = Instant::now()
+            .checked_sub(Duration::from_millis(500))
+            .unwrap_or(Instant::now()); // allow capture
         match do_capture(
-            &db,
-            &monitor,
-            monitor_id,
-            &device_name,
-            &snapshot_writer,
-            &tree_walker_config,
+            &capture_params,
             &CaptureTrigger::Manual,
-            use_pii_removal,
             None, // first capture — no previous hash
             last_db_write,
+            None, // first capture — no elements ref
+            &mut walk_budget,
         )
         .await
         {
@@ -276,6 +327,10 @@ pub async fn event_driven_capture_loop(
                 if let Some(ref result) = output.result {
                     last_content_hash = result.content_hash;
                     last_db_write = Instant::now();
+                    // Update elements cache for this device (first frame = anchor)
+                    if let Some(hash) = result.content_hash {
+                        last_elements_cache.insert(device_name.clone(), (result.frame_id, hash));
+                    }
                     vision_metrics.record_capture();
                     vision_metrics.record_db_write(Duration::from_millis(result.duration_ms));
                     if let Some(ref cache) = hot_frame_cache {
@@ -299,14 +354,128 @@ pub async fn event_driven_capture_loop(
         );
     }
 
+    // Cache sorted excluded SCK window IDs to avoid recreating the persistent
+    // SCK stream every time a transient window (tooltip, popup, badge) appears
+    // or disappears.  Only update when the sorted set actually changes.
+    let mut cached_excluded_ids: Vec<u32> = Vec::new();
+
     loop {
         if stop_signal.load(Ordering::Relaxed) {
             info!("event-driven capture stopping for monitor {}", monitor_id);
             break;
         }
 
+        // Focus-aware gating — always on. Skips or pauses capture on
+        // non-focused monitors. If focus resolution fails on this platform
+        // (Linux Wayland, permission denied, etc.) the controller's
+        // NullFocusTracker + Unknown-event fallback makes `state()` return
+        // Active for every monitor, preserving the pre-feature behaviour.
+        //
+        // Outcome for non-Active states is either a `continue` (skip this
+        // iteration) or setting `warm_trigger_override` — which falls through
+        // to the normal capture path further down, bypassing other trigger
+        // detection. This lets the Warm path capture only when pixels
+        // actually changed without duplicating the whole capture machinery.
+        let mut warm_trigger_override: Option<CaptureTrigger> = None;
+        {
+            use crate::focus_aware_controller::CaptureState;
+            match focus_controller.state(monitor_id) {
+                CaptureState::Active => { /* fall through to normal capture */ }
+                CaptureState::Warm => {
+                    // Cheap visual-diff-only cadence: capture only if pixels
+                    // changed. ~5s between screenshots keeps CPU low while
+                    // still catching bursty events (notifications, popups).
+                    // The full-rate Active path costs far more (OCR + DB +
+                    // a11y tree walk) — Warm does a screenshot + 15×15 sample
+                    // diff and only progresses if the diff crosses threshold.
+                    if last_warm_visual_check.elapsed() < Duration::from_secs(5) {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        continue;
+                    }
+                    last_warm_visual_check = Instant::now();
+
+                    // Without a comparer (visual_check disabled globally),
+                    // we can't cheaply detect change — idle.
+                    let Some(ref mut comparer) = frame_comparer else {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        continue;
+                    };
+
+                    // Use cached excluded window ids if available to avoid
+                    // re-enumerating every Warm tick. If the list hasn't been
+                    // seeded yet (Active path fills it), this snapshot pass
+                    // is still correct — it just might include pixels from
+                    // soon-to-be-excluded transient windows.
+                    let snap = capture_monitor_image(&monitor, &cached_excluded_ids).await;
+                    match snap {
+                        Ok((image, _)) => {
+                            let diff = comparer.compare(&image);
+                            if diff > visual_change_threshold {
+                                debug!(
+                                    "warm visual change on monitor {} (diff={:.4})",
+                                    monitor_id, diff
+                                );
+                                warm_trigger_override = Some(CaptureTrigger::VisualChange);
+                                // Fall through to normal capture path with
+                                // warm_trigger_override set.
+                            } else {
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            debug!("warm visual check failed on monitor {}: {}", monitor_id, e);
+                            tokio::time::sleep(Duration::from_millis(250)).await;
+                            continue;
+                        }
+                    }
+                }
+                CaptureState::Cold => {
+                    // Block until focus returns. 5s backstop guards against
+                    // stuck waiters if a focus event is ever missed.
+                    let notify = focus_controller.notify_for(monitor_id);
+                    tokio::select! {
+                        _ = notify.notified() => {}
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    }
+                    continue;
+                }
+            }
+        }
+
         // Skip capture while the screen is locked / screensaver active
         if crate::sleep_monitor::screen_is_locked() {
+            tokio::time::sleep(poll_interval).await;
+            continue;
+        }
+
+        // After unlock or wake, invalidate persistent SCStream handles so
+        // the next capture picks up fresh frames instead of stale ones.
+        // Use spawn_blocking to avoid blocking the tokio thread — the
+        // underlying sck_rs::stop_all_streams() is a synchronous C call
+        // that can block on system I/O and previously caused deadlocks.
+        #[cfg(target_os = "macos")]
+        if screenpipe_screen::stream_invalidation::take() {
+            info!(
+                "invalidating persistent streams after unlock/wake for monitor {}",
+                monitor_id
+            );
+            let invalidate_result = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(|| {
+                    screenpipe_screen::stream_invalidation::invalidate_streams();
+                }),
+            )
+            .await;
+            match invalidate_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("stream invalidation task failed: {}", e),
+                Err(_) => warn!("stream invalidation timed out after 5s, continuing"),
+            }
+        }
+
+        // Skip capture while DRM streaming content is focused or outside schedule
+        if crate::drm_detector::drm_content_paused() || crate::schedule_monitor::schedule_paused() {
             tokio::time::sleep(poll_interval).await;
             continue;
         }
@@ -322,42 +491,77 @@ pub async fn event_driven_capture_loop(
                 state.config.min_capture_interval_ms = profile.min_capture_interval_ms;
                 state.config.idle_capture_interval_ms = profile.idle_capture_interval_ms;
                 state.config.jpeg_quality = profile.jpeg_quality;
+                snapshot_writer.set_quality(profile.jpeg_quality);
                 visual_check_interval = Duration::from_millis(profile.visual_check_interval_ms);
                 visual_change_threshold = profile.visual_change_threshold;
                 visual_check_enabled = profile.visual_check_interval_ms > 0;
             }
         }
 
-        // Check for external triggers (non-blocking)
-        let mut trigger = match trigger_rx.try_recv() {
-            Ok(trigger) => Some(trigger),
-            Err(broadcast::error::TryRecvError::Empty) => {
-                // Poll activity feed for state transitions
-                state.poll_activity(&activity_feed)
-            }
-            Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                debug!(
-                    "trigger channel lagged by {} messages on monitor {}",
-                    n, monitor_id
-                );
-                // Drain missed triggers, just capture now
-                Some(CaptureTrigger::Manual)
-            }
-            Err(broadcast::error::TryRecvError::Closed) => {
-                warn!("trigger channel closed for monitor {}", monitor_id);
-                break;
+        // Check for external triggers (non-blocking).
+        // Once the channel is closed, skip try_recv and rely on polling only.
+        // If the Warm path above detected a visual change, short-circuit
+        // directly to VisualChange — the regular trigger sources (external
+        // broadcast, activity feed) don't apply to non-focused monitors.
+        let mut trigger = if let Some(warm) = warm_trigger_override.take() {
+            Some(warm)
+        } else if trigger_channel_closed {
+            state.poll_activity(&activity_feed)
+        } else {
+            match trigger_rx.try_recv() {
+                Ok(trigger) => Some(trigger),
+                Err(broadcast::error::TryRecvError::Empty) => {
+                    // Poll activity feed for state transitions
+                    state.poll_activity(&activity_feed)
+                }
+                Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    debug!(
+                        "trigger channel lagged by {} messages on monitor {}",
+                        n, monitor_id
+                    );
+                    // Drain missed triggers, just capture now
+                    Some(CaptureTrigger::Manual)
+                }
+                Err(broadcast::error::TryRecvError::Closed) => {
+                    // Don't break — fall through to activity feed polling and visual
+                    // change detection so capture keeps working even without UI triggers.
+                    warn!(
+                        "trigger channel closed for monitor {}, continuing with polling-only mode",
+                        monitor_id
+                    );
+                    trigger_channel_closed = true;
+                    state.poll_activity(&activity_feed)
+                }
             }
         };
 
         // Visual change detection: periodically screenshot + frame diff
+        // Re-check DRM pause before touching SCK — the flag may have been set
+        // between the top-of-loop check and here.
+        // Use the same window exclusions as the full capture so the diff image
+        // matches what we'd actually store — avoids triggering on excluded
+        // windows and seeing phantom "visual changes" from their pixels.
         if trigger.is_none()
             && visual_check_enabled
             && state.can_capture()
+            && !crate::drm_detector::drm_content_paused()
+            && !crate::schedule_monitor::schedule_paused()
             && last_visual_check.elapsed() >= visual_check_interval
         {
             last_visual_check = Instant::now();
+            let vc_filters = WindowFilters::new(
+                &capture_params.tree_walker_config.ignored_windows,
+                &capture_params.tree_walker_config.included_windows,
+                &[],
+            );
+            let mut fresh_ids = get_excluded_sck_window_ids(&vc_filters);
+            fresh_ids.sort_unstable();
+            fresh_ids.dedup();
+            if fresh_ids != cached_excluded_ids {
+                cached_excluded_ids = fresh_ids;
+            }
             if let Some(ref mut comparer) = frame_comparer {
-                match capture_monitor_image(&monitor).await {
+                match capture_monitor_image(&monitor, &cached_excluded_ids).await {
                     Ok((image, _dur)) => {
                         let diff = comparer.compare(&image);
                         if diff > visual_change_threshold {
@@ -379,6 +583,21 @@ pub async fn event_driven_capture_loop(
         }
 
         if let Some(trigger) = trigger {
+            // Clipboard events don't need a full capture cycle (screenshot +
+            // tree walk + OCR). The clipboard text is already stored by the
+            // UI recorder's input event batch. Triggering a full paired
+            // capture here causes 250-800ms of blocking work (pbpaste +
+            // spawn_blocking tree walk + OCR semaphore) which saturates the
+            // thread pool and causes input lag on USB HID devices.
+            if matches!(trigger, CaptureTrigger::Clipboard) {
+                debug!(
+                    "clipboard trigger on monitor {} — skipping capture (text stored via input events)",
+                    monitor_id
+                );
+                tokio::time::sleep(poll_interval).await;
+                continue;
+            }
+
             // Reset content hash on app/window change so the first frame
             // of a new context is never deduped by a stale hash
             if matches!(
@@ -386,12 +605,51 @@ pub async fn event_driven_capture_loop(
                 CaptureTrigger::AppSwitch { .. } | CaptureTrigger::WindowFocus { .. }
             ) {
                 last_content_hash = None;
+                // Also reset elements cache on context change
+                last_elements_cache.remove(&device_name);
             }
 
             if state.can_capture() {
+                // Pre-capture DRM gate: check BEFORE any SCK call.
+                // Uses AX APIs only — prevents even a single leaked frame.
+                {
+                    let trigger_app = match &trigger {
+                        CaptureTrigger::AppSwitch { app_name } => Some(app_name.as_str()),
+                        _ => None,
+                    };
+                    if crate::drm_detector::pre_capture_drm_check(pause_on_drm_content, trigger_app)
+                    {
+                        debug!(
+                            "pre-capture DRM check blocked capture on monitor {}",
+                            monitor_id
+                        );
+                        tokio::time::sleep(poll_interval).await;
+                        continue;
+                    }
+                }
+
                 // Heartbeat: record that the loop is alive and attempting a capture.
                 // This keeps health "ok" even if the DB write below times out.
                 vision_metrics.record_capture_attempt();
+
+                // Compute elements_ref for frame-to-frame element dedup.
+                // If the current content_hash matches the previous frame's hash
+                // for this device, reference that frame's elements instead of
+                // inserting duplicate element rows.
+                let elements_ref = if let Some(hash) = last_content_hash {
+                    if let Some(&(prev_frame_id, prev_hash)) = last_elements_cache.get(&device_name)
+                    {
+                        if hash == prev_hash && hash != 0 {
+                            Some(prev_frame_id)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
                 // Timeout prevents the capture loop from blocking indefinitely
                 // if the DB is truly stuck. 15s is generous — normal captures take
@@ -400,16 +658,12 @@ pub async fn event_driven_capture_loop(
                 let capture_result = tokio::time::timeout(
                     Duration::from_secs(15),
                     do_capture(
-                        &db,
-                        &monitor,
-                        monitor_id,
-                        &device_name,
-                        &snapshot_writer,
-                        &tree_walker_config,
+                        &capture_params,
                         &trigger,
-                        use_pii_removal,
                         last_content_hash,
                         last_db_write,
+                        elements_ref,
+                        &mut walk_budget,
                     ),
                 )
                 .await;
@@ -437,6 +691,16 @@ pub async fn event_driven_capture_loop(
                             // Full capture — update hash, metrics, cache
                             last_content_hash = result.content_hash;
                             last_db_write = Instant::now();
+
+                            // Update elements cache: only when we inserted new elements
+                            // (not when we referenced another frame's elements)
+                            if !output.elements_deduped {
+                                if let Some(hash) = result.content_hash {
+                                    last_elements_cache
+                                        .insert(device_name.clone(), (result.frame_id, hash));
+                                }
+                            }
+
                             vision_metrics.record_capture();
                             vision_metrics
                                 .record_db_write(Duration::from_millis(result.duration_ms));
@@ -446,15 +710,17 @@ pub async fn event_driven_capture_loop(
                             }
 
                             debug!(
-                                "event capture: trigger={}, frame_id={}, text_source={:?}, dur={}ms",
+                                "event capture: trigger={}, frame_id={}, text_source={:?}, dur={}ms, elements_deduped={}, monitor={}",
                                 trigger.as_str(),
                                 result.frame_id,
                                 result.text_source,
-                                result.duration_ms
+                                result.duration_ms,
+                                output.elements_deduped,
+                                monitor_id
                             );
                         } else {
                             // Content dedup or window filter — capture skipped
-                            info!(
+                            debug!(
                                 "capture skipped DB write for monitor {} (trigger={})",
                                 monitor_id,
                                 trigger.as_str()
@@ -463,6 +729,14 @@ pub async fn event_driven_capture_loop(
                     }
                     Ok(Err(e)) => {
                         consecutive_capture_errors += 1;
+
+                        // Mark captured on failure to reset idle timer — without
+                        // this, needs_idle_capture() fires every poll tick (50ms)
+                        // once 30s elapses, creating ~20 capture attempts/second
+                        // on systems where capture fundamentally can't work
+                        // (e.g. Wayland without ZwlrScreencopy).
+                        state.mark_captured();
+
                         if consecutive_capture_errors == 1 {
                             // First failure — log at error level (shows in Sentry)
                             error!(
@@ -483,8 +757,19 @@ pub async fn event_driven_capture_loop(
                                 monitor_id, consecutive_capture_errors, e
                             );
                         }
+
+                        // Exponential backoff for persistent failures — avoids
+                        // hammering a broken capture path (missing Wayland
+                        // protocol, permission denied, etc.) while still
+                        // recovering quickly from transient errors.
+                        if consecutive_capture_errors >= 3 {
+                            let backoff_secs = (consecutive_capture_errors as u64 / 3).min(30); // cap at 30s
+                            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        }
                     }
                     Err(_timeout) => {
+                        consecutive_capture_errors += 1;
+                        state.mark_captured();
                         warn!(
                             "event capture timed out (trigger={}, monitor={}) — DB pool may be saturated",
                             trigger.as_str(),
@@ -548,11 +833,14 @@ struct CaptureOutput {
     /// The captured image — reused for frame comparer update to avoid taking
     /// a redundant extra screenshot after each capture.
     image: image::DynamicImage,
+    /// Whether elements were deduped (referenced another frame's elements).
+    elements_deduped: bool,
 }
 
 fn resolve_capture_metadata(
     tree_snapshot: Option<&screenpipe_a11y::tree::TreeSnapshot>,
     trigger: &CaptureTrigger,
+    lightweight_app_name: Option<&str>,
 ) -> (Option<String>, Option<String>, Option<String>) {
     let (mut app_name, mut window_name, browser_url) = match tree_snapshot {
         Some(snap) => (
@@ -562,6 +850,18 @@ fn resolve_capture_metadata(
         ),
         None => (None, None, None),
     };
+
+    // Fallback to the lightweight focused-app query when the tree walk returned
+    // nothing (focused_window AX query failed, e.g. Zoom during meetings).
+    // Without this, captures triggered by click/visual_change/idle would be
+    // stored with null app_name even though we know the focused app.
+    if app_name.is_none() {
+        if let Some(name) = lightweight_app_name {
+            if !name.is_empty() {
+                app_name = Some(name.to_string());
+            }
+        }
+    }
 
     match trigger {
         CaptureTrigger::AppSwitch {
@@ -592,6 +892,55 @@ fn resolve_capture_metadata(
     (app_name, window_name, browser_url)
 }
 
+/// Rate-limit OCR-heavy apps. Two groups:
+///
+/// **Terminals** (wezterm/alacritty/…): bypass accessibility entirely and
+/// always run Vision OCR (~300ms/frame). Typing-pause triggers fire every
+/// few seconds, so cap at 1/30s.
+///
+/// **Electron document editors** (Obsidian today): AX tree often comes back
+/// empty or thin, forcing OCR on a fullscreen editor. Every capture hits
+/// ~150% CPU for a frame of mostly-useless OCR (gutter line numbers + tab
+/// bar). Same 30s cap keeps the app visible in the timeline while cutting
+/// CPU ~30× — still captures ~2 frames/min of what the user is writing.
+/// See issue #3002.
+///
+/// Returns `true` if this capture should be skipped (too recent).
+fn terminal_ocr_throttled(app_name: &str) -> bool {
+    const INTERVAL: Duration = Duration::from_secs(30);
+    let n = app_name.to_lowercase();
+    // Mirror the app_prefers_ocr list in paired_capture.rs: terminals whose
+    // AX tree is raw buffer / window chrome and OCR is the only useful source.
+    let is_ocr_only = n.contains("wezterm")
+        || n.contains("alacritty")
+        || n.contains("kitty")
+        || n.contains("hyper")
+        || n.contains("warp");
+    // Electron editors whose AX tree is frequently empty/thin. OCR would run
+    // as a fallback on every capture otherwise — prohibitively expensive on a
+    // fullscreen Obsidian editor.
+    let is_electron_editor = n == "obsidian";
+    if !is_ocr_only && !is_electron_editor {
+        return false;
+    }
+
+    static LAST_CAPTURE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    let map = LAST_CAPTURE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = match map.lock() {
+        Ok(g) => g,
+        // Poisoned mutex: don't block captures, just allow this one
+        Err(_) => return false,
+    };
+    let now = Instant::now();
+    match guard.get(&n) {
+        Some(&last) if now.duration_since(last) < INTERVAL => true,
+        _ => {
+            guard.insert(n, now);
+            false
+        }
+    }
+}
+
 /// Perform a single event-driven capture.
 ///
 /// When `previous_content_hash` is `Some` and matches the current accessibility
@@ -599,28 +948,116 @@ fn resolve_capture_metadata(
 /// `CaptureOutput.result` will be `None` in that case — the caller should still
 /// update the frame comparer with the image but skip DB/metrics work.
 async fn do_capture(
-    db: &DatabaseManager,
-    monitor: &SafeMonitor,
-    monitor_id: u32,
-    device_name: &str,
-    snapshot_writer: &SnapshotWriter,
-    tree_walker_config: &TreeWalkerConfig,
+    params: &CaptureParams<'_>,
     trigger: &CaptureTrigger,
-    use_pii_removal: bool,
     previous_content_hash: Option<i64>,
     last_db_write: Instant,
+    elements_ref_frame_id: Option<i64>,
+    walk_budget: &mut screenpipe_a11y::budget::AppWalkBudget,
 ) -> Result<CaptureOutput> {
     let captured_at = Utc::now();
 
-    // Take screenshot
-    let (image, capture_dur) = capture_monitor_image(monitor).await?;
+    // Resolve ignored windows to SCK window IDs so ScreenCaptureKit
+    // excludes them from the capture buffer (zero overhead, pixel-perfect).
+    // Sort + dedup so the persistent stream isn't needlessly recreated when
+    // transient windows (tooltips, popups) cause ordering changes.
+    let window_filters = WindowFilters::new(
+        &params.tree_walker_config.ignored_windows,
+        &params.tree_walker_config.included_windows,
+        &[],
+    );
+    let mut excluded_ids = get_excluded_sck_window_ids(&window_filters);
+    excluded_ids.sort_unstable();
+    excluded_ids.dedup();
+
+    // Take screenshot (with ignored windows excluded at the OS level)
+    let (image, capture_dur) = capture_monitor_image(params.monitor, &excluded_ids).await?;
     debug!(
         "screenshot captured in {:?} for monitor {}",
-        capture_dur, monitor_id
+        capture_dur, params.monitor_id
     );
 
-    // Walk accessibility tree on blocking thread (AX APIs are synchronous)
-    let config = tree_walker_config.clone();
+    // When an ignored window covers most of a monitor, SCK replaces its
+    // pixels with black.  The resulting frame is nearly all-black — storing
+    // it wastes the tree walk, OCR, DB write, and produces ugly black frames
+    // in the timeline.  Detect this cheaply by sampling pixels: if >95% are
+    // near-black, skip everything but still return the image so the frame
+    // comparer stays updated (prevents re-triggering on the same black frame).
+    if is_frame_mostly_black(&image) {
+        debug!(
+            "captured frame is mostly black on monitor {} — skipping DB write (likely ignored window covering screen)",
+            params.monitor_id
+        );
+        return Ok(CaptureOutput {
+            result: None,
+            image,
+            elements_deduped: false,
+        });
+    }
+
+    // Walk accessibility tree on blocking thread (AX APIs are synchronous).
+    // Apply adaptive budget overrides: expensive apps (Electron/Discord) get
+    // reduced max_nodes and timeout to avoid blocking their UI thread.
+    let mut config = params.tree_walker_config.clone();
+
+    // Get the focused app name for budget decisions. AppSwitch triggers carry
+    // the name directly; for all other triggers (visual change, idle, manual)
+    // we do a lightweight AX query to get the focused app. This ensures the
+    // walk budget applies to ALL captures, not just app switches.
+    let trigger_app = match trigger {
+        CaptureTrigger::AppSwitch { app_name } => Some(app_name.clone()),
+        _ => {
+            #[cfg(target_os = "macos")]
+            {
+                get_focused_app_name_lightweight()
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                None
+            }
+        }
+    };
+
+    // Terminal OCR rate-limit: wezterm/alacritty/kitty/hyper/warp all bypass AX
+    // and run full Vision OCR (~300ms) per capture. Typing-pause triggers fire
+    // every few seconds in an active terminal, so cap to 1 capture per 30s per app.
+    if let Some(ref app) = trigger_app {
+        if terminal_ocr_throttled(app) {
+            debug!(
+                "terminal OCR throttle: skipping {} capture (within 30s of previous)",
+                app
+            );
+            return Ok(CaptureOutput {
+                result: None,
+                image,
+                elements_deduped: false,
+            });
+        }
+    }
+
+    use screenpipe_a11y::tree::TreeWalkResult;
+    if let Some(ref app) = trigger_app {
+        let decision = walk_budget.should_walk(app);
+        if !decision.walk {
+            debug!(
+                "walk budget: throttling tree walk for {} (tier={:?}) — skipping capture",
+                app, decision.tier
+            );
+            // Skip the entire capture. Previously this fell through to a
+            // TreeWalkResult::NotFound which triggered OCR fallback — but the
+            // fallback costs ~322ms of Vision CPU, more than the walk we just
+            // throttled to save CPU. The next trigger past the budget
+            // min_interval will produce a fresh walk with real AX text.
+            return Ok(CaptureOutput {
+                result: None,
+                image,
+                elements_deduped: false,
+            });
+        }
+        config.max_nodes_override = Some(decision.max_nodes);
+        config.walk_timeout_override = Some(decision.timeout);
+    }
+
     let tree_walk_result = tokio::task::spawn_blocking(move || {
         crate::paired_capture::walk_accessibility_tree(&config)
     })
@@ -628,21 +1065,65 @@ async fn do_capture(
 
     // If the window was skipped (incognito/private browsing or user filter),
     // bail out entirely — don't OCR the screenshot.
-    use screenpipe_a11y::tree::TreeWalkResult;
+
+    // Record walk cost for adaptive budget before consuming the result
+    if let TreeWalkResult::Found(ref snap) = tree_walk_result {
+        walk_budget.record_walk(&snap.app_name, snap.walk_duration, snap.truncated);
+        if snap.walk_duration > std::time::Duration::from_millis(100) {
+            let next = walk_budget.should_walk(&snap.app_name);
+            debug!(
+                "walk budget: {}ms for {} → tier={:?} (next: max_nodes={}, timeout={}ms)",
+                snap.walk_duration.as_millis(),
+                snap.app_name,
+                next.tier,
+                next.max_nodes,
+                next.timeout.as_millis(),
+            );
+        }
+    }
+
     let tree_snapshot = match tree_walk_result {
         TreeWalkResult::Found(snap) => Some(snap),
         TreeWalkResult::Skipped(reason) => {
-            warn!(
+            debug!(
                 "skipping capture: window filtered ({}) on monitor {}",
-                reason, monitor_id
+                reason, params.monitor_id
             );
             return Ok(CaptureOutput {
                 result: None,
                 image,
+                elements_deduped: false,
             });
         }
         TreeWalkResult::NotFound => None,
     };
+
+    // Safety net: when the tree walk returned NotFound (AX failure, budget skip,
+    // etc.) the Skipped(UserIgnored) path didn't fire.  If the focused app still
+    // matches an ignored-window pattern, bail out now to prevent OCR from
+    // capturing text from an excluded window (e.g. startup capture while
+    // Bitwarden is focused but AX hadn't initialized yet).
+    if tree_snapshot.is_none() {
+        if let Some(ref app) = trigger_app {
+            let app_lower = app.to_lowercase();
+            if params
+                .tree_walker_config
+                .ignored_windows
+                .iter()
+                .any(|ig| app_lower.contains(&ig.to_lowercase()))
+            {
+                debug!(
+                    "skipping capture: focused app '{}' matches ignored window on monitor {} (tree walk was NotFound)",
+                    app, params.monitor_id
+                );
+                return Ok(CaptureOutput {
+                    result: None,
+                    image,
+                    elements_deduped: false,
+                });
+            }
+        }
+    }
 
     // Content dedup: skip capture if accessibility text hasn't changed.
     // Never dedup Idle/Manual triggers — these are fallback captures that must
@@ -658,13 +1139,14 @@ async fn do_capture(
                     if prev == new_hash && new_hash != 0 {
                         info!(
                             "content dedup: skipping capture for monitor {} (hash={}, trigger={})",
-                            monitor_id,
+                            params.monitor_id,
                             new_hash,
                             trigger.as_str()
                         );
                         return Ok(CaptureOutput {
                             result: None,
                             image,
+                            elements_deduped: false,
                         });
                     }
                 }
@@ -675,7 +1157,7 @@ async fn do_capture(
     // Use tree metadata by default, but for focus-change triggers prefer the
     // event payload when the tree lags or reports the wrong frontmost target.
     let (app_name_owned, window_name_owned, browser_url_owned) =
-        resolve_capture_metadata(tree_snapshot.as_ref(), trigger);
+        resolve_capture_metadata(tree_snapshot.as_ref(), trigger, trigger_app.as_deref());
 
     // Skip lock screen / screensaver — these waste disk and pollute timeline.
     // Also update the global SCREEN_IS_LOCKED flag so subsequent loop iterations
@@ -688,18 +1170,19 @@ async fn do_capture(
         {
             warn!(
                 "skipping capture: lock screen app '{}' on monitor {}",
-                app, monitor_id
+                app, params.monitor_id
             );
             crate::sleep_monitor::set_screen_locked(true);
             return Ok(CaptureOutput {
                 result: None,
                 image,
+                elements_deduped: false,
             });
         } else if crate::sleep_monitor::screen_is_locked() {
             // Screen was marked locked but now a real app is focused — unlock
             debug!(
                 "screen unlocked: app '{}' detected on monitor {}",
-                app, monitor_id
+                app, params.monitor_id
             );
             crate::sleep_monitor::set_screen_locked(false);
         }
@@ -709,21 +1192,63 @@ async fn do_capture(
         // can't read loginwindow's UI so app_name comes back None/"Unknown".
         warn!(
             "skipping capture: no app detected and screen is locked on monitor {}",
-            monitor_id
+            params.monitor_id
         );
         return Ok(CaptureOutput {
             result: None,
             image,
+            elements_deduped: false,
+        });
+    }
+
+    // Final ignored-window gate: check resolved metadata (app + window) against
+    // ignored patterns. This catches edge cases where the tree walk succeeded but
+    // didn't return Skipped (e.g. the trigger carried the app name, not the tree).
+    {
+        let check_app = app_name_owned.as_deref().unwrap_or_default().to_lowercase();
+        let check_win = window_name_owned
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase();
+        if params.tree_walker_config.ignored_windows.iter().any(|ig| {
+            let ig_lower = ig.to_lowercase();
+            (!check_app.is_empty() && check_app.contains(&ig_lower))
+                || (!check_win.is_empty() && check_win.contains(&ig_lower))
+        }) {
+            debug!(
+                "skipping capture: resolved app='{}' / window='{}' matches ignored pattern on monitor {}",
+                check_app, check_win, params.monitor_id
+            );
+            return Ok(CaptureOutput {
+                result: None,
+                image,
+                elements_deduped: false,
+            });
+        }
+    }
+
+    // DRM content detection: check if the focused app/URL is a streaming service.
+    // When detected, set the global pause flag so ALL monitors stop capture
+    // and the monitor watcher releases all SCK handles.
+    if crate::drm_detector::check_and_update_drm_state(
+        params.pause_on_drm_content,
+        app_name_owned.as_deref(),
+        browser_url_owned.as_deref(),
+    ) {
+        return Ok(CaptureOutput {
+            result: None,
+            image,
+            elements_deduped: false,
         });
     }
 
     let ctx = CaptureContext {
-        db,
-        snapshot_writer,
+        db: params.db,
+        snapshot_writer: params.snapshot_writer,
         image: Arc::new(image),
         captured_at,
-        monitor_id,
-        device_name,
+        monitor_id: params.monitor_id,
+        device_name: params.device_name,
         app_name: app_name_owned.as_deref(),
         window_name: window_name_owned.as_deref(),
         browser_url: browser_url_owned.as_deref(),
@@ -731,19 +1256,143 @@ async fn do_capture(
         capture_trigger: trigger.as_str(),
         capture_provenance: None,
         force_ocr: false,
-        use_pii_removal,
         enable_main_body_distillation: false,
         main_body_distillation_threshold: 0.60,
+        use_pii_removal: params.use_pii_removal,
+        languages: params.languages.to_vec(),
+        elements_ref_frame_id,
     };
 
     let result = paired_capture(&ctx, tree_snapshot.as_ref()).await?;
+    let deduped = elements_ref_frame_id.is_some();
     // Extract image from Arc for comparer reuse. Arc::try_unwrap succeeds
     // because paired_capture no longer retains a clone.
     let image = Arc::try_unwrap(ctx.image).unwrap_or_else(|arc| (*arc).clone());
     Ok(CaptureOutput {
         result: Some(result),
         image,
+        elements_deduped: deduped,
     })
+}
+
+/// Cheaply get the focused app name. Used to tag captures and to apply
+/// per-app throttles (walk budget, terminal OCR, Obsidian OCR).
+///
+/// Tries NSWorkspace first: filters `running_apps()` to the one with
+/// `is_active() == true`. This is authoritative at the AppKit level and
+/// works for Electron apps (Obsidian, Discord, …) where the AX sys-wide
+/// query returns empty — see issue #3002. Falls back to AX only for
+/// edge cases where NSWorkspace reports no active app (space
+/// transitions, post-login).
+///
+/// **Caching**: `running_apps()` allocates an NSArray of every process
+/// (50–200 entries on a typical mac) and the iteration plus `is_active()`
+/// check costs a few ms. Capture triggers fire on every click / typing
+/// pause / visual change — paying that cost on every trigger is wasteful
+/// when the frontmost app rarely changes between triggers. A 1-second
+/// TTL keeps staleness bounded to something no human perceives while
+/// collapsing the common case to a single atomic load.
+#[cfg(target_os = "macos")]
+fn get_focused_app_name_lightweight() -> Option<String> {
+    use arc_swap::ArcSwap;
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    const CACHE_TTL: Duration = Duration::from_secs(1);
+
+    // (name, captured_at). ArcSwap gives lock-free reads; in the common
+    // case the whole function is one atomic load + a clock read + clone.
+    static CACHE: OnceLock<ArcSwap<(Option<String>, Instant)>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| {
+        ArcSwap::from_pointee((None, Instant::now() - CACHE_TTL - Duration::from_secs(1)))
+    });
+
+    let now = Instant::now();
+    {
+        let snap = cache.load();
+        if now.duration_since(snap.1) < CACHE_TTL {
+            return snap.0.clone();
+        }
+    }
+
+    let fresh = query_frontmost_app_name_uncached();
+    cache.store(std::sync::Arc::new((fresh.clone(), now)));
+    fresh
+}
+
+#[cfg(target_os = "macos")]
+fn query_frontmost_app_name_uncached() -> Option<String> {
+    use cidre::{ax, ns, objc};
+
+    // Wrapped in an autorelease pool because `running_apps()` returns
+    // autoreleased NSRunningApplication objects; without draining they
+    // leak across polls (same precedent as get_frontmost_pid in
+    // screenpipe-screen).
+    let from_ns = objc::ar_pool(|| {
+        let workspace = ns::Workspace::shared();
+        let apps = workspace.running_apps();
+        for app in apps.iter() {
+            if app.is_active() {
+                return app.localized_name().map(|s| s.to_string());
+            }
+        }
+        None
+    });
+    if from_ns.as_deref().is_some_and(|n| !n.is_empty()) {
+        return from_ns;
+    }
+
+    // AX fallback — the pre-#3002 path. Kept for the edge cases where
+    // NSWorkspace itself reports no active app.
+    let sys = ax::UiElement::sys_wide();
+    let app = sys.focused_app().ok()?;
+    let pid = app.pid().ok()?;
+    ns::RunningApp::with_pid(pid)
+        .and_then(|app| app.localized_name())
+        .map(|s| s.to_string())
+}
+
+/// Cheaply detect if a captured frame is predominantly black.
+///
+/// When ScreenCaptureKit excludes an ignored window, the excluded pixels
+/// become black.  If the window covers most of the monitor the frame is
+/// nearly all-black — we want to skip storing it.
+///
+/// Strategy: sample a grid of pixels (≈200 points) and check if >95% have
+/// an RGB sum below a threshold.  Real content — even dark-mode apps — has
+/// variation (scrollbars, text, status bar).  Pure SCK-excluded regions are
+/// exactly `(0, 0, 0)` or very close to it.
+fn is_frame_mostly_black(image: &image::DynamicImage) -> bool {
+    let rgb = image.to_rgb8();
+    let (w, h) = rgb.dimensions();
+    if w == 0 || h == 0 {
+        return true;
+    }
+
+    // Sample on a ~15×15 grid ≈ 225 points (sub-microsecond)
+    let step_x = (w / 15).max(1);
+    let step_y = (h / 15).max(1);
+    let mut total = 0u32;
+    let mut black = 0u32;
+
+    let mut y = 0;
+    while y < h {
+        let mut x = 0;
+        while x < w {
+            total += 1;
+            let px = rgb.get_pixel(x, y);
+            // Threshold: R+G+B < 15 — catches pure black and near-black
+            // from JPEG compression artifacts but not real dark-mode content.
+            if (px[0] as u16 + px[1] as u16 + px[2] as u16) < 15 {
+                black += 1;
+            }
+            x += step_x;
+        }
+        y += step_y;
+    }
+
+    let ratio = black as f64 / total as f64;
+    ratio > 0.95
 }
 
 #[cfg(test)]
@@ -792,7 +1441,9 @@ mod tests {
         assert!(!state.needs_idle_capture());
 
         // Simulate waiting
-        state.last_capture = Instant::now() - Duration::from_millis(150);
+        state.last_capture = Instant::now()
+            .checked_sub(Duration::from_millis(150))
+            .unwrap_or(Instant::now());
         assert!(state.needs_idle_capture());
     }
 
@@ -804,7 +1455,9 @@ mod tests {
         };
         let mut state = EventDrivenCapture::new(config);
 
-        state.last_capture = Instant::now() - Duration::from_millis(150);
+        state.last_capture = Instant::now()
+            .checked_sub(Duration::from_millis(150))
+            .unwrap_or(Instant::now());
         assert!(state.needs_idle_capture());
 
         state.mark_captured();
@@ -850,5 +1503,64 @@ mod tests {
         assert!(config.capture_on_clipboard);
         assert_eq!(config.visual_check_interval_ms, 3_000);
         assert!((config.visual_change_threshold - 0.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_all_black_frame_detected() {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(1920, 1080));
+        assert!(is_frame_mostly_black(&img));
+    }
+
+    #[test]
+    fn test_normal_frame_not_detected() {
+        let mut buf = image::RgbImage::new(1920, 1080);
+        // Fill with typical content colors
+        for px in buf.pixels_mut() {
+            *px = image::Rgb([120, 130, 140]);
+        }
+        let img = image::DynamicImage::ImageRgb8(buf);
+        assert!(!is_frame_mostly_black(&img));
+    }
+
+    #[test]
+    fn test_frame_with_visible_menubar_not_skipped() {
+        // A menu bar at y=0 gets sampled by the grid → enough non-black
+        // pixels to keep the frame (it has real content visible).
+        let mut buf = image::RgbImage::new(1920, 1080);
+        for y in 0..22 {
+            for x in 0..1920 {
+                buf.put_pixel(x, y, image::Rgb([200, 200, 200]));
+            }
+        }
+        let img = image::DynamicImage::ImageRgb8(buf);
+        // Menu bar is ~2% of pixels but hits a full grid row (~7% of samples)
+        // so the frame is NOT detected as mostly black — correct, it has content.
+        assert!(!is_frame_mostly_black(&img));
+    }
+
+    #[test]
+    fn test_pure_black_with_single_bright_pixel_still_black() {
+        // A single bright pixel shouldn't prevent detection
+        let mut buf = image::RgbImage::new(1920, 1080);
+        buf.put_pixel(960, 540, image::Rgb([255, 255, 255]));
+        let img = image::DynamicImage::ImageRgb8(buf);
+        assert!(is_frame_mostly_black(&img));
+    }
+
+    #[test]
+    fn test_dark_mode_app_not_falsely_detected() {
+        // Dark mode: dark grey background (30, 30, 30) — NOT pure black
+        let mut buf = image::RgbImage::new(1920, 1080);
+        for px in buf.pixels_mut() {
+            *px = image::Rgb([30, 30, 30]);
+        }
+        let img = image::DynamicImage::ImageRgb8(buf);
+        assert!(!is_frame_mostly_black(&img));
+    }
+
+    #[test]
+    fn test_empty_image_detected() {
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(0, 0));
+        assert!(is_frame_mostly_black(&img));
     }
 }

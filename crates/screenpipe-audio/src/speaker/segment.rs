@@ -121,7 +121,7 @@ fn handle_new_segment(
 pub struct SegmentIterator {
     samples: Vec<f32>,
     sample_rate: u32,
-    session: ort::Session,
+    session: ort::session::Session,
     embedding_extractor: Arc<Mutex<EmbeddingExtractor>>,
     embedding_manager: Arc<Mutex<EmbeddingManager>>,
     current_position: usize,
@@ -176,7 +176,7 @@ impl SegmentIterator {
             .insert_axis(Axis(1))
             .to_owned();
 
-        let inputs = ort::inputs![array].context("Failed to prepare inputs")?;
+        let inputs = ort::inputs![ort::value::TensorRef::from_array_view(array.view())?];
         let ort_outs = self
             .session
             .run(inputs)
@@ -184,7 +184,7 @@ impl SegmentIterator {
         let ort_out = ort_outs.get("output").context("Output tensor not found")?;
 
         let ort_out = ort_out
-            .try_extract_tensor::<f32>()
+            .try_extract_array::<f32>()
             .context("Failed to extract tensor")?;
 
         let mut result = None;
@@ -310,7 +310,7 @@ pub fn get_speaker_from_embedding(
     embedding_manager: &mut EmbeddingManager,
     embedding: Vec<f32>,
 ) -> String {
-    let search_threshold = 0.2; // cosine similarity threshold (1 - distance), equivalent to 0.8 distance
+    let search_threshold = 0.45; // cosine similarity threshold (1 - distance), aligned with DB threshold of 0.55 distance
 
     embedding_manager
         .search_speaker(embedding.clone(), search_threshold)

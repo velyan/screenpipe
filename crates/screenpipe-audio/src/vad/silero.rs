@@ -25,9 +25,36 @@ pub struct SileroVad {
 
 impl SileroVad {
     /// Pre-download the model file without initializing the VAD engine.
-    /// Safe to call from anywhere — uses atomic flag to prevent duplicate downloads.
+    /// Non-blocking: kicks off the download and returns immediately with an
+    /// error if it isn't ready yet. Uses an atomic flag to prevent duplicate
+    /// downloads. Intended for the production audio loop, which retries on
+    /// every frame anyway.
     pub async fn ensure_model_downloaded() -> anyhow::Result<PathBuf> {
         Self::get_or_download_model().await
+    }
+
+    /// Wait until the model is available on disk, downloading if necessary.
+    /// Unlike `ensure_model_downloaded`, this blocks until the file is ready
+    /// — safe to call from parallel tests or anywhere that needs the model
+    /// synchronously. Polls every 200ms while a download is in flight.
+    pub async fn ensure_model_available() -> anyhow::Result<PathBuf> {
+        loop {
+            match Self::get_or_download_model().await {
+                Ok(path) => return Ok(path),
+                Err(e) => {
+                    let msg = e.to_string();
+                    // These two errors mean "a download is in flight, come
+                    // back later". Any other error is fatal.
+                    if msg.contains("download already in progress")
+                        || msg.contains("not available yet")
+                    {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
     }
 
     pub async fn new() -> anyhow::Result<Self> {
@@ -72,41 +99,25 @@ impl SileroVad {
             return Ok(path);
         }
 
-        // Use atomic flag instead of Once — allows retry if download fails
         if DOWNLOADING
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+            .is_err()
         {
-            info!("initiating silero vad model download...");
-            tokio::spawn(async move {
-                match Self::download_model().await {
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!("error downloading silerovad model: {}", e);
-                        // Reset flag so a retry is possible
-                        DOWNLOADING.store(false, Ordering::SeqCst);
-                    }
-                }
-            });
+            return Err(anyhow::anyhow!(
+                "silero vad model download already in progress"
+            ));
         }
 
-        // Wait for download to complete, with timeout
-        let timeout = tokio::time::Duration::from_secs(120);
-        let start = tokio::time::Instant::now();
-        while !path.exists() {
-            if start.elapsed() > timeout {
-                DOWNLOADING.store(false, Ordering::SeqCst);
-                return Err(anyhow::anyhow!(
-                    "timed out waiting for silero vad model download after {:?}",
-                    timeout
-                ));
+        tokio::spawn(async move {
+            if let Err(e) = Self::download_model().await {
+                warn!("error downloading silero vad model: {}", e);
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
+            DOWNLOADING.store(false, Ordering::SeqCst);
+        });
 
-        let mut cached = MODEL_PATH.lock().await;
-        *cached = Some(path.clone());
-        Ok(path)
+        Err(anyhow::anyhow!(
+            "silero vad model not available yet; download started in background"
+        ))
     }
 
     async fn download_model() -> anyhow::Result<()> {

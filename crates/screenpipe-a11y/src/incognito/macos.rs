@@ -4,10 +4,14 @@
 
 //! macOS incognito detector using AppleScript window properties.
 //!
-//! Chromium-based browsers (Chrome, Edge, Brave, Arc) expose `mode` and
-//! `incognito` properties on each window.  We iterate **all** windows and
+//! Chromium-based browsers (Chrome, Edge, Brave, Vivaldi, Opera) expose `mode`
+//! and `incognito` properties on each window.  We iterate **all** windows and
 //! match by title, since the captured window may not be the front window.
 //! This is **locale-independent** and reliable for those browsers.
+//!
+//! Arc is **not** handled here — Arc 1.138+ broke its AppleScript bridge
+//! entirely.  Arc incognito detection is handled in the tree walker via
+//! `AXIdentifier` (which contains "bigIncognitoBrowserWindow" for incognito).
 //!
 //! For non-Chromium browsers (Firefox, Safari) we fall back to title-based
 //! detection via [`super::titles::is_title_private`].
@@ -29,7 +33,8 @@ use super::IncognitoDetector;
 const CACHE_TTL: Duration = Duration::from_secs(2);
 
 /// Chromium-based browser names (lowercased) for which the AppleScript
-/// window properties API is available.
+/// window properties API is available.  Arc is excluded — its AppleScript
+/// bridge is broken since v1.138.
 const CHROMIUM_BROWSERS: &[&str] = &[
     "google chrome",
     "chrome",
@@ -38,31 +43,26 @@ const CHROMIUM_BROWSERS: &[&str] = &[
     "edge",
     "brave browser",
     "brave",
-    "arc",
     "vivaldi",
     "opera",
+    "comet",
 ];
 
 /// Maps an app name to the AppleScript application identifier.
-///
-/// Some apps have short display names ("Arc") that match their AppleScript
-/// dict, while others need the full name ("Google Chrome").
 fn applescript_app_name(app_name: &str) -> &str {
     let lower = app_name.to_lowercase();
     match lower.as_str() {
         "chrome" => "Google Chrome",
         "edge" => "Microsoft Edge",
         "brave" => "Brave Browser",
-        _ => app_name, // "Google Chrome", "Arc", "Vivaldi", "Opera" work as-is
+        _ => app_name, // "Google Chrome", "Vivaldi", "Opera" work as-is
     }
 }
 
-/// Batch cache: stores the set of incognito window titles for a browser app.
-/// One AppleScript call fetches ALL incognito titles, so switching between
-/// windows within the TTL is free (no extra osascript spawns).
+/// Batch cache: stores incognito window titles from a single AppleScript call.
 struct BatchCache {
     app_name: String,
-    incognito_titles: HashSet<String>,
+    incognito_window_titles: HashSet<String>,
     timestamp: Instant,
 }
 
@@ -78,23 +78,16 @@ impl MacOSIncognitoDetector {
     }
 
     /// Returns `true` if the app name (lowercased) is a known Chromium
-    /// browser that supports window property queries.
+    /// browser that supports window property queries (excludes Arc).
     fn is_chromium_browser(app_name: &str) -> bool {
         let lower = app_name.to_lowercase();
         CHROMIUM_BROWSERS.iter().any(|b| lower.contains(b))
     }
 
-    /// Batch-query all incognito window titles for a browser via AppleScript.
-    ///
-    /// Returns `Some(set_of_incognito_titles)` (possibly empty), or `None`
-    /// if the script failed (browser not running, permission denied, etc.).
-    ///
-    /// Cost: one `osascript` spawn (~150-200 ms), regardless of window count.
-    fn query_all_incognito_titles(app_name: &str) -> Option<HashSet<String>> {
+    /// Query all incognito window titles via AppleScript.
+    fn query_incognito_titles(app_name: &str) -> Option<HashSet<String>> {
         let as_name = applescript_app_name(app_name);
 
-        // Collects names of all incognito windows, separated by "|||".
-        // Checks both `mode` (Chrome/Edge/Brave) and `incognito` property (Arc).
         let script = format!(
             r#"if application "{name}" is running then
     tell application "{name}"
@@ -113,7 +106,7 @@ impl MacOSIncognitoDetector {
                 if result_list is "" then
                     set result_list to name of w
                 else
-                    set result_list to result_list & "|||" & name of w
+                    set result_list to result_list & "~~~" & name of w
                 end if
             end if
         end repeat
@@ -157,12 +150,12 @@ end if"#,
                 Some(HashSet::new())
             }
             _ => {
-                let titles: HashSet<String> = result.split("|||").map(|s| s.to_string()).collect();
+                let titles: HashSet<String> = result.split("~~~").map(|s| s.to_string()).collect();
                 debug!(
                     "incognito: {} has {} incognito window(s): {:?}",
                     as_name,
                     titles.len(),
-                    titles
+                    titles,
                 );
                 Some(titles)
             }
@@ -171,32 +164,26 @@ end if"#,
 
     /// Check if a window title belongs to an incognito window, using the
     /// batch cache.  One AppleScript call per browser per TTL interval.
-    ///
-    /// The lock is released before calling AppleScript (~150-200 ms) to
-    /// avoid blocking concurrent threads.
     fn check_with_cache(&self, app_name: &str, window_title: &str) -> Option<bool> {
-        // Check cache while holding the lock briefly.
         {
             let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = cache.as_ref() {
                 if entry.app_name.eq_ignore_ascii_case(app_name)
                     && entry.timestamp.elapsed() < CACHE_TTL
                 {
-                    return Some(entry.incognito_titles.contains(window_title));
+                    return Some(entry.incognito_window_titles.contains(window_title));
                 }
             }
         }
-        // Lock released — safe to do slow I/O.
 
-        let titles = Self::query_all_incognito_titles(app_name)?;
+        let titles = Self::query_incognito_titles(app_name)?;
         let is_incognito = titles.contains(window_title);
 
-        // Re-acquire lock to store the result.
         {
             let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             *cache = Some(BatchCache {
                 app_name: app_name.to_string(),
-                incognito_titles: titles,
+                incognito_window_titles: titles,
                 timestamp: Instant::now(),
             });
         }
@@ -206,9 +193,7 @@ end if"#,
 
 impl IncognitoDetector for MacOSIncognitoDetector {
     fn is_incognito(&self, app_name: &str, _process_id: i32, window_title: &str) -> bool {
-        // Strategy 1: AppleScript query for Chromium browsers — checks all
-        // windows and matches by title, so it works even when the incognito
-        // window is not in front.
+        // Strategy 1: AppleScript query for Chromium browsers (not Arc).
         if Self::is_chromium_browser(app_name) {
             if let Some(is_private) = self.check_with_cache(app_name, window_title) {
                 return is_private;
@@ -219,6 +204,8 @@ impl IncognitoDetector for MacOSIncognitoDetector {
         // Strategy 2: Localized title matching (all browsers).
         is_title_private(window_title)
     }
+
+    // Arc's is_url_incognito is no longer needed — AXIdentifier handles it.
 }
 
 #[cfg(test)]
@@ -229,12 +216,13 @@ mod tests {
     fn test_is_chromium_browser() {
         assert!(MacOSIncognitoDetector::is_chromium_browser("Google Chrome"));
         assert!(MacOSIncognitoDetector::is_chromium_browser("google chrome"));
-        assert!(MacOSIncognitoDetector::is_chromium_browser("Arc"));
         assert!(MacOSIncognitoDetector::is_chromium_browser(
             "Microsoft Edge"
         ));
         assert!(MacOSIncognitoDetector::is_chromium_browser("Brave Browser"));
         assert!(MacOSIncognitoDetector::is_chromium_browser("Vivaldi"));
+        // Arc is NOT in the list — handled via AXIdentifier
+        assert!(!MacOSIncognitoDetector::is_chromium_browser("Arc"));
         assert!(!MacOSIncognitoDetector::is_chromium_browser("Firefox"));
         assert!(!MacOSIncognitoDetector::is_chromium_browser("Safari"));
         assert!(!MacOSIncognitoDetector::is_chromium_browser("TextEdit"));
@@ -245,14 +233,12 @@ mod tests {
         assert_eq!(applescript_app_name("Chrome"), "Google Chrome");
         assert_eq!(applescript_app_name("Edge"), "Microsoft Edge");
         assert_eq!(applescript_app_name("Brave"), "Brave Browser");
-        assert_eq!(applescript_app_name("Arc"), "Arc");
         assert_eq!(applescript_app_name("Google Chrome"), "Google Chrome");
     }
 
     #[test]
     fn test_fallback_to_title_for_firefox() {
         let detector = MacOSIncognitoDetector::new();
-        // Firefox is not a Chromium browser, so it should fall back to title.
         assert!(detector.is_incognito("Firefox", 0, "Mozilla Firefox (Private Browsing)"));
         assert!(!detector.is_incognito("Firefox", 0, "Reddit - Mozilla Firefox"));
     }
@@ -260,74 +246,70 @@ mod tests {
     #[test]
     fn test_fallback_to_title_for_safari() {
         let detector = MacOSIncognitoDetector::new();
-        // Safari private windows don't change title, so this returns false.
-        // That's a known limitation documented in the module.
         assert!(!detector.is_incognito("Safari", 0, "Apple"));
     }
 
     #[test]
-    fn test_batch_cache_reuse() {
+    fn test_batch_cache_with_window_titles() {
         let detector = MacOSIncognitoDetector::new();
 
-        // Seed batch cache with known incognito titles.
         {
             let mut cache = detector.cache.lock().unwrap();
-            let mut titles = HashSet::new();
-            titles.insert("Secret Page".to_string());
-            titles.insert("Dog".to_string());
             *cache = Some(BatchCache {
                 app_name: "Google Chrome".to_string(),
-                incognito_titles: titles,
+                incognito_window_titles: {
+                    let mut s = HashSet::new();
+                    s.insert("Secret Page".to_string());
+                    s.insert("Dog".to_string());
+                    s
+                },
                 timestamp: Instant::now(),
             });
         }
 
-        // Both incognito titles should be detected without osascript.
         assert!(detector.is_incognito("Google Chrome", 0, "Dog"));
         assert!(detector.is_incognito("Google Chrome", 0, "Secret Page"));
-        // Normal title should return false from cache.
         assert!(!detector.is_incognito("Google Chrome", 0, "GitHub"));
     }
 
     #[test]
-    fn test_batch_cache_different_app_misses() {
+    fn test_cache_different_app_misses() {
         let detector = MacOSIncognitoDetector::new();
 
-        // Seed cache for Chrome.
         {
             let mut cache = detector.cache.lock().unwrap();
-            let mut titles = HashSet::new();
-            titles.insert("Dog".to_string());
             *cache = Some(BatchCache {
                 app_name: "Google Chrome".to_string(),
-                incognito_titles: titles,
+                incognito_window_titles: {
+                    let mut s = HashSet::new();
+                    s.insert("Dog".to_string());
+                    s
+                },
                 timestamp: Instant::now(),
             });
         }
 
-        // Different app should miss cache.
-        let result = detector.check_with_cache("Arc", "Dog");
-        // Result depends on whether Arc is running.
+        // Different app should miss cache
+        let result = detector.check_with_cache("Brave Browser", "Dog");
         if let Some(val) = result {
             let _ = val;
         }
     }
 
     #[test]
-    fn test_batch_cache_expiry() {
+    fn test_cache_expiry() {
         let detector = MacOSIncognitoDetector::new();
 
-        // Seed with an expired entry.
         {
             let mut cache = detector.cache.lock().unwrap();
             *cache = Some(BatchCache {
                 app_name: "Google Chrome".to_string(),
-                incognito_titles: HashSet::new(),
+                incognito_window_titles: HashSet::new(),
                 timestamp: Instant::now() - Duration::from_secs(10),
             });
         }
 
-        // Cache is expired — will re-query or fall back.
+        // Cache is expired — will re-query or fall back
         let result = detector.check_with_cache("Google Chrome", "Dog");
         if let Some(val) = result {
             let _ = val;

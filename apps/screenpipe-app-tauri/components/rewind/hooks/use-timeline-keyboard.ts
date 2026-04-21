@@ -153,7 +153,8 @@ export function useTimelineKeyboard(opts: {
 	// In embedded mode, only handle closing the search modal (don't close the window)
 	useEffect(() => {
 		if (embedded) return;
-		const unlisten = listen("escape-pressed", () => {
+
+		const handleEscape = () => {
 			// Exit search-result review mode first
 			if (inSearchReviewMode) {
 				clearSearchHighlight();
@@ -171,9 +172,38 @@ export function useTimelineKeyboard(opts: {
 			}
 			pausePlayback();
 			commands.closeWindow("Main");
-		});
-		return () => { unlisten.then((fn) => fn()); };
-	}, [showSearchModal, embedded, resetFilters, inSearchReviewMode, clearSearchHighlight]);
+		};
+
+		// Listen for Rust global-shortcut Escape event
+		const unlisten = listen("escape-pressed", handleEscape);
+
+		// Fallback: direct keydown listener for Escape and Alt+S.
+		// On Windows, global shortcut registrations can be lost due to
+		// focus races (unregister/register happen in separate threads)
+		// or the OS intercepting Alt as a menu-bar activator.
+		// These direct listeners work whenever the webview has focus.
+		const handleKeyDown = (e: KeyboardEvent) => {
+			if (e.key === "Escape") {
+				e.preventDefault();
+				handleEscape();
+			}
+			// Alt+S (Windows) / Ctrl+Cmd+S (macOS) — close timeline
+			const isToggleShortcut = isMac
+				? e.metaKey && e.ctrlKey && e.key.toLowerCase() === "s"
+				: e.altKey && e.key.toLowerCase() === "s";
+			if (isToggleShortcut) {
+				e.preventDefault();
+				pausePlayback();
+				commands.closeWindow("Main");
+			}
+		};
+		window.addEventListener("keydown", handleKeyDown);
+
+		return () => {
+			unlisten.then((fn) => fn());
+			window.removeEventListener("keydown", handleKeyDown);
+		};
+	}, [showSearchModal, embedded, resetFilters, inSearchReviewMode, clearSearchHighlight, isMac, pausePlayback]);
 
 	// Handle arrow key navigation via JS keydown (no global hotkey stealing)
 	useEffect(() => {

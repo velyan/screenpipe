@@ -39,11 +39,15 @@
       "icons/screenpipe-logo-tray-black.png"
     ],
     "resources": [
-      "assets/*"
+      "assets/*",
+      "mlx.metallib"
     ],
     "macOS": {
       "entitlements": "entitlements.plist",
       "hardenedRuntime": true
+    },
+    "windows": {
+      "signCommand": "powershell -ExecutionPolicy Bypass -File sign-azure.ps1 %1"
     }
   },
   "plugins": {
@@ -120,8 +124,7 @@
         "enable": true,
         "scope": [
           "$APPDATA/**",
-          "$HOME/.screenpipe/**",
-          "**"
+          "$HOME/.screenpipe/**"
         ]
       },
       "csp": null

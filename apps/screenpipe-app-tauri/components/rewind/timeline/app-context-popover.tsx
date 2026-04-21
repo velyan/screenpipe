@@ -10,6 +10,7 @@ import { extractDomain, FaviconImg } from "./favicon-utils";
 import { format } from "date-fns";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { commands } from "@/lib/utils/tauri";
+import { localFetch } from "@/lib/api";
 
 interface UiEventSummary {
 	event_type: string;
@@ -63,7 +64,8 @@ export function AppContextPopover({
 	onClose,
 	onSearch,
 }: AppContextPopoverProps) {
-	const allApps = appNames && appNames.length > 1 ? appNames : [appName];
+	// Deduplicate app names (trim + unique) to prevent showing same icon twice
+	const allApps = [...new Set((appNames && appNames.length > 0 ? appNames : [appName]).map(n => n.trim()).filter(Boolean))];
 	const [copied, setCopied] = useState(false);
 
 	// compute time range from frames
@@ -83,7 +85,7 @@ export function AppContextPopover({
 		const start = timeRange.start.toISOString().replace("T", " ").replace("Z", "");
 		const end = timeRange.end.toISOString().replace("T", " ").replace("Z", "");
 		const query = `SELECT event_type, text_content, app_name, window_title, timestamp FROM ui_events WHERE timestamp BETWEEN '${start}' AND '${end}' ORDER BY timestamp DESC LIMIT 30`;
-		fetch("http://localhost:3030/raw_sql", {
+		localFetch("/raw_sql", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ query }),
