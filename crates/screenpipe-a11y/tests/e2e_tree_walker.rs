@@ -300,7 +300,9 @@ mod e2e {
                     println!("  Cache dedup confirmed working!");
                 } else if snap.app_name == snap2.app_name {
                     // Same app but content changed (dynamic app like Finder with timestamps)
-                    println!("  [info] Same app but content changed between walks (dynamic content)");
+                    println!(
+                        "  [info] Same app but content changed between walks (dynamic content)"
+                    );
                 } else {
                     println!("  [warn] App changed between walks (focus issue)");
                 }

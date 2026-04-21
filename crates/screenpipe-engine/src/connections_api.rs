@@ -1174,12 +1174,9 @@ async fn connection_proxy(
     // forwarded verbatim — without this, callers silently hit defaults and
     // bad requests like 400s on `values:append`.
     let target_url = match raw_query.as_deref() {
-        Some(q) if !q.is_empty() => format!(
-            "{}/{}?{}",
-            base_url,
-            api_path.trim_start_matches('/'),
-            q
-        ),
+        Some(q) if !q.is_empty() => {
+            format!("{}/{}?{}", base_url, api_path.trim_start_matches('/'), q)
+        }
         _ => format!("{}/{}", base_url, api_path.trim_start_matches('/')),
     };
 

@@ -804,14 +804,14 @@ pub(crate) async fn capture_active_window(
                     let (image, _) = capture_monitor_image(&monitor, &excluded_window_ids)
                         .await
                         .map_err(|error| {
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            JsonResponse(json!({
-                                "error": "monitor_fallback_capture_failed",
-                                "message": error.to_string(),
-                            })),
-                        )
-                    })?;
+                            (
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                JsonResponse(json!({
+                                    "error": "monitor_fallback_capture_failed",
+                                    "message": error.to_string(),
+                                })),
+                            )
+                        })?;
 
                     (
                         image,
@@ -845,14 +845,14 @@ pub(crate) async fn capture_active_window(
                 let (image, _) = capture_monitor_image(&monitor, &excluded_window_ids)
                     .await
                     .map_err(|error| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        JsonResponse(json!({
-                            "error": "monitor_fallback_capture_failed",
-                            "message": error.to_string(),
-                        })),
-                    )
-                })?;
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            JsonResponse(json!({
+                                "error": "monitor_fallback_capture_failed",
+                                "message": error.to_string(),
+                            })),
+                        )
+                    })?;
 
                 (
                     image,

@@ -153,10 +153,8 @@ impl RecordingConfig {
     ) -> Self {
         let engine_str = audio_engine_override.unwrap_or(&settings.audio_transcription_engine);
         #[allow(deprecated)]
-        let (enable_input_capture, enable_accessibility) = (
-            settings.enable_input_capture,
-            settings.enable_accessibility,
-        );
+        let (enable_input_capture, enable_accessibility) =
+            (settings.enable_input_capture, settings.enable_accessibility);
 
         // Sync the record_while_locked preference to the shared atomic flag
         // so the audio recording loop can read it without holding a config reference.

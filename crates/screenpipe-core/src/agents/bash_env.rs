@@ -136,7 +136,10 @@ mod tests {
         let mtime2 = std::fs::metadata(&second).unwrap().modified().unwrap();
         assert_eq!(first, second);
         // content unchanged → we did not rewrite the file
-        assert_eq!(mtime1, mtime2, "wrapper should not be rewritten when content matches");
+        assert_eq!(
+            mtime1, mtime2,
+            "wrapper should not be rewritten when content matches"
+        );
     }
 
     #[test]
