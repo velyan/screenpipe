@@ -8,17 +8,20 @@ import { useSettings } from "@/lib/hooks/use-settings";
 import { useTheme } from "@/components/theme-provider";
 import { Switch } from "@/components/ui/switch";
 import { Card, CardContent } from "@/components/ui/card";
-import { Moon, Sun, Monitor, Layers, MessageSquare, FlaskConical, ExternalLink } from "lucide-react";
+import { Moon, Sun, Monitor, Layers, MessageSquare, PanelLeft, Maximize2 } from "lucide-react";
+import { usePlatform } from "@/lib/hooks/use-platform";
 import { HelpTooltip } from "@/components/ui/help-tooltip";
 import { useToast } from "@/components/ui/use-toast";
 import { Button } from "@/components/ui/button";
 import { Settings } from "@/lib/hooks/use-settings";
 import { open } from "@tauri-apps/plugin-shell";
+import { invoke } from "@tauri-apps/api/core";
 
 export function DisplaySection() {
   const { settings, updateSettings } = useSettings();
   const { theme, setTheme } = useTheme();
   const { toast } = useToast();
+  const { isMac } = usePlatform();
 
   const handleSettingsChange = (newSettings: Partial<Settings>) => {
     if (settings) {
@@ -32,25 +35,12 @@ export function DisplaySection() {
     { value: "dark" as const, label: "Dark", icon: Moon },
   ];
 
-  const handleDownloadBeta = async () => {
-    await open("https://screenpi.pe/beta");
-    toast({
-      title: "Opening beta download",
-      description: "Download the beta app to run it alongside stable",
-      duration: 5000,
-    });
-  };
 
   return (
     <div className="space-y-5">
-      <div className="space-y-1">
-        <h1 className="text-xl font-bold tracking-tight text-foreground">
-          Display
-        </h1>
-        <p className="text-muted-foreground text-sm">
-          Theme, windows, and overlay appearance
-        </p>
-      </div>
+      <p className="text-muted-foreground text-sm mb-4">
+        Theme, windows, and overlay appearance
+      </p>
 
       <div className="space-y-2">
         <Card className="border-border bg-card">
@@ -155,7 +145,7 @@ export function DisplaySection() {
               <div className="flex items-center space-x-2.5">
                 <MessageSquare className="h-4 w-4 text-muted-foreground shrink-0" />
                 <div>
-                  <h3 className="text-sm font-medium text-foreground">Chat always on top</h3>
+                  <h3 className="text-sm font-medium text-foreground">Chat Always on Top</h3>
                   <p className="text-xs text-muted-foreground">Keep chat window above other windows</p>
                 </div>
               </div>
@@ -200,28 +190,109 @@ export function DisplaySection() {
           </CardContent>
         </Card>
 
+        {isMac && (
+          <Card className="border-border bg-card">
+            <CardContent className="px-3 py-2.5">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-2.5">
+                  <PanelLeft className="h-4 w-4 text-muted-foreground shrink-0" />
+                  <div>
+                    <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                      Translucent Sidebar
+                      <HelpTooltip text="Apply a macOS vibrancy effect to the sidebar for a frosted glass look." />
+                    </h3>
+                    <p className="text-xs text-muted-foreground">Frosted glass sidebar effect</p>
+                  </div>
+                </div>
+                <Switch
+                  checked={settings?.translucentSidebar ?? true}
+                  onCheckedChange={(checked) => {
+                    handleSettingsChange({ translucentSidebar: checked });
+                    toast({
+                      title: checked ? "translucent sidebar enabled" : "translucent sidebar disabled",
+                    });
+                  }}
+                />
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5">
             <div className="flex items-center justify-between">
               <div className="flex items-center space-x-2.5">
-                <FlaskConical className="h-4 w-4 text-muted-foreground shrink-0" />
+                <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
                 <div>
-                  <h3 className="text-sm font-medium text-foreground">Beta Version</h3>
-                  <p className="text-xs text-muted-foreground">Runs alongside stable</p>
+                  <h3 className="text-sm font-medium text-foreground">Show Shortcut Reminder</h3>
+                  <p className="text-xs text-muted-foreground">Overlay showing the screenpipe shortcut</p>
                 </div>
               </div>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={handleDownloadBeta}
-                className="ml-4 flex items-center gap-1.5 h-7 text-xs"
-              >
-                Download
-                <ExternalLink className="h-3 w-3" />
-              </Button>
+              <Switch
+                id="shortcut-overlay"
+                checked={settings?.showShortcutOverlay ?? false}
+                onCheckedChange={async (checked) => {
+                  handleSettingsChange({ showShortcutOverlay: checked });
+                  try {
+                    if (checked) {
+                      await invoke("show_shortcut_reminder", { shortcut: settings.showScreenpipeShortcut });
+                    } else {
+                      await invoke("hide_shortcut_reminder");
+                    }
+                  } catch (e) {}
+                }}
+              />
             </div>
           </CardContent>
         </Card>
+
+        {settings?.showShortcutOverlay && (
+          <Card className="border-border bg-card">
+            <CardContent className="px-3 py-2.5">
+              <div className="space-y-2.5">
+                <div className="flex items-center space-x-2.5">
+                  <Maximize2 className="h-4 w-4 text-muted-foreground shrink-0" />
+                  <div>
+                    <h3 className="text-sm font-medium text-foreground">Overlay Size</h3>
+                    <p className="text-xs text-muted-foreground">Size of the shortcut reminder overlay</p>
+                  </div>
+                </div>
+                <div className="flex gap-2 ml-[26px]">
+                  {([
+                    { value: "small", label: "Small" },
+                    { value: "medium", label: "Medium" },
+                    { value: "large", label: "Large" },
+                  ]).map((option) => {
+                    const isActive = (settings?.shortcutOverlaySize ?? "small") === option.value;
+                    return (
+                      <button
+                        key={option.value}
+                        onClick={async () => {
+                          handleSettingsChange({ shortcutOverlaySize: option.value });
+                          try {
+                            await invoke("hide_shortcut_reminder");
+                            // Wait for store.bin to flush to disk before re-showing
+                            await new Promise(r => setTimeout(r, 500));
+                            await invoke("show_shortcut_reminder", { shortcut: settings.showScreenpipeShortcut });
+                          } catch {}
+                        }}
+                        type="button"
+                        className={`flex-1 px-2.5 py-1.5 rounded-md border-2 transition-all text-center cursor-pointer ${
+                          isActive
+                            ? "border-primary bg-primary/5"
+                            : "border-border hover:border-muted-foreground/30"
+                        }`}
+                      >
+                        <div className="font-medium text-xs text-foreground">{option.label}</div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
       </div>
     </div>
   );

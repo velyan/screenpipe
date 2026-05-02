@@ -9,6 +9,7 @@ import { open } from "@tauri-apps/plugin-shell";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
 import posthog from "posthog-js";
+import { localFetch } from "@/lib/api";
 
 const WELCOME_URL = "https://screenpi.pe/welcome";
 // minimum seconds before Continue is enabled (so screenpipe has time to capture)
@@ -61,7 +62,7 @@ export default function ReadContent({ handleNextSlide }: ReadContentProps) {
 
     const poll = async () => {
       try {
-        const res = await fetch("http://localhost:3030/health", {
+        const res = await localFetch("/health", {
           signal: AbortSignal.timeout(2000),
         });
         if (res.ok) {
@@ -127,7 +128,7 @@ export default function ReadContent({ handleNextSlide }: ReadContentProps) {
       frames_detected: framesDetected,
     });
     // trigger FTS indexing so the welcome page content is searchable immediately
-    fetch("http://localhost:3030/fts/index", { method: "POST" }).catch(() => {});
+    localFetch("/fts/index", { method: "POST" }).catch(() => {});
     handleNextSlide();
   }, [handleNextSlide, framesDetected]);
 

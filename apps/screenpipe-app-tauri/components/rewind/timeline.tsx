@@ -28,6 +28,7 @@ import { useKeywordSearchStore } from "@/lib/hooks/use-keyword-search-store";
 import { usePlatform } from "@/lib/hooks/use-platform";
 import { useAudioPlayback } from "@/lib/hooks/use-audio-playback";
 import { useHealthCheck } from "@/lib/hooks/use-health-check";
+import { useSettings } from "@/lib/hooks/use-settings";
 import { usePipes, type TemplatePipe } from "@/lib/hooks/use-pipes";
 
 import posthog from "posthog-js";
@@ -37,6 +38,7 @@ import { useTimelineFilters } from "@/components/rewind/hooks/use-timeline-filte
 import { useScrollZoom } from "@/components/rewind/hooks/use-scroll-zoom";
 import { useDateNavigation } from "@/components/rewind/hooks/use-date-navigation";
 import { useTimelineKeyboard } from "@/components/rewind/hooks/use-timeline-keyboard";
+import { localFetch } from "@/lib/api";
 
 export interface StreamTimeSeriesResponse {
 	timestamp: string;
@@ -85,10 +87,68 @@ const easeOutCubic = (x: number): number => {
 	return 1 - Math.pow(1 - x, 3);
 };
 
-
+// Tiny dot-strip showing all search-result positions; click to jump.
+// Each result is a small bar; the active one is bright yellow with a glow.
+// Renders nothing for ≤1 result (the counter alone is sufficient).
+function SearchResultStrip({
+	resultsLength,
+	activeIndex,
+	onJump,
+}: {
+	resultsLength: number;
+	activeIndex: number;
+	onJump: (index: number) => void;
+}) {
+	if (resultsLength <= 1) return null;
+	const stripWidth = 110;
+	const stripHeight = 14;
+	const denom = Math.max(1, resultsLength - 1);
+	return (
+		<div
+			className="relative shrink-0"
+			style={{ width: stripWidth, height: stripHeight }}
+			role="slider"
+			aria-label="Search result position"
+			aria-valuemin={1}
+			aria-valuemax={resultsLength}
+			aria-valuenow={activeIndex + 1}
+		>
+			<div className="absolute left-0 right-0 top-1/2 -translate-y-1/2 h-px bg-white/15" />
+			{Array.from({ length: resultsLength }).map((_, i) => {
+				const isActive = i === activeIndex;
+				const x = (i / denom) * stripWidth;
+				return (
+					<button
+						key={i}
+						type="button"
+						onClick={() => onJump(i)}
+						className="absolute top-1/2 cursor-pointer focus:outline-none"
+						style={{
+							left: x - (isActive ? 2 : 1),
+							width: isActive ? 4 : 2,
+							height: isActive ? 10 : 5,
+							transform: "translateY(-50%)",
+							borderRadius: 1.5,
+							backgroundColor: isActive
+								? "rgb(250, 204, 21)"
+								: "rgba(255, 255, 255, 0.45)",
+							boxShadow: isActive
+								? "0 0 5px rgba(250, 204, 21, 0.7)"
+								: "none",
+							transition: "all 120ms ease-out",
+							zIndex: isActive ? 2 : 1,
+						}}
+						title={`Match ${i + 1}`}
+					/>
+				);
+			})}
+		</div>
+	);
+}
 
 export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 	const { isMac } = usePlatform();
+	const { settings } = useSettings();
 	const { health } = useHealthCheck();
 	const [currentIndex, setCurrentIndex] = useState(0);
 	const [showAudioTranscript, setShowAudioTranscript] = useState(false);
@@ -100,6 +160,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 	const scrubberRef = useRef<HTMLDivElement | null>(null);
 	// Stable guardRefs object for Live Text click guards — refs are stable, so useMemo with empty deps is fine
 	const guardRefs = useMemo(() => ({ filters: filtersRef, scrubber: scrubberRef }), []);
+
 	const [startAndEndDates, setStartAndEndDates] = useState<TimeRange>(() => {
 		// Lazy init to avoid SSR/client hydration mismatch from new Date()
 		const now = new Date();
@@ -180,6 +241,13 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 
 	const { meetings } = useMeetings(frames);
 
+	// Force guard rect refresh when inner timeline mounts/unmounts
+	useEffect(() => {
+		const timer = setTimeout(() => {
+			window.dispatchEvent(new Event("resize"));
+		}, 500);
+		return () => clearTimeout(timer);
+	}, [frames.length]);
 
 	// --- Extracted hooks ---
 
@@ -386,6 +454,9 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 	// Hide timeline when mouse moves to a different screen (skip in embedded mode)
 	useEffect(() => {
 		if (embedded) return;
+		// Window mode is a small movable window; cursor is often "outside" vs fullscreen
+		// monitor bounds, which incorrectly fired closeWindow and unregistered Escape.
+		if (settings?.overlayMode === "window") return;
 		let initialScreenBounds: { x: number; y: number; width: number; height: number } | null = null;
 		let checkInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -440,7 +511,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 				clearInterval(checkInterval);
 			}
 		};
-	}, []);
+	}, [embedded, settings?.overlayMode]);
 
 	// Helper to navigate to a timestamp
 	const navigateToTimestamp = useCallback(async (targetTimestamp: string) => {
@@ -466,12 +537,13 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 		};
 	}, [navigateToTimestamp]);
 
+
 	// Listen for navigate-to-frame events (deep link: screenpipe://frame/12345)
 	useEffect(() => {
 		const fetchFrameMetadata = async (id: string, retries = 3): Promise<{ timestamp?: string } | null> => {
 			for (let i = 0; i < retries; i++) {
 				try {
-					const resp = await fetch(`http://localhost:3030/frames/${id}/metadata`);
+					const resp = await localFetch(`/frames/${id}/metadata`);
 					if (resp.ok) {
 						const data = await resp.json();
 						return data;
@@ -980,6 +1052,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 			<div
 				ref={containerRef}
 				className="inset-0 flex flex-col text-foreground relative"
+				data-testid="section-timeline"
 				onWheel={onContainerWheel}
 				style={{
 					height: embedded ? "100%" : "100vh",
@@ -1032,8 +1105,8 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 
 								try {
 									// Query the server for the next valid frame
-									const response = await fetch(
-										`http://localhost:3030/frames/next-valid?frame_id=${failedFrameId}&direction=forward&limit=50`
+									const response = await localFetch(
+										`/frames/next-valid?frame_id=${failedFrameId}&direction=forward&limit=50`
 									);
 
 									if (response.ok) {
@@ -1152,13 +1225,16 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 						startAndEndDates={startAndEndDates}
 						onDateChange={handleDateChange}
 						onJumpToday={handleJumpToday}
-						onSearchClick={() => {
-							if (embedded) {
-								setShowSearchModal(true);
-							} else {
-								commands.showWindow({ Search: { query: null } });
-							}
-						}}
+						// Embedded timeline no longer renders a search button
+						// here — the AppSidebar's top bar (next to the macOS
+						// traffic lights) owns search now and emits an
+						// `open-search` event that the listener below picks
+						// up. Standalone timeline window keeps its button.
+						onSearchClick={
+							embedded
+								? undefined
+								: () => commands.showWindow({ Search: { query: null } })
+						}
 						onChatClick={embedded ? undefined : () => commands.showWindow("Chat")}
 						embedded={embedded}
 						isPlaying={isPlaying}
@@ -1183,7 +1259,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 					const browserUrl = currentFrame?.devices?.[0]?.metadata?.browser_url;
 					if (!browserUrl) return null;
 					return (
-						<div className={`absolute ${embedded ? "top-1" : "top-[calc(env(safe-area-inset-top)+4px)]"} left-0 right-0 z-[45] flex justify-center pointer-events-none`}>
+						<div className={`absolute ${embedded ? "top-[56px]" : "top-[calc(env(safe-area-inset-top)+4px)]"} left-0 right-0 z-[45] flex justify-center pointer-events-none`}>
 							<button
 								type="button"
 								className="flex items-center gap-1.5 max-w-lg min-w-0 px-3 py-1 rounded-full bg-black/70 backdrop-blur-sm border border-white/10 hover:bg-black/80 hover:border-white/20 transition-colors cursor-pointer pointer-events-auto"
@@ -1342,18 +1418,25 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 						<span className="text-white/60 truncate max-w-[120px]">&ldquo;{searchQuery}&rdquo;</span>
 						<button
 							className="px-1.5 hover:text-white/80 disabled:text-white/30"
-							disabled={searchResultIndex <= 0}
-							onClick={() => navigateToSearchResult(searchResultIndex - 1)}
+							disabled={searchResultIndex >= searchResults.length - 1}
+							onClick={() => navigateToSearchResult(searchResultIndex + 1)}
+							title="Older match (←)"
 						>
 							&#9664;
 						</button>
-						<span className="tabular-nums font-medium">
-							{searchResultIndex + 1} / {searchResults.length}
+						<SearchResultStrip
+							resultsLength={searchResults.length}
+							activeIndex={searchResultIndex}
+							onJump={navigateToSearchResult}
+						/>
+						<span className="tabular-nums font-medium text-white/80">
+							{searchResultIndex + 1}/{searchResults.length}
 						</span>
 						<button
 							className="px-1.5 hover:text-white/80 disabled:text-white/30"
-							disabled={searchResultIndex >= searchResults.length - 1}
-							onClick={() => navigateToSearchResult(searchResultIndex + 1)}
+							disabled={searchResultIndex <= 0}
+							onClick={() => navigateToSearchResult(searchResultIndex - 1)}
+							title={isMac ? "Newer match (→ or ⌘G)" : "Newer match (→ or Ctrl+G)"}
 						>
 							&#9654;
 						</button>

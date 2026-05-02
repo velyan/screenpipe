@@ -14,21 +14,23 @@ use tracing::{debug, error, info};
 use crate::store::{OnboardingStore, SettingsStore};
 
 #[cfg(target_os = "macos")]
+use super::content_process::setup_content_process_handler;
+#[cfg(target_os = "macos")]
 use super::first_responder::{make_nswindow_webview_first_responder, make_webview_first_responder};
 #[cfg(target_os = "macos")]
 use super::focus::{restore_frontmost_app, restore_frontmost_app_if_external_with_app};
 use super::panel::{main_label_for_mode, MAIN_CREATED_MODE};
 #[cfg(target_os = "macos")]
 use super::panel::{show_panel_visible, MAIN_PANEL_SHOWN};
-use super::util::screen_aware_size;
 #[cfg(target_os = "macos")]
 use super::util::run_on_main_thread_safe;
+use super::util::screen_aware_size;
 
+use tauri::Emitter;
 #[cfg(target_os = "macos")]
 use tauri_nspanel::ManagerExt;
 #[cfg(target_os = "macos")]
 use tauri_nspanel::WebviewWindowExt;
-use tauri::Emitter;
 
 #[derive(PartialEq)]
 pub enum RewindWindowId {
@@ -141,6 +143,15 @@ impl ShowRewindWindow {
                 .min_inner_size(min.0, min.1);
         }
 
+        // Hide title text on macOS for every window built through this helper.
+        // Title bar stays opaque (no Overlay style) so content doesn't bleed
+        // under the traffic lights — sibling helper window_builder() opts into
+        // Overlay where it's wanted.
+        #[cfg(target_os = "macos")]
+        {
+            builder = builder.hidden_title(true);
+        }
+
         builder
     }
 
@@ -176,6 +187,16 @@ impl ShowRewindWindow {
         {
             // Windows needs explicit decorations for non-overlay windows
             builder = builder.decorations(true);
+        }
+
+        // Apply theme from settings
+        if let Ok(Some(settings)) = SettingsStore::get(app) {
+            let tauri_theme = match settings.ui_theme.as_str() {
+                "light" => Some(tauri::Theme::Light),
+                "dark" => Some(tauri::Theme::Dark),
+                _ => None, // "system" or others
+            };
+            builder = builder.theme(tauri_theme);
         }
 
         builder
@@ -214,10 +235,16 @@ impl ShowRewindWindow {
         overlay_mode: &str,
         label: &str,
     ) -> tauri::Result<WebviewWindow> {
-        let capturable = SettingsStore::get(app)
-            .unwrap_or_default()
-            .unwrap_or_default()
-            .show_overlay_in_screen_recording;
+        #[cfg(target_os = "macos")]
+        // Ensure delegate-level recovery is installed for already-created main windows.
+        // This catches WKWebView content-process termination directly from WebKit.
+        setup_content_process_handler(window);
+
+        let capturable = crate::config::is_e2e_mode()
+            || SettingsStore::get(app)
+                .unwrap_or_default()
+                .unwrap_or_default()
+                .show_overlay_in_screen_recording;
 
         if overlay_mode == "window" {
             info!("showing existing main window (window mode)");
@@ -251,8 +278,18 @@ impl ShowRewindWindow {
             }
             #[cfg(not(target_os = "macos"))]
             {
+                #[cfg(target_os = "windows")]
+                if let Err(e) = crate::windows_overlay::set_display_affinity(window, capturable) {
+                    error!("Failed to set display affinity: {}", e);
+                }
                 window.unminimize().ok();
                 window.show().ok();
+                #[cfg(target_os = "windows")]
+                if let Err(e) =
+                    crate::windows_overlay::center_window_mode_on_cursor_monitor(window, app)
+                {
+                    tracing::warn!("Failed to center window-mode overlay: {}", e);
+                }
                 window.set_focus().ok();
                 let _ = app.emit("window-focused", true);
             }
@@ -331,13 +368,27 @@ impl ShowRewindWindow {
             }
             #[cfg(target_os = "windows")]
             {
+                if let Err(e) = crate::windows_overlay::set_display_affinity(window, capturable) {
+                    error!("Failed to set display affinity: {}", e);
+                }
                 window.show().ok();
-                // Overlay mode: bring to front WITHOUT stealing focus.
-                // Using bring_to_front (SWP_NOACTIVATE) instead of
-                // bring_to_front_and_activate (SetForegroundWindow) prevents
-                // the overlay from yanking focus away from fullscreen games.
-                if let Err(e) = crate::windows_overlay::bring_to_front(window) {
-                    error!("Failed to bring window to front: {}", e);
+                // Reposition overlay to the monitor where the cursor is,
+                // matching macOS behavior where the panel moves to the active screen.
+                if let Ok(cursor) = app.cursor_position() {
+                    if let Err(e) = crate::windows_overlay::reposition_to_cursor_monitor(
+                        window,
+                        cursor.x as i32,
+                        cursor.y as i32,
+                    ) {
+                        error!("Failed to reposition overlay to cursor monitor: {}", e);
+                    }
+                }
+                // Always activate after repositioning so the overlay receives keyboard focus.
+                // Without this, re-showing an already-created overlay when another screenpipe
+                // window (e.g. Home) holds focus leaves the overlay visible but not interactive —
+                // Escape and all shortcuts are swallowed by the unfocused background window.
+                if let Err(e) = crate::windows_overlay::bring_to_front_and_activate(window) {
+                    error!("Failed to activate overlay: {}", e);
                 }
                 let _ = app.emit("window-focused", true);
             }
@@ -393,9 +444,12 @@ impl ShowRewindWindow {
             *MAIN_CREATED_MODE.lock().unwrap_or_else(|e| e.into_inner()) = overlay_mode.clone();
         // === Other windows: standard show path ===
         } else if let Some(window) = id.get(app) {
+            #[cfg(target_os = "macos")]
+            setup_content_process_handler(&window);
+
             if id.label() == RewindWindowId::Onboarding.label() {
                 if onboarding_store.is_completed {
-                    return ShowRewindWindow::Main.show(app);
+                    return ShowRewindWindow::Home { page: None }.show(app);
                 }
             }
 
@@ -412,7 +466,8 @@ impl ShowRewindWindow {
 
                 // Reposition to center of primary monitor
                 if let Ok(Some(monitor)) = app.primary_monitor() {
-                    let logical: LogicalSize<f64> = monitor.size().to_logical(monitor.scale_factor());
+                    let logical: LogicalSize<f64> =
+                        monitor.size().to_logical(monitor.scale_factor());
                     let pos = monitor.position();
                     let scale = monitor.scale_factor();
                     let origin_x = pos.x as f64 / scale;
@@ -421,8 +476,12 @@ impl ShowRewindWindow {
                     let bar_h = 80.0;
                     let x = origin_x + (logical.width - bar_w) / 2.0;
                     let y = origin_y + logical.height * 0.22;
-                    window.set_size(Size::Logical(LogicalSize::new(bar_w, bar_h))).ok();
-                    window.set_position(Position::Logical(LogicalPosition::new(x, y))).ok();
+                    window
+                        .set_size(Size::Logical(LogicalSize::new(bar_w, bar_h)))
+                        .ok();
+                    window
+                        .set_position(Position::Logical(LogicalPosition::new(x, y)))
+                        .ok();
                 }
 
                 // Bring to front with high level (already class-swizzled to NSPanel)
@@ -466,35 +525,39 @@ impl ShowRewindWindow {
 
                 #[cfg(target_os = "macos")]
                 {
-                    use objc::{msg_send, sel, sel_impl};
-                    use tauri_nspanel::cocoa::base::{id as cocoa_id, nil as cocoa_nil};
-                    if let Ok(ns_win) = window.ns_window() {
-                        unsafe {
-                            // Activate the app so it comes to the foreground
-                            let ns_app: cocoa_id =
-                                msg_send![objc::class!(NSApplication), sharedApplication];
-                            let _: () = msg_send![ns_app, activateIgnoringOtherApps: true];
+                    let window_clone = window.clone();
+                    run_on_main_thread_safe(app, move || {
+                        use objc::{msg_send, sel, sel_impl};
+                        use tauri_nspanel::cocoa::base::{id as cocoa_id, nil as cocoa_nil};
+                        if let Ok(ns_win) = window_clone.ns_window() {
+                            unsafe {
+                                // Activate the app so it comes to the foreground
+                                let ns_app: cocoa_id =
+                                    msg_send![objc::class!(NSApplication), sharedApplication];
+                                let _: () = msg_send![ns_app, activateIgnoringOtherApps: true];
 
-                            // Move the window to the active space (current workspace)
-                            // NSWindowCollectionBehaviorMoveToActiveSpace = 1 << 1 = 2
-                            let behavior: u64 = msg_send![ns_win as cocoa_id, collectionBehavior];
-                            let move_to_active: u64 = 1 << 1;
-                            let _: () = msg_send![ns_win as cocoa_id, setCollectionBehavior: behavior | move_to_active];
+                                // Move the window to the active space (current workspace)
+                                // NSWindowCollectionBehaviorMoveToActiveSpace = 1 << 1 = 2
+                                let behavior: u64 =
+                                    msg_send![ns_win as cocoa_id, collectionBehavior];
+                                let move_to_active: u64 = 1 << 1;
+                                let _: () = msg_send![ns_win as cocoa_id, setCollectionBehavior: behavior | move_to_active];
 
-                            // Bring window to front and make it key
-                            let _: () =
-                                msg_send![ns_win as cocoa_id, makeKeyAndOrderFront: cocoa_nil];
+                                // Bring window to front and make it key
+                                let _: () =
+                                    msg_send![ns_win as cocoa_id, makeKeyAndOrderFront: cocoa_nil];
 
-                            // Set WKWebView as first responder so keyboard input works.
-                            // Without this, re-showing an existing Settings window may
-                            // leave the content_view as first responder (tao#208).
-                            make_nswindow_webview_first_responder(ns_win as cocoa_id);
+                                // Set WKWebView as first responder so keyboard input works.
+                                // Without this, re-showing an existing Settings window may
+                                // leave the content_view as first responder (tao#208).
+                                make_nswindow_webview_first_responder(ns_win as cocoa_id);
 
-                            // Remove MoveToActiveSpace so the window stays pinned to this space
-                            let _: () =
-                                msg_send![ns_win as cocoa_id, setCollectionBehavior: behavior];
+                                // Remove MoveToActiveSpace so the window stays pinned to this space
+                                let _: () =
+                                    msg_send![ns_win as cocoa_id, setCollectionBehavior: behavior];
+                            }
                         }
-                    }
+                    });
                 }
                 #[cfg(not(target_os = "macos"))]
                 {
@@ -517,7 +580,8 @@ impl ShowRewindWindow {
                     let settings = SettingsStore::get(app)
                         .unwrap_or_default()
                         .unwrap_or_default();
-                    let capturable = settings.show_overlay_in_screen_recording;
+                    let capturable =
+                        crate::config::is_e2e_mode() || settings.show_overlay_in_screen_recording;
                     let chat_on_top = settings.chat_always_on_top;
                     let app_clone = app.clone();
                     run_on_main_thread_safe(app, move || {
@@ -598,8 +662,8 @@ impl ShowRewindWindow {
                     .unwrap_or_default()
                     .unwrap_or_default();
                 let overlay_mode = settings.overlay_mode;
-                #[allow(unused_variables)] // used only on macOS
-                let show_in_recording = settings.show_overlay_in_screen_recording;
+                let show_in_recording =
+                    crate::config::is_e2e_mode() || settings.show_overlay_in_screen_recording;
                 // Record what mode we're creating so we can detect changes later
                 *MAIN_CREATED_MODE.lock().unwrap_or_else(|e| e.into_inner()) = overlay_mode.clone();
                 let use_window_mode = overlay_mode == "window";
@@ -619,7 +683,11 @@ impl ShowRewindWindow {
                         // and tray on notched MacBooks. NSPanel with proper collection
                         // behaviors handles fullscreen Space visibility instead.
                         let builder = self
-                            .window_builder_with_label(app, "/", main_label_for_mode("window"))
+                            .window_builder_with_label(
+                                app,
+                                "/overlay",
+                                main_label_for_mode("window"),
+                            )
                             .title("screenpipe")
                             .inner_size(win_w, win_h)
                             .min_inner_size(800.0, 600.0)
@@ -634,8 +702,13 @@ impl ShowRewindWindow {
                     #[cfg(not(target_os = "macos"))]
                     let window = {
                         let app_clone = app.clone();
+                        let capturable = show_in_recording;
                         let builder = self
-                            .window_builder_with_label(app, "/", main_label_for_mode("window"))
+                            .window_builder_with_label(
+                                app,
+                                "/overlay",
+                                main_label_for_mode("window"),
+                            )
                             .title("screenpipe")
                             .inner_size(win_w, win_h)
                             .min_inner_size(800.0, 600.0)
@@ -648,7 +721,25 @@ impl ShowRewindWindow {
                                     payload.event(),
                                     tauri::webview::PageLoadEvent::Finished
                                 ) {
+                                    #[cfg(target_os = "windows")]
+                                    if let Err(e) = crate::windows_overlay::set_display_affinity(
+                                        &win, capturable,
+                                    ) {
+                                        tracing::error!("Failed to set display affinity: {}", e);
+                                    }
                                     win.show().ok();
+                                    #[cfg(target_os = "windows")]
+                                    if let Err(e) =
+                                        crate::windows_overlay::center_window_mode_on_cursor_monitor(
+                                            &win,
+                                            &app_clone,
+                                        )
+                                    {
+                                        tracing::warn!(
+                                            "Failed to center new window-mode overlay: {}",
+                                            e
+                                        );
+                                    }
                                     win.set_focus().ok();
                                     let _ = app_clone.emit("window-focused", true);
                                 }
@@ -751,10 +842,44 @@ impl ShowRewindWindow {
                                                 }
                                             });
                                         }
+                                        #[cfg(not(target_os = "macos"))]
+                                        {
+                                            // Only keep Escape when the overlay is still visible.
+                                            // Otherwise Home (or another app window) can hold focus while
+                                            // the overlay is already gone — returning here would skip
+                                            // blur unregister and leave the global Escape hook stuck on.
+                                            if crate::commands::any_screenpipe_webview_has_focus(&app)
+                                                && crate::commands::main_overlay_is_visible(&app)
+                                            {
+                                                info!(
+                                                    "main-window blur: another screenpipe window has focus, keep Escape registered"
+                                                );
+                                                let _ = app.emit("window-focused", false);
+                                                return;
+                                            }
+                                        }
+                                        // Stale blur debounce: close_window already set MAIN_CLOSE_IN_PROGRESS
+                                        // and scheduled unregister — do not schedule a second unregister here.
+                                        if crate::commands::is_main_close_in_progress() {
+                                            let _ = app.emit("window-focused", false);
+                                            return;
+                                        }
                                         // Unregister window shortcuts on focus loss (#2219)
+                                        info!(
+                                            "shortcut-sync: scheduling unregister (reason=main_window_blur_debounce)"
+                                        );
+                                        let expected_gen =
+                                            crate::commands::current_window_shortcuts_generation();
                                         let app3 = app.clone();
                                         std::thread::spawn(move || {
-                                            let _ = crate::commands::unregister_window_shortcuts(app3);
+                                            info!(
+                                                "shortcut-sync: unregister execute (reason=main_window_blur_debounce)"
+                                            );
+                                            let _ = crate::commands::unregister_window_shortcuts_if_generation_unchanged(
+                                                app3,
+                                                expected_gen,
+                                                "main_window_blur_debounce",
+                                            );
                                         });
                                         let _ = app.emit("window-focused", false);
                                     });
@@ -785,7 +910,7 @@ impl ShowRewindWindow {
                                     // Re-register window shortcuts on focus gain
                                     let app_reg = app_clone.clone();
                                     std::thread::spawn(move || {
-                                        let _ = crate::commands::register_window_shortcuts(app_reg);
+                                        let _ = crate::commands::register_window_shortcuts_with_generation(app_reg);
                                     });
                                     let _ = app_clone.emit("window-focused", true);
                                 }
@@ -867,7 +992,11 @@ impl ShowRewindWindow {
                         min.1.min(logical_size.height),
                     );
                     let builder = self
-                        .window_builder_with_label(app, "/", main_label_for_mode("fullscreen"))
+                        .window_builder_with_label(
+                            app,
+                            "/overlay",
+                            main_label_for_mode("fullscreen"),
+                        )
                         .always_on_top(true)
                         .decorations(false)
                         .skip_taskbar(true)
@@ -915,8 +1044,14 @@ impl ShowRewindWindow {
                         min.0.min(logical_size.width),
                         min.1.min(logical_size.height),
                     );
+                    let app_clone = app.clone();
+                    let capturable = show_in_recording;
                     let builder = self
-                        .window_builder_with_label(app, "/", main_label_for_mode("fullscreen"))
+                        .window_builder_with_label(
+                            app,
+                            "/overlay",
+                            main_label_for_mode("fullscreen"),
+                        )
                         .title("screenpipe")
                         .visible_on_all_workspaces(true)
                         .always_on_top(true)
@@ -924,7 +1059,7 @@ impl ShowRewindWindow {
                         .resizable(false)
                         .maximizable(false)
                         .minimizable(false)
-                        .focused(true)
+                        .focused(false)
                         .transparent(true)
                         .visible(false)
                         .skip_taskbar(true)
@@ -932,15 +1067,31 @@ impl ShowRewindWindow {
                         .min_inner_size(clamped_min.0, clamped_min.1)
                         .inner_size(logical_size.width, logical_size.height)
                         .max_inner_size(logical_size.width, logical_size.height)
-                        .position(position.x as f64, position.y as f64);
-                    let win = builder.build()?;
-
-                    // Setup Win32 overlay with click-through disabled so user can interact
-                    if let Err(e) = crate::windows_overlay::setup_overlay(&win, false) {
-                        error!("Failed to setup Windows overlay: {}", e);
-                    }
-
-                    win
+                        .position(position.x as f64, position.y as f64)
+                        .on_page_load(move |win, payload| {
+                            if matches!(payload.event(), tauri::webview::PageLoadEvent::Finished) {
+                                // Setup Win32 overlay AFTER webview loads so the
+                                // window becomes visible only when JS is ready
+                                // to handle keyboard events.
+                                if let Err(e) = crate::windows_overlay::setup_overlay(&win, false) {
+                                    tracing::error!("Failed to setup Windows overlay: {}", e);
+                                }
+                                // Apply display affinity so OBS/screen recorders respect the setting
+                                if let Err(e) =
+                                    crate::windows_overlay::set_display_affinity(&win, capturable)
+                                {
+                                    tracing::error!("Failed to set display affinity: {}", e);
+                                }
+                                // Activate so keyboard focus goes to the webview
+                                if let Err(e) =
+                                    crate::windows_overlay::bring_to_front_and_activate(&win)
+                                {
+                                    tracing::error!("Failed to activate overlay: {}", e);
+                                }
+                                let _ = app_clone.emit("window-focused", true);
+                            }
+                        });
+                    builder.build()?
                 };
 
                 // Linux uses a normal decorated window (overlay not yet implemented).
@@ -951,7 +1102,11 @@ impl ShowRewindWindow {
                     let (linux_w, linux_h) = screen_aware_size(app, 1200.0, 800.0);
                     let app_clone = app.clone();
                     let builder = self
-                        .window_builder_with_label(app, "/", main_label_for_mode("fullscreen"))
+                        .window_builder_with_label(
+                            app,
+                            "/overlay",
+                            main_label_for_mode("fullscreen"),
+                        )
                         .title("screenpipe")
                         .inner_size(linux_w, linux_h)
                         .min_inner_size(800.0, 600.0)
@@ -1096,11 +1251,40 @@ impl ShowRewindWindow {
                                             }
                                         });
                                     }
+                                    #[cfg(target_os = "windows")]
+                                    {
+                                        if crate::commands::any_screenpipe_webview_has_focus(&app)
+                                            && crate::commands::main_overlay_is_visible(&app)
+                                        {
+                                            info!(
+                                                "Main overlay blur: another screenpipe window has focus, keep Escape registered"
+                                            );
+                                            let _ = app.emit("window-focused", false).ok();
+                                            return;
+                                        }
+                                    }
+                                    // Stale debounce after close_window: same as main-window path (#2219).
+                                    if crate::commands::is_main_close_in_progress() {
+                                        let _ = app.emit("window-focused", false).ok();
+                                        return;
+                                    }
                                     // Unregister window-specific shortcuts (arrows, Escape)
                                     // so they don't steal keys from other apps (#2219)
+                                    info!(
+                                        "shortcut-sync: scheduling unregister (reason=main_overlay_blur_debounce)"
+                                    );
+                                    let expected_gen =
+                                        crate::commands::current_window_shortcuts_generation();
                                     let app3 = app.clone();
                                     std::thread::spawn(move || {
-                                        let _ = crate::commands::unregister_window_shortcuts(app3);
+                                        info!(
+                                            "shortcut-sync: unregister execute (reason=main_overlay_blur_debounce)"
+                                        );
+                                        let _ = crate::commands::unregister_window_shortcuts_if_generation_unchanged(
+                                            app3,
+                                            expected_gen,
+                                            "main_overlay_blur_debounce",
+                                        );
                                     });
                                     let _ = app.emit("window-focused", false).ok();
                                 });
@@ -1129,7 +1313,7 @@ impl ShowRewindWindow {
                                 // Re-register window-specific shortcuts on focus gain
                                 let app_reg = app_clone.clone();
                                 std::thread::spawn(move || {
-                                    let _ = crate::commands::register_window_shortcuts(app_reg);
+                                    let _ = crate::commands::register_window_shortcuts_with_generation(app_reg);
                                 });
                                 let _ = app_clone.emit("window-focused", true).ok();
                             }
@@ -1161,10 +1345,80 @@ impl ShowRewindWindow {
                     Some(p) => format!("/home?section={}", p),
                     None => "/home".to_string(),
                 };
+
                 let builder = self.window_builder(app, &url).focused(true);
                 #[cfg(target_os = "macos")]
-                let builder = builder.hidden_title(true);
+                let builder = {
+                    use tauri::window::Color;
+                    use tauri::TitleBarStyle;
+                    builder
+                        .title_bar_style(TitleBarStyle::Overlay)
+                        .hidden_title(true)
+                        .background_color(Color(0, 0, 0, 1))
+                        .effects(tauri::utils::config::WindowEffectsConfig {
+                            effects: vec![tauri::window::Effect::Menu],
+                            state: Some(tauri::window::EffectState::Active),
+                            ..Default::default()
+                        })
+                };
                 let window = builder.build()?;
+
+                // When Main loses focus to Home, Main's debounce used to unregister Escape
+                // while the overlay stayed visible. Re-register on Home focus; unregister
+                // when Home blurs and no screenpipe window has focus (user left the app).
+                #[cfg(not(target_os = "macos"))]
+                {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    use std::sync::Arc;
+                    use std::time::Duration;
+                    let app_h = app.clone();
+                    let home_blur_cancel = Arc::new(AtomicBool::new(false));
+                    window.on_window_event(move |event| {
+                        if let tauri::WindowEvent::Focused(focused) = event {
+                            if !focused {
+                                home_blur_cancel.store(false, Ordering::SeqCst);
+                                let cancel = home_blur_cancel.clone();
+                                let app_c = app_h.clone();
+                                std::thread::spawn(move || {
+                                    std::thread::sleep(Duration::from_millis(300));
+                                    if cancel.load(Ordering::SeqCst) {
+                                        return;
+                                    }
+                                    if crate::commands::any_screenpipe_webview_has_focus(&app_c) {
+                                        return;
+                                    }
+                                    if crate::commands::is_main_close_in_progress() {
+                                        return;
+                                    }
+                                    let expected_gen =
+                                        crate::commands::current_window_shortcuts_generation();
+                                    let app2 = app_c.clone();
+                                    std::thread::spawn(move || {
+                                        info!(
+                                            "shortcut-sync: unregister execute (reason=home_blur_no_screenpipe_focus)"
+                                        );
+                                        let _ = crate::commands::unregister_window_shortcuts_if_generation_unchanged(
+                                            app2,
+                                            expected_gen,
+                                            "home_blur_no_screenpipe_focus",
+                                        );
+                                    });
+                                });
+                            } else {
+                                home_blur_cancel.store(true, Ordering::SeqCst);
+                                let app_c = app_h.clone();
+                                std::thread::spawn(move || {
+                                    info!(
+                                        "shortcut-sync: register_if_visible execute (reason=home_focus)"
+                                    );
+                                    crate::commands::register_window_shortcuts_if_main_visible(
+                                        app_c,
+                                    );
+                                });
+                            }
+                        }
+                    });
+                }
 
                 // Disable WKWebView's native scroll so wheel events reach JavaScript
                 // (needed for embedded timeline scroll gestures)
@@ -1193,7 +1447,8 @@ impl ShowRewindWindow {
                 let bar_w = 680.0_f64;
                 let bar_h = 80.0; // input row + footer
                 let (x, y) = if let Ok(Some(monitor)) = app.primary_monitor() {
-                    let logical: LogicalSize<f64> = monitor.size().to_logical(monitor.scale_factor());
+                    let logical: LogicalSize<f64> =
+                        monitor.size().to_logical(monitor.scale_factor());
                     let pos = monitor.position();
                     let scale = monitor.scale_factor();
                     let origin_x = pos.x as f64 / scale;
@@ -1206,30 +1461,28 @@ impl ShowRewindWindow {
                     (200.0, 140.0)
                 };
                 let bar_w = if let Ok(Some(monitor)) = app.primary_monitor() {
-                    let logical: LogicalSize<f64> = monitor.size().to_logical(monitor.scale_factor());
+                    let logical: LogicalSize<f64> =
+                        monitor.size().to_logical(monitor.scale_factor());
                     bar_w.min(logical.width - 40.0)
                 } else {
                     bar_w
                 };
 
-                let builder = WebviewWindow::builder(
-                    app,
-                    self.id().label(),
-                    WebviewUrl::App(url.into()),
-                )
-                .title("")
-                .visible(false) // show after panel conversion
-                .accept_first_mouse(true)
-                .shadow(true)
-                .decorations(false)
-                .transparent(true)
-                .always_on_top(true)
-                .visible_on_all_workspaces(true)
-                .inner_size(bar_w, bar_h)
-                .min_inner_size(400.0, 56.0)
-                .position(x, y)
-                .focused(true)
-                .resizable(true);
+                let builder =
+                    WebviewWindow::builder(app, self.id().label(), WebviewUrl::App(url.into()))
+                        .title("")
+                        .visible(false) // show after panel conversion
+                        .accept_first_mouse(true)
+                        .shadow(true)
+                        .decorations(false)
+                        .transparent(true)
+                        .always_on_top(true)
+                        .visible_on_all_workspaces(true)
+                        .inner_size(bar_w, bar_h)
+                        .min_inner_size(400.0, 56.0)
+                        .position(x, y)
+                        .focused(true)
+                        .resizable(true);
 
                 let window = builder.build()?;
 
@@ -1251,7 +1504,8 @@ impl ShowRewindWindow {
                                 // Do NOT use to_panel() — its Id::from_retained_ptr causes
                                 // use-after-free on window.close() → SIGSEGV
                                 let nspanel_class: id = msg_send![
-                                    tauri_nspanel::raw_nspanel::RawNSPanel::class(), class
+                                    tauri_nspanel::raw_nspanel::RawNSPanel::class(),
+                                    class
                                 ];
                                 object_setClass(ns_win, nspanel_class);
 
@@ -1283,7 +1537,7 @@ impl ShowRewindWindow {
             }
             ShowRewindWindow::Onboarding => {
                 if onboarding_store.is_completed {
-                    return ShowRewindWindow::Main.show(app);
+                    return ShowRewindWindow::Home { page: None }.show(app);
                 }
 
                 // Clamp onboarding window size to primary monitor to prevent min > max panic
@@ -1344,43 +1598,44 @@ impl ShowRewindWindow {
 
                             if let Ok(panel) = window_clone.to_panel() {
                                 let chat_on_top = SettingsStore::get(window_clone.app_handle())
-                                .unwrap_or_default()
-                                .unwrap_or_default()
-                                .chat_always_on_top;
+                                    .unwrap_or_default()
+                                    .unwrap_or_default()
+                                    .chat_always_on_top;
 
-                            if chat_on_top {
-                                // Level 1001 to appear above fullscreen apps
-                                panel.set_level(1001);
-                                // NonActivatingPanel (128) so clicking the chat doesn't
-                                // activate the app (which would switch Spaces away from
-                                // fullscreen apps). Preserve existing style bits.
-                                unsafe {
-                                    let current: i32 = msg_send![&*panel, styleMask];
-                                    panel.set_style_mask(current | 128);
+                                if chat_on_top {
+                                    // Level 1001 to appear above fullscreen apps
+                                    panel.set_level(1001);
+                                    // NonActivatingPanel (128) so clicking the chat doesn't
+                                    // activate the app (which would switch Spaces away from
+                                    // fullscreen apps). Preserve existing style bits.
+                                    unsafe {
+                                        let current: i32 = msg_send![&*panel, styleMask];
+                                        panel.set_style_mask(current | 128);
+                                    }
+                                } else {
+                                    panel.set_level(0);
                                 }
-                            } else {
-                                panel.set_level(0);
-                            }
 
-                            // Don't hide when app deactivates
-                            panel.set_hides_on_deactivate(false);
+                                // Don't hide when app deactivates
+                                panel.set_hides_on_deactivate(false);
 
-                            // Enable dragging by clicking anywhere on the window background
-                            let _: () = unsafe {
-                                msg_send![&*panel, setMovableByWindowBackground: true]
-                            };
+                                // Enable dragging by clicking anywhere on the window background
+                                let _: () = unsafe {
+                                    msg_send![&*panel, setMovableByWindowBackground: true]
+                                };
 
-                            // NSWindowSharingNone=0 hides from screen recorders, NSWindowSharingReadOnly=1 allows capture
-                            let capturable = SettingsStore::get(window_clone.app_handle())
-                                .unwrap_or_default()
-                                .unwrap_or_default()
-                                .show_overlay_in_screen_recording;
-                            let sharing: u64 = if capturable { 1 } else { 0 };
-                            let _: () = unsafe { msg_send![&*panel, setSharingType: sharing] };
+                                // NSWindowSharingNone=0 hides from screen recorders, NSWindowSharingReadOnly=1 allows capture
+                                let capturable = crate::config::is_e2e_mode()
+                                    || SettingsStore::get(window_clone.app_handle())
+                                        .unwrap_or_default()
+                                        .unwrap_or_default()
+                                        .show_overlay_in_screen_recording;
+                                let sharing: u64 = if capturable { 1 } else { 0 };
+                                let _: () = unsafe { msg_send![&*panel, setSharingType: sharing] };
 
-                            // MoveToActiveSpace so show_existing can pull
-                            // it to any Space (including fullscreen).
-                            panel.set_collection_behaviour(
+                                // MoveToActiveSpace so show_existing can pull
+                                // it to any Space (including fullscreen).
+                                panel.set_collection_behaviour(
                                 NSWindowCollectionBehavior::NSWindowCollectionBehaviorMoveToActiveSpace |
                                 NSWindowCollectionBehavior::NSWindowCollectionBehaviorIgnoresCycle |
                                 NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary
@@ -1447,7 +1702,49 @@ impl ShowRewindWindow {
             }
         };
 
+        #[cfg(target_os = "macos")]
+        setup_content_process_handler(&window);
+
         Ok(window)
+    }
+
+    /// Hide Main panel without restoring the previous frontmost app.
+    /// Used when transitioning from Main to another screenpipe window (e.g. Home/Settings)
+    /// so that focus stays with the app instead of bouncing to the previous app.
+    pub fn hide_without_restore(&self, app: &AppHandle) -> tauri::Result<()> {
+        let id = self.id();
+        if id.label() == RewindWindowId::Main.label() {
+            #[cfg(target_os = "macos")]
+            {
+                MAIN_PANEL_SHOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+                let app_clone = app.clone();
+                run_on_main_thread_safe(app, move || {
+                    for label in &["main", "main-window"] {
+                        if let Ok(panel) = app_clone.get_webview_panel(label) {
+                            if panel.is_visible() {
+                                unsafe {
+                                    use objc::{msg_send, sel, sel_impl};
+                                    let _: () = msg_send![&*panel, setAlphaValue: 0.0f64];
+                                }
+                                panel.order_out(None);
+                            }
+                        }
+                    }
+                    // Intentionally do NOT call restore_frontmost_app() here —
+                    // we're transitioning to another screenpipe window.
+                });
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                for label in &["main", "main-window"] {
+                    if let Some(window) = app.get_webview_window(label) {
+                        window.hide().ok();
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn close(&self, app: &AppHandle) -> tauri::Result<()> {

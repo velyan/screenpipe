@@ -7,6 +7,7 @@ import React, { useEffect, useState, useCallback } from "react";
 import { Battery, BatteryCharging, BatteryLow, Zap, Leaf, Gauge } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useSettings } from "@/lib/hooks/use-settings";
+import { localFetch } from "@/lib/api";
 
 interface PowerState {
   battery_pct: number | null;
@@ -49,7 +50,7 @@ export function BatterySaverSection() {
 
   const fetchStatus = useCallback(async () => {
     try {
-      const res = await fetch("http://localhost:3030/power");
+      const res = await localFetch("/power");
       if (res.ok) {
         const data: PowerStatus = await res.json();
         setStatus(data);
@@ -71,7 +72,7 @@ export function BatterySaverSection() {
     if (updating) return;
     setUpdating(true);
     try {
-      const res = await fetch("http://localhost:3030/power", {
+      const res = await localFetch("/power", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ mode }),

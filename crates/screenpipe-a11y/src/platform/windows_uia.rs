@@ -28,14 +28,16 @@ use windows::Win32::UI::Accessibility::{
     AutomationElementMode_Full, AutomationElementMode_None, CUIAutomation, IUIAutomation,
     IUIAutomationCacheRequest, IUIAutomationElement, IUIAutomationFocusChangedEventHandler,
     IUIAutomationFocusChangedEventHandler_Impl, IUIAutomationTreeWalker, TreeScope_Element,
-    TreeScope_Subtree, UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId,
-    UIA_ClassNamePropertyId, UIA_ControlTypePropertyId, UIA_HasKeyboardFocusPropertyId,
-    UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId, UIA_NamePropertyId,
-    UIA_ValueValuePropertyId, UIA_PROPERTY_ID,
+    TreeScope_Subtree, UIA_AcceleratorKeyPropertyId, UIA_AccessKeyPropertyId,
+    UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId, UIA_ClassNamePropertyId,
+    UIA_ControlTypePropertyId, UIA_HasKeyboardFocusPropertyId, UIA_HelpTextPropertyId,
+    UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId, UIA_IsPasswordPropertyId,
+    UIA_LocalizedControlTypePropertyId, UIA_NamePropertyId, UIA_ValueValuePropertyId,
+    UIA_PROPERTY_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId, PeekMessageW,
-    TranslateMessage, MSG, PM_REMOVE,
+    DispatchMessageW, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+    MsgWaitForMultipleObjects, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, QS_ALLINPUT,
 };
 
 /// Shared state for pending focus changes (set by COM handler, read by UIA thread)
@@ -78,6 +80,11 @@ impl UiaContext {
             cache_request.AddProperty(UIA_ValueValuePropertyId)?;
             cache_request.AddProperty(UIA_HasKeyboardFocusPropertyId)?;
             cache_request.AddProperty(UIA_IsKeyboardFocusablePropertyId)?;
+            cache_request.AddProperty(UIA_HelpTextPropertyId)?;
+            cache_request.AddProperty(UIA_IsPasswordPropertyId)?;
+            cache_request.AddProperty(UIA_AcceleratorKeyPropertyId)?;
+            cache_request.AddProperty(UIA_AccessKeyPropertyId)?;
+            cache_request.AddProperty(UIA_LocalizedControlTypePropertyId)?;
 
             // Use Control View (skips raw layout elements, ~50% fewer nodes)
             let control_view_condition = automation.ControlViewCondition()?;
@@ -102,6 +109,11 @@ impl UiaContext {
             walker_cache_request.AddProperty(UIA_ValueValuePropertyId)?;
             walker_cache_request.AddProperty(UIA_HasKeyboardFocusPropertyId)?;
             walker_cache_request.AddProperty(UIA_IsKeyboardFocusablePropertyId)?;
+            walker_cache_request.AddProperty(UIA_HelpTextPropertyId)?;
+            walker_cache_request.AddProperty(UIA_IsPasswordPropertyId)?;
+            walker_cache_request.AddProperty(UIA_AcceleratorKeyPropertyId)?;
+            walker_cache_request.AddProperty(UIA_AccessKeyPropertyId)?;
+            walker_cache_request.AddProperty(UIA_LocalizedControlTypePropertyId)?;
             let control_view_condition2 = automation.ControlViewCondition()?;
             walker_cache_request.SetTreeFilter(&control_view_condition2)?;
             walker_cache_request.SetAutomationElementMode(AutomationElementMode_Full)?;
@@ -199,6 +211,12 @@ impl UiaContext {
         let is_focused = self.get_cached_bool_opt(element, UIA_HasKeyboardFocusPropertyId);
         let is_keyboard_focusable =
             self.get_cached_bool_opt(element, UIA_IsKeyboardFocusablePropertyId);
+        let help_text = self.get_cached_string(element, UIA_HelpTextPropertyId);
+        let is_password = self.get_cached_bool_opt(element, UIA_IsPasswordPropertyId);
+        let accelerator_key = self.get_cached_string(element, UIA_AcceleratorKeyPropertyId);
+        let access_key = self.get_cached_string(element, UIA_AccessKeyPropertyId);
+        let localized_control_type =
+            self.get_cached_string(element, UIA_LocalizedControlTypePropertyId);
 
         let mut children = Vec::new();
         if *count < max_elements {
@@ -237,6 +255,13 @@ impl UiaContext {
             is_enabled,
             is_focused,
             is_keyboard_focusable,
+            help_text,
+            is_password,
+            is_selected: None, // requires SelectionItemPattern, not available via simple cache
+            is_expanded: None, // requires ExpandCollapsePattern, not available via simple cache
+            accelerator_key,
+            access_key,
+            localized_control_type,
             children,
         }
     }
@@ -260,6 +285,12 @@ impl UiaContext {
         let is_focused = self.get_cached_bool_opt(element, UIA_HasKeyboardFocusPropertyId);
         let is_keyboard_focusable =
             self.get_cached_bool_opt(element, UIA_IsKeyboardFocusablePropertyId);
+        let help_text = self.get_cached_string(element, UIA_HelpTextPropertyId);
+        let is_password = self.get_cached_bool_opt(element, UIA_IsPasswordPropertyId);
+        let accelerator_key = self.get_cached_string(element, UIA_AcceleratorKeyPropertyId);
+        let access_key = self.get_cached_string(element, UIA_AccessKeyPropertyId);
+        let localized_control_type =
+            self.get_cached_string(element, UIA_LocalizedControlTypePropertyId);
 
         let mut children = Vec::new();
         if *count < max_elements {
@@ -290,6 +321,13 @@ impl UiaContext {
             is_enabled,
             is_focused,
             is_keyboard_focusable,
+            help_text,
+            is_password,
+            is_selected: None,
+            is_expanded: None,
+            accelerator_key,
+            access_key,
+            localized_control_type,
             children,
         }
     }
@@ -661,14 +699,62 @@ pub fn run_uia_thread(
             }
         }
 
-        // Sleep to avoid busy-waiting (50ms = responsive but low CPU)
-        std::thread::sleep(Duration::from_millis(50));
+        // Block until a Windows message arrives or a computed timeout elapses.
+        // This replaces the old 50ms sleep-poll: the thread stays asleep until
+        // something actually needs to happen (COM event, debounce, or re-capture).
+        let wait_ms = compute_next_timeout(
+            &pending_focus,
+            debounce_dur,
+            &last_capture_time,
+            interval_dur,
+            &config,
+        );
+        unsafe {
+            MsgWaitForMultipleObjects(None, false, wait_ms as u32, QS_ALLINPUT);
+        }
     }
 
     // Cleanup
     let _ = uia.unsubscribe_focus_changes(&handler_interface);
     unsafe { CoUninitialize() };
     debug!("UIA worker thread stopped");
+}
+
+/// Compute the next timeout for MsgWaitForMultipleObjects.
+/// Returns the minimum of:
+/// - Time until debounce fires (if pending focus exists)
+/// - Time until periodic re-capture
+/// - Max 1000ms safety ceiling
+fn compute_next_timeout(
+    pending_focus: &Arc<Mutex<Option<PendingFocus>>>,
+    debounce_dur: Duration,
+    last_capture_time: &Instant,
+    interval_dur: Duration,
+    config: &UiCaptureConfig,
+) -> u64 {
+    let mut min_ms: u64 = 1000; // safety ceiling
+
+    // Time until debounce fires
+    if let Some(ref pf) = *pending_focus.lock() {
+        let elapsed = pf.time.elapsed();
+        if elapsed >= debounce_dur {
+            return 0; // Ready now
+        }
+        let remaining = (debounce_dur - elapsed).as_millis() as u64;
+        min_ms = min_ms.min(remaining);
+    }
+
+    // Time until periodic re-capture
+    if config.tree_capture_interval_ms > 0 {
+        let elapsed = last_capture_time.elapsed();
+        if elapsed >= interval_dur {
+            return 0; // Ready now
+        }
+        let remaining = (interval_dur - elapsed).as_millis() as u64;
+        min_ms = min_ms.min(remaining);
+    }
+
+    min_ms.max(1) // avoid 0 (which means infinite in Win32)
 }
 
 /// Capture a window tree and send it through the channel if it changed.
@@ -796,42 +882,12 @@ fn get_window_info(hwnd: HWND) -> (String, Option<String>, u32) {
 
 /// Get text content from the Windows clipboard
 pub fn get_clipboard_text_impl() -> Option<String> {
-    use windows::Win32::Foundation::HANDLE;
-    use windows::Win32::Foundation::HGLOBAL;
-    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
-    use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
-    use windows::Win32::System::Ole::CF_UNICODETEXT;
-
-    unsafe {
-        if OpenClipboard(HWND::default()).is_err() {
-            return None;
-        }
-
-        let result = (|| -> Option<String> {
-            let handle: HANDLE = GetClipboardData(CF_UNICODETEXT.0 as u32).ok()?;
-            let hglobal = HGLOBAL(handle.0);
-            let ptr = GlobalLock(hglobal) as *const u16;
-            if ptr.is_null() {
-                return None;
-            }
-
-            // Find null terminator
-            let mut len = 0;
-            while *ptr.add(len) != 0 {
-                len += 1;
-                if len > 1_000_000 {
-                    break; // Safety cap: 1M chars
-                }
-            }
-
-            let slice = std::slice::from_raw_parts(ptr, len);
-            let text = String::from_utf16_lossy(slice);
-            let _ = GlobalUnlock(hglobal);
-            Some(text)
-        })();
-
-        let _ = CloseClipboard();
-        result
+    let mut clipboard = arboard::Clipboard::new().ok()?;
+    let text = clipboard.get_text().ok()?;
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
     }
 }
 
@@ -915,6 +971,13 @@ mod tests {
             is_enabled: true,
             is_focused: None,
             is_keyboard_focusable: None,
+            help_text: None,
+            is_password: None,
+            is_selected: None,
+            is_expanded: None,
+            accelerator_key: None,
+            access_key: None,
+            localized_control_type: None,
             children: vec![],
         };
         let node2 = AccessibilityNode {
@@ -927,6 +990,13 @@ mod tests {
             is_enabled: true,
             is_focused: None,
             is_keyboard_focusable: None,
+            help_text: None,
+            is_password: None,
+            is_selected: None,
+            is_expanded: None,
+            accelerator_key: None,
+            access_key: None,
+            localized_control_type: None,
             children: vec![],
         };
         assert_ne!(compute_tree_hash(&node1), compute_tree_hash(&node2));
@@ -949,6 +1019,13 @@ mod tests {
             is_enabled: true,
             is_focused: None,
             is_keyboard_focusable: None,
+            help_text: None,
+            is_password: None,
+            is_selected: None,
+            is_expanded: None,
+            accelerator_key: None,
+            access_key: None,
+            localized_control_type: None,
             children: vec![AccessibilityNode {
                 control_type: "Button".to_string(),
                 name: Some("OK".to_string()),
@@ -959,6 +1036,13 @@ mod tests {
                 is_enabled: true,
                 is_focused: None,
                 is_keyboard_focusable: None,
+                help_text: None,
+                is_password: None,
+                is_selected: None,
+                is_expanded: None,
+                accelerator_key: None,
+                access_key: None,
+                localized_control_type: None,
                 children: vec![],
             }],
         };
@@ -979,41 +1063,28 @@ mod tests {
             is_enabled: true,
             is_focused: None,
             is_keyboard_focusable: None,
+            help_text: None,
+            is_password: None,
+            is_selected: None,
+            is_expanded: None,
+            accelerator_key: None,
+            access_key: None,
+            localized_control_type: None,
             children: vec![
                 AccessibilityNode {
                     control_type: "Button".to_string(),
                     name: Some("A".to_string()),
-                    automation_id: None,
-                    class_name: None,
-                    value: None,
-                    bounds: None,
-                    is_enabled: true,
-                    is_focused: None,
-                    is_keyboard_focusable: None,
-                    children: vec![],
+                    ..Default::default()
                 },
                 AccessibilityNode {
                     control_type: "Text".to_string(),
                     name: Some("B".to_string()),
-                    automation_id: None,
-                    class_name: None,
-                    value: None,
-                    bounds: None,
-                    is_enabled: true,
-                    is_focused: None,
-                    is_keyboard_focusable: None,
                     children: vec![AccessibilityNode {
                         control_type: "Text".to_string(),
                         name: Some("C".to_string()),
-                        automation_id: None,
-                        class_name: None,
-                        value: None,
-                        bounds: None,
-                        is_enabled: true,
-                        is_focused: None,
-                        is_keyboard_focusable: None,
-                        children: vec![],
+                        ..Default::default()
                     }],
+                    ..Default::default()
                 },
             ],
         };

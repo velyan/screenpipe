@@ -53,6 +53,7 @@ export function TeamSection() {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [inviteEmail, setInviteEmail] = useState("");
   const [sendingInvite, setSendingInvite] = useState(false);
+  const [togglingAutoJoin, setTogglingAutoJoin] = useState(false);
   const [passphraseInput, setPassphraseInput] = useState("");
   const [pendingJoin, setPendingJoin] = useState<{
     teamId: string;
@@ -179,11 +180,34 @@ export function TeamSection() {
   const handleJoinFromLink = async () => {
     if (!inviteInput.trim()) return;
     try {
-      const parsed = new URL(inviteInput.trim());
-      const teamId = parsed.searchParams.get("team_id");
-      const inviteToken = parsed.searchParams.get("invite_token");
-      const claimToken = parsed.searchParams.get("claim");
-      const base64Key = parsed.searchParams.get("key");
+      const input = inviteInput.trim();
+      let teamId: string | null = null;
+      let inviteToken: string | null = null;
+      let claimToken: string | null = null;
+      let base64Key: string | null = null;
+
+      // Handle web URL format: https://screenpi.pe/join/TOKEN#key=BASE64
+      const webMatch = input.match(/screenpi\.pe\/join\/([^#?]+)/);
+      if (webMatch) {
+        inviteToken = webMatch[1];
+        const hashMatch = input.match(/#key=(.+)/);
+        if (hashMatch) base64Key = hashMatch[1];
+
+        // Fetch team_id from server
+        const infoRes = await fetch(`https://screenpi.pe/api/team/join/info?token=${encodeURIComponent(inviteToken)}`);
+        if (!infoRes.ok) throw new Error("invalid or expired invite link");
+        const info = await infoRes.json();
+        if (info.expired) throw new Error("invite link expired");
+        if (info.used) throw new Error("invite link already used");
+        teamId = info.team_id;
+      } else {
+        // Legacy format: screenpipe://join-team?team_id=X&invite_token=Y&key=Z
+        const parsed = new URL(input);
+        teamId = parsed.searchParams.get("team_id");
+        inviteToken = parsed.searchParams.get("invite_token");
+        claimToken = parsed.searchParams.get("claim");
+        base64Key = parsed.searchParams.get("key");
+      }
 
       if (!teamId) throw new Error("invalid invite link — missing team_id");
 
@@ -324,10 +348,7 @@ export function TeamSection() {
     return (
       <div className="space-y-6">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight text-foreground">
-            Team
-          </h1>
-          <p className="text-sm text-muted-foreground mt-0.5">
+          <p className="text-sm text-muted-foreground">
             manage your team and share pipe configurations and content filters
           </p>
         </div>
@@ -356,10 +377,7 @@ export function TeamSection() {
     return (
       <div className="space-y-6">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight text-foreground">
-            Team
-          </h1>
-          <p className="text-sm text-muted-foreground mt-0.5">loading...</p>
+          <p className="text-sm text-muted-foreground">loading...</p>
         </div>
         <Skeleton className="h-32 w-full" />
         <Skeleton className="h-24 w-full" />
@@ -372,10 +390,7 @@ export function TeamSection() {
     return (
       <div className="space-y-6">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight text-foreground">
-            Join Team
-          </h1>
-          <p className="text-sm text-muted-foreground mt-0.5">
+          <p className="text-sm text-muted-foreground">
             enter the passphrase from your team admin to complete joining
           </p>
         </div>
@@ -431,10 +446,7 @@ export function TeamSection() {
     return (
       <div className="space-y-6">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight text-foreground">
-            Team
-          </h1>
-          <p className="text-sm text-muted-foreground mt-0.5">
+          <p className="text-sm text-muted-foreground">
             share pipe configurations and content filters with your team using end-to-end encryption
           </p>
         </div>
@@ -476,7 +488,7 @@ export function TeamSection() {
           {showJoinInput ? (
             <div className="flex gap-2">
               <Input
-                placeholder="screenpipe://join-team?team_id=...&key=..."
+                placeholder="paste invite link (https://screenpi.pe/join/... or screenpipe://...)"
                 value={inviteInput}
                 onChange={(e) => setInviteInput(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && handleJoinFromLink()}
@@ -531,10 +543,7 @@ export function TeamSection() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight text-foreground">
-            Team
-          </h1>
-          <p className="text-sm text-muted-foreground mt-0.5">
+          <p className="text-sm text-muted-foreground">
             {team.team.name}
           </p>
         </div>
@@ -549,6 +558,32 @@ export function TeamSection() {
           </Badge>
         </div>
       </div>
+
+      {/* Missing encryption key — need invite link to sync */}
+      {team.missingKey && (
+        <Card className="p-4 border-yellow-500/50 bg-yellow-500/5">
+          <div className="flex items-center gap-2 mb-2">
+            <Lock className="h-4 w-4 text-yellow-600" />
+            <h3 className="text-sm font-medium text-yellow-600">encryption key missing on this device</h3>
+          </div>
+          <p className="text-xs text-muted-foreground mb-3">
+            you&apos;re in the team but the encryption key isn&apos;t on this device.
+            paste the team invite link to sync the key.
+          </p>
+          <div className="flex items-center gap-2">
+            <Input
+              placeholder="paste invite link (https://screenpi.pe/join/...)"
+              value={inviteInput}
+              onChange={(e) => setInviteInput(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && handleJoinFromLink()}
+              className="h-8 text-xs font-mono"
+            />
+            <Button size="sm" onClick={handleJoinFromLink} disabled={joining || !inviteInput.trim()}>
+              {joining ? <Loader2 className="h-3 w-3 animate-spin" /> : "sync key"}
+            </Button>
+          </div>
+        </Card>
+      )}
 
       {/* Invite link (admin only) */}
       {isAdmin && team.inviteLink && (
@@ -614,6 +649,82 @@ export function TeamSection() {
         </Card>
       )}
 
+      {/* Auto-join by domain (admin only) */}
+      {isAdmin && (
+        <Card className="p-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-medium flex items-center gap-1.5">
+                <Globe className="h-4 w-4" />
+                auto-join by email domain
+              </h3>
+              <p className="text-xs text-muted-foreground mt-1">
+                {team.team?.auto_join_domain
+                  ? `anyone signing up with @${team.team.auto_join_domain} auto-joins this team`
+                  : "new users with your company email domain will auto-join this team"}
+              </p>
+            </div>
+            <Button
+              variant={team.team?.auto_join_domain ? "destructive" : "outline"}
+              size="sm"
+              className="text-xs whitespace-nowrap"
+              disabled={togglingAutoJoin}
+              onClick={async () => {
+                setTogglingAutoJoin(true);
+                try {
+                  const userEmail = settings.user?.email || "";
+                  const userDomain = userEmail.split("@")[1]?.toLowerCase();
+                  const isEnabled = !!team.team?.auto_join_domain;
+                  const newDomain = isEnabled ? null : userDomain;
+
+                  if (!isEnabled && !userDomain) {
+                    toast({ title: "could not detect your email domain", variant: "destructive" });
+                    return;
+                  }
+
+                  const token = settings.user?.token;
+                  const res = await fetch("https://screenpi.pe/api/team", {
+                    method: "PATCH",
+                    headers: {
+                      "Content-Type": "application/json",
+                      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+                    },
+                    body: JSON.stringify({ auto_join_domain: newDomain }),
+                  });
+
+                  const data = await res.json();
+                  if (!res.ok) {
+                    toast({ title: data.error || "failed to update", variant: "destructive" });
+                    return;
+                  }
+
+                  if (data.retro_added > 0) {
+                    toast({ title: `auto-join enabled — ${data.retro_added} existing user(s) added to team` });
+                  } else {
+                    toast({ title: isEnabled ? "auto-join disabled" : "auto-join enabled" });
+                  }
+
+                  // Refresh team data
+                  team.fetchTeam();
+                } catch (e: any) {
+                  toast({ title: "failed to update", description: e.message, variant: "destructive" });
+                } finally {
+                  setTogglingAutoJoin(false);
+                }
+              }}
+            >
+              {togglingAutoJoin ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : team.team?.auto_join_domain ? (
+                "disable"
+              ) : (
+                "enable"
+              )}
+            </Button>
+          </div>
+        </Card>
+      )}
+
       {/* Members */}
       <Card className="p-4">
         <h3 className="text-sm font-medium mb-3 flex items-center gap-1.5">
@@ -627,8 +738,10 @@ export function TeamSection() {
               className="flex items-center justify-between py-1.5 px-2 rounded-md hover:bg-muted/50"
             >
               <div className="flex items-center gap-2">
-                <span className="text-sm font-mono truncate max-w-[180px]">
-                  {m.user_id === settings.user?.id ? "you" : m.user_id}
+                <span className="text-sm truncate max-w-[180px]">
+                  {m.user_id === settings.user?.id
+                    ? (settings.user?.name || "you")
+                    : (m.name || m.email?.split("@")[0] || m.user_id.slice(0, 8) + "…")}
                 </span>
                 <Badge variant="outline" className="text-[10px]">
                   {m.role}

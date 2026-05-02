@@ -1,6 +1,6 @@
 [package]
 name = "screenpipe-app"
-version = "2.2.142"
+version = "2.4.125"
 description = "24/7 memory for your desktop. 100% local."
 authors = ["you"]
 license = ""
@@ -22,6 +22,9 @@ tauri = { version = "=2.10.1", features = [
   "devtools",
   "image-png",
   "image-ico",
+  # Embedded child webview (the agent-controlled browser sidebar) requires
+  # WindowBuilder::add_child, which is currently behind the unstable feature.
+  "unstable",
 ] }
 tauri-utils = { version = "=2.8.2", features = [] }
 # plugins
@@ -38,6 +41,7 @@ tauri-plugin-http = "=2.5.7"
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+base64 = "0.22"
 
 tower-http = { version = "0.4.0", features = ["cors", "trace"] }
 http = "0.2"
@@ -61,7 +65,7 @@ dark-light = "2.0.0"
 tokio = { version = "1.36.0", features = ["full"] }
 
 # HTTP client
-reqwest = { version = "=0.12.12", features = ["blocking", "multipart", "json"] }
+reqwest = { version = "=0.12.12", default-features = false, features = ["blocking", "multipart", "json", "rustls-tls", "rustls-tls-native-roots"] }
 
 # tracing
 tracing = "0.1.40"
@@ -95,21 +99,24 @@ raw-window-handle = "0.6"
 
 notify = "8.0.0"
 futures = "0.3.30"
-async-stream = "0.3"
+tokio-tungstenite = "0.24"
 
 chrono = "0.4.39"
 chrono-tz = "0.10"
 tauri-plugin-opener = "2.5.3"
 uuid = { version = "1.0", features = ["v4"] }
 urlencoding = "2"
+url = "2"
+async-trait = "0.1"
 
 # Cloud sync utilities
 hostname = "0.4"
 
 # Screenpipe core (for sync)
-screenpipe-core = { path = "../../../crates/screenpipe-core", features = ["cloud-sync"] }
+screenpipe-core = { path = "../../../crates/screenpipe-core", features = ["cloud-sync", "secrets"] }
 
 # Embedded screenpipe server
+screenpipe-config = { path = "../../../crates/screenpipe-config", features = ["specta"] }
 screenpipe-engine = { path = "../../../crates/screenpipe-engine", default-features = false }
 screenpipe-screen = { path = "../../../crates/screenpipe-screen" }
 screenpipe-a11y = { path = "../../../crates/screenpipe-a11y" }
@@ -117,13 +124,20 @@ screenpipe-audio = { path = "../../../crates/screenpipe-audio" }
 screenpipe-db = { path = "../../../crates/screenpipe-db" }
 screenpipe-vault = { path = "../../../crates/screenpipe-vault" }
 screenpipe-connect = { path = "../../../crates/screenpipe-connect" }
+screenpipe-secrets = { path = "../../../crates/screenpipe-secrets" }
 screenpipe-events = { path = "../../../crates/screenpipe-events" }
+sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio-rustls"] }
 image = "0.25.5"
 icalendar = "0.17"
+
+# jemalloc — aggressively returns freed pages to OS, reducing RSS bloat
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
 
 [target."cfg(not(any(target_os = \"android\", target_os = \"ios\")))".dependencies]
 tauri-plugin-cli = "2.4.1"
 tauri-plugin-global-shortcut = "2.3.1"
+tauri-plugin-webdriver = { version = "0.2", optional = true }
 
 [target."cfg(any(target_os = \"macos\", windows, target_os = \"linux\"))".dependencies]
 tauri-plugin-single-instance = { version = "2.3.7", features = ["deep-link"] }
@@ -157,6 +171,7 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Dwm",
+    "Win32_Security_Cryptography",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -171,13 +186,14 @@ image = "0.25.5"
 futures-channel = "0.3.30"
 lazy_static = "1.5.0"
 
-
 [features]
+default = ["custom-protocol", "qwen3-asr", "parakeet"]
 metal = ["screenpipe-audio/metal"]
 pulseaudio = ["screenpipe-audio/pulseaudio"]
+directml = ["screenpipe-engine/directml"]
 vulkan = ["screenpipe-audio/vulkan"]
 cargo-clippy = []
-default = ["custom-protocol", "qwen3-asr"]
+e2e = ["tauri-plugin-webdriver"]
 
 # DO NOT REMOVE!!
 custom-protocol = ["tauri/custom-protocol"]
@@ -194,6 +210,10 @@ enterprise-build = []
 apple-intelligence = ["screenpipe-engine/apple-intelligence"]
 
 qwen3-asr = ["screenpipe-engine/qwen3-asr"]
+parakeet = ["screenpipe-engine/parakeet"]
+# macOS only — requires Apple MLX (Metal)
+parakeet-mlx = ["screenpipe-engine/parakeet-mlx"]
+jemalloc = ["tikv-jemallocator"]
 
 
 [package.metadata.cargo-machete]

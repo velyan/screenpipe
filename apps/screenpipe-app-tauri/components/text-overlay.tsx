@@ -285,7 +285,10 @@ export const TextOverlay = memo(function TextOverlay({
 			if (blockWidth <= 0 || blockHeight <= 0) continue;
 
 			// Skip if this highlight largely overlaps an existing one
-			// (OCR + accessibility can return near-identical bounding boxes)
+			// (OCR + accessibility can return near-identical bounding boxes).
+			// Compare against the smaller of the two areas so a tight word box
+			// inside a paragraph-sized one isn't suppressed when both match.
+			const thisArea = blockWidth * blockHeight;
 			const isDuplicate = result.some(existing => {
 				const overlapLeft = Math.max(existing.left, blockLeft);
 				const overlapTop = Math.max(existing.top, blockTop);
@@ -293,8 +296,9 @@ export const TextOverlay = memo(function TextOverlay({
 				const overlapBottom = Math.min(existing.top + existing.height, blockTop + blockHeight);
 				if (overlapRight <= overlapLeft || overlapBottom <= overlapTop) return false;
 				const overlapArea = (overlapRight - overlapLeft) * (overlapBottom - overlapTop);
-				const thisArea = blockWidth * blockHeight;
-				return overlapArea > thisArea * 0.5;
+				const existingArea = existing.width * existing.height;
+				const minArea = Math.min(thisArea, existingArea);
+				return overlapArea > minArea * 0.7;
 			});
 			if (isDuplicate) continue;
 
@@ -346,6 +350,12 @@ export const TextOverlay = memo(function TextOverlay({
 						transition: "opacity 600ms ease-out",
 					}}
 				>
+					<style>{`
+						@keyframes screenpipe-search-hl-pulse {
+							0%, 100% { box-shadow: 0 0 6px rgba(250, 204, 21, 0.45); }
+							50%      { box-shadow: 0 0 14px rgba(250, 204, 21, 0.85); }
+						}
+					`}</style>
 					{highlights.map((hl) => (
 						<div
 							key={hl.key}
@@ -355,9 +365,13 @@ export const TextOverlay = memo(function TextOverlay({
 								top: hl.top,
 								width: hl.width,
 								height: hl.height,
-								backgroundColor: "rgba(250, 204, 21, 0.35)",
-								border: "1px solid rgba(250, 204, 21, 0.7)",
-								borderRadius: "2px",
+								backgroundColor: "rgba(250, 204, 21, 0.22)",
+								border: "1px solid rgba(250, 204, 21, 0.85)",
+								borderRadius: "3px",
+								boxShadow: "0 0 6px rgba(250, 204, 21, 0.45)",
+								animation: highlightFading
+									? undefined
+									: "screenpipe-search-hl-pulse 1.8s ease-in-out infinite",
 							}}
 						/>
 					))}

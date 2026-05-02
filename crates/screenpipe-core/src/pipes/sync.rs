@@ -15,7 +15,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use tracing::{info, warn};
 
-use super::parse_frontmatter;
+use super::{
+    load_local_overrides, parse_frontmatter, read_tombstones, save_local_overrides, serialize_pipe,
+};
 
 /// Current schema version for the sync manifest.
 pub const PIPE_SYNC_SCHEMA: u32 = 1;
@@ -144,6 +146,16 @@ pub fn build_local_manifest(pipes_dir: &Path, machine_id: &str) -> PipeSyncManif
                 last_modified_by: machine_id.to_string(),
             },
         );
+    }
+
+    // Load local tombstones so cloud sync doesn't re-import deleted pipes
+    let tombstones = read_tombstones(pipes_dir);
+    for (name, entry) in &tombstones {
+        if !manifest.pipes.contains_key(name) {
+            manifest
+                .tombstones
+                .insert(name.clone(), entry.deleted_at.clone());
+        }
     }
 
     manifest
@@ -297,7 +309,23 @@ pub fn apply_manifest_to_disk(
                         // Force enabled: false for newly imported pipes
                         force_disabled(&synced.raw_content)
                     } else {
-                        synced.raw_content.clone()
+                        // For updates, ALWAYS preserve the local enabled state.
+                        // The enabled flag is device-local — syncing it across
+                        // machines causes one device's toggle to flip others.
+                        let local_overrides = load_local_overrides(pipes_dir);
+                        let local_enabled = if let Some(&ov) = local_overrides.get(name) {
+                            ov
+                        } else if pipe_md.exists() {
+                            // No explicit override — read current enabled from disk
+                            std::fs::read_to_string(&pipe_md)
+                                .ok()
+                                .and_then(|c| parse_frontmatter(&c).ok())
+                                .map(|(cfg, _)| cfg.enabled)
+                                .unwrap_or(false)
+                        } else {
+                            false
+                        };
+                        override_enabled(&synced.raw_content, local_enabled)
                     };
 
                     if let Err(e) = std::fs::write(&pipe_md, &content) {
@@ -324,6 +352,13 @@ pub fn apply_manifest_to_disk(
                         info!("pipe sync: deleted pipe '{}'", name);
                     }
                 }
+                // Clean up device-local enabled override
+                let mut overrides = load_local_overrides(pipes_dir);
+                if overrides.remove(name.as_str()).is_some() {
+                    if let Err(e) = save_local_overrides(pipes_dir, &overrides) {
+                        warn!("failed to remove local override for '{}': {}", name, e);
+                    }
+                }
             }
             PipeSyncAction::Skipped(_) => {}
         }
@@ -338,14 +373,17 @@ pub fn apply_manifest_to_disk(
 
 /// Force `enabled: false` in pipe.md content for imported pipes.
 fn force_disabled(raw_content: &str) -> String {
+    override_enabled(raw_content, false)
+}
+
+/// Override the `enabled` field in pipe.md content with the given value.
+/// Used to apply device-local enabled overrides after sync.
+fn override_enabled(raw_content: &str, enabled: bool) -> String {
     match parse_frontmatter(raw_content) {
         Ok((mut config, body)) => {
-            config.enabled = false;
-            // Re-serialize
-            let mut cfg = config.clone();
-            cfg.name = String::new();
-            match serde_yaml::to_string(&cfg) {
-                Ok(yaml) => format!("---\n{}---\n\n{}\n", yaml, body),
+            config.enabled = enabled;
+            match serialize_pipe(&config, &body) {
+                Ok(content) => content,
                 Err(_) => raw_content.to_string(),
             }
         }

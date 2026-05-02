@@ -13,11 +13,36 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
 };
-use std::time::Duration;
+use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 use crate::server::AppState;
 use crate::ui_recorder::{tree_walker_snapshot, TreeWalkerSnapshot};
+
+/// Cached health response to avoid recomputing on every poll.
+/// Multiple WebSocket clients + HTTP polls can call /health dozens of
+/// times per second. The response only changes meaningfully every ~1s.
+static HEALTH_CACHE: std::sync::LazyLock<RwLock<(u64, Option<HealthCheckResponse>)>> =
+    std::sync::LazyLock::new(|| RwLock::new((0, None)));
+
+/// Minimum interval between full health recomputations (in seconds).
+const HEALTH_CACHE_TTL_SECS: u64 = 1;
+
+/// Describe the most likely cause of a DB-write stall from pool stats.
+/// Old message always said "pool exhaustion likely" which was wrong when the
+/// real cause was elsewhere (e.g. metrics gap on reconciliation path) and the
+/// pools were fully idle. Only call out pool saturation when idle counts are 0.
+fn suspected_stall_cause(read_idle: u32, write_idle: u32) -> &'static str {
+    if write_idle == 0 && read_idle == 0 {
+        "both pools saturated"
+    } else if write_idle == 0 {
+        "write pool saturated"
+    } else if read_idle == 0 {
+        "read pool saturated"
+    } else {
+        "pools idle — cause upstream (writer path, lock contention, or missing metrics)"
+    }
+}
 
 use screenpipe_screen::monitor::{
     get_cached_monitor_descriptions, get_monitor_by_id, list_monitors, list_monitors_detailed,
@@ -34,7 +59,7 @@ pub struct MonitorInfo {
     pub is_default: bool,
 }
 
-#[derive(Serialize, OaSchema, Deserialize)]
+#[derive(Serialize, OaSchema, Deserialize, Clone)]
 pub struct HealthCheckResponse {
     pub status: String,
     pub status_code: u16,
@@ -55,9 +80,27 @@ pub struct HealthCheckResponse {
     pub accessibility: Option<TreeWalkerSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_stats: Option<PoolHealthInfo>,
+    /// True when vision capture loop is alive but DB writes have stopped (pool exhaustion).
+    #[serde(default)]
+    pub vision_db_write_stalled: bool,
+    /// True when audio devices are active but DB writes have stopped (pool exhaustion).
+    #[serde(default)]
+    pub audio_db_write_stalled: bool,
+    /// True when DRM streaming content is detected and capture should be fully stopped.
+    #[serde(default)]
+    pub drm_content_paused: bool,
+    /// True when recording is paused due to work-hours schedule.
+    #[serde(default)]
+    pub schedule_paused: bool,
+    /// Device hostname for remote monitoring
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// Screenpipe version
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
-#[derive(Serialize, OaSchema, Deserialize)]
+#[derive(Serialize, OaSchema, Deserialize, Clone)]
 pub struct PoolHealthInfo {
     pub read_pool_size: u32,
     pub read_pool_idle: u32,
@@ -65,7 +108,7 @@ pub struct PoolHealthInfo {
     pub write_pool_idle: u32,
 }
 
-#[derive(Serialize, OaSchema, Deserialize)]
+#[derive(Serialize, OaSchema, Deserialize, Clone)]
 pub struct PipelineHealthInfo {
     pub uptime_secs: f64,
     pub frames_captured: u64,
@@ -82,7 +125,7 @@ pub struct PipelineHealthInfo {
     pub ocr_cache_hit_rate: f64,
 }
 
-#[derive(Serialize, OaSchema, Deserialize)]
+#[derive(Serialize, OaSchema, Deserialize, Clone)]
 pub struct AudioPipelineHealthInfo {
     pub uptime_secs: f64,
     pub chunks_sent: u64,
@@ -128,6 +171,35 @@ pub struct AudioPipelineHealthInfo {
 
 #[oasgen]
 pub async fn health_check(State(state): State<Arc<AppState>>) -> JsonResponse<HealthCheckResponse> {
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    // Return cached response if still fresh. This prevents thundering-herd
+    // scenarios where dozens of WebSocket clients + HTTP polls recompute the
+    // full health response simultaneously.
+    {
+        let cache = HEALTH_CACHE.read().await;
+        if now_ts.saturating_sub(cache.0) < HEALTH_CACHE_TTL_SECS {
+            if let Some(ref cached) = cache.1 {
+                return JsonResponse(cached.clone());
+            }
+        }
+    }
+
+    let response = health_check_inner(&state).await;
+
+    // Cache the result
+    {
+        let mut cache = HEALTH_CACHE.write().await;
+        *cache = (now_ts, Some(response.clone()));
+    }
+
+    JsonResponse(response)
+}
+
+async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -210,15 +282,27 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> JsonResponse<He
     {
         let capture_fresh =
             now_ts.saturating_sub(vision_snap.last_capture_attempt_ts) < threshold_secs;
-        let db_stale = vision_snap.last_db_write_ts == 0
-            || now_ts.saturating_sub(vision_snap.last_db_write_ts) > threshold_secs;
+        // Require at least one successful DB write before flagging a stall.
+        // last_db_write_ts == 0 means "never written yet" (pipeline warming up),
+        // not "writes stopped" — same fix as audio side.
+        let db_stale = vision_snap.last_db_write_ts > 0
+            && now_ts.saturating_sub(vision_snap.last_db_write_ts) > threshold_secs;
         let stalled = capture_fresh && db_stale;
         if stalled {
-            warn!(
-                "health_check: vision DB writes stalled — capture heartbeat {}s ago but last DB write {}s ago (pool exhaustion likely)",
-                now_ts.saturating_sub(vision_snap.last_capture_attempt_ts),
-                if vision_snap.last_db_write_ts > 0 { now_ts.saturating_sub(vision_snap.last_db_write_ts) } else { 0 },
-            );
+            // throttle to once per 60s to avoid log spam (health runs every ~1s)
+            static LAST_VISION_STALL_LOG: AtomicU64 = AtomicU64::new(0);
+            let prev = LAST_VISION_STALL_LOG.load(Ordering::Relaxed);
+            if now_ts.saturating_sub(prev) >= 60 {
+                LAST_VISION_STALL_LOG.store(now_ts, Ordering::Relaxed);
+                let (rs, ri, ws, wi) = state.db.pool_stats();
+                warn!(
+                    "health_check: vision DB writes stalled — capture heartbeat {}s ago but last DB write {}s ago ({}) | pool: read={}/{} idle, write={}/{} idle",
+                    now_ts.saturating_sub(vision_snap.last_capture_attempt_ts),
+                    now_ts.saturating_sub(vision_snap.last_db_write_ts),
+                    suspected_stall_cause(ri, wi),
+                    ri, rs, wi, ws,
+                );
+            }
         }
         stalled
     } else {
@@ -229,15 +313,30 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> JsonResponse<He
         && global_audio_active
         && audio_snap.uptime_secs > 120.0
     {
+        // Only flag a stall when the transcription consumer is actively processing
+        // (heartbeat recent) but DB writes have stopped. This prevents false positives
+        // during silence when VAD filters everything and nothing is written to DB.
+        let transcription_fresh = audio_snap.last_transcription_attempt_ts > 0
+            && now_ts.saturating_sub(audio_snap.last_transcription_attempt_ts) < threshold_secs;
         let db_stale = audio_snap.last_db_write_ts == 0
             || now_ts.saturating_sub(audio_snap.last_db_write_ts) > threshold_secs;
-        if db_stale {
-            warn!(
-                "health_check: audio DB writes stalled — devices active but last DB write {}s ago (pool exhaustion likely)",
-                if audio_snap.last_db_write_ts > 0 { now_ts.saturating_sub(audio_snap.last_db_write_ts) } else { 0 },
-            );
+        let stalled = transcription_fresh && db_stale;
+        if stalled {
+            // throttle to once per 60s to avoid log spam (health runs every ~1s)
+            static LAST_AUDIO_STALL_LOG: AtomicU64 = AtomicU64::new(0);
+            let prev = LAST_AUDIO_STALL_LOG.load(Ordering::Relaxed);
+            if now_ts.saturating_sub(prev) >= 60 {
+                LAST_AUDIO_STALL_LOG.store(now_ts, Ordering::Relaxed);
+                let (rs, ri, ws, wi) = state.db.pool_stats();
+                warn!(
+                    "health_check: audio transcription writes stalled — transcription active but last DB write {}s ago ({}) | pool: read={}/{} idle, write={}/{} idle",
+                    if audio_snap.last_db_write_ts > 0 { now_ts.saturating_sub(audio_snap.last_db_write_ts) } else { 0 },
+                    suspected_stall_cause(ri, wi),
+                    ri, rs, wi, ws,
+                );
+            }
         }
-        db_stale
+        stalled
     } else {
         false
     };
@@ -392,7 +491,7 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> JsonResponse<He
             }
             if vision_db_write_stalled {
                 detail_parts.push(format!(
-                    "vision DB writes stalled for {}s — capture running but data not saved (restart recommended)",
+                    "vision DB writes stalled for {}s — capture running but DB writes not landing",
                     now_ts.saturating_sub(vision_snap.last_db_write_ts)
                 ));
             }
@@ -405,8 +504,11 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> JsonResponse<He
                 ));
             }
             if audio_db_write_stalled {
+                // Audio files themselves are persisted to disk + audio_chunks table
+                // before transcription is attempted. This stall reflects
+                // audio_transcriptions writes, not raw audio loss.
                 detail_parts.push(format!(
-                    "audio DB writes stalled for {}s — devices active but data not saved (restart recommended)",
+                    "audio transcription writes stalled for {}s — audio captured, transcription not landing",
                     now_ts.saturating_sub(audio_snap.last_db_write_ts)
                 ));
             }
@@ -469,7 +571,7 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> JsonResponse<He
         None
     };
 
-    JsonResponse(HealthCheckResponse {
+    HealthCheckResponse {
         status: overall_status.to_string(),
         status_code,
         last_frame_timestamp: last_frame,
@@ -507,22 +609,10 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> JsonResponse<He
             let (meeting_detected, meeting_app) =
                 if let Some(detector) = state.audio_manager.meeting_detector() {
                     let in_meeting = detector.is_in_meeting();
-                    let app = if in_meeting {
-                        match tokio::time::timeout(
-                            Duration::from_millis(500),
-                            detector.current_meeting_app(),
-                        )
-                        .await
-                        {
-                            Ok(app) => app,
-                            Err(_) => {
-                                warn!("health_check: meeting_detector lock timed out after 500ms");
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
+                    // v2 detection reports meeting state via AtomicBool flag;
+                    // the specific app name is tracked in the v2 detection loop,
+                    // not exposed through MeetingDetector.
+                    let app: Option<String> = None;
                     (Some(in_meeting), app)
                 } else {
                     (None, None)
@@ -589,7 +679,13 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> JsonResponse<He
                 write_pool_idle: wi,
             })
         },
-    })
+        vision_db_write_stalled,
+        audio_db_write_stalled,
+        drm_content_paused: crate::drm_detector::drm_content_paused(),
+        schedule_paused: crate::schedule_monitor::schedule_paused(),
+        hostname: hostname::get().ok().and_then(|h| h.into_string().ok()),
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+    }
 }
 
 /// Returns raw vision pipeline metrics snapshot.
@@ -690,5 +786,77 @@ pub async fn api_vision_status() -> JsonResponse<serde_json::Value> {
             "status": "error",
             "message": e
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_response(status: &str) -> HealthCheckResponse {
+        HealthCheckResponse {
+            status: status.to_string(),
+            status_code: 200,
+            last_frame_timestamp: None,
+            last_audio_timestamp: None,
+            frame_status: "ok".to_string(),
+            audio_status: "ok".to_string(),
+            message: "test".to_string(),
+            verbose_instructions: None,
+            device_status_details: None,
+            monitors: None,
+            pipeline: None,
+            audio_pipeline: None,
+            accessibility: None,
+            pool_stats: None,
+            vision_db_write_stalled: false,
+            audio_db_write_stalled: false,
+            drm_content_paused: false,
+            schedule_paused: false,
+            hostname: None,
+            version: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn health_cache_fresh_then_stale() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Seed the cache with a fresh timestamp
+        {
+            let mut cache = HEALTH_CACHE.write().await;
+            *cache = (now, Some(dummy_response("healthy")));
+        }
+
+        // Reading within TTL should return the cached value
+        {
+            let cache = HEALTH_CACHE.read().await;
+            assert!(now.saturating_sub(cache.0) < HEALTH_CACHE_TTL_SECS);
+            assert_eq!(cache.1.as_ref().unwrap().status, "healthy");
+        }
+
+        // Now seed a stale timestamp
+        let stale_ts = now - HEALTH_CACHE_TTL_SECS - 1;
+        {
+            let mut cache = HEALTH_CACHE.write().await;
+            *cache = (stale_ts, Some(dummy_response("degraded")));
+        }
+
+        // Should be expired
+        {
+            let cache = HEALTH_CACHE.read().await;
+            assert!(now.saturating_sub(cache.0) >= HEALTH_CACHE_TTL_SECS);
+        }
+    }
+
+    #[test]
+    fn health_response_is_cloneable() {
+        let resp = dummy_response("healthy");
+        let cloned = resp.clone();
+        assert_eq!(cloned.status, "healthy");
+        assert_eq!(cloned.status_code, 200);
     }
 }

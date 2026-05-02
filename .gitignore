@@ -70,5 +70,14 @@ screenpipe-app-tauri/src-tauri/.next/
 # Claude Code
 .claude/worktrees/
 .claude/*.local* # local changes are specific to the individual developer, let's not check them in for everyone.
+.claude/*.lock
 apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-arm64-1.19.2/
 apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.19.2/
+crates/screenpipe-audio/onnxruntime-win-x64-1.19.2.zip
+crates/screenpipe-audio/onnxruntime-win-arm64-1.19.2.zip
+crates/screenpipe-audio/openblas-0.3.31-x64.zip
+crates/screenpipe-audio/openblas-0.3.31-woa64-dll.zip
+apps/screenpipe-app-tauri/src-tauri/openblas/
+apps/screenpipe-app-tauri/src-tauri/mlx.metallib
+.serena/
+.worktrees/

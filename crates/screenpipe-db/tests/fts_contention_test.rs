@@ -23,7 +23,9 @@ mod fts_contention_tests {
             .with_max_level(tracing::Level::INFO)
             .try_init();
 
-        let db = DatabaseManager::new("sqlite::memory:").await.unwrap();
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
 
         sqlx::migrate!("./src/migrations")
             .run(&db.pool)
@@ -96,7 +98,7 @@ mod fts_contention_tests {
             let t0 = Instant::now();
             for (frame_id, text, app_name, window_name) in chunk {
                 sqlx::query(
-                    "INSERT OR IGNORE INTO frames_fts(id, full_text, app_name, window_name, browser_url) \
+                    "INSERT OR IGNORE INTO frames_fts(rowid, full_text, app_name, window_name, browser_url) \
                      VALUES (?1, ?2, ?3, ?4, '')",
                 )
                 .bind(frame_id)
@@ -190,7 +192,7 @@ mod fts_contention_tests {
                 let mut tx = db_for_fts.begin_immediate_with_retry().await.unwrap();
                 for (frame_id, text, app_name, window_name) in chunk {
                     sqlx::query(
-                        "INSERT OR IGNORE INTO frames_fts(id, full_text, app_name, window_name, browser_url) \
+                        "INSERT OR IGNORE INTO frames_fts(rowid, full_text, app_name, window_name, browser_url) \
                          VALUES (?1, ?2, ?3, ?4, '')",
                     )
                     .bind(frame_id)

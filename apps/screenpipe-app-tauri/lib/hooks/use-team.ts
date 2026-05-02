@@ -26,12 +26,16 @@ export interface TeamInfo {
   name: string;
   created_at: string;
   member_count: number;
+  auto_join_domain?: string | null;
 }
 
 export interface TeamMember {
   user_id: string;
   role: "admin" | "member";
   joined_at: string;
+  // populated by backend when /api/team/members joins the users table
+  name?: string | null;
+  email?: string | null;
 }
 
 export interface TeamConfig {
@@ -54,6 +58,8 @@ interface TeamState {
   configs: TeamConfig[];
   inviteLink: string | null;
   invitePassphrase: string | null;
+  /** True when user is in a team but encryption key is not on this device */
+  missingKey: boolean;
   loading: boolean;
   error: string | null;
 }
@@ -104,6 +110,7 @@ export function useTeam() {
     configs: [],
     inviteLink: null,
     invitePassphrase: null,
+    missingKey: false,
     loading: true,
     error: null,
   });
@@ -148,6 +155,7 @@ export function useTeam() {
       // load team key from storage
       const key = await loadTeamKeyFromStore(data.team.id);
       teamKeyRef.current = key;
+      const missingKey = !key;
 
       // generate invite link if admin and has key
       // the invite is now a web URL with the AES key in the URL fragment
@@ -185,6 +193,7 @@ export function useTeam() {
         role: data.role,
         inviteLink,
         invitePassphrase,
+        missingKey,
         loading: false,
       }));
 
@@ -369,6 +378,7 @@ export function useTeam() {
       configs: [],
       inviteLink: null,
       invitePassphrase: null,
+      missingKey: false,
       loading: false,
       error: null,
     });
@@ -398,6 +408,7 @@ export function useTeam() {
       configs: [],
       inviteLink: null,
       invitePassphrase: null,
+      missingKey: false,
       loading: false,
       error: null,
     });

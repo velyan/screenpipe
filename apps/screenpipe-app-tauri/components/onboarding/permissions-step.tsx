@@ -63,9 +63,9 @@ function PermissionRow({
         </div>
       </div>
 
-      <div className="flex flex-col items-start min-w-0">
+      <div className="flex flex-col items-start min-w-0 text-left">
         <span className="font-mono text-xs font-medium">{title}</span>
-        <span className="font-mono text-[10px] text-muted-foreground group-hover:enabled:text-background/50 leading-tight">
+        <span className="font-mono text-[10px] text-muted-foreground group-hover:enabled:text-background/50 leading-tight text-left">
           {subtitle}
         </span>
       </div>
@@ -90,7 +90,7 @@ export default function PermissionsStep({
 }: PermissionsStepProps) {
   const { isMac, isLoading: isPlatformLoading } = usePlatform();
   const [statuses, setStatuses] = useState<Record<string, boolean>>({});
-  const [arcInstalled, setArcInstalled] = useState(false);
+  const [installedBrowsers, setInstalledBrowsers] = useState<string[]>([]);
   const [requesting, setRequesting] = useState(false);
   const [showSkip, setShowSkip] = useState(false);
   const hasAdvancedRef = useRef(false);
@@ -100,39 +100,39 @@ export default function PermissionsStep({
     {
       id: "screen",
       icon: <Monitor className="w-3.5 h-3.5" strokeWidth={1.5} />,
-      title: "screen recording",
-      subtitle: "capture your display for visual context",
+      title: "Capture your screen",
+      subtitle: "Lets Screenpipe index what's on your screen — windows, docs, chats, code",
       check: () => commands.checkScreenRecordingPermission(),
       request: () => commands.requestPermission("screenRecording"),
     },
     {
       id: "mic",
       icon: <Mic className="w-3.5 h-3.5" strokeWidth={1.5} />,
-      title: "microphone",
-      subtitle: "transcribe audio from meetings & conversations",
+      title: "Capture what you say",
+      subtitle: "Lets Screenpipe transcribe your voice in meetings and calls",
       check: () => commands.checkMicrophonePermission(),
       request: () => commands.requestPermission("microphone"),
     },
     {
       id: "accessibility",
       icon: <Keyboard className="w-3.5 h-3.5" strokeWidth={1.5} />,
-      title: "accessibility",
-      subtitle: "read text from any app via the accessibility tree",
+      title: "Read on-screen text",
+      subtitle: "Lets Screenpipe understand app content without OCR",
       check: () => commands.checkAccessibilityPermissionCmd(),
       request: () => commands.requestPermission("accessibility"),
       macOnly: true,
     },
     {
-      id: "arc",
+      id: "browsers",
       icon: <Globe className="w-3.5 h-3.5" strokeWidth={1.5} />,
-      title: "browser urls (arc)",
-      subtitle: "capture the current url from arc browser",
+      title: "Capture browser URLs",
+      subtitle: "So Screenpipe knows what you were reading, not just what the pixels say",
       check: async () => {
-        const granted = await commands.checkArcAutomationPermission();
+        const granted = await commands.checkBrowsersAutomationPermission();
         return granted ? "granted" : "denied";
       },
       request: async () => {
-        await commands.requestArcAutomationPermission();
+        await commands.requestBrowsersAutomationPermission();
       },
       macOnly: true,
       optional: true,
@@ -142,7 +142,7 @@ export default function PermissionsStep({
   // Filter permissions for this platform
   const activePermissions = permissions.filter((p) => {
     if (p.macOnly && !isMac) return false;
-    if (p.id === "arc" && !arcInstalled) return false;
+    if (p.id === "browsers" && installedBrowsers.length === 0) return false;
     return true;
   });
 
@@ -176,15 +176,14 @@ export default function PermissionsStep({
       return changed ? { ...prev, ...results } : prev;
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isMac, arcInstalled]);
+  }, [isMac, installedBrowsers.length]);
 
-  // Check Arc installation once
+  // Check installed browsers once
   useEffect(() => {
     if (isPlatformLoading) return;
-    commands.checkArcInstalled().then(setArcInstalled).catch(() => {});
+    commands.getInstalledBrowsers().then(setInstalledBrowsers).catch(() => {});
   }, [isPlatformLoading]);
 
-  // Non-mac: skip permissions entirely
   useEffect(() => {
     if (isPlatformLoading) return;
     if (!isMac && !hasAdvancedRef.current) {
@@ -251,11 +250,10 @@ export default function PermissionsStep({
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img className="w-12 h-12 mb-2" src="/128x128.png" alt="screenpipe" />
         <h1 className="font-mono text-base font-bold text-foreground">
-          grant permissions
+          Unlock the full experience
         </h1>
         <p className="font-mono text-[10px] text-muted-foreground mt-1 text-center max-w-xs">
-          screenpipe needs these macos permissions to capture your screen, audio,
-          and app content
+          Enable these permissions to get the most out of Screenpipe
         </p>
       </div>
 

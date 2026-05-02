@@ -3,6 +3,10 @@
 ## Product vision
 Read `VISION.md` before making product decisions, adding features, or changing UX. Stability over features. Activation over new capabilities. No feature creep.
 
+## Design
+
+Refer to `DESIGN.md` before making design decisions.
+
 ## File Headers
 Every source file (.rs, .ts, .tsx, .js, .jsx, .swift, .py) must include this comment at the top (below any shebangs or `use` directives that must be first):
 
@@ -38,3 +42,7 @@ Use `#` for Python, `//` for Rust/TS/JS/Swift. Keep it as the first comment in t
 
 ## git usage
 - make sure to understand there is always bunch of other agents working on the same codebase in parallel, never delete local code or use git reset or such
+
+## context
+
+- always use progressive disclosure when designing agentic systems

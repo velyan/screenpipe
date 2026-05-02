@@ -18,6 +18,12 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
+/// Overall sync timeout (30 minutes).
+const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Per-file upload timeout (10 minutes — enough for ~2GB at slow speeds).
+const FILE_UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 /// Configuration for remote sync.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncConfig {
@@ -107,12 +113,6 @@ WHERE o.text LIKE '%search%' ORDER BY f.timestamp DESC LIMIT 20;
 SELECT timestamp, transcription, device, is_input_device
 FROM audio_transcriptions
 WHERE transcription LIKE '%search%' ORDER BY timestamp DESC LIMIT 20;
-```
-
-**accessibility** — Accessibility tree text (macOS)
-```sql
-SELECT timestamp, app_name, window_name, text_content
-FROM accessibility WHERE text_content LIKE '%search%' ORDER BY timestamp DESC;
 ```
 
 **speakers** — Identified speakers
@@ -274,6 +274,14 @@ async fn list_remote_recursive(sftp: &SftpSession, base: &str, prefix: &str) -> 
     files
 }
 
+/// Get remote file metadata (size, mtime). Returns None if file doesn't exist.
+async fn remote_file_meta(sftp: &SftpSession, path: &str) -> Option<(u64, Option<u64>)> {
+    sftp.metadata(path)
+        .await
+        .ok()
+        .map(|m| (m.size.unwrap_or(0), m.mtime.map(|t| t as u64)))
+}
+
 async fn upload_file(sftp: &SftpSession, local: &Path, remote: &str) -> Result<u64> {
     let mut src = tokio::fs::File::open(local)
         .await
@@ -300,6 +308,19 @@ async fn upload_file(sftp: &SftpSession, local: &Path, remote: &str) -> Result<u
         .await
         .map_err(|e| anyhow::anyhow!("close {}: {}", remote, e))?;
     Ok(written)
+}
+
+/// Upload a file with a per-file timeout.
+async fn upload_file_with_timeout(sftp: &SftpSession, local: &Path, remote: &str) -> Result<u64> {
+    tokio::time::timeout(FILE_UPLOAD_TIMEOUT, upload_file(sftp, local, remote))
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "upload timed out after {}s: {}",
+                FILE_UPLOAD_TIMEOUT.as_secs(),
+                remote
+            )
+        })?
 }
 
 /// Recursively sync a local directory to remote. Skips files already on remote.
@@ -353,14 +374,41 @@ async fn sync_dir(
             ))
             .await;
         } else if ft.is_file() {
-            // Always re-upload db.sqlite (it changes every sync).
-            // For everything else, skip if already on remote.
             let is_db = name == "db.sqlite";
-            if !is_db && remote_files.contains(&relative) {
+
+            if is_db {
+                // Delta sync for db.sqlite: compare local size+mtime vs remote.
+                // Only re-upload if the file has actually changed.
+                let local_meta = entry.metadata().await.ok();
+                let local_size = local_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+                let local_mtime = local_meta
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs());
+
+                if let Some((remote_size, remote_mtime)) =
+                    remote_file_meta(sftp, &remote_path).await
+                {
+                    let size_match = remote_size == local_size;
+                    let mtime_match = match (local_mtime, remote_mtime) {
+                        (Some(l), Some(r)) => l <= r,
+                        _ => false, // if we can't compare mtime, re-upload
+                    };
+                    if size_match && mtime_match {
+                        debug!("db.sqlite unchanged ({}B), skipping", local_size);
+                        continue;
+                    }
+                    debug!(
+                        "db.sqlite changed: local={}B remote={}B, re-uploading",
+                        local_size, remote_size
+                    );
+                }
+            } else if remote_files.contains(&relative) {
                 continue;
             }
 
-            match upload_file(sftp, &local_path, &remote_path).await {
+            match upload_file_with_timeout(sftp, &local_path, &remote_path).await {
                 Ok(bytes) => {
                     *files_transferred += 1;
                     *bytes_transferred += bytes;
@@ -378,13 +426,23 @@ async fn sync_dir(
 
 /// Sync the entire ~/.screenpipe directory to the remote server.
 pub async fn sync_to_remote(config: &SyncConfig, data_dir: &Path) -> SyncResult {
-    match sync_to_remote_inner(config, data_dir).await {
-        Ok(r) => r,
-        Err(e) => SyncResult {
+    // Wrap the entire sync in a timeout
+    match tokio::time::timeout(SYNC_TIMEOUT, sync_to_remote_inner(config, data_dir)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => SyncResult {
             ok: false,
             files_transferred: 0,
             bytes_transferred: 0,
             error: Some(e.to_string()),
+        },
+        Err(_) => SyncResult {
+            ok: false,
+            files_transferred: 0,
+            bytes_transferred: 0,
+            error: Some(format!(
+                "sync timed out after {} minutes",
+                SYNC_TIMEOUT.as_secs() / 60
+            )),
         },
     }
 }
@@ -394,6 +452,32 @@ async fn sync_to_remote_inner(config: &SyncConfig, data_dir: &Path) -> Result<Sy
         "sync starting → {}@{}:{}",
         config.user, config.host, config.port
     );
+
+    // Checkpoint WAL before syncing so db.sqlite contains all recent data.
+    // This is best-effort — if the DB is locked or doesn't exist, we skip.
+    let db_path = data_dir.join("db.sqlite");
+    if db_path.exists() {
+        let mut wal_cmd = tokio::process::Command::new("sqlite3");
+        wal_cmd
+            .arg(&db_path)
+            .arg("PRAGMA wal_checkpoint(TRUNCATE);");
+        #[cfg(windows)]
+        wal_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        match wal_cmd.output().await {
+            Ok(out) if out.status.success() => {
+                debug!("WAL checkpoint completed before sync");
+            }
+            Ok(out) => {
+                debug!(
+                    "WAL checkpoint returned non-zero (may be locked): {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            Err(e) => {
+                debug!("WAL checkpoint skipped (sqlite3 not available): {}", e);
+            }
+        }
+    }
 
     let (session, sftp) = connect_sftp(config).await?;
 
@@ -528,6 +612,22 @@ pub async fn discover_ssh_hosts() -> Vec<DiscoveredHost> {
     }
 
     hosts.extend(discover_tailscale().await);
+
+    // mDNS discovery — find screenpipe instances advertising on LAN
+    for (host, port) in crate::mdns::browse().await {
+        hosts.push(DiscoveredHost {
+            host: if port != 3030 {
+                format!("{}:{}", host, port)
+            } else {
+                host
+            },
+            port,
+            user: None,
+            key_path: None,
+            source: "mdns".into(),
+            alias: None,
+        });
+    }
 
     // Dedup + filter noise
     let mut seen = HashSet::new();
@@ -681,11 +781,11 @@ fn parse_known_hosts(content: &str) -> Vec<DiscoveredHost> {
 }
 
 async fn discover_tailscale() -> Vec<DiscoveredHost> {
-    let out = match tokio::process::Command::new("tailscale")
-        .args(["status", "--json"])
-        .output()
-        .await
-    {
+    let mut ts_cmd = tokio::process::Command::new("tailscale");
+    ts_cmd.args(["status", "--json"]);
+    #[cfg(windows)]
+    ts_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    let out = match ts_cmd.output().await {
         Ok(o) if o.status.success() => o,
         _ => return vec![],
     };

@@ -44,26 +44,24 @@ fn create_speech_segment(
     let start_f64 = start * (sample_rate as f64);
     let end_f64 = end * (sample_rate as f64);
 
-    let start_idx = start_f64.min((samples.len() - 1600) as f64) as usize;
+    let start_idx = start_f64.min((samples.len().saturating_sub(1600)) as f64) as usize;
     let mut end_idx = end_f64.min(samples.len() as f64) as usize;
 
-    // TODO: Why is this empty sometimes?
-    let mut samples = padded_samples[start_idx..end_idx].to_vec();
-    // // Ensure the segment has at least 1600 samples
     let min_length = 1600;
-    let segment_samples = if end_idx - start_idx < min_length {
-        if end_idx + (min_length - (end_idx - start_idx)) <= samples.len() {
-            // Increase the end index if possible
-            end_idx += min_length - (end_idx - start_idx);
+    let mut segment_vec;
+
+    let segment_samples = if end_idx.saturating_sub(start_idx) < min_length {
+        let diff = min_length - end_idx.saturating_sub(start_idx);
+        if end_idx + diff <= padded_samples.len() {
+            end_idx += diff;
             &padded_samples[start_idx..end_idx]
-        } else if start_idx >= min_length - (end_idx - start_idx) {
-            // Otherwise, pad the samples.
-
-            samples.resize(1600, 0.0);
-
-            samples.as_slice()
+        } else if start_idx >= diff {
+            let start_idx_new = start_idx - diff;
+            &padded_samples[start_idx_new..end_idx]
         } else {
-            &padded_samples[start_idx..end_idx]
+            segment_vec = padded_samples[start_idx..end_idx].to_vec();
+            segment_vec.resize(min_length, 0.0);
+            segment_vec.as_slice()
         }
     } else {
         &padded_samples[start_idx..end_idx]
@@ -121,7 +119,7 @@ fn handle_new_segment(
 pub struct SegmentIterator {
     samples: Vec<f32>,
     sample_rate: u32,
-    session: ort::Session,
+    session: ort::session::Session,
     embedding_extractor: Arc<Mutex<EmbeddingExtractor>>,
     embedding_manager: Arc<Mutex<EmbeddingManager>>,
     current_position: usize,
@@ -176,7 +174,7 @@ impl SegmentIterator {
             .insert_axis(Axis(1))
             .to_owned();
 
-        let inputs = ort::inputs![array].context("Failed to prepare inputs")?;
+        let inputs = ort::inputs![ort::value::TensorRef::from_array_view(array.view())?];
         let ort_outs = self
             .session
             .run(inputs)
@@ -184,7 +182,7 @@ impl SegmentIterator {
         let ort_out = ort_outs.get("output").context("Output tensor not found")?;
 
         let ort_out = ort_out
-            .try_extract_tensor::<f32>()
+            .try_extract_array::<f32>()
             .context("Failed to extract tensor")?;
 
         let mut result = None;
@@ -310,7 +308,7 @@ pub fn get_speaker_from_embedding(
     embedding_manager: &mut EmbeddingManager,
     embedding: Vec<f32>,
 ) -> String {
-    let search_threshold = 0.2; // cosine similarity threshold (1 - distance), equivalent to 0.8 distance
+    let search_threshold = 0.45; // cosine similarity threshold (1 - distance), aligned with DB threshold of 0.55 distance
 
     embedding_manager
         .search_speaker(embedding.clone(), search_threshold)

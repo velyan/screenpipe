@@ -22,35 +22,15 @@ import {
   TooltipTrigger,
   TooltipProvider,
 } from "./ui/tooltip";
+import { localFetch } from "@/lib/api";
 import { useHealthCheck } from "@/lib/hooks/use-health-check";
 import { loadAllConversations } from "@/lib/chat-storage";
+import { redactPii } from "@/lib/utils/redact-pii";
 
 interface VideoChunk {
   device_name: string;
   file_path: string;
   id: number;
-}
-
-function redactPii(text: string): string {
-  return text
-    // emails
-    .replace(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g, "[EMAIL]")
-    // phone numbers (various formats)
-    .replace(/(\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}/g, "[PHONE]")
-    // SSN
-    .replace(/\b\d{3}-\d{2}-\d{4}\b/g, "[SSN]")
-    // credit card numbers
-    .replace(/\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b/g, "[CARD]")
-    // API keys / tokens (long hex or base64 strings)
-    .replace(/\b(sk|pk|key|token|secret|password|api[_-]?key)[_-]?\s*[:=]\s*\S{8,}/gi, "$1=[REDACTED]")
-    // bearer tokens
-    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]{20,}/g, "Bearer [REDACTED]")
-    // IP addresses (keep localhost)
-    .replace(/\b(?!127\.0\.0\.1\b)(?!0\.0\.0\.0\b)\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b/g, "[IP]")
-    // home directory paths (redact username)
-    .replace(/\/Users\/[^/\s]+/g, "/Users/[USER]")
-    .replace(/C:\\Users\\[^\\\s]+/g, "C:\\Users\\[USER]")
-    .replace(/\/home\/[^/\s]+/g, "/home/[USER]");
 }
 
 const ShareLinkDisplay = ({
@@ -148,7 +128,7 @@ export const ShareLogsButton = ({
     setIsLoadingVideo(true);
     try {
       // Fetch last video chunks
-      const response = await fetch("http://localhost:3030/raw_sql", {
+      const response = await localFetch("/raw_sql", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -164,8 +144,8 @@ export const ShareLogsButton = ({
       const chunks = (await response.json()) as VideoChunk[];
 
       // Merge frames
-      const mergeResponse = await fetch(
-        "http://localhost:3030/experimental/frames/merge",
+      const mergeResponse = await localFetch(
+        "/experimental/frames/merge",
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },

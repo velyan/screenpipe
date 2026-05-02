@@ -153,9 +153,9 @@
     --info-foreground: 0 0% 0%;
     --info-muted: 0 0% 15%;
 
-    /* Muted colors */
+    /* Muted colors — brightened for vibrancy/translucent sidebar */
     --muted: 0 0% 14%;
-    --muted-foreground: 0 0% 60%; /* #999999 */
+    --muted-foreground: 0 0% 75%; /* Brightened from 60% for vibrancy contrast */
 
     /* Accent colors */
     --accent: 0 0% 14%;
@@ -212,6 +212,12 @@
 
   body {
     @apply bg-background text-foreground !pointer-events-auto !overscroll-none;
+  }
+
+  /* When translucent sidebar is enabled on macOS, the OS handles the background */
+  html.macos-vibrancy,
+  body.macos-vibrancy {
+    background-color: transparent !important;
   }
 
   /* Prevent intermittent scrollbars on Windows overlay — html/body should never scroll,
@@ -325,12 +331,198 @@
     display: none;  /* Chrome, Safari and Opera */
   }
 
+  /* Minimal scrollbar: visible track + thumb, no up/down arrow buttons (like reference) */
+  .scrollbar-minimal {
+    scrollbar-width: thin;  /* Firefox: thin scrollbar, no arrows */
+    scrollbar-color: hsl(var(--muted-foreground) / 0.5) transparent;
+  }
+  .scrollbar-minimal::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  .scrollbar-minimal::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .scrollbar-minimal::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted-foreground) / 0.4);
+    border-radius: 4px;
+  }
+  .scrollbar-minimal::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.6);
+  }
+  .scrollbar-minimal::-webkit-scrollbar-button {
+    display: none;  /* No arrow buttons */
+  }
+
+  /* Vibrant sidebar theme — Minimal macOS backdrop */
+  .vibrant-sidebar {
+    /* Light mode: subtle light overlay on translucent background */
+    background-color: rgba(255, 255, 255, 0.08) !important;
+    border-color: transparent;
+  }
+  .light .vibrant-sidebar {
+    background-color: rgba(255, 255, 255, 0.08) !important;
+  }
+  .dark .vibrant-sidebar {
+    /* Dark mode: subtle bright overlay on translucent background */
+    background-color: rgba(255, 255, 255, 0.06) !important;
+  }
+
+  /* System light mode fallback — covers the gap before JS applies .light class */
+  @media (prefers-color-scheme: light) {
+    html:not(.dark) .vibrant-sidebar {
+      background-color: rgba(255, 255, 255, 0.08) !important;
+    }
+    html:not(.dark) .vibrant-sidebar-fg {
+      color: hsl(0 0% 0%) !important;
+    }
+    html:not(.dark) .vibrant-sidebar-fg-muted {
+      color: hsl(0 0% 40%) !important;
+    }
+    html:not(.dark) .vibrant-nav-active {
+      color: hsl(0 0% 0%) !important;
+    }
+    html:not(.dark) .vibrant-nav-hover:hover {
+      color: hsl(0 0% 0%) !important;
+    }
+    html:not(.dark) .vibrant-nav-item {
+      color: hsl(0 0% 40%) !important;
+    }
+    html:not(.dark) .vibrant-nav-item:hover {
+      color: hsl(0 0% 0%) !important;
+    }
+    html:not(.dark) .vibrant-nav-item:hover .vibrant-sidebar-fg-muted {
+      color: hsl(0 0% 0%) !important;
+    }
+    html:not(.dark) .vibrant-heading {
+      color: hsl(0 0% 0%) !important;
+    }
+    html:not(.dark) .vibrant-card-border {
+      border-color: hsl(0 0% 0% / 0.1) !important;
+    }
+    html:not(.dark) .vibrant-btn-border {
+      border-color: hsl(0 0% 0% / 0.2) !important;
+      color: hsl(0 0% 0%) !important;
+    }
+    html:not(.dark) .vibrant-btn-border:hover {
+      color: hsl(0 0% 0% / 0.8) !important;
+    }
+    html:not(.dark) .vibrant-sidebar-border {
+      border-color: hsl(0 0% 0% / 0.08) !important;
+    }
+  }
+
+  /* System dark mode fallback — covers the gap before JS applies .dark class.
+     Applies to BOTH background and all text colors so there is no flash of
+     dark-vibrancy-background + light-mode text (= invisible text) on first
+     paint when macOS is in Auto/dark mode. */
+  @media (prefers-color-scheme: dark) {
+    html:not(.light) .vibrant-sidebar {
+      background-color: rgba(255, 255, 255, 0.06) !important;
+    }
+    html:not(.light) .vibrant-sidebar-fg {
+      color: hsl(0 0% 100%) !important;
+    }
+    html:not(.light) .vibrant-sidebar-fg-muted {
+      color: hsl(0 0% 75%) !important;
+    }
+    html:not(.light) .vibrant-nav-active {
+      color: hsl(0 0% 100%) !important;
+    }
+    html:not(.light) .vibrant-nav-hover:hover {
+      color: hsl(0 0% 100%) !important;
+    }
+    html:not(.light) .vibrant-nav-item {
+      color: hsl(0 0% 80%) !important;
+    }
+    html:not(.light) .vibrant-nav-item:hover {
+      color: hsl(0 0% 100%) !important;
+    }
+    html:not(.light) .vibrant-nav-item:hover .vibrant-sidebar-fg-muted {
+      color: hsl(0 0% 100%) !important;
+    }
+    html:not(.light) .vibrant-heading {
+      color: hsl(0 0% 100%) !important;
+    }
+    html:not(.light) .vibrant-card-border {
+      border-color: hsl(0 0% 100% / 0.1) !important;
+    }
+    html:not(.light) .vibrant-btn-border {
+      border-color: hsl(0 0% 100% / 0.2) !important;
+      color: hsl(0 0% 100%) !important;
+    }
+    html:not(.light) .vibrant-btn-border:hover {
+      color: hsl(0 0% 100% / 0.8) !important;
+    }
+    html:not(.light) .vibrant-sidebar-border {
+      border-color: hsl(0 0% 100% / 0.08) !important;
+    }
+  }
+
+  .vibrant-sidebar-border {
+    border-color: transparent;
+  }
+  .vibrant-sidebar-fg {
+    color: hsl(var(--foreground));
+  }
+  .vibrant-sidebar-fg-muted {
+    color: hsl(var(--muted-foreground));
+  }
+  .vibrant-nav-active {
+    color: hsl(var(--foreground));
+    font-weight: 600;
+  }
+  .vibrant-nav-hover:hover {
+    color: hsl(var(--foreground));
+  }
+  .vibrant-nav-item {
+    color: hsl(var(--muted-foreground));
+  }
+  .vibrant-nav-item:hover {
+    color: hsl(var(--foreground));
+  }
+  /* Icon inside a hovered nav item inherits the foreground color */
+  .vibrant-nav-item:hover .vibrant-sidebar-fg-muted {
+    color: hsl(var(--foreground));
+  }
+  .vibrant-heading {
+    color: hsl(var(--foreground));
+  }
+  .vibrant-card-border {
+    border-color: hsl(var(--foreground) / 0.1);
+  }
+  .vibrant-btn-border {
+    border-color: hsl(var(--foreground) / 0.2);
+    color: hsl(var(--foreground));
+  }
+  .vibrant-btn-border:hover {
+    color: hsl(var(--foreground) / 0.8);
+  }
+
   @keyframes shimmer {
     0% {
       background-position: -200% 0;
     }
     100% {
       background-position: 200% 0;
+    }
+  }
+
+  /* sp-pulse — slow soft halo for live-streaming chat rows in the
+     sidebar. Tailwind's default `animate-pulse` is too loud (opacity
+     fades from 1 → 0.5) and `animate-ping` flashes outward too
+     aggressively. We want a calmer breath — opacity dips less far,
+     scales out slightly, and breathes at 1.6s so it reads as
+     "background activity" rather than "alert me now". */
+  @keyframes sp-pulse {
+    0%,
+    100% {
+      transform: scale(1);
+      opacity: 0.55;
+    }
+    50% {
+      transform: scale(1.6);
+      opacity: 0;
     }
   }
 

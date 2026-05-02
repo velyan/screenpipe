@@ -51,6 +51,7 @@
     "fs:allow-create",
     "fs:allow-mkdir",
     "fs:allow-remove",
+    "fs:allow-rename",
     "global-shortcut:allow-is-registered",
     "global-shortcut:allow-register",
     "global-shortcut:allow-unregister",
@@ -124,6 +125,14 @@
           "requireLiteralLeadingDot": false
         },
         {
+          "path": "$DOWNLOAD",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$DOWNLOAD/*",
+          "requireLiteralLeadingDot": false
+        },
+        {
           "path": "$HOME/.screenpipe/*",
           "requireLiteralLeadingDot": false
         },
@@ -165,6 +174,14 @@
         },
         {
           "path": "$APPDATA/Claude/**",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/AppData/Roaming/Claude",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/AppData/Roaming/Claude/**",
           "requireLiteralLeadingDot": false
         }
       ]

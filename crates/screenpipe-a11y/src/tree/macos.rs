@@ -27,6 +27,7 @@ const BROWSER_NAMES: &[&str] = &[
     "vivaldi",
     "opera",
     "zen",
+    "comet",
     "brave browser",
     "google chrome",
     "microsoft edge",
@@ -360,6 +361,9 @@ fn looks_like_url(s: &str) -> bool {
 pub struct MacosTreeWalker {
     config: TreeWalkerConfig,
     incognito_detector: Box<dyn crate::incognito::IncognitoDetector>,
+    /// Gates the per-walk `AXEnhancedUserInterface` toggle so we only poke a
+    /// given renderer at most once per TTL instead of on every walk.
+    enhanced_mode_cache: super::enhanced_mode_cache::EnhancedModeCache,
 }
 
 impl MacosTreeWalker {
@@ -367,6 +371,7 @@ impl MacosTreeWalker {
         Self {
             config,
             incognito_detector: crate::incognito::create_detector(),
+            enhanced_mode_cache: super::enhanced_mode_cache::EnhancedModeCache::with_default_ttl(),
         }
     }
 }
@@ -484,9 +489,28 @@ impl MacosTreeWalker {
         // and causes the renderer to materialize the full AX tree.
         // Ref: https://codereview.chromium.org/6909013
         // Ref: https://github.com/electron/electron/issues/7206
-        let eui_attr_name = cf::String::from_str("AXEnhancedUserInterface");
-        let eui_attr = ax::Attr::with_string(&eui_attr_name);
-        let _ = ax_app.set_attr(eui_attr, cf::Boolean::value_true());
+        //
+        // The toggle is expensive (the renderer rebuilds its AX tree each time
+        // we poke it), so we only re-assert it once per TTL per pid. Chromium
+        // latches the mode so one poke is plenty; if the renderer ever drops
+        // the mode we recover on the next TTL window.
+        if self.enhanced_mode_cache.should_enable(pid) {
+            let eui_attr_name = cf::String::from_str("AXEnhancedUserInterface");
+            let eui_attr = ax::Attr::with_string(&eui_attr_name);
+            let _ = ax_app.set_attr(eui_attr, cf::Boolean::value_true());
+
+            // Also set AXManualAccessibility — the Chromium-specific flag.
+            // Newer Electron builds (and Chrome itself) respond to this without
+            // the "screen reader is active" side effects of EnhancedUserInterface.
+            // Some apps (Obsidian in particular — issue #3002) never materialize
+            // their tree under EnhancedUserInterface alone. Idempotent to set
+            // both: the better-supported flag wins.
+            let ama_attr_name = cf::String::from_str("AXManualAccessibility");
+            let ama_attr = ax::Attr::with_string(&ama_attr_name);
+            let _ = ax_app.set_attr(ama_attr, cf::Boolean::value_true());
+
+            debug!("enhanced AX mode enabled for pid={} app={}", pid, app_name);
+        }
 
         let window_val = match ax_app.attr_value(ax::attr::focused_window()) {
             Ok(v) => v,
@@ -505,9 +529,21 @@ impl MacosTreeWalker {
         let window_name = get_string_attr(window, ax::attr::title()).unwrap_or_default();
         let window_id = get_u32_attr_by_name(window, "AXWindowNumber");
 
+        // Fast path: Arc (and potentially other browsers) tag incognito windows
+        // with "Incognito" in AXIdentifier (e.g. "bigIncognitoBrowserWindow-...").
+        // This is more reliable than AppleScript which Arc 1.138+ broke entirely.
+        if self.config.ignore_incognito_windows {
+            if let Some(ax_id) = get_string_attr(window, ax::attr::id()) {
+                let ax_id_lower = ax_id.to_lowercase();
+                if ax_id_lower.contains("incognito") || ax_id_lower.contains("private") {
+                    return Ok(TreeWalkResult::Skipped(SkipReason::Incognito));
+                }
+            }
+        }
+
         // Skip incognito / private browsing windows.  Uses the full detector
         // which checks AppleScript window properties for Chromium browsers
-        // (Arc, Chrome, Edge, etc.) and falls back to localized title matching.
+        // (Chrome, Edge, etc.) and falls back to localized title matching.
         if self.config.ignore_incognito_windows
             && self
                 .incognito_detector
@@ -575,6 +611,17 @@ impl MacosTreeWalker {
             }
         }
         let focused_element = extract_focused_element_context(window_bounds.as_ref());
+
+        // If a browser extension popup matching an ignored window was detected,
+        // skip the entire capture — including the screenshot — to prevent the
+        // popup content from appearing in the timeline.
+        if state.hit_ignored_extension {
+            debug!(
+                "skipping capture: browser extension popup matched ignored window in app={}",
+                app_name
+            );
+            return Ok(TreeWalkResult::Skipped(SkipReason::UserIgnored));
+        }
 
         let text_content = state.text_buffer;
         // Don't bail on empty text — we still need the app_name and window_name
@@ -659,6 +706,12 @@ struct WalkState {
     monitor_y: f64,
     monitor_w: f64,
     monitor_h: f64,
+    /// User-configured ignored window patterns (lowercase) for filtering browser
+    /// extension popups whose AXWebArea title matches an ignored keyword.
+    ignored_windows_lower: Vec<String>,
+    /// Set to true when a browser extension popup matching an ignored pattern is
+    /// detected. Signals the caller to skip the entire capture (including screenshot).
+    hit_ignored_extension: bool,
 }
 
 impl WalkState {
@@ -668,8 +721,8 @@ impl WalkState {
             nodes: Vec::with_capacity(256),
             node_count: 0,
             max_depth: config.max_depth,
-            max_nodes: config.max_nodes,
-            walk_timeout: config.walk_timeout,
+            max_nodes: config.effective_max_nodes(),
+            walk_timeout: config.effective_walk_timeout(),
             element_timeout_secs: config.element_timeout_secs,
             start,
             truncated: false,
@@ -683,6 +736,12 @@ impl WalkState {
             monitor_y: config.monitor_y,
             monitor_w: config.monitor_width,
             monitor_h: config.monitor_height,
+            ignored_windows_lower: config
+                .ignored_windows
+                .iter()
+                .map(|s| s.to_lowercase())
+                .collect(),
+            hit_ignored_extension: false,
         }
     }
 
@@ -758,6 +817,12 @@ fn walk_element(elem: &ax::UiElement, depth: usize, state: &mut WalkState) {
         state.max_depth_reached = depth;
     }
 
+    // Yield every 100 elements to let macOS process pending HID/input events.
+    // Without this, tight AX IPC loops can starve USB mouse/keyboard event delivery.
+    if state.node_count.is_multiple_of(100) {
+        std::thread::yield_now();
+    }
+
     // Set a per-element timeout to prevent IPC hangs
     let _ = elem.set_messaging_timeout_secs(state.element_timeout_secs);
 
@@ -775,8 +840,34 @@ fn walk_element(elem: &ax::UiElement, depth: usize, state: &mut WalkState) {
     // Extract text from this element
     if should_extract_text(&role_str) {
         extract_text(elem, &role_str, depth, state);
-    } else if role_str == "AXGroup" || role_str == "AXWebArea" {
+    } else if role_str == "AXWebArea" {
+        // Browser extension popup detection: AXWebArea nodes inside Chrome/Arc/Edge
+        // carry the extension name as their title and a chrome-extension:// URL.
+        // If the title matches an ignored-window pattern, skip the entire subtree
+        // to prevent capturing password manager or other sensitive extension content.
+        if !state.ignored_windows_lower.is_empty() {
+            let matches = |val: &str| {
+                let lower = val.to_lowercase();
+                state
+                    .ignored_windows_lower
+                    .iter()
+                    .any(|ig| lower.contains(ig.as_str()))
+            };
+            if get_string_attr(elem, ax::attr::title()).is_some_and(|t| matches(&t))
+                || get_string_attr(elem, ax::attr::url()).is_some_and(|u| matches(&u))
+            {
+                state.hit_ignored_extension = true;
+                return;
+            }
+        }
         // Groups and web areas: only extract if they have a direct value
+        if let Some(val) = get_string_attr(elem, ax::attr::value()) {
+            if !val.is_empty() {
+                append_text(&mut state.text_buffer, &val);
+            }
+        }
+    } else if role_str == "AXGroup" {
+        // Groups: only extract if they have a direct value
         if let Some(val) = get_string_attr(elem, ax::attr::value()) {
             if !val.is_empty() {
                 append_text(&mut state.text_buffer, &val);
@@ -812,12 +903,15 @@ fn extract_text(elem: &ax::UiElement, role_str: &str, depth: usize, state: &mut 
         if let Some(val) = get_string_attr(elem, ax::attr::value()) {
             if !val.is_empty() {
                 append_text(&mut state.text_buffer, &val);
-                state.nodes.push(AccessibilityTreeNode {
-                    role: role_str.to_string(),
-                    text: val.trim().to_string(),
-                    depth: depth.min(255) as u8,
+                let mut node = AccessibilityTreeNode::new(
+                    role_str.to_string(),
+                    val.trim().to_string(),
+                    depth.min(255) as u8,
                     bounds,
-                });
+                );
+                node.value = Some(val.trim().to_string());
+                fill_ax_props(&mut node, elem, role_str);
+                state.nodes.push(node);
                 return;
             }
         }
@@ -828,12 +922,14 @@ fn extract_text(elem: &ax::UiElement, role_str: &str, depth: usize, state: &mut 
         if let Some(val) = get_string_attr(elem, ax::attr::value()) {
             if !val.is_empty() {
                 append_text(&mut state.text_buffer, &val);
-                state.nodes.push(AccessibilityTreeNode {
-                    role: role_str.to_string(),
-                    text: val.trim().to_string(),
-                    depth: depth.min(255) as u8,
+                let mut node = AccessibilityTreeNode::new(
+                    role_str.to_string(),
+                    val.trim().to_string(),
+                    depth.min(255) as u8,
                     bounds,
-                });
+                );
+                fill_ax_props(&mut node, elem, role_str);
+                state.nodes.push(node);
                 return;
             }
         }
@@ -843,12 +939,14 @@ fn extract_text(elem: &ax::UiElement, role_str: &str, depth: usize, state: &mut 
     if let Some(title) = get_string_attr(elem, ax::attr::title()) {
         if !title.is_empty() {
             append_text(&mut state.text_buffer, &title);
-            state.nodes.push(AccessibilityTreeNode {
-                role: role_str.to_string(),
-                text: title.trim().to_string(),
-                depth: depth.min(255) as u8,
+            let mut node = AccessibilityTreeNode::new(
+                role_str.to_string(),
+                title.trim().to_string(),
+                depth.min(255) as u8,
                 bounds,
-            });
+            );
+            fill_ax_props(&mut node, elem, role_str);
+            state.nodes.push(node);
             return;
         }
     }
@@ -857,12 +955,14 @@ fn extract_text(elem: &ax::UiElement, role_str: &str, depth: usize, state: &mut 
     if let Some(desc) = get_string_attr(elem, ax::attr::desc()) {
         if !desc.is_empty() {
             append_text(&mut state.text_buffer, &desc);
-            state.nodes.push(AccessibilityTreeNode {
-                role: role_str.to_string(),
-                text: desc.trim().to_string(),
-                depth: depth.min(255) as u8,
+            let mut node = AccessibilityTreeNode::new(
+                role_str.to_string(),
+                desc.trim().to_string(),
+                depth.min(255) as u8,
                 bounds,
-            });
+            );
+            fill_ax_props(&mut node, elem, role_str);
+            state.nodes.push(node);
         }
     }
 }
@@ -1028,6 +1128,55 @@ fn get_string_attr(elem: &ax::UiElement, attr: &ax::Attr) -> Option<String> {
             None
         }
     })
+}
+
+/// Extract a boolean attribute from an AX element.
+fn get_bool_attr(elem: &ax::UiElement, attr: &ax::Attr) -> Option<bool> {
+    elem.attr_value(attr).ok().and_then(|v| {
+        if v.get_type_id() == cf::Boolean::type_id() {
+            let b: &cf::Boolean = unsafe { std::mem::transmute(&*v) };
+            Some(b.value())
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether a role represents an interactive/actionable element (buttons, inputs, etc.).
+fn is_interactive_role(role_str: &str) -> bool {
+    matches!(
+        role_str,
+        "AXButton"
+            | "AXTextField"
+            | "AXTextArea"
+            | "AXComboBox"
+            | "AXCheckBox"
+            | "AXRadioButton"
+            | "AXPopUpButton"
+            | "AXMenuButton"
+            | "AXMenuItem"
+            | "AXLink"
+            | "AXDisclosureTriangle"
+            | "AXTab"
+    )
+}
+
+/// Fill automation properties on an AccessibilityTreeNode from an AX element.
+/// Only fetches bool states for interactive elements to limit IPC overhead.
+fn fill_ax_props(node: &mut AccessibilityTreeNode, elem: &ax::UiElement, role_str: &str) {
+    node.automation_id = get_string_attr(elem, ax::attr::id());
+    node.subrole = get_string_attr(elem, ax::attr::subrole());
+    node.role_description = get_string_attr(elem, ax::attr::role_desc());
+    node.help_text = get_string_attr(elem, ax::attr::help());
+    // Bool states and extra string attrs only for interactive elements (limits IPC calls)
+    if is_interactive_role(role_str) {
+        node.placeholder = get_string_attr(elem, ax::attr::placeholder_value());
+        node.url = get_string_attr(elem, ax::attr::url());
+        node.is_enabled = get_bool_attr(elem, ax::attr::enabled());
+        node.is_focused = get_bool_attr(elem, ax::attr::focused());
+        node.is_selected = get_bool_attr(elem, ax::attr::selected());
+        node.is_expanded = get_bool_attr(elem, ax::attr::expanded());
+    }
 }
 
 #[cfg(test)]

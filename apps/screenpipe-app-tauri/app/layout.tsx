@@ -185,15 +185,35 @@ export default function RootLayout({
           dangerouslySetInnerHTML={{
             __html: `
               (function() {
+                // Apply theme to prevent flash and ensure sidebar/main content consistency.
+                // Priority: stored preference > system preference
                 try {
                   var theme = localStorage.getItem('screenpipe-ui-theme');
-                  if (!theme) {
+                  if (!theme || theme === 'system') {
+                    // No preference or 'system' mode: detect system preference for consistent startup
                     theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
                   }
                   document.documentElement.classList.add(theme);
                 } catch (e) {
-                  document.documentElement.classList.add('light');
+                  // localStorage unavailable, detect system preference as fallback
+                  var systemTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+                  document.documentElement.classList.add(systemTheme);
                 }
+
+                // Crash recovery: if React fails to render, the page stays blank.
+                // After 8s, if <body> has no visible children, reload once.
+                var RELOAD_KEY = '__sp_crash_reload';
+                setTimeout(function() {
+                  var body = document.body;
+                  if (!body || body.children.length === 0 || body.offsetHeight === 0) {
+                    var last = sessionStorage.getItem(RELOAD_KEY);
+                    // Only auto-reload once per 30s to avoid infinite loops
+                    if (!last || Date.now() - Number(last) > 30000) {
+                      sessionStorage.setItem(RELOAD_KEY, String(Date.now()));
+                      window.location.reload();
+                    }
+                  }
+                }, 8000);
               })();
             `,
           }}

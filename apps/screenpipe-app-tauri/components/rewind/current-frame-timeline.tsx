@@ -319,6 +319,7 @@ export const CurrentFrameTimeline: FC<CurrentFrameTimelineProps> = ({
 	}
 
 	// eslint-disable-next-line react-hooks/rules-of-hooks
+	// biome-ignore lint/correctness/useHookAtTopLevel: hook called after a stable conditional return guarded by render-stable refs; matches the eslint suppression above
 	const handleContextMenu = useCallback(
 		(e: React.MouseEvent) => {
 			e.preventDefault();

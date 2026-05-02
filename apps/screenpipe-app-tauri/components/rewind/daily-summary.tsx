@@ -22,8 +22,7 @@ import {
 import { platform } from "@tauri-apps/plugin-os";
 import { Command } from "@tauri-apps/plugin-shell";
 import posthog from "posthog-js";
-
-const API = "http://localhost:3030";
+import { localFetch } from "@/lib/api";
 
 // ─── Generation lock ────────────────────────────────────────────────────────
 // Prevents duplicate generation across remounts, multiple windows, and
@@ -221,7 +220,7 @@ async function isPluggedIn(): Promise<boolean> {
 
 async function checkAiAvailable(): Promise<boolean> {
   try {
-    const resp = await fetch(`${API}/ai/status`, {
+    const resp = await localFetch("/ai/status", {
       signal: AbortSignal.timeout(2000),
     });
     if (!resp.ok) return false;
@@ -306,8 +305,8 @@ export function DailySummaryCard({
 
       // Fetch audio + OCR frames in parallel
       const [audioData, ocrData] = await Promise.all([
-        fetch(
-          `${API}/search?${new URLSearchParams({
+        localFetch(
+          `/search?${new URLSearchParams({
             content_type: "audio",
             ...timeParams,
             limit: "100",
@@ -316,8 +315,8 @@ export function DailySummaryCard({
         )
           .then((r) => (r.ok ? r.json() : { data: [] }))
           .catch(() => ({ data: [] })),
-        fetch(
-          `${API}/search?${new URLSearchParams({
+        localFetch(
+          `/search?${new URLSearchParams({
             content_type: "ocr",
             ...timeParams,
             limit: "1000",
@@ -373,7 +372,7 @@ export function DailySummaryCard({
         let context = parts.join("\n");
         if (context.length > 6000) context = context.slice(0, 6000);
 
-        const aiResp = await fetch(`${API}/ai/chat/completions`, {
+        const aiResp = await localFetch("/ai/chat/completions", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({

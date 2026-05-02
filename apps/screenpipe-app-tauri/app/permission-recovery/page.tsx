@@ -5,7 +5,7 @@
 "use client";
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
-import { Monitor, Mic, Keyboard, Globe, Check, RefreshCw } from "lucide-react";
+import { Monitor, Mic, Keyboard, Lock, Check, RefreshCw } from "lucide-react";
 import { commands } from "@/lib/utils/tauri";
 import { usePlatform } from "@/lib/hooks/use-platform";
 import posthog from "posthog-js";
@@ -72,9 +72,9 @@ function PermissionRow({
 
 export default function PermissionRecoveryPage() {
   const [permissions, setPermissions] = useState<Record<string, string> | null>(null);
-  const [arcInstalled, setArcInstalled] = useState(false);
-  const [arcAutomationOk, setArcAutomationOk] = useState(false);
-  const [arcChecked, setArcChecked] = useState(false);
+  // Keychain: "granted" if enabled or unavailable (no keychain on this OS),
+  // "denied" only if the user previously opted in but access is now refused.
+  const [keychainStatus, setKeychainStatus] = useState<"granted" | "denied" | "checking">("checking");
   const { isMac: isMacOS } = usePlatform();
   const restartTriggeredRef = useRef(false);
 
@@ -82,14 +82,6 @@ export default function PermissionRecoveryPage() {
     try {
       const perms = await commands.doPermissionsCheck(false);
       setPermissions(perms);
-
-      const installed = await commands.checkArcInstalled().catch(() => false);
-      setArcInstalled(installed);
-      if (installed) {
-        const granted = await commands.checkArcAutomationPermission().catch(() => false);
-        setArcAutomationOk(granted);
-      }
-      setArcChecked(true);
       return perms;
     } catch (error) {
       console.error("failed to check permissions:", error);
@@ -97,23 +89,44 @@ export default function PermissionRecoveryPage() {
     }
   }, []);
 
+  const checkKeychain = useCallback(async () => {
+    try {
+      const res = await commands.getKeychainStatus();
+      if (res.status === "ok") {
+        // "enabled" = user opted in and key accessible
+        // "unavailable" = OS keychain missing (Linux without libsecret, etc.) — treat as ok
+        // "disabled" = user never opted in OR access denied — only treat as denied on mac
+        //   where access-denied is actionable via re-enable.
+        if (res.data.state === "enabled" || res.data.state === "unavailable") {
+          setKeychainStatus("granted");
+        } else {
+          setKeychainStatus("denied");
+        }
+      }
+    } catch {
+      // keep previous status on error
+    }
+  }, []);
+
   useEffect(() => {
     checkPermissions();
+    if (isMacOS) checkKeychain();
     const interval = setInterval(() => {
       if (restartTriggeredRef.current) return;
       checkPermissions();
+      if (isMacOS) checkKeychain();
     }, 3000);
     return () => clearInterval(interval);
-  }, [checkPermissions]);
+  }, [checkPermissions, checkKeychain, isMacOS]);
 
+  // Auto-close and restart when critical permissions are restored
   useEffect(() => {
-    if (!permissions || restartTriggeredRef.current || !arcChecked) return;
+    if (!permissions || restartTriggeredRef.current) return;
 
     const screenOk = permissions.screenRecording === "granted" || permissions.screenRecording === "notNeeded";
     const micOk = permissions.microphone === "granted" || permissions.microphone === "notNeeded";
-    const arcOk = !arcInstalled || arcAutomationOk;
 
-    if (screenOk && micOk && arcOk) {
+    if (screenOk && micOk) {
       restartTriggeredRef.current = true;
       setTimeout(async () => {
         try {
@@ -125,13 +138,18 @@ export default function PermissionRecoveryPage() {
         }
       }, 1000);
     }
-  }, [permissions, arcChecked, arcInstalled, arcAutomationOk]);
+  }, [permissions]);
 
   const handleFix = async (permission: Parameters<typeof commands.requestPermission>[0]) => {
     posthog.capture("permission_recovery_manual_fix", { permission });
     try { await commands.requestPermission(permission); } catch {}
-    // Immediate recheck after requesting
     await checkPermissions();
+  };
+
+  const handleFixKeychain = async () => {
+    posthog.capture("permission_recovery_manual_fix", { permission: "keychain" });
+    try { await commands.enableKeychainEncryption(); } catch {}
+    await checkKeychain();
   };
 
   const screenStatus = permissions?.screenRecording === "granted" || permissions?.screenRecording === "notNeeded"
@@ -141,9 +159,7 @@ export default function PermissionRecoveryPage() {
   const accessibilityStatus = permissions?.accessibility === "granted" || permissions?.accessibility === "notNeeded"
     ? "granted" : permissions === null ? "checking" : "denied";
 
-  const allCriticalOk = screenStatus === "granted" && micStatus === "granted";
-  const arcNeedsFix = isMacOS && arcInstalled && !arcAutomationOk;
-  const allOk = allCriticalOk && !arcNeedsFix && arcChecked;
+  const allOk = screenStatus === "granted" && micStatus === "granted";
 
   return (
     <div className="flex flex-col w-full h-screen overflow-hidden bg-background">
@@ -158,13 +174,9 @@ export default function PermissionRecoveryPage() {
         ) : (
           <div className="w-full max-w-sm space-y-4">
             <div className="text-center">
-              <h2 className="font-mono text-sm">
-                {allCriticalOk ? "permissions" : "recording paused"}
-              </h2>
+              <h2 className="font-mono text-sm">recording paused</h2>
               <p className="font-mono text-xs text-muted-foreground mt-1">
-                {allCriticalOk
-                  ? "optional permissions need attention"
-                  : "some permissions were revoked"}
+                some permissions were revoked
               </p>
             </div>
 
@@ -187,21 +199,18 @@ export default function PermissionRecoveryPage() {
                 <PermissionRow
                   icon={<Keyboard className="w-4 h-4" strokeWidth={1.5} />}
                   label="accessibility"
-                  description="shortcuts"
+                  description="read text from apps"
                   status={accessibilityStatus}
                   onFix={() => handleFix("accessibility")}
                 />
               )}
-              {isMacOS && arcInstalled && (
+              {isMacOS && keychainStatus === "denied" && (
                 <PermissionRow
-                  icon={<Globe className="w-4 h-4" strokeWidth={1.5} />}
-                  label="arc urls"
-                  description="browser capture"
-                  status={arcAutomationOk ? "granted" : permissions === null ? "checking" : "denied"}
-                  onFix={async () => {
-                    posthog.capture("permission_recovery_arc_automation");
-                    await commands.requestArcAutomationPermission();
-                  }}
+                  icon={<Lock className="w-4 h-4" strokeWidth={1.5} />}
+                  label="secure storage"
+                  description="encrypt api keys & credentials"
+                  status={keychainStatus}
+                  onFix={handleFixKeychain}
                 />
               )}
             </div>

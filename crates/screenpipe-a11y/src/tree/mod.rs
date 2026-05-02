@@ -13,6 +13,7 @@ mod macos;
 mod windows;
 
 pub mod cache;
+pub mod enhanced_mode_cache;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -72,7 +73,7 @@ pub struct WindowBounds {
 }
 
 /// A single node extracted from the accessibility tree, preserving role and hierarchy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AccessibilityTreeNode {
     pub role: String,
     pub text: String,
@@ -81,6 +82,85 @@ pub struct AccessibilityTreeNode {
     /// None if the element doesn't expose AXPosition/AXSize.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bounds: Option<NodeBounds>,
+
+    // --- Automation properties (all Optional, filled per-platform) ---
+    /// Stable unique identifier for targeting elements.
+    /// Windows: UIA AutomationId. macOS: AXIdentifier. Linux: AT-SPI object path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub automation_id: Option<String>,
+    /// Class/type info. Windows: Win32 ClassName. macOS: AXSubrole. Linux: AT-SPI attributes "class".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub class_name: Option<String>,
+    /// Current value (distinct from label text). For text fields, sliders, combo boxes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// Tooltip or help text. Windows: UIA HelpText. macOS: AXHelp. Linux: AT-SPI Description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub help_text: Option<String>,
+    /// Associated URL. macOS: AXURL. Windows/Linux: extracted from value if URL-like.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Placeholder text for input fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    /// Human-readable role description. macOS: AXRoleDescription. Windows: LocalizedControlType.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role_description: Option<String>,
+    /// Fine-grained role classification. macOS: AXSubrole.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subrole: Option<String>,
+    /// Whether element is interactive/enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_enabled: Option<bool>,
+    /// Whether element currently has focus.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_focused: Option<bool>,
+    /// Whether element is selected (list items, tabs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_selected: Option<bool>,
+    /// Whether element is expanded (tree items, disclosure triangles).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_expanded: Option<bool>,
+    /// Whether element is a password field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_password: Option<bool>,
+    /// Whether element can receive keyboard focus.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_keyboard_focusable: Option<bool>,
+    /// Keyboard shortcut (Windows: AcceleratorKey).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accelerator_key: Option<String>,
+    /// Access key mnemonic (Windows: AccessKey).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_key: Option<String>,
+}
+
+impl AccessibilityTreeNode {
+    /// Create a node with only the core fields; all automation properties default to None.
+    pub fn new(role: String, text: String, depth: u8, bounds: Option<NodeBounds>) -> Self {
+        Self {
+            role,
+            text,
+            depth,
+            bounds,
+            automation_id: None,
+            class_name: None,
+            value: None,
+            help_text: None,
+            url: None,
+            placeholder: None,
+            role_description: None,
+            subrole: None,
+            is_enabled: None,
+            is_focused: None,
+            is_selected: None,
+            is_expanded: None,
+            is_password: None,
+            is_keyboard_focusable: None,
+            accelerator_key: None,
+            access_key: None,
+        }
+    }
 }
 
 /// Focused element context captured with the active window snapshot.
@@ -227,6 +307,10 @@ pub struct TreeWalkerConfig {
     pub monitor_height: f64,
     /// Automatically detect and skip incognito / private browsing windows.
     pub ignore_incognito_windows: bool,
+    /// Per-walk override for `max_nodes` (set by adaptive budget, takes precedence).
+    pub max_nodes_override: Option<usize>,
+    /// Per-walk override for `walk_timeout` (set by adaptive budget, takes precedence).
+    pub walk_timeout_override: Option<Duration>,
 }
 
 impl Default for TreeWalkerConfig {
@@ -247,7 +331,21 @@ impl Default for TreeWalkerConfig {
             monitor_width: 0.0,
             monitor_height: 0.0,
             ignore_incognito_windows: true,
+            max_nodes_override: None,
+            walk_timeout_override: None,
         }
+    }
+}
+
+impl TreeWalkerConfig {
+    /// Return the effective max_nodes (override if set, else default).
+    pub fn effective_max_nodes(&self) -> usize {
+        self.max_nodes_override.unwrap_or(self.max_nodes)
+    }
+
+    /// Return the effective walk_timeout (override if set, else default).
+    pub fn effective_walk_timeout(&self) -> Duration {
+        self.walk_timeout_override.unwrap_or(self.walk_timeout)
     }
 }
 

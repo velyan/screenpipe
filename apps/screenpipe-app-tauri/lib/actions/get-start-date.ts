@@ -1,4 +1,5 @@
 import { isAfter } from "date-fns";
+import { localFetch } from "@/lib/api";
 
 export async function getStartDate() {
 	try {
@@ -32,7 +33,7 @@ export async function getStartDate() {
          LIMIT 1
 `;
 
-		const videoFetch = fetch("http://localhost:3030/raw_sql", {
+		const videoFetch = localFetch("/raw_sql", {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",
@@ -40,7 +41,7 @@ export async function getStartDate() {
 			body: JSON.stringify({ query: videoChunkQuery }),
 		});
 
-		const audioFetch = fetch("http://localhost:3030/raw_sql", {
+		const audioFetch = localFetch("/raw_sql", {
 			method: "POST",
 			headers: {
 				"Content-Type": "application/json",

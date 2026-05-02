@@ -6,6 +6,7 @@ import { useSettings } from "@/lib/hooks/use-settings";
 import { parseInt } from "lodash";
 import posthog from "posthog-js";
 import { cn } from "@/lib/utils";
+import { getApiBaseUrl } from "@/lib/api";
 
 export function ExportButton() {
 	const [isExporting, setIsExporting] = useState(false);
@@ -58,7 +59,7 @@ export function ExportButton() {
 
 			// Create WebSocket connection - send frame_ids in message body to avoid URL length limits
 			ws = new WebSocket(
-				`ws://localhost:3030/frames/export?fps=${settings.fps ?? 0.5}`,
+				`${getApiBaseUrl().replace("http", "ws")}/frames/export?fps=0.5`,
 			);
 
 			// Set a timeout to handle connection issues

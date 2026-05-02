@@ -30,7 +30,7 @@ struct DeviceResponse {
 /// Helper to create a test database with frames
 async fn create_test_db_with_frames(num_frames: i64) -> Arc<DatabaseManager> {
     let db = Arc::new(
-        DatabaseManager::new("sqlite::memory:")
+        DatabaseManager::new("sqlite::memory:", Default::default())
             .await
             .expect("Failed to create test database"),
     );
@@ -103,7 +103,7 @@ mod tests {
 
         // Read initial frames (with timeout)
         let mut received_frames = Vec::new();
-        let initial_fetch = timeout(std::time::Duration::from_secs(5), async {
+        let _initial_fetch = timeout(std::time::Duration::from_secs(5), async {
             while let Some(Ok(msg)) = read.next().await {
                 if let Message::Text(text) = msg {
                     if text == "\"keep-alive-text\"" {

@@ -24,14 +24,18 @@ serde_json = "1.0"
 # Concurrency
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
+arc-swap = "1"
 
 # Regex for privacy patterns
 regex = "1.10"
 
+# Clipboard access (native NSPasteboard/Win32/X11 — no subprocess)
+arboard = "3"
+
 [target.'cfg(target_os = "macos")'.dependencies]
-cidre = { version = "0.13", features = ["ax", "cg", "blocks", "ns", "app"] }
+cidre = { version = "0.13", features = ["ax", "cg", "blocks", "ns", "app", "dispatch"] }
 core-foundation = "0.10"
-core-graphics = "0.24"
+core-graphics = { version = "0.24.0", features = ["highsierra"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Native Windows APIs - no rdev dependency

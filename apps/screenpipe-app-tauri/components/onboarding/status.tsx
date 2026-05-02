@@ -13,6 +13,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { useSettings, DEFAULT_PROMPT } from "@/lib/hooks/use-settings";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { localFetch } from "@/lib/api";
 import { homeDir, join } from "@tauri-apps/api/path";
 import { readTextFile } from "@tauri-apps/plugin-fs";
 import { getVersion } from "@tauri-apps/api/app";
@@ -96,7 +97,7 @@ const OnboardingStatus: React.FC<OnboardingStatusProps> = ({
 
     const poll = async () => {
       try {
-        const res = await fetch("http://localhost:3030/health", {
+        const res = await localFetch("/health", {
           signal: AbortSignal.timeout(2000),
         });
         if (res.ok) {
@@ -208,10 +209,10 @@ const OnboardingStatus: React.FC<OnboardingStatusProps> = ({
   const ensureDefaultPreset = async () => {
     if (settings.aiPresets.length === 0) {
       const defaultPreset = {
-        id: "pi-agent",
-        provider: "pi" as const,
+        id: "screenpipe-cloud",
+        provider: "screenpipe-cloud" as const,
         url: "",
-        model: "claude-haiku-4-5",
+        model: "auto",
         maxContextChars: 200000,
         defaultPreset: true,
         prompt: "",
@@ -390,7 +391,7 @@ const OnboardingStatus: React.FC<OnboardingStatusProps> = ({
     });
     setSetupState("starting");
     try {
-      const healthCheck = await fetch("http://localhost:3030/health", {
+      const healthCheck = await localFetch("/health", {
         method: "GET",
         signal: AbortSignal.timeout(3000),
       }).catch(() => null);

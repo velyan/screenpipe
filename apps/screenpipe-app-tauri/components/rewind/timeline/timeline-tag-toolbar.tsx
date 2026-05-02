@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import posthog from "posthog-js";
 import { PipeAIIcon } from "@/components/pipe-ai-icon";
+import { localFetch } from "@/lib/api";
 import { showChatWithPrefill } from "@/lib/chat-utils";
 import { type TemplatePipe } from "@/lib/hooks/use-pipes";
 import { AnimatePresence, motion } from "framer-motion";
@@ -80,7 +81,7 @@ export function TimelineTagToolbar({ anchorRect, onAskAI, onRunPipe, templatePip
 	// Fetch user's frequent tags once on mount via raw SQL
 	useEffect(() => {
 		let cancelled = false;
-		fetch("http://localhost:3030/raw_sql", {
+		localFetch("/raw_sql", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({
@@ -168,7 +169,7 @@ export function TimelineTagToolbar({ anchorRect, onAskAI, onRunPipe, templatePip
 		if (!selectionRange || isDeleting) return;
 		setIsDeleting(true);
 		try {
-			const resp = await fetch("http://localhost:3030/data/delete-range", {
+			const resp = await localFetch("/data/delete-range", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({

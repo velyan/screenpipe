@@ -22,6 +22,7 @@ import { Card } from "../ui/card";
 import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
+import { localFetch } from "@/lib/api";
 import { listen } from "@tauri-apps/api/event";
 import { PricingToggle } from "./pricing-toggle";
 import { ReferralCard } from "./referral-card";
@@ -55,7 +56,7 @@ export function AccountSection() {
                     stripe_connected: true,
                   },
                 });
-                loadUser(settings.user.token!, true);
+                loadUser(settings.user.token!);
               }
               toast({
                 title: "stripe connected!",
@@ -177,23 +178,18 @@ export function AccountSection() {
     <div className="space-y-6">
       {/* Header + login status */}
       <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight text-foreground">
-            Account
-          </h1>
-          <p className="text-sm text-muted-foreground mt-0.5">
-            {settings.user?.token
-              ? `logged in as ${settings.user.email}`
-              : "not logged in"}
-          </p>
-        </div>
+        <p className="text-sm text-muted-foreground">
+          {settings.user?.token
+            ? `logged in as ${settings.user.email}`
+            : "not logged in"}
+        </p>
         <div className="flex gap-2">
           {settings.user?.token ? (
             <>
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => openUrl("https://screenpi.pe/user-dashboard")}
+                onClick={() => openUrl("https://screenpi.pe/account")}
               >
                 <UserCog className="w-4 h-4 mr-1.5" />
                 manage
@@ -202,7 +198,7 @@ export function AccountSection() {
                 variant="outline"
                 size="sm"
                 onClick={async () => {
-                  updateSettings({ user: undefined });
+                  updateSettings({ user: null as any });
                   // Restart Pi with null token so it stops using the old
                   // account's quota. Next message will auto-start as anonymous.
                   try {
@@ -254,7 +250,7 @@ export function AccountSection() {
               <span>✓</span> cloud transcription — higher quality
             </div>
             <div className="flex items-center gap-2">
-              <span>✓</span> higher AI query limits + credits
+              <span>✓</span> 100x more AI queries
             </div>
             <div className="flex items-center gap-2">
               <span>✓</span> priority support
@@ -301,8 +297,8 @@ export function AccountSection() {
                     onClick={async () => {
                       setPipeSyncing(true);
                       try {
-                        await fetch("http://localhost:3030/sync/pipes/pull", { method: "POST" });
-                        await fetch("http://localhost:3030/sync/pipes/push", { method: "POST" });
+                        await localFetch("/sync/pipes/pull", { method: "POST" });
+                        await localFetch("/sync/pipes/push", { method: "POST" });
                         toast({ title: "pipes synced" });
                       } catch (e: any) {
                         toast({ title: "sync failed", description: e.message, variant: "destructive" });
@@ -379,7 +375,7 @@ export function AccountSection() {
                 </div>
                 <div className="flex items-center gap-2 text-foreground">
                   <Sparkles className="h-3.5 w-3.5 shrink-0" />
-                  higher AI query limits + credits
+                  100x more AI queries
                 </div>
                 <div className="flex items-center gap-2 text-foreground">
                   <Sparkles className="h-3.5 w-3.5 shrink-0" />
@@ -471,7 +467,7 @@ export function AccountSection() {
                 </div>
                 <div className="flex items-center gap-2 text-foreground">
                   <Sparkles className="h-3.5 w-3.5 shrink-0" />
-                  higher AI query limits + credits
+                  100x more AI queries
                 </div>
                 <div className="flex items-center gap-2 text-foreground">
                   <Sparkles className="h-3.5 w-3.5 shrink-0" />

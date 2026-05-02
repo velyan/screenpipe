@@ -13,7 +13,6 @@ import { listen, emit } from "@tauri-apps/api/event";
 import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { openSettingsWindow } from "@/lib/utils/window";
 import { useTimelineStore } from "@/lib/hooks/use-timeline-store";
-import { homeDir, join } from "@tauri-apps/api/path";
 
 export function DeeplinkHandler() {
   const { toast } = useToast();
@@ -38,24 +37,48 @@ export function DeeplinkHandler() {
               title: "logged in!",
               description: "you have been logged in",
             });
-            // Force-restart Pi with the new token so it picks up the new
-            // account immediately. Without this, Pi keeps running with the
-            // old/null token and the user hits the free-tier rate limit.
+            // Notify the chat UI to restart Pi with the new token so it
+            // picks up the new account immediately. The chat component knows
+            // the active session ID; we just pass the key.
             try {
-              const home = await homeDir();
-              const dir = await join(home, ".screenpipe", "pi-chat");
-              await commands.piStart("chat", dir, apiKey, null);
-              console.log("[deeplink] restarted Pi with new auth token");
+              await emit("pi-reauth", { apiKey });
+              console.log("[deeplink] emitted pi-reauth with new auth token");
             } catch (e) {
-              // Pi may not be running yet — that's fine, it'll start
-              // with the correct token on first message
-              console.log("[deeplink] Pi restart after login skipped:", e);
+              console.log("[deeplink] pi-reauth emit skipped:", e);
             }
           } catch (error) {
-            console.error("failed to load user:", error);
+            const msg = error instanceof Error ? error.message : String(error);
+            console.error("failed to load user:", msg);
             toast({
               title: "failed to load user",
-              description: "failed to load user",
+              description: msg || "unknown error",
+            });
+          }
+        }
+      }
+
+      // Handle subscription activation deep link.
+      // Louis's email/success page can include:
+      //   screenpipe://subscription-success?purchase_token=<token>
+      // This lets existing app users activate pro without re-logging in.
+      if (
+        parsedUrl.host === "subscription-success" ||
+        parsedUrl.pathname?.includes("subscription-success")
+      ) {
+        const purchaseToken = parsedUrl.searchParams.get("purchase_token");
+        if (purchaseToken) {
+          try {
+            await loadUser(purchaseToken);
+            toast({
+              title: "welcome to screenpipe pro!",
+              description: "your subscription is now active",
+            });
+          } catch (error) {
+            const msg = error instanceof Error ? error.message : String(error);
+            toast({
+              title: "activation failed",
+              description: msg || "try logging out and back in",
+              variant: "destructive",
             });
           }
         }
@@ -69,6 +92,9 @@ export function DeeplinkHandler() {
         const success = parsedUrl.searchParams.get("success") === "true";
         const error = parsedUrl.searchParams.get("error");
         await emit("google-calendar-auth-result", { success, error });
+        // Bring the settings window to the front so the user lands back
+        // where they started (instead of staring at the timeline).
+        await openSettingsWindow();
         toast({
           title: success
             ? "google calendar connected!"
@@ -149,6 +175,26 @@ export function DeeplinkHandler() {
         }
       }
 
+      // Handle in-app file viewer: screenpipe://view?path=<encoded-path>
+      // Notification bodies with markdown links to local files are rewritten
+      // to this scheme by the /notify route in src-tauri/src/notifications/rewrite.rs
+      if (parsedUrl.host === "view" || parsedUrl.pathname === "view") {
+        const filePath = parsedUrl.searchParams.get("path");
+        if (filePath) {
+          try {
+            const { invoke } = await import("@tauri-apps/api/core");
+            await invoke("open_viewer_window", { path: filePath });
+          } catch (error) {
+            console.error("Failed to open viewer:", error);
+            toast({
+              title: "couldn't open file",
+              description: filePath,
+              variant: "destructive",
+            });
+          }
+        }
+      }
+
       // Handle frame deep links: screenpipe://frame/12345
       if (parsedUrl.pathname?.startsWith("/frame/") || parsedUrl.host === "frame") {
         const frameId = url.split("frame/")[1]?.replace(/^\//, "");
@@ -194,7 +240,7 @@ export function DeeplinkHandler() {
       }),
 
       listen("shortcut-start-recording", async () => {
-        await commands.spawnScreenpipe(null);
+        await commands.startCapture();
 
         toast({
           title: "recording started",
@@ -203,11 +249,11 @@ export function DeeplinkHandler() {
       }),
 
       listen("shortcut-stop-recording", async () => {
-        await commands.stopScreenpipe();
+        await commands.stopCapture();
 
         toast({
-          title: "recording stopped",
-          description: "screen recording has been stopped",
+          title: "recording paused",
+          description: "capture paused — pipes and search still available",
         });
       }),
 

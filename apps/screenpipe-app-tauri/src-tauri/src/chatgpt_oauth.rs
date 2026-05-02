@@ -11,30 +11,34 @@
 //!  1. PKCE authorize → auth code
 //!  2. Exchange auth code → access_token + refresh_token
 //!  3. Use access_token directly as Bearer token for OpenAI API
+//!
+//! Tokens are stored in the `secrets` table (encrypted with AES-256-GCM,
+//! key in OS keychain) via `screenpipe_secrets::SecretStore`.
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
 use tauri::AppHandle;
 use tauri_plugin_opener::OpenerExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const ISSUER: &str = "https://auth.openai.com";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CALLBACK_PORT: u16 = 1455;
 
+/// Key used in the secrets table for ChatGPT OAuth tokens.
+/// The legacy migration in screenpipe-secrets also writes to this key
+/// when it finds chatgpt-oauth.json.
+const SECRET_KEY: &str = "oauth:chatgpt";
+
 // ── Token storage ──────────────────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone)]
 struct OAuthTokens {
-    /// The OAuth access_token used as Bearer token for OpenAI API calls
     access_token: String,
-    /// OAuth refresh token for obtaining new credentials
     refresh_token: String,
-    /// Unix-epoch seconds when the access token expires
     expires_at: Option<u64>,
 }
 
@@ -43,33 +47,52 @@ pub struct ChatGptOAuthStatus {
     pub logged_in: bool,
 }
 
-fn get_token_path() -> Result<PathBuf, String> {
-    let home = dirs::home_dir().ok_or("could not find home directory")?;
-    let dir = home.join(".screenpipe");
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| format!("failed to create .screenpipe dir: {}", e))?;
-    Ok(dir.join("chatgpt-oauth.json"))
+/// Open a connection to the secrets store (same DB as the screenpipe server).
+async fn open_secret_store() -> Result<screenpipe_secrets::SecretStore, String> {
+    let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    let db_path = data_dir.join("db.sqlite");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let pool = sqlx::SqlitePool::connect(&db_url)
+        .await
+        .map_err(|e| format!("failed to open db: {}", e))?;
+
+    let secret_key = match crate::secrets::get_key_if_encryption_enabled() {
+        crate::secrets::KeyResult::Found(k) => Some(k),
+        _ => None,
+    };
+
+    screenpipe_secrets::SecretStore::new(pool, secret_key)
+        .await
+        .map_err(|e| format!("failed to init secret store: {}", e))
 }
 
-fn read_tokens() -> Option<OAuthTokens> {
-    let path = get_token_path().ok()?;
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+async fn read_tokens_from_store() -> Option<OAuthTokens> {
+    let store = open_secret_store().await.ok()?;
+    let bytes = store.get(SECRET_KEY).await.ok()??;
+    serde_json::from_slice(&bytes).ok()
 }
 
-fn write_tokens(tokens: &OAuthTokens) -> Result<(), String> {
-    let path = get_token_path()?;
-    let content = serde_json::to_string_pretty(tokens)
-        .map_err(|e| format!("failed to serialize tokens: {}", e))?;
-    std::fs::write(path, content).map_err(|e| format!("failed to write tokens: {}", e))
+async fn write_tokens_to_store(tokens: &OAuthTokens) -> Result<(), String> {
+    let store = open_secret_store().await?;
+    let json = serde_json::to_vec(tokens).map_err(|e| format!("serialize: {}", e))?;
+    store
+        .set(SECRET_KEY, &json)
+        .await
+        .map_err(|e| format!("failed to save token: {}", e))
+}
+
+async fn delete_tokens_from_store() -> Result<(), String> {
+    let store = open_secret_store().await?;
+    store
+        .delete(SECRET_KEY)
+        .await
+        .map_err(|e| format!("failed to delete token: {}", e))
 }
 
 fn is_token_expired(tokens: &OAuthTokens) -> bool {
     match tokens.expires_at {
-        Some(expires_at) => {
-            let now = unix_now();
-            now >= expires_at.saturating_sub(60)
-        }
+        Some(expires_at) => unix_now() >= expires_at.saturating_sub(60),
         None => false,
     }
 }
@@ -112,7 +135,7 @@ async fn do_refresh_token(refresh_token: &str) -> Result<OAuthTokens, String> {
             "grant_type": "refresh_token",
             "client_id": CLIENT_ID,
             "refresh_token": refresh_token,
-            "scope": "openid profile email offline_access",
+            "scope": "openid profile email offline_access api.connectors.read api.connectors.invoke",
         }))
         .send()
         .await
@@ -147,14 +170,16 @@ async fn do_refresh_token(refresh_token: &str) -> Result<OAuthTokens, String> {
         expires_at: Some(unix_now() + expires_in),
     };
 
-    write_tokens(&tokens)?;
+    write_tokens_to_store(&tokens).await?;
     info!("ChatGPT token refreshed successfully");
     Ok(tokens)
 }
 
 /// Get a valid access token, refreshing automatically if expired.
 pub async fn get_valid_token() -> Result<String, String> {
-    let tokens = read_tokens().ok_or("not logged in to ChatGPT")?;
+    let tokens = read_tokens_from_store()
+        .await
+        .ok_or("not logged in to ChatGPT")?;
 
     if is_token_expired(&tokens) {
         let refreshed = do_refresh_token(&tokens.refresh_token).await?;
@@ -167,43 +192,51 @@ pub async fn get_valid_token() -> Result<String, String> {
 // ── Local callback server ──────────────────────────────────────────────
 
 async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<String, String> {
-    let (mut stream, _) = listener
-        .accept()
-        .await
-        .map_err(|e| format!("failed to accept connection: {}", e))?;
+    loop {
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .map_err(|e| format!("failed to accept connection: {}", e))?;
 
-    let mut buf = vec![0u8; 4096];
-    let n = stream
-        .read(&mut buf)
-        .await
-        .map_err(|e| format!("failed to read request: {}", e))?;
+        let mut buf = vec![0u8; 4096];
+        let n = match stream.read(&mut buf).await {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
 
-    let request = String::from_utf8_lossy(&buf[..n]);
+        let request = String::from_utf8_lossy(&buf[..n]);
 
-    // Parse: GET /auth/callback?code=xxx HTTP/1.1
-    let code = request
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1).map(String::from))
-        .and_then(|path| reqwest::Url::parse(&format!("http://localhost{}", path)).ok())
-        .and_then(|url| {
-            url.query_pairs()
-                .find(|(k, _)| k == "code")
-                .map(|(_, v)| v.to_string())
-        })
-        .ok_or_else(|| "no authorization code in callback".to_string())?;
+        let code = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1).map(String::from))
+            .and_then(|path| reqwest::Url::parse(&format!("http://localhost{}", path)).ok())
+            .and_then(|url| {
+                url.query_pairs()
+                    .find(|(k, _)| k == "code")
+                    .map(|(_, v)| v.to_string())
+            });
 
-    let html = concat!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n",
-        "<html><body style=\"font-family:system-ui;text-align:center;padding:60px\">",
-        "<h2>Login successful!</h2>",
-        "<p>You can close this tab and return to screenpipe.</p>",
-        "<script>window.close()</script>",
-        "</body></html>"
-    );
-    let _ = stream.write_all(html.as_bytes()).await;
-
-    Ok(code)
+        match code {
+            Some(code) => {
+                let html = concat!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n",
+                    "<html><body style=\"font-family:system-ui;text-align:center;padding:60px\">",
+                    "<h2>Login successful!</h2>",
+                    "<p>You can close this tab and return to screenpipe.</p>",
+                    "<script>window.close()</script>",
+                    "</body></html>"
+                );
+                let _ = stream.write_all(html.as_bytes()).await;
+                return Ok(code);
+            }
+            None => {
+                let _ = stream
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        }
+    }
 }
 
 // ── Tauri commands ─────────────────────────────────────────────────────
@@ -213,13 +246,15 @@ async fn wait_for_callback(listener: tokio::net::TcpListener) -> Result<String, 
 pub async fn chatgpt_oauth_login(app_handle: AppHandle) -> Result<bool, String> {
     let (code_verifier, code_challenge) = generate_pkce();
 
-    // Bind the local callback server
     let listener = match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", CALLBACK_PORT)).await
     {
         Ok(l) => l,
-        Err(_) => tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .map_err(|e| format!("failed to start local server: {}", e))?,
+        Err(_) => match tokio::net::TcpListener::bind(format!("[::1]:{}", CALLBACK_PORT)).await {
+            Ok(l) => l,
+            Err(_) => tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(|e| format!("failed to start local server: {}", e))?,
+        },
     };
 
     let port = listener
@@ -228,17 +263,18 @@ pub async fn chatgpt_oauth_login(app_handle: AppHandle) -> Result<bool, String> 
         .port();
 
     let redirect_uri = format!("http://localhost:{}/auth/callback", port);
-
     let state = uuid::Uuid::new_v4().simple().to_string();
 
-    // Build the authorization URL (matches Codex CLI params)
     let mut auth_url = reqwest::Url::parse(&format!("{ISSUER}/oauth/authorize")).unwrap();
     auth_url
         .query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", CLIENT_ID)
         .append_pair("redirect_uri", &redirect_uri)
-        .append_pair("scope", "openid profile email offline_access")
+        .append_pair(
+            "scope",
+            "openid profile email offline_access api.connectors.read api.connectors.invoke",
+        )
         .append_pair("code_challenge", &code_challenge)
         .append_pair("code_challenge_method", "S256")
         .append_pair("id_token_add_organizations", "true")
@@ -246,7 +282,6 @@ pub async fn chatgpt_oauth_login(app_handle: AppHandle) -> Result<bool, String> 
         .append_pair("state", &state)
         .append_pair("originator", "codex_cli_rs");
 
-    // Open system browser
     app_handle
         .opener()
         .open_url(auth_url.as_str(), None::<&str>)
@@ -254,7 +289,6 @@ pub async fn chatgpt_oauth_login(app_handle: AppHandle) -> Result<bool, String> 
 
     info!("waiting for ChatGPT OAuth callback on port {}", port);
 
-    // Wait for the redirect with a 120-second timeout
     let auth_code = tokio::time::timeout(
         std::time::Duration::from_secs(120),
         wait_for_callback(listener),
@@ -263,7 +297,6 @@ pub async fn chatgpt_oauth_login(app_handle: AppHandle) -> Result<bool, String> 
     .map_err(|_| "OAuth login timed out (120s)".to_string())?
     .map_err(|e| format!("OAuth callback error: {}", e))?;
 
-    // Exchange authorization code for access_token + refresh_token
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
@@ -313,8 +346,8 @@ pub async fn chatgpt_oauth_login(app_handle: AppHandle) -> Result<bool, String> 
         expires_at: Some(unix_now() + expires_in),
     };
 
-    write_tokens(&tokens)?;
-    info!("ChatGPT OAuth login successful — token saved");
+    write_tokens_to_store(&tokens).await?;
+    info!("ChatGPT OAuth login successful — token saved to secret store");
 
     Ok(true)
 }
@@ -322,7 +355,7 @@ pub async fn chatgpt_oauth_login(app_handle: AppHandle) -> Result<bool, String> 
 #[tauri::command]
 #[specta::specta]
 pub async fn chatgpt_oauth_status() -> Result<ChatGptOAuthStatus, String> {
-    match read_tokens() {
+    match read_tokens_from_store().await {
         Some(tokens) => {
             if is_token_expired(&tokens) {
                 match do_refresh_token(&tokens.refresh_token).await {
@@ -340,15 +373,12 @@ pub async fn chatgpt_oauth_status() -> Result<ChatGptOAuthStatus, String> {
     }
 }
 
-/// Return the current valid access token (auto-refreshing if needed).
-/// Used by the frontend to call OpenAI APIs directly (e.g. /v1/models).
 #[tauri::command]
 #[specta::specta]
 pub async fn chatgpt_oauth_get_token() -> Result<String, String> {
     get_valid_token().await
 }
 
-/// Fetch available models from OpenAI using the stored OAuth token.
 #[tauri::command]
 #[specta::specta]
 pub async fn chatgpt_oauth_models() -> Result<Vec<String>, String> {
@@ -392,10 +422,7 @@ pub async fn chatgpt_oauth_models() -> Result<Vec<String>, String> {
 #[tauri::command]
 #[specta::specta]
 pub async fn chatgpt_oauth_logout() -> Result<bool, String> {
-    let path = get_token_path()?;
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|e| format!("failed to remove token file: {}", e))?;
-    }
+    delete_tokens_from_store().await?;
     info!("ChatGPT OAuth logged out");
     Ok(true)
 }

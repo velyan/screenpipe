@@ -34,10 +34,14 @@ pub fn get_apple_languages(languages: &[Language]) -> Vec<String> {
         m
     });
 
-    languages
+    let mut result: Vec<String> = languages
         .iter()
         .filter_map(|lang| map.get(lang).map(|&s| s.to_string()))
-        .collect()
+        .collect();
+    if languages.contains(&Language::Chinese) && !result.contains(&"zh-Hant".to_string()) {
+        result.push("zh-Hant".to_string());
+    }
+    result
 }
 
 #[allow(dead_code)]
@@ -69,6 +73,33 @@ struct OcrResult {
 #[cfg(target_os = "macos")]
 extern "C" fn release_callback(_refcon: *mut c_void, _data_ptr: *const *const c_void) {
     // Implement your release logic here
+}
+
+#[cfg(target_os = "macos")]
+fn utf16_word_ranges(s: &str) -> Vec<(usize, usize, String)> {
+    let mut out = Vec::new();
+    let mut utf16_pos: usize = 0;
+    let mut word_start: Option<usize> = None;
+    let mut word_buf = String::new();
+
+    for c in s.chars() {
+        let c_utf16 = c.len_utf16();
+        if c.is_whitespace() {
+            if let Some(start) = word_start.take() {
+                out.push((start, utf16_pos - start, std::mem::take(&mut word_buf)));
+            }
+        } else {
+            if word_start.is_none() {
+                word_start = Some(utf16_pos);
+            }
+            word_buf.push(c);
+        }
+        utf16_pos += c_utf16;
+    }
+    if let Some(start) = word_start.take() {
+        out.push((start, utf16_pos - start, word_buf));
+    }
+    out
 }
 
 #[cfg(target_os = "macos")]
@@ -161,39 +192,70 @@ pub fn perform_ocr_apple(
                     };
                     let text = observation_result.string();
                     let confidence = observation_result.confidence() as f64;
-                    let Ok(bbox_result) =
-                        observation_result.bounding_box_for_range(ns::Range::new(0, text.len()))
-                    else {
-                        // Skip bounding box if it fails, still capture the text
-                        overall_confidence += confidence;
-                        ocr_text.push_str(text.to_string().as_str());
+                    let s = text.to_string();
+                    if s.is_empty() {
                         return;
-                    };
-                    let bbox = bbox_result.bounding_box();
-                    let x = bbox.origin.x;
-                    let y_vision = bbox.origin.y; // Vision: bottom-left origin, Y up
-                    let height = bbox.size.height;
-                    let width = bbox.size.width;
-                    // Convert to top-left origin (same as other OCR engines) so pipeline/DB stay consistent
-                    let top = 1.0 - y_vision - height;
-
-                    ocr_results_vec.push(serde_json::json!({
-                        "level": "0",
-                        "page_num": "0",
-                        "block_num": "0",
-                        "par_num": "0",
-                        "line_num": "0",
-                        "word_num": "0",
-                        "left": x.to_string(),
-                        "top": top.to_string(),
-                        "width": width.to_string(),
-                        "height": height.to_string(),
-                        "conf": confidence.to_string(),
-                        "text": text.to_string(),
-                    }));
+                    }
 
                     overall_confidence += confidence;
-                    ocr_text.push_str(text.to_string().as_str());
+                    ocr_text.push_str(&s);
+
+                    // Apple Vision groups multiple words/lines into one observation. Tokenize
+                    // by whitespace and emit one record per word with its own bbox so the
+                    // timeline search highlight can be tight on the matched word.
+                    // bounding_box_for_range expects an NSRange in UTF-16 code units, not
+                    // Rust byte offsets — walk chars summing len_utf16() to build the offsets.
+                    let word_ranges = utf16_word_ranges(&s);
+                    if word_ranges.is_empty() {
+                        return;
+                    }
+
+                    let emit_record = |ocr_results_vec: &mut Vec<serde_json::Value>,
+                                       word_text: &str,
+                                       word_num: usize,
+                                       utf16_start: usize,
+                                       utf16_len: usize| {
+                        let Ok(bbox_result) = observation_result
+                            .bounding_box_for_range(ns::Range::new(utf16_start, utf16_len))
+                        else {
+                            return;
+                        };
+                        let bbox = bbox_result.bounding_box();
+                        let x = bbox.origin.x;
+                        let y_vision = bbox.origin.y; // Vision: bottom-left origin, Y up
+                        let height = bbox.size.height;
+                        let width = bbox.size.width;
+                        // Convert to top-left origin (same as other OCR engines)
+                        let top = 1.0 - y_vision - height;
+
+                        // Stay on level "0" (Apple Native, flat) so frames hit the
+                        // bulk fast-path in insert_ocr_elements; level 5 would route
+                        // every word through the per-row Tesseract hierarchical path.
+                        ocr_results_vec.push(serde_json::json!({
+                            "level": "0",
+                            "page_num": "0",
+                            "block_num": "0",
+                            "par_num": "0",
+                            "line_num": "0",
+                            "word_num": word_num.to_string(),
+                            "left": x.to_string(),
+                            "top": top.to_string(),
+                            "width": width.to_string(),
+                            "height": height.to_string(),
+                            "conf": confidence.to_string(),
+                            "text": word_text.to_string(),
+                        }));
+                    };
+
+                    for (i, (utf16_start, utf16_len, word_text)) in word_ranges.iter().enumerate() {
+                        emit_record(
+                            &mut ocr_results_vec,
+                            word_text,
+                            i + 1,
+                            *utf16_start,
+                            *utf16_len,
+                        );
+                    }
                 });
 
                 let json_output_string =
@@ -208,4 +270,66 @@ pub fn perform_ocr_apple(
 
         default_ocr_result
     })
+}
+
+#[cfg(all(target_os = "macos", test))]
+mod tests {
+    use super::utf16_word_ranges;
+
+    #[test]
+    fn empty_string_yields_empty() {
+        assert!(utf16_word_ranges("").is_empty());
+    }
+
+    #[test]
+    fn whitespace_only_yields_empty() {
+        assert!(utf16_word_ranges("   \t\n  ").is_empty());
+    }
+
+    #[test]
+    fn single_word_one_range() {
+        let r = utf16_word_ranges("rotor");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0], (0, 5, "rotor".to_string()));
+    }
+
+    #[test]
+    fn two_words_two_ranges() {
+        let r = utf16_word_ranges("hello world");
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0], (0, 5, "hello".to_string()));
+        assert_eq!(r[1], (6, 5, "world".to_string()));
+    }
+
+    #[test]
+    fn leading_and_trailing_whitespace_skipped() {
+        let r = utf16_word_ranges("  rotor  ");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0], (2, 5, "rotor".to_string()));
+    }
+
+    #[test]
+    fn cjk_no_whitespace_collapses_to_one_range() {
+        // No whitespace in CJK strings → single range covering the whole string.
+        // Each Han char is 1 UTF-16 code unit (BMP), so utf16_len == char count.
+        let r = utf16_word_ranges("你好世界");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].0, 0);
+        assert_eq!(r[0].1, 4);
+        assert_eq!(r[0].2, "你好世界");
+    }
+
+    #[test]
+    fn supplementary_chars_count_as_two_utf16_units() {
+        // Emoji 🎉 (U+1F389) lives outside the BMP and takes 2 UTF-16 code units.
+        let r = utf16_word_ranges("a 🎉 b");
+        assert_eq!(r.len(), 3);
+        assert_eq!(r[0], (0, 1, "a".to_string()));
+        // 🎉 starts at utf16 offset 2, length 2
+        assert_eq!(r[1].0, 2);
+        assert_eq!(r[1].1, 2);
+        // 'b' is at utf16 offset 5 (1 + 1 + 2 + 1)
+        assert_eq!(r[2].0, 5);
+        assert_eq!(r[2].1, 1);
+    }
 }

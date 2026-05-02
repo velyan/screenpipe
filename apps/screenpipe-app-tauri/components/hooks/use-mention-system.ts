@@ -9,8 +9,7 @@ import {
   buildAppMentionSuggestions,
   type MentionSuggestion,
 } from "@/lib/chat-utils";
-
-const SCREENPIPE_API = "http://localhost:3030";
+import { localFetch } from "@/lib/api";
 const APP_SUGGESTION_LIMIT = 10;
 
 interface Speaker {
@@ -135,7 +134,7 @@ export function useMentionSystem(opts: {
 
     const cursorPos = e.target.selectionStart || 0;
     const textBeforeCursor = value.slice(0, cursorPos);
-    const atMatch = textBeforeCursor.match(/@(\w*)$/);
+    const atMatch = textBeforeCursor.match(/@([\w-]*)$/);
 
     if (atMatch) {
       setShowMentionDropdown(true);
@@ -183,8 +182,8 @@ export function useMentionSystem(opts: {
     const searchSpeakers = async () => {
       setIsLoadingSpeakers(true);
       try {
-        const response = await fetch(
-          `${SCREENPIPE_API}/speakers/search?name=${encodeURIComponent(mentionFilter)}`
+        const response = await localFetch(
+          `/speakers/search?name=${encodeURIComponent(mentionFilter)}`
         );
         if (response.ok) {
           const speakers: Speaker[] = await response.json();
@@ -214,7 +213,7 @@ export function useMentionSystem(opts: {
     if (!appFilterOpen || recentSpeakers.length > 0) return;
     (async () => {
       try {
-        const response = await fetch(`${SCREENPIPE_API}/speakers/search?name=`);
+        const response = await localFetch(`/speakers/search?name=`);
         if (response.ok) {
           const speakers: Speaker[] = await response.json();
           setRecentSpeakers(

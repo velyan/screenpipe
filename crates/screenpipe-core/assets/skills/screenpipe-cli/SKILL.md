@@ -5,12 +5,18 @@ description: Manage screenpipe pipes (scheduled AI automations) and connections 
 
 # Screenpipe CLI
 
-Use `bunx screenpipe@latest` to run CLI commands (or `npx screenpipe@latest`). No separate install needed.
+Use `bun x screenpipe@latest` to run CLI commands. No separate install needed.
+
+**IMPORTANT**: Always run `bun x` commands from a clean temp directory to avoid node_modules conflicts:
+```bash
+cd "$(mktemp -d)" && bun x screenpipe@latest <command>
+```
 
 ## Shell
 
-- **macOS/Linux** → `bash`
-- **Windows** → `powershell`
+- **All platforms** → `bash` (on Windows, the bundled git-portable bash is used automatically)
+
+> **Note:** the bash tool truncates output around ~50 KB. Long listings (`connection list`, `pipe list`, etc.) are sorted with connected/enabled rows first, but if you need a specific row, pipe through `grep` or `head` rather than scanning the full output — e.g. `bun x screenpipe@latest connection list | grep -E 'browser|connected'`.
 
 ---
 
@@ -21,14 +27,14 @@ Pipes are markdown-based AI automations that run on schedule. Each pipe lives at
 ### Commands
 
 ```bash
-bunx screenpipe@latest pipe list                    # List all pipes (compact table)
-bunx screenpipe@latest pipe enable <name>           # Enable a pipe
-bunx screenpipe@latest pipe disable <name>          # Disable a pipe
-bunx screenpipe@latest pipe run <name>              # Run once immediately (for testing)
-bunx screenpipe@latest pipe logs <name>             # View execution logs
-bunx screenpipe@latest pipe install <url-or-path>   # Install from GitHub or local path
-bunx screenpipe@latest pipe delete <name>           # Delete a pipe
-bunx screenpipe@latest pipe models list             # View AI model presets
+bun x screenpipe@latest pipe list                    # List all pipes (compact table)
+bun x screenpipe@latest pipe enable <name>           # Enable a pipe
+bun x screenpipe@latest pipe disable <name>          # Disable a pipe
+bun x screenpipe@latest pipe run <name>              # Run once immediately (for testing)
+bun x screenpipe@latest pipe logs <name>             # View execution logs
+bun x screenpipe@latest pipe install <url-or-path>   # Install from GitHub or local path
+bun x screenpipe@latest pipe delete <name>           # Delete a pipe
+bun x screenpipe@latest pipe models list             # View AI model presets
 ```
 
 ### Creating a Pipe
@@ -39,7 +45,7 @@ Create `~/.screenpipe/pipes/<name>/pipe.md` with YAML frontmatter + prompt:
 ---
 schedule: every 30m
 enabled: true
-preset: Oai
+preset: ["Primary", "Fallback"]
 ---
 
 Your prompt instructions here. The AI agent executes this on schedule.
@@ -51,17 +57,37 @@ Your prompt instructions here. The AI agent executes this on schedule.
 3. Output summary / send notification
 ```
 
-**Schedule syntax**: `every 30m`, `every 1h`, `every day at 9am`, `every monday at 9am`, or cron: `*/30 * * * *`, `0 9 * * *`
+**Schedule syntax**:
+- Recurring: `every 30m`, `every 1h`, `every day at 9am`, `every monday at 9am`, or cron `*/30 * * * *`, `0 9 * * *`
+- One-off (fires once, then auto-disables): `at <RFC3339 timestamp>` — e.g. `at 2026-04-29T17:00:00-07:00`
+- Manual only: `manual` (run via `pipe run` or API trigger)
 
-**Config fields**: `schedule`, `enabled` (bool), `preset` (AI preset name), `history` (bool — include previous output as context)
+**One-off scheduled tasks** (use this when the user says "in 2 days", "tomorrow at 5pm", "next Monday", "remind me to check X later", or any other future-time deferred action):
+
+```yaml
+---
+schedule: at 2026-04-29T17:00:00-07:00
+enabled: true
+preset: auto
+---
+
+Check Gmail for a reply from Mark about the HIPAA evidence pack.
+If found, summarize and send a notification. If not, note it.
+```
+
+Resolve "in 2 days" / "tomorrow 5pm" / "next Monday" against the user's local timezone (which is in the context header), format as RFC3339 with offset, and put it in the `at <iso>` schedule.
+
+When fired, the pipe auto-disables itself — `enabled: false` is set in the local-overrides file. The pipe.md stays on disk as history. Users see upcoming one-offs in the chat sidebar's "upcoming" section with a countdown ("in 2d 4h"). To cancel before fire time: `pipe disable <name>`. To re-run after firing: `pipe enable <name>` then `pipe run <name>` (or set a new `at <iso>`).
+
+**Config fields**: `schedule`, `enabled` (bool), `preset` (string or array — e.g. `"Oai"` or `["Primary", "Fallback"]`), `history` (bool — include previous output as context)
 
 Screenpipe prepends a context header with time range, timezone, OS, and API URL before each execution. No template variables needed.
 
 After creating:
 ```bash
-bunx screenpipe@latest pipe install ~/.screenpipe/pipes/my-pipe
-bunx screenpipe@latest pipe enable my-pipe
-bunx screenpipe@latest pipe run my-pipe   # test immediately
+bun x screenpipe@latest pipe install ~/.screenpipe/pipes/my-pipe
+bun x screenpipe@latest pipe enable my-pipe
+bun x screenpipe@latest pipe run my-pipe   # test immediately
 ```
 
 ### Editing Config
@@ -90,31 +116,39 @@ Manage integrations (Telegram, Slack, Discord, Email, Todoist, Teams) from the C
 ### Commands
 
 ```bash
-bunx screenpipe@latest connection list              # List all connections + status
-bunx screenpipe@latest connection list --json       # JSON output
-bunx screenpipe@latest connection get <id>          # Show saved credentials
-bunx screenpipe@latest connection get <id> --json   # JSON output
-bunx screenpipe@latest connection set <id> key=val  # Save credentials
-bunx screenpipe@latest connection test <id>         # Test a connection
-bunx screenpipe@latest connection remove <id>       # Remove credentials
+bun x screenpipe@latest connection list              # List all connections + status
+bun x screenpipe@latest connection list --json       # JSON output
+bun x screenpipe@latest connection get <id>          # Show saved credentials
+bun x screenpipe@latest connection get <id> --json   # JSON output
+bun x screenpipe@latest connection set <id> key=val  # Save credentials
+bun x screenpipe@latest connection test <id>         # Test a connection
+bun x screenpipe@latest connection remove <id>       # Remove credentials
 ```
 
 ### Examples
 
 ```bash
 # Set up Telegram
-bunx screenpipe@latest connection set telegram bot_token=123456:ABC-DEF chat_id=5776185278
+bun x screenpipe@latest connection set telegram bot_token=123456:ABC-DEF chat_id=5776185278
 
 # Set up Slack webhook
-bunx screenpipe@latest connection set slack webhook_url=https://hooks.slack.com/services/...
+bun x screenpipe@latest connection set slack webhook_url=https://hooks.slack.com/services/...
 
 # Verify it works
-bunx screenpipe@latest connection test telegram
+bun x screenpipe@latest connection test telegram
 
 # Check what's connected
-bunx screenpipe@latest connection list
+bun x screenpipe@latest connection list
 ```
 
 Connection IDs: `telegram`, `slack`, `discord`, `email`, `todoist`, `teams`, `google-calendar`, `apple-intelligence`, `openclaw`
 
 Credentials are stored locally at `~/.screenpipe/connections.json`.
+
+## Publishing pipes to the store
+
+```bash
+screenpipe pipe publish <pipe-name>
+```
+
+Reads `~/.screenpipe/pipes/<pipe-name>/pipe.md`, extracts title/description/icon/category from YAML frontmatter, and publishes to the screenpipe pipe store. Requires auth (SCREENPIPE_API_KEY env var or `~/.screenpipe/auth.json`).

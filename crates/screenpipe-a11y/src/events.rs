@@ -164,7 +164,7 @@ pub struct ElementBounds {
 // ============================================================================
 
 /// A node in the accessibility tree
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AccessibilityNode {
     /// Control type (e.g., "Button", "Edit", "Text", "Window")
     pub control_type: String,
@@ -199,6 +199,34 @@ pub struct AccessibilityNode {
     /// Whether the element can receive keyboard focus
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_keyboard_focusable: Option<bool>,
+
+    /// Tooltip or help text (UIA HelpText)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub help_text: Option<String>,
+
+    /// Whether the element is a password field (UIA IsPassword)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_password: Option<bool>,
+
+    /// Whether the element is selected (UIA SelectionItem.IsSelected)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_selected: Option<bool>,
+
+    /// Whether the element is expanded (UIA ExpandCollapse.ExpandCollapseState)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_expanded: Option<bool>,
+
+    /// Keyboard shortcut (UIA AcceleratorKey)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accelerator_key: Option<String>,
+
+    /// Access key mnemonic (UIA AccessKey)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_key: Option<String>,
+
+    /// Localized control type description (UIA LocalizedControlType)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub localized_control_type: Option<String>,
 
     /// Child elements
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -877,5 +905,23 @@ mod tests {
         assert_eq!(EventType::from_str("c"), Some(EventType::Click));
         assert_eq!(EventType::from_str("text"), Some(EventType::Text));
         assert_eq!(EventType::from_str("invalid"), None);
+    }
+
+    #[test]
+    fn test_text_event_accepts_app_context() {
+        let mut event = UiEvent::text(Utc::now(), 100, "hello world".to_string());
+        assert!(event.app_name.is_none());
+        assert!(event.window_title.is_none());
+
+        event.app_name = Some("Cursor".to_string());
+        event.window_title = Some("main.rs — my-project".to_string());
+
+        assert_eq!(event.app_name.as_deref(), Some("Cursor"));
+        assert_eq!(event.window_title.as_deref(), Some("main.rs — my-project"));
+
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("\"event_type\":\"text\""));
+        assert!(json.contains("\"app_name\":\"Cursor\""));
+        assert!(json.contains("main.rs"));
     }
 }

@@ -3,6 +3,7 @@ import { Message, RequestBody, ResponseFormat } from '../types';
 import OpenAI from 'openai';
 import type { ChatCompletionMessage, ChatCompletionCreateParams } from 'openai/resources/chat';
 import type { ResponseFormatJSONSchema } from 'openai/resources';
+import { captureException } from '@sentry/cloudflare';
 
 export class OpenAIProvider implements AIProvider {
 	supportsTools = true;
@@ -10,8 +11,8 @@ export class OpenAIProvider implements AIProvider {
 	supportsJson = true;
 	private client: OpenAI;
 
-	constructor(apiKey: string) {
-		this.client = new OpenAI({ apiKey });
+	constructor(apiKey: string, baseURL?: string) {
+		this.client = new OpenAI({ apiKey, ...(baseURL ? { baseURL } : {}) });
 	}
 
 	private createJSONSchemaFormat(schema: Record<string, unknown>, name: string, description?: string): ResponseFormatJSONSchema {
@@ -71,7 +72,12 @@ export class OpenAIProvider implements AIProvider {
 			response_format: this.formatResponseFormat(body.response_format),
 			tools: body.tools as ChatCompletionCreateParams['tools'],
 		});
-	
+
+		// Capture scope fields for the error path below — `this` inside the
+		// ReadableStream start() refers to the controller, not the provider.
+		const modelForTags = body.model;
+		const baseURLForTags = this.client.baseURL || 'openai-default';
+
 		return new ReadableStream({
 			async start(controller) {
 				try {
@@ -105,6 +111,22 @@ export class OpenAIProvider implements AIProvider {
 					controller.close();
 				} catch (error: any) {
 					console.error('Streaming error:', error);
+					// Record the error in Sentry with model/provider tags. This
+					// path is normally swallowed into an SSE `data: {error:…}`
+					// event, so without this the client sees "random error"
+					// and we have no server-side trace. Tags let you filter
+					// by model (e.g. gemma4-31b) or provider (e.g. tinfoil).
+					try {
+						captureException(error, {
+							tags: {
+								model: modelForTags,
+								base_url: baseURLForTags,
+								error_path: 'openai_streaming',
+								status: String(error?.status ?? 'unknown'),
+							},
+							level: 'warning',
+						});
+					} catch {}
 					const errorMessage = error?.message || 'Unknown streaming error';
 					const errorStatus = error?.status || 500;
 					try {
@@ -139,11 +161,42 @@ export class OpenAIProvider implements AIProvider {
 					role: msg.role,
 					content: Array.isArray(msg.content)
 						? msg.content.map((part) => {
-								if (part.type === 'image') {
+								// OpenAI image_url format (from Pi's convertToLlm)
+								if (part.type === 'image_url' && part.image_url?.url) {
 									return {
 										type: 'image_url',
 										image_url: {
-											url: part.image?.url,
+											url: part.image_url.url,
+											detail: part.image_url.detail || 'auto',
+										},
+									};
+								}
+								// Pi native format: { type: "image", data: "base64...", mimeType: "image/png" }
+								if (part.type === 'image' && part.data && part.mimeType) {
+									return {
+										type: 'image_url',
+										image_url: {
+											url: `data:${part.mimeType};base64,${part.data}`,
+											detail: 'auto',
+										},
+									};
+								}
+								// Anthropic base64 format
+								if (part.type === 'image' && part.source?.type === 'base64') {
+									return {
+										type: 'image_url',
+										image_url: {
+											url: `data:${part.source.media_type || part.source.mediaType || 'image/png'};base64,${part.source.data}`,
+											detail: 'auto',
+										},
+									};
+								}
+								// Legacy: { type: "image", image: { url: "..." } }
+								if (part.type === 'image' && part.image?.url) {
+									return {
+										type: 'image_url',
+										image_url: {
+											url: part.image.url,
 											detail: 'auto',
 										},
 									};

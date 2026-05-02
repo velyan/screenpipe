@@ -28,7 +28,7 @@
     <a href="https://screenpi.pe" target="_blank">
         <img src="https://img.shields.io/badge/ダウンロード-デスクトップアプリ-black?style=for-the-badge" alt="ダウンロード">
     </a>
-    <a href="https://github.com/screenpipe/screenpipe/raw/main/crates/screenpipe-integrations/screenpipe-mcp/screenpipe-mcp.mcpb" target="_blank">
+    <a href="https://github.com/screenpipe/screenpipe/releases?q=mcp-v&expanded=true" target="_blank">
         <img src="https://img.shields.io/badge/インストール-Claude%20拡張機能-D97706?style=for-the-badge&logo=anthropic&logoColor=white" alt="claude拡張機能をインストール">
     </a>
 </p>
@@ -37,8 +37,8 @@
     <a href="https://discord.gg/screenpipe">
         <img src="https://img.shields.io/discord/823813159592001537?color=5865F2&logo=discord&logoColor=white&style=flat-square" alt="discord">
     </a>
-    <a href="https://twitter.com/screen_pipe">
-        <img alt="x" src="https://img.shields.io/twitter/url/https/twitter.com/diffuserslib.svg?style=social&label=フォロー%20%40screen_pipe">
+    <a href="https://twitter.com/screenpipe">
+        <img alt="x" src="https://img.shields.io/twitter/url/https/twitter.com/diffuserslib.svg?style=social&label=フォロー%20%40screenpipe">
     </a>
 </p>
 
@@ -81,5 +81,5 @@ screenpipeは画面と音声を24時間365日録画し、すべてをローカ�
 <p align="center">
     <a href="https://docs.screenpi.pe">ドキュメント</a> ·
     <a href="https://discord.gg/screenpipe">discord</a> ·
-    <a href="https://twitter.com/screen_pipe">x</a>
+    <a href="https://twitter.com/screenpipe">x</a>
 </p>

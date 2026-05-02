@@ -52,13 +52,12 @@ pub async fn get_or_download_model(model_type: PyannoteModel) -> Result<PathBuf>
         PyannoteModel::Embedding => "wespeaker_en_voxceleb_CAM++.onnx",
     };
 
-    // Check in-memory cache
-    {
-        let cached = model_path_lock.lock().await;
-        if let Some(path) = cached.as_ref() {
-            debug!("using cached {} model: {:?}", filename, path);
-            return Ok(path.clone());
-        }
+    // Check in-memory cache — verify the cached path still exists on disk.
+    // macOS periodically clears ~/Library/Caches, which leaves the in-memory
+    // path dangling and causes ORT to fail loading the ONNX model. On a miss,
+    // drop the stale entry and fall through to the disk-cache / download path.
+    if let Some(path) = take_valid_cached_path(model_path_lock, filename).await {
+        return Ok(path);
     }
 
     let cache_dir = get_cache_dir()?;
@@ -79,52 +78,90 @@ pub async fn get_or_download_model(model_type: PyannoteModel) -> Result<PathBuf>
         return Ok(path);
     }
 
-    // Need to download — use atomic flag to prevent duplicate downloads
-    if downloading_flag
+    // Download with retries — use atomic flag to prevent concurrent downloads.
+    // Starter returns immediately (non-blocking); concurrent callers wait for the file.
+    let started_download = downloading_flag
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
+        .is_ok();
+    if started_download {
         info!("initiating {} model download...", filename);
         let model_type_clone = model_type;
+        let model_name = filename.to_string();
         let flag = downloading_flag;
         tokio::spawn(async move {
-            match download_model(model_type_clone).await {
-                Ok(_) => {}
-                Err(e) => {
-                    warn!("error downloading {} model: {}", filename, e);
-                    // Reset flag so a retry is possible
-                    flag.store(false, Ordering::SeqCst);
+            const MAX_RETRIES: u32 = 3;
+            let mut last_err = None;
+            for attempt in 1..=MAX_RETRIES {
+                info!(
+                    "{} model download attempt {}/{}",
+                    model_name, attempt, MAX_RETRIES
+                );
+                match download_model(&model_type_clone).await {
+                    Ok(_) => {
+                        last_err = None;
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "{} model download attempt {} failed: {}",
+                            model_name, attempt, e
+                        );
+                        last_err = Some(e);
+                        if attempt < MAX_RETRIES {
+                            tokio::time::sleep(tokio::time::Duration::from_secs(2u64.pow(attempt)))
+                                .await;
+                        }
+                    }
                 }
             }
+            if let Some(e) = last_err {
+                warn!(
+                    "{} model download failed after {} retries: {}",
+                    model_name, MAX_RETRIES, e
+                );
+            }
+            flag.store(false, Ordering::SeqCst);
         });
-    }
+    } else {
+        // Another task is downloading — wait for the file to appear
+        let timeout = tokio::time::Duration::from_secs(120);
+        let start = tokio::time::Instant::now();
+        while !path.exists() {
+            if start.elapsed() > timeout {
+                return Err(anyhow::anyhow!(
+                    "timed out waiting for {} model download after {:?}",
+                    filename,
+                    timeout
+                ));
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
 
-    // Wait for the file to appear, with a timeout
-    let timeout = tokio::time::Duration::from_secs(120);
-    let start = tokio::time::Instant::now();
-    while !path.exists() {
-        if start.elapsed() > timeout {
-            downloading_flag.store(false, Ordering::SeqCst);
+        if !path.exists() {
             return Err(anyhow::anyhow!(
-                "timed out waiting for {} model download after {:?}",
-                filename,
-                timeout
+                "{} model file missing after download",
+                filename
             ));
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let mut cached = model_path_lock.lock().await;
+        *cached = Some(path.clone());
+        return Ok(path);
     }
 
-    let mut cached = model_path_lock.lock().await;
-    *cached = Some(path.clone());
-    Ok(path)
+    Err(anyhow::anyhow!(
+        "{} model not available yet; download started in background",
+        filename
+    ))
 }
 
+#[derive(Clone, Copy)]
 pub enum PyannoteModel {
     Segmentation,
     Embedding,
 }
 
-async fn download_model(model_type: PyannoteModel) -> Result<()> {
+async fn download_model(model_type: &PyannoteModel) -> Result<()> {
     let (url, filename) = match model_type {
         PyannoteModel::Segmentation => (
             "https://github.com/screenpipe/screenpipe/raw/refs/heads/main/crates/screenpipe-audio/models/pyannote/segmentation-3.0.onnx",
@@ -138,7 +175,20 @@ async fn download_model(model_type: PyannoteModel) -> Result<()> {
 
     info!("downloading {} model from {}", filename, url);
     let response = reqwest::get(url).await?;
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "download failed: HTTP {} for {}",
+            response.status(),
+            url
+        ));
+    }
     let model_data = response.bytes().await?;
+    if model_data.is_empty() {
+        return Err(anyhow::anyhow!(
+            "download returned empty body for {}",
+            filename
+        ));
+    }
 
     let cache_dir = get_cache_dir()?;
     tokio::fs::create_dir_all(&cache_dir).await?;
@@ -171,4 +221,84 @@ async fn download_model(model_type: PyannoteModel) -> Result<()> {
 fn get_cache_dir() -> Result<PathBuf> {
     let proj_dirs = dirs::cache_dir().ok_or_else(|| anyhow::anyhow!("failed to get cache dir"))?;
     Ok(proj_dirs.join("screenpipe").join("models"))
+}
+
+/// Return the in-memory cached model path only if the underlying file still
+/// exists on disk. If the cache entry points at a file that has since been
+/// removed (e.g. macOS clearing `~/Library/Caches`), the entry is dropped so
+/// the caller falls through to the disk-cache / download path.
+async fn take_valid_cached_path(
+    model_path_lock: &Mutex<Option<PathBuf>>,
+    filename: &str,
+) -> Option<PathBuf> {
+    let mut cached = model_path_lock.lock().await;
+    match cached.as_ref() {
+        Some(path) if path.exists() => {
+            debug!("using cached {} model: {:?}", filename, path);
+            Some(path.clone())
+        }
+        Some(path) => {
+            warn!(
+                "cached {} model at {:?} no longer exists on disk, redownloading",
+                filename, path
+            );
+            *cached = None;
+            None
+        }
+        None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn cached_path_returned_when_file_exists_on_disk() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("segmentation-3.0.onnx");
+        tokio::fs::write(&path, b"fake onnx bytes").await.unwrap();
+
+        let lock: Mutex<Option<PathBuf>> = Mutex::new(Some(path.clone()));
+        let resolved = take_valid_cached_path(&lock, "segmentation-3.0.onnx").await;
+
+        assert_eq!(resolved, Some(path));
+        assert!(
+            lock.lock().await.is_some(),
+            "cache entry should survive a successful lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_cached_path_is_dropped_when_file_missing() {
+        // Simulates macOS clearing `~/Library/Caches` out from under us:
+        // the in-memory cache still points at a path whose file is gone.
+        // Without the existence check, get_or_download_model would return
+        // this dangling path and ORT would fail to load the ONNX model.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("segmentation-3.0.onnx");
+        tokio::fs::write(&path, b"fake onnx bytes").await.unwrap();
+        tokio::fs::remove_file(&path).await.unwrap();
+        assert!(!path.exists());
+
+        let lock: Mutex<Option<PathBuf>> = Mutex::new(Some(path));
+        let resolved = take_valid_cached_path(&lock, "segmentation-3.0.onnx").await;
+
+        assert!(
+            resolved.is_none(),
+            "must not return a cached path whose file has been deleted"
+        );
+        assert!(
+            lock.lock().await.is_none(),
+            "stale cache entry should be cleared so the next call redownloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_cache_returns_none() {
+        let lock: Mutex<Option<PathBuf>> = Mutex::new(None);
+        let resolved = take_valid_cached_path(&lock, "segmentation-3.0.onnx").await;
+        assert!(resolved.is_none());
+    }
 }

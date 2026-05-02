@@ -4,7 +4,7 @@ import { parseKeyboardShortcut } from "@/lib/utils";
 import { Switch } from "@/components/ui/switch";
 import { toast } from "@/components/ui/use-toast";
 import { cn } from "@/lib/utils";
-import { Pencil } from "lucide-react";
+import { Pencil, X } from "lucide-react";
 import { commands } from "@/lib/utils/tauri";
 import { invoke } from "@tauri-apps/api/core";
 import hotkeys from "hotkeys-js";
@@ -43,6 +43,11 @@ const ShortcutRow = ({
     const handleKeyDown = (event: KeyboardEvent) => {
       event.preventDefault();
 
+      if (event.key === "Escape") {
+        setIsRecording(false);
+        return;
+      }
+
       const MODIFIER_KEYS = ["SUPER", "CTRL", "ALT", "SHIFT"] as const;
       const KEY_CODE_MAP: Record<number, string> = {
         91: "SUPER",
@@ -71,11 +76,20 @@ const ShortcutRow = ({
       }
     };
 
+    // Cancel recording when clicking outside this row's button
+    const handleClickOutside = (event: MouseEvent) => {
+      const target = event.target as HTMLElement;
+      if (!target.closest("[data-shortcut-recording]")) {
+        setIsRecording(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handleClickOutside);
     hotkeys.filter = () => true;
     hotkeys("*", handleKeyDown);
 
     return () => {
-      setIsRecording(false);
+      document.removeEventListener("mousedown", handleClickOutside);
       // Re-register all global shortcuts after recording
       invoke("resume_global_shortcuts").catch(() => {});
       hotkeys.unbind("*");
@@ -247,6 +261,7 @@ const ShortcutRow = ({
       </div>
       <div className="flex items-center gap-4">
         <button
+          data-shortcut-recording={isRecording ? "true" : undefined}
           onClick={() => {
             if (getShortcutState() === ShortcutState.DISABLED) return;
             setIsRecording(true);
@@ -261,7 +276,17 @@ const ShortcutRow = ({
           )}
         >
           {isRecording ? (
-            <span className="animate-pulse">recording...</span>
+            <span className="flex items-center justify-between gap-2 w-full">
+              <span className="animate-pulse">press keys...</span>
+              <span
+                role="button"
+                onClick={(e) => { e.stopPropagation(); setIsRecording(false); }}
+                className="text-muted-foreground hover:text-foreground transition-colors"
+                title="cancel"
+              >
+                <X className="h-3 w-3" />
+              </span>
+            </span>
           ) : getShortcutState() === ShortcutState.DISABLED ? (
             <span>Disabled</span>
           ) : (

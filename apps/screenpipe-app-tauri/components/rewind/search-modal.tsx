@@ -13,6 +13,7 @@ import { cn } from "@/lib/utils";
 import { commands } from "@/lib/utils/tauri";
 import { showChatWithPrefill } from "@/lib/chat-utils";
 import { ThumbnailHighlightOverlay } from "./thumbnail-highlight-overlay";
+import { localFetch, getApiBaseUrl } from "@/lib/api";
 
 interface SpeakerResult {
   id: number;
@@ -134,7 +135,7 @@ function useSuggestions(isOpen: boolean) {
           end_time: endTime.toISOString(),
         });
 
-        const resp = await fetch(`http://localhost:3030/search?${params}`, {
+        const resp = await localFetch(`/search?${params}`, {
           signal: AbortSignal.timeout(5000),
         });
         if (cancelled) return;
@@ -230,11 +231,11 @@ function useSuggestions(isOpen: boolean) {
 const FrameThumbnail = ({ frameId, alt }: { frameId: number; alt: string }) => {
   const [isLoading, setIsLoading] = useState(true);
   const [hasError, setHasError] = useState(false);
-  const [src, setSrc] = useState(`http://localhost:3030/frames/${frameId}`);
+  const [src, setSrc] = useState(`${getApiBaseUrl()}/frames/${frameId}`);
   const retryCount = useRef(0);
 
   useEffect(() => {
-    setSrc(`http://localhost:3030/frames/${frameId}`);
+    setSrc(`${getApiBaseUrl()}/frames/${frameId}`);
     setIsLoading(true);
     setHasError(false);
     retryCount.current = 0;
@@ -268,7 +269,7 @@ const FrameThumbnail = ({ frameId, alt }: { frameId: number; alt: string }) => {
             if (retryCount.current < 3) {
               retryCount.current += 1;
               setTimeout(() => {
-                setSrc(`http://localhost:3030/frames/${frameId}?retry=${retryCount.current}`);
+                setSrc(`${getApiBaseUrl()}/frames/${frameId}?retry=${retryCount.current}`);
               }, 1000 * retryCount.current);
             } else {
               setIsLoading(false);
@@ -506,7 +507,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
 
     // Fire all three facet queries in parallel
     const fetchFacet = async (sql: string) => {
-      const resp = await fetch("http://localhost:3030/raw_sql", {
+      const resp = await localFetch("/raw_sql", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ query: sql }),
@@ -531,7 +532,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
     fetchFacet(
       `SELECT f.browser_url as url, COUNT(*) as cnt
        FROM frames_fts
-       JOIN frames f ON f.id = frames_fts.id
+       JOIN frames f ON f.id = frames_fts.rowid
        WHERE frames_fts MATCH '${escaped}'
        AND f.browser_url IS NOT NULL AND f.browser_url != ''
        GROUP BY f.browser_url ORDER BY cnt DESC LIMIT 200`
@@ -552,7 +553,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
     fetchFacet(
       `SELECT DATE(f.timestamp) as d, MIN(f.timestamp) as ts, COUNT(*) as cnt
        FROM frames_fts
-       JOIN frames f ON f.id = frames_fts.id
+       JOIN frames f ON f.id = frames_fts.rowid
        WHERE frames_fts MATCH '${escaped}'
        GROUP BY DATE(f.timestamp)
        ORDER BY d DESC LIMIT 30`
@@ -743,7 +744,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
       setIsSearchingTags(true);
       try {
         // Fetch all distinct tags with counts from the tags + vision_tags tables
-        const tagsResp = await fetch("http://localhost:3030/raw_sql", {
+        const tagsResp = await localFetch("/raw_sql", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -773,7 +774,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
         if (matched.length > 0 && !cancelled) {
           // Fetch frames tagged with matching tags
           const inList = matched.map(t => `'${t.name.replace(/'/g, "''")}'`).join(",");
-          const framesResp = await fetch("http://localhost:3030/raw_sql", {
+          const framesResp = await localFetch("/raw_sql", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -829,9 +830,9 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
       try {
         // For @ with no text, fetch all speakers; otherwise search by name
         const url = searchTerm.length > 0
-          ? `http://localhost:3030/speakers/search?name=${encodeURIComponent(searchTerm)}`
-          : `http://localhost:3030/speakers/search?name=`;
-        const resp = await fetch(url, {
+          ? `/speakers/search?name=${encodeURIComponent(searchTerm)}`
+          : `/speakers/search?name=`;
+        const resp = await localFetch(url, {
           signal: AbortSignal.any([controller.signal, AbortSignal.timeout(3000)]),
         });
         if (resp.ok && !cancelled) {
@@ -870,8 +871,8 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
           limit: "30",
           offset: "0",
         });
-        const resp = await fetch(
-          `http://localhost:3030/search?${params}`,
+        const resp = await localFetch(
+          `/search?${params}`,
           { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]) }
         );
         if (resp.ok && !cancelled) {
@@ -898,7 +899,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                 const lo = new Date(d.getTime() - 30_000).toISOString();
                 const hi = new Date(d.getTime() + 30_000).toISOString();
                 const escaped = ts.replace(/'/g, "''");
-                const resp = await fetch("http://localhost:3030/raw_sql", {
+                const resp = await localFetch("/raw_sql", {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
                   body: JSON.stringify({
@@ -999,8 +1000,8 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
         limit: TRANSCRIPTION_PAGE_SIZE.toString(),
         offset: newOffset.toString(),
       });
-      const resp = await fetch(
-        `http://localhost:3030/search?${params}`,
+      const resp = await localFetch(
+        `/search?${params}`,
         { signal: AbortSignal.timeout(5000) }
       );
       if (resp.ok) {

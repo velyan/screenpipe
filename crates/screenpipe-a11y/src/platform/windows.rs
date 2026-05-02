@@ -20,16 +20,19 @@ use super::windows_uia::{self, ClickElementRequest};
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, VK_CAPITAL, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU,
     VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetForegroundWindow, GetMessageW, GetWindowTextW,
-    GetWindowThreadProcessId, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HC_ACTION,
-    HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_XBUTTONDOWN,
+    GetWindowThreadProcessId, PostThreadMessageW, SetTimer, SetWindowsHookExW, TranslateMessage,
+    UnhookWindowsHookEx, EVENT_SYSTEM_FOREGROUND, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG,
+    MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT,
+    WM_RBUTTONDOWN, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_XBUTTONDOWN,
 };
 
 /// Permission status for UI capture
@@ -276,6 +279,16 @@ impl UiRecorder {
 // Thread-local state for hook callbacks
 // ============================================================================
 
+/// A deferred clipboard read request, queued from the LL hook and processed
+/// in the message loop where blocking is safe.
+struct PendingClipboard {
+    operation: char,
+    timestamp: chrono::DateTime<Utc>,
+    relative_ms: u64,
+    app_name: Option<String>,
+    window_title: Option<String>,
+}
+
 struct HookState {
     tx: Sender<UiEvent>,
     start: Instant,
@@ -288,6 +301,8 @@ struct HookState {
     activity_feed: Option<ActivityFeed>,
     click_queue: Arc<Mutex<Vec<ClickElementRequest>>>,
     focused_element: Arc<Mutex<Option<ElementContext>>>,
+    /// Clipboard operations deferred from the LL hook to the message loop.
+    pending_clipboard: Vec<PendingClipboard>,
 }
 
 // Thread-local storage for hook state
@@ -328,6 +343,7 @@ fn run_native_hooks(
             activity_feed,
             click_queue,
             focused_element,
+            pending_clipboard: Vec::new(),
         }));
     });
 
@@ -355,15 +371,19 @@ fn run_native_hooks(
         }
 
         // Message loop (required for hooks to receive events)
+        // Install a timer so GetMessageW wakes periodically for text buffer flushing.
+        // Without this, typed text stays in the buffer until the next input event.
+        const TEXT_FLUSH_TIMER_ID: usize = 42;
+        SetTimer(HWND::default(), TEXT_FLUSH_TIMER_ID, 100, None);
+
         let mut msg = MSG::default();
         while !stop.load(Ordering::Relaxed) {
-            // Use PeekMessage with a timeout to allow checking stop flag
             if GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
 
-            // Check for text buffer flush
+            // Check for text buffer flush (runs on timer tick and after every message)
             HOOK_STATE.with(|state| {
                 // Use try_borrow_mut to avoid panic — LL hook callbacks can
                 // fire synchronously during DispatchMessageW above
@@ -372,6 +392,42 @@ fn run_native_hooks(
                         if let Some(last_time) = s.last_text_time {
                             if last_time.elapsed().as_millis() as u64 >= s.config.text_timeout_ms {
                                 flush_text_buffer(s);
+                            }
+                        }
+
+                        // Process deferred clipboard operations — safe to block here
+                        // since we're in the message loop, not a LL hook callback.
+                        if !s.pending_clipboard.is_empty() {
+                            let pending = std::mem::take(&mut s.pending_clipboard);
+                            let capture_content = s.config.capture_clipboard_content;
+                            let apply_pii = s.config.apply_pii_removal;
+                            for p in pending {
+                                let content = if capture_content {
+                                    get_clipboard_text().map(|c| {
+                                        if apply_pii {
+                                            remove_pii(&c)
+                                        } else {
+                                            c
+                                        }
+                                    })
+                                } else {
+                                    None
+                                };
+                                let event = UiEvent {
+                                    id: None,
+                                    timestamp: p.timestamp,
+                                    relative_ms: p.relative_ms,
+                                    data: EventData::Clipboard {
+                                        operation: p.operation,
+                                        content,
+                                    },
+                                    app_name: p.app_name,
+                                    window_title: p.window_title,
+                                    browser_url: None,
+                                    element: None,
+                                    frame_id: None,
+                                };
+                                let _ = s.tx.try_send(event);
                             }
                         }
                     }
@@ -465,98 +521,26 @@ unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: 
                 }
 
                 // Check for clipboard operations (Ctrl+C, Ctrl+X, Ctrl+V)
+                // IMPORTANT: Do NOT read clipboard or apply PII regex here — this is
+                // a low-level hook callback that must return in <10ms or it stalls the
+                // entire system input queue. Instead, defer to the message loop.
                 if mods & 0x02 != 0 && s.config.capture_clipboard {
                     // Ctrl is pressed
-                    let apply_pii = s.config.apply_pii_removal;
-                    match vk_code {
-                        0x43 => {
-                            // C
-                            let event = UiEvent {
-                                id: None,
-                                timestamp,
-                                relative_ms: t,
-                                data: EventData::Clipboard {
-                                    operation: 'c',
-                                    content: if s.config.capture_clipboard_content {
-                                        get_clipboard_text().map(|c| {
-                                            if apply_pii {
-                                                remove_pii(&c)
-                                            } else {
-                                                c
-                                            }
-                                        })
-                                    } else {
-                                        None
-                                    },
-                                },
-                                app_name: app_name.clone(),
-                                window_title: window_title.clone(),
-                                browser_url: None,
-                                element: None,
-                                frame_id: None,
-                            };
-                            let _ = s.tx.try_send(event);
-                            return;
-                        }
-                        0x58 => {
-                            // X
-                            let event = UiEvent {
-                                id: None,
-                                timestamp,
-                                relative_ms: t,
-                                data: EventData::Clipboard {
-                                    operation: 'x',
-                                    content: if s.config.capture_clipboard_content {
-                                        get_clipboard_text().map(|c| {
-                                            if apply_pii {
-                                                remove_pii(&c)
-                                            } else {
-                                                c
-                                            }
-                                        })
-                                    } else {
-                                        None
-                                    },
-                                },
-                                app_name: app_name.clone(),
-                                window_title: window_title.clone(),
-                                browser_url: None,
-                                element: None,
-                                frame_id: None,
-                            };
-                            let _ = s.tx.try_send(event);
-                            return;
-                        }
-                        0x56 => {
-                            // V
-                            let event = UiEvent {
-                                id: None,
-                                timestamp,
-                                relative_ms: t,
-                                data: EventData::Clipboard {
-                                    operation: 'v',
-                                    content: if s.config.capture_clipboard_content {
-                                        get_clipboard_text().map(|c| {
-                                            if apply_pii {
-                                                remove_pii(&c)
-                                            } else {
-                                                c
-                                            }
-                                        })
-                                    } else {
-                                        None
-                                    },
-                                },
-                                app_name: app_name.clone(),
-                                window_title: window_title.clone(),
-                                browser_url: None,
-                                element: None,
-                                frame_id: None,
-                            };
-                            let _ = s.tx.try_send(event);
-                            return;
-                        }
-                        _ => {}
+                    let op = match vk_code {
+                        0x43 => Some('c'), // C
+                        0x58 => Some('x'), // X
+                        0x56 => Some('v'), // V
+                        _ => None,
+                    };
+                    if let Some(operation) = op {
+                        s.pending_clipboard.push(PendingClipboard {
+                            operation,
+                            timestamp,
+                            relative_ms: t,
+                            app_name: app_name.clone(),
+                            window_title: window_title.clone(),
+                        });
+                        return;
                     }
                 }
 
@@ -1083,8 +1067,132 @@ fn get_clipboard_text() -> Option<String> {
 }
 
 // ============================================================================
-// App Observer (Windows)
+// App Observer (Windows) — event-driven via SetWinEventHook
 // ============================================================================
+
+/// Thread-local state for the app observer WinEvent callback.
+struct AppObserverState {
+    tx: Sender<UiEvent>,
+    start: Instant,
+    config: UiCaptureConfig,
+    current_app: Arc<Mutex<Option<String>>>,
+    current_window: Arc<Mutex<Option<String>>>,
+    focused_element: Arc<Mutex<Option<ElementContext>>>,
+    last_hwnd: isize,
+    last_title: Option<String>,
+}
+
+thread_local! {
+    static APP_OBSERVER_STATE: std::cell::RefCell<Option<Box<AppObserverState>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Timer ID for the safety-net periodic check.
+const APP_OBSERVER_TIMER_ID: usize = 1;
+
+/// Process a foreground window change in the app observer.
+fn process_foreground_change(state: &mut AppObserverState) {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        let hwnd_val = hwnd.0 as isize;
+
+        if hwnd_val == state.last_hwnd {
+            return;
+        }
+
+        // Get window title
+        let mut title_buf = [0u16; 512];
+        let len = GetWindowTextW(hwnd, &mut title_buf);
+        let title = if len > 0 {
+            Some(String::from_utf16_lossy(&title_buf[..len as usize]))
+        } else {
+            None
+        };
+
+        // Get process ID
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+
+        // Get process name
+        let app_name = get_process_name(pid).unwrap_or_else(|| "Unknown".to_string());
+
+        // Check exclusions
+        if !state.config.should_capture_app(&app_name) {
+            state.last_hwnd = hwnd_val;
+            return;
+        }
+
+        if let Some(ref t) = title {
+            if !state.config.should_capture_window(t) {
+                state.last_hwnd = hwnd_val;
+                return;
+            }
+        }
+
+        // Update shared state for event listener thread
+        *state.current_app.lock() = Some(app_name.clone());
+        *state.current_window.lock() = title.clone();
+
+        // Get focused element context from UIA thread
+        let element = if state.config.capture_context {
+            state.focused_element.lock().clone()
+        } else {
+            None
+        };
+
+        // Send app switch event
+        if state.config.capture_app_switch {
+            let mut event = UiEvent::app_switch(
+                Utc::now(),
+                state.start.elapsed().as_millis() as u64,
+                app_name.clone(),
+                pid as i32,
+            );
+            event.element = element.clone();
+            let _ = state.tx.try_send(event);
+        }
+
+        // Send window focus event
+        if state.config.capture_window_focus && title != state.last_title {
+            let event = UiEvent {
+                id: None,
+                timestamp: Utc::now(),
+                relative_ms: state.start.elapsed().as_millis() as u64,
+                data: EventData::WindowFocus {
+                    app: app_name,
+                    title: title.clone(),
+                },
+                app_name: None,
+                window_title: None,
+                browser_url: None,
+                element,
+                frame_id: None,
+            };
+            let _ = state.tx.try_send(event);
+        }
+
+        state.last_hwnd = hwnd_val;
+        state.last_title = title;
+    }
+}
+
+/// WinEvent callback for EVENT_SYSTEM_FOREGROUND changes.
+unsafe extern "system" fn foreground_event_proc(
+    _hook: HWINEVENTHOOK,
+    _event: u32,
+    _hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _event_thread: u32,
+    _event_time: u32,
+) {
+    APP_OBSERVER_STATE.with(|state| {
+        if let Ok(mut guard) = state.try_borrow_mut() {
+            if let Some(ref mut s) = *guard {
+                process_foreground_change(s);
+            }
+        }
+    });
+}
 
 fn run_app_observer(
     tx: Sender<UiEvent>,
@@ -1095,98 +1203,122 @@ fn run_app_observer(
     current_window: Arc<Mutex<Option<String>>>,
     focused_element: Arc<Mutex<Option<ElementContext>>>,
 ) {
-    let mut last_hwnd: isize = 0;
-    let mut last_title: Option<String> = None;
+    // Initialize thread-local state
+    APP_OBSERVER_STATE.with(|state| {
+        *state.borrow_mut() = Some(Box::new(AppObserverState {
+            tx,
+            start,
+            config,
+            current_app,
+            current_window,
+            focused_element,
+            last_hwnd: 0,
+            last_title: None,
+        }));
+    });
 
-    while !stop.load(Ordering::Relaxed) {
+    // Save thread ID so the stop logic can post WM_QUIT
+    let thread_id = unsafe { GetCurrentThreadId() };
+
+    // Spawn a watcher that posts WM_QUIT when stop is signaled
+    let stop_clone = stop.clone();
+    thread::spawn(move || {
+        while !stop_clone.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         unsafe {
-            let hwnd = GetForegroundWindow();
-            let hwnd_val = hwnd.0 as isize;
+            let _ = PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+    });
 
-            if hwnd_val != last_hwnd {
-                // Get window title
-                let mut title_buf = [0u16; 512];
-                let len = GetWindowTextW(hwnd, &mut title_buf);
-                let title = if len > 0 {
-                    Some(String::from_utf16_lossy(&title_buf[..len as usize]))
-                } else {
-                    None
-                };
+    unsafe {
+        // Register WinEvent hook for foreground window changes (event-driven, no polling)
+        let hook = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            None,
+            Some(foreground_event_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
 
-                // Get process ID
-                let mut pid: u32 = 0;
-                GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        // Safety-net timer: re-check foreground every 2s in case a hook event was missed
+        SetTimer(HWND::default(), APP_OBSERVER_TIMER_ID, 2000, None);
 
-                // Get process name
-                let app_name = get_process_name(pid).unwrap_or_else(|| "Unknown".to_string());
-
-                // Check exclusions
-                if !config.should_capture_app(&app_name) {
-                    last_hwnd = hwnd_val;
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    continue;
-                }
-
-                if let Some(ref t) = title {
-                    if !config.should_capture_window(t) {
-                        last_hwnd = hwnd_val;
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        continue;
-                    }
-                }
-
-                // Update shared state for event listener thread
-                *current_app.lock() = Some(app_name.clone());
-                *current_window.lock() = title.clone();
-
-                // Get focused element context from UIA thread
-                let element = if config.capture_context {
-                    focused_element.lock().clone()
-                } else {
-                    None
-                };
-
-                // Send app switch event
-                if config.capture_app_switch {
-                    let mut event = UiEvent::app_switch(
-                        Utc::now(),
-                        start.elapsed().as_millis() as u64,
-                        app_name.clone(),
-                        pid as i32,
-                    );
-                    event.element = element.clone();
-                    let _ = tx.try_send(event);
-                }
-
-                // Send window focus event
-                if config.capture_window_focus && title != last_title {
-                    let event = UiEvent {
-                        id: None,
-                        timestamp: Utc::now(),
-                        relative_ms: start.elapsed().as_millis() as u64,
-                        data: EventData::WindowFocus {
-                            app: app_name,
-                            title: title.clone(),
-                        },
-                        app_name: None,
-                        window_title: None,
-                        browser_url: None,
-                        element,
-                        frame_id: None,
-                    };
-                    let _ = tx.try_send(event);
-                }
-
-                last_hwnd = hwnd_val;
-                last_title = title;
+        // Process initial foreground window
+        APP_OBSERVER_STATE.with(|state| {
+            if let Some(ref mut s) = *state.borrow_mut() {
+                process_foreground_change(s);
             }
+        });
+
+        // Block on message pump (wakes only on events/timer, no busy-polling)
+        let mut msg = MSG::default();
+        loop {
+            let ret = GetMessageW(&mut msg, HWND::default(), 0, 0);
+            if ret.0 <= 0 {
+                break; // WM_QUIT or error
+            }
+
+            // Handle timer messages as a safety-net foreground check
+            if msg.message == WM_TIMER && msg.wParam.0 == APP_OBSERVER_TIMER_ID {
+                APP_OBSERVER_STATE.with(|state| {
+                    if let Ok(mut guard) = state.try_borrow_mut() {
+                        if let Some(ref mut s) = *guard {
+                            process_foreground_change(s);
+                        }
+                    }
+                });
+            }
+
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
 
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Cleanup
+        if !hook.is_invalid() {
+            let _ = UnhookWinEvent(hook);
+        }
     }
+
+    debug!("App observer stopped");
+}
+
+/// Cached PID→process name mapping with TTL to avoid CreateToolhelp32Snapshot on every lookup.
+static PROCESS_NAME_CACHE: std::sync::OnceLock<
+    Mutex<std::collections::HashMap<u32, (String, Instant)>>,
+> = std::sync::OnceLock::new();
+
+fn process_name_cache() -> &'static Mutex<std::collections::HashMap<u32, (String, Instant)>> {
+    PROCESS_NAME_CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
 pub(crate) fn get_process_name(pid: u32) -> Option<String> {
+    let now = Instant::now();
+    // Check cache first
+    {
+        let cache = process_name_cache().lock();
+        if let Some((name, cached_at)) = cache.get(&pid) {
+            if now.duration_since(*cached_at) < std::time::Duration::from_secs(60) {
+                return Some(name.clone());
+            }
+        }
+    }
+    // Cache miss — do the expensive lookup
+    let name = get_process_name_uncached(pid)?;
+    {
+        let mut cache = process_name_cache().lock();
+        // Evict if too large
+        if cache.len() > 200 {
+            cache.clear();
+        }
+        cache.insert(pid, (name.clone(), now));
+    }
+    Some(name)
+}
+
+fn get_process_name_uncached(pid: u32) -> Option<String> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -1250,5 +1382,74 @@ mod tests {
         assert_eq!(0x02, 2); // Ctrl
         assert_eq!(0x04, 4); // Alt
         assert_eq!(0x08, 8); // Win
+    }
+
+    fn make_test_state(tx: tokio::sync::mpsc::Sender<UiEvent>, text: &str) -> HookState {
+        HookState {
+            tx,
+            start: std::time::Instant::now(),
+            config: crate::config::UiCaptureConfig::default(),
+            last_mouse_pos: (0, 0),
+            text_buf: text.to_string(),
+            last_text_time: if text.is_empty() {
+                None
+            } else {
+                Some(std::time::Instant::now())
+            },
+            current_app: Arc::new(parking_lot::Mutex::new(Some("test".into()))),
+            current_window: Arc::new(parking_lot::Mutex::new(Some("test window".into()))),
+            activity_feed: None,
+            click_queue: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            focused_element: Arc::new(parking_lot::Mutex::new(None)),
+            pending_clipboard: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_flush_text_buffer() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut state = make_test_state(tx, "hello world");
+
+        // Buffer has content — flush should send a Text event
+        flush_text_buffer(&mut state);
+        assert!(state.text_buf.is_empty());
+        assert!(state.last_text_time.is_none());
+
+        let event = rx.try_recv().unwrap();
+        match event.data {
+            EventData::Text { ref content, .. } => {
+                assert_eq!(content, "hello world");
+            }
+            _ => panic!("expected Text event, got {:?}", event.data),
+        }
+    }
+
+    #[test]
+    fn test_flush_empty_buffer_is_noop() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut state = make_test_state(tx, "");
+
+        flush_text_buffer(&mut state);
+        assert!(rx.try_recv().is_err()); // No event sent
+    }
+
+    #[test]
+    fn test_vk_to_char_punctuation() {
+        assert_eq!(vk_to_char(0xBA, 0), Some(';'));
+        assert_eq!(vk_to_char(0xBA, 1), Some(':'));
+        assert_eq!(vk_to_char(0xBE, 0), Some('.'));
+        assert_eq!(vk_to_char(0xBF, 0), Some('/'));
+        assert_eq!(vk_to_char(0xBF, 1), Some('?'));
+        assert_eq!(vk_to_char(0x0D, 0), Some('\n')); // Enter
+        assert_eq!(vk_to_char(0x08, 0), Some('\x08')); // Backspace
+    }
+
+    #[test]
+    fn test_vk_to_char_unknown_returns_none() {
+        // F1-F12 and other non-printable keys should return None
+        assert_eq!(vk_to_char(0x70, 0), None); // F1
+        assert_eq!(vk_to_char(0x7B, 0), None); // F12
+        assert_eq!(vk_to_char(0x2E, 0), None); // Delete
+        assert_eq!(vk_to_char(0x25, 0), None); // Left arrow
     }
 }

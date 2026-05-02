@@ -54,6 +54,15 @@ async checkArcInstalled() : Promise<boolean> {
     return await TAURI_INVOKE("check_arc_installed");
 },
 /**
+ * Returns true on macOS 14.4+ where the CoreAudio Process Tap API is
+ * available. Used to gate the "experimental System Audio via CoreAudio"
+ * toggle — we don't show it on platforms where flipping it would be a
+ * no-op. False on Windows, Linux, and older macOS.
+ */
+async checkCoreaudioProcessTapAvailable() : Promise<boolean> {
+    return await TAURI_INVOKE("check_coreaudio_process_tap_available");
+},
+/**
  * Check if Automation permission for Arc is already granted.
  * In production (.app bundle): uses direct FFI check (correct identity, no Terminal).
  * In dev mode: runs the binary itself via launchctl (detached from Terminal) so
@@ -71,8 +80,49 @@ async checkArcAutomationPermission() : Promise<boolean> {
 async requestArcAutomationPermission() : Promise<boolean> {
     return await TAURI_INVOKE("request_arc_automation_permission");
 },
+/**
+ * Returns the names of installed Chromium browsers that need Automation permission
+ */
+async getInstalledBrowsers() : Promise<string[]> {
+    return await TAURI_INVOKE("get_installed_browsers");
+},
+/**
+ * Check if Automation permission is granted for all installed Chromium browsers.
+ * Returns true only if ALL installed browsers have automation granted.
+ */
+async checkBrowsersAutomationPermission() : Promise<boolean> {
+    return await TAURI_INVOKE("check_browsers_automation_permission");
+},
+/**
+ * Request Automation permission for installed Chromium browsers that are already running.
+ * Never force-launches browsers — only prompts for ones the user already has open.
+ * Opens System Settings > Automation as fallback for browsers not running.
+ */
+async requestBrowsersAutomationPermission() : Promise<boolean> {
+    return await TAURI_INVOKE("request_browsers_automation_permission");
+},
+/**
+ * Returns per-browser automation permission status for all installed Chromium browsers.
+ */
+async getBrowsersAutomationStatus() : Promise<BrowserAutomationStatus[]> {
+    return await TAURI_INVOKE("get_browsers_automation_status");
+},
+/**
+ * Request automation permission for a single browser by name.
+ * Returns the new status: "granted", "denied", or "not_asked".
+ */
+async requestSingleBrowserAutomation(browserName: string) : Promise<string> {
+    return await TAURI_INVOKE("request_single_browser_automation", { browserName });
+},
 async getEnv(name: string) : Promise<string> {
     return await TAURI_INVOKE("get_env", { name });
+},
+/**
+ * Returns which E2E seeds are requested (env SCREENPIPE_E2E_SEED, comma-separated).
+ * Rust uses "onboarding" in setup to complete onboarding at startup.
+ */
+async getE2eSeedFlags() : Promise<string[]> {
+    return await TAURI_INVOKE("get_e2e_seed_flags");
 },
 /**
  * Check vault lock state from filesystem (no server needed).
@@ -129,6 +179,10 @@ async updateGlobalShortcuts(showShortcut: string, startShortcut: string, stopSho
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Start the server (if not running) and capture.
+ * This is the main entry point called by the frontend.
+ */
 async spawnScreenpipe(overrideArgs: string[] | null) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("spawn_screenpipe", { overrideArgs }) };
@@ -137,9 +191,37 @@ async spawnScreenpipe(overrideArgs: string[] | null) : Promise<Result<null, stri
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Stop capture AND server so the next spawn_screenpipe does a full restart.
+ * Called by "Apply & Restart", audio shortcuts, updates, and rollbacks.
+ * The tray toggle uses stop_capture / start_capture to keep the server alive.
+ */
 async stopScreenpipe() : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("stop_screenpipe") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Start recording. Requires the server to be running.
+ */
+async startCapture() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("start_capture") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Stop recording without killing the server.
+ * Pipes, memories, search, and the HTTP API remain accessible.
+ */
+async stopCapture() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("stop_capture") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -161,12 +243,65 @@ async getAudioDevices() : Promise<Result<AudioDeviceInfo[], string>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Read the current boot phase of the server. Used by the onboarding UI to
+ * show progress ("updating database", "loading pipes", ...) while the HTTP
+ * server is not yet listening — in particular during long DB migrations
+ * where /health is unreachable.
+ */
+async getBootPhase() : Promise<BootPhaseSnapshot> {
+    return await TAURI_INVOKE("get_boot_phase");
+},
 async isEnterpriseBuildCmd() : Promise<boolean> {
     return await TAURI_INVOKE("is_enterprise_build_cmd");
+},
+/**
+ * Read the enterprise license key from `enterprise.json`.
+ * Checks in order:
+ * 1. Next to executable (pushed via Intune/MDM to Program Files / .app bundle)
+ * 2. `~/.screenpipe/enterprise.json` (entered manually by employee via in-app prompt)
+ * Returns None if no file is found or is invalid.
+ */
+async getEnterpriseLicenseKey() : Promise<string | null> {
+    return await TAURI_INVOKE("get_enterprise_license_key");
+},
+/**
+ * Save the enterprise license key to `~/.screenpipe/enterprise.json`.
+ * Used by the in-app prompt when enterprise.json is not deployed via MDM.
+ */
+async saveEnterpriseLicenseKey(licenseKey: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("save_enterprise_license_key", { licenseKey }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Called by the frontend after fetching the enterprise policy.
+ */
+async setEnterprisePolicy(hiddenSections: string[]) : Promise<void> {
+    await TAURI_INVOKE("set_enterprise_policy", { hiddenSections });
 },
 async getDiskUsage(forceRefresh: boolean | null, dataDir: string | null) : Promise<Result<JsonValue, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("get_disk_usage", { forceRefresh, dataDir }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async listCacheFiles() : Promise<Result<CacheFile[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_cache_files") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteCacheFiles(paths: string[]) : Promise<Result<bigint, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_cache_files", { paths }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -191,6 +326,30 @@ async updateShowScreenpipeShortcut(newShortcut: string, enabled: boolean) : Prom
 async showWindow(window: ShowRewindWindow) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("show_window", { window }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Like `show_window` but forces macOS app activation first, so the target
+ * window actually comes to the foreground when the caller is a
+ * `NSNonactivatingPanelMask` panel (notifications, tray, etc.).
+ * 
+ * Without this, clicking "Open" in the notification panel on macOS often
+ * appears to do nothing: the non-activating panel style prevents the app
+ * from becoming active, and overlay/fullscreen main modes rely on an
+ * activate-aware `show_panel_visible(activate_app=true)` path that only
+ * fires for `overlay_mode == "window"`. The window technically shows but
+ * stays behind whatever app the user was in.
+ * 
+ * Callers that represent explicit user intent (clicking Open on a
+ * notification) should use this variant. Passive show-surface callers
+ * should keep using `show_window` to avoid stealing focus unnecessarily.
+ */
+async showWindowActivated(window: ShowRewindWindow) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("show_window_activated", { window }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -323,6 +482,30 @@ async showOnboardingWindow() : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async getKeychainStatus() : Promise<Result<KeychainStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_keychain_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async enableKeychainEncryption() : Promise<Result<KeychainStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("enable_keychain_encryption") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async disableKeychainEncryption() : Promise<Result<KeychainStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("disable_keychain_encryption") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async openSearchWindow(query: string | null) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("open_search_window", { query }) };
@@ -358,6 +541,43 @@ async showNotificationPanel(payload: string) : Promise<Result<null, string>> {
 async hideNotificationPanel() : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("hide_notification_panel") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Open the viewer window for `path`. Reuses an existing window if one
+ * for the same path is already open.
+ */
+async openViewerWindow(path: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("open_viewer_window", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Read a file for the viewer. Returns text for text-like files, a
+ * base64 data URL for images. Files larger than `MAX_VIEWER_FILE_BYTES`
+ * are truncated for text or refused for images, since both would blow
+ * up the renderer.
+ */
+async readViewerFile(path: string) : Promise<Result<ViewerContent, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_viewer_file", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Reveal a file in the OS file browser (Finder / Explorer / etc).
+ */
+async revealInDefaultBrowser(path: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("reveal_in_default_browser", { path }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -628,7 +848,9 @@ async piInstall() : Promise<Result<null, string>> {
 }
 },
 /**
- * Send a prompt to Pi, optionally with images
+ * Send a prompt to Pi, optionally with images.
+ * The command is serialized through the queue — it will wait for any prior
+ * command (new_session, abort) to fully complete before being written to stdin.
  */
 async piPrompt(sessionId: string | null, message: string, images: PiImageContent[] | null) : Promise<Result<null, string>> {
     try {
@@ -639,7 +861,34 @@ async piPrompt(sessionId: string | null, message: string, images: PiImageContent
 }
 },
 /**
- * Abort current Pi operation. Waits for the Pi SDK to confirm the abort completed.
+ * Read the current queued-prompt list for a session. Useful for an initial
+ * render before the first `pi-queue-changed` event arrives, and for new
+ * chat windows opening on top of an in-progress queue.
+ */
+async piPending(sessionId: string | null) : Promise<Result<PiQueuedPrompt[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pi_pending", { sessionId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Cancel a single queued prompt. Returns true if it was still in the queue
+ * (and is now removed), false if it had already been pulled into the
+ * in-flight slot — at that point `pi_abort` is the right tool.
+ */
+async piCancelQueued(sessionId: string | null, promptId: string) : Promise<Result<boolean, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pi_cancel_queued", { sessionId, promptId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Abort current Pi operation. Priority command — cancels all pending commands
+ * in the queue and sends abort directly. Waits for the SDK's done event.
  */
 async piAbort(sessionId: string | null) : Promise<Result<null, string>> {
     try {
@@ -651,7 +900,8 @@ async piAbort(sessionId: string | null) : Promise<Result<null, string>> {
 },
 /**
  * Start a new Pi session (clears conversation history).
- * Waits for the Pi SDK to finish aborting any in-flight work and resetting state.
+ * Serialized through the queue — waits for any in-flight work to complete,
+ * then sends new_session and waits for the SDK's done event before returning.
  */
 async piNewSession(sessionId: string | null) : Promise<Result<null, string>> {
     try {
@@ -662,12 +912,50 @@ async piNewSession(sessionId: string | null) : Promise<Result<null, string>> {
 }
 },
 /**
+ * Hot-swap Pi's active model without killing the subprocess. Preserves the
+ * full conversation state in-place — the user can switch haiku ↔ sonnet ↔ opus
+ * mid-session and the new model sees the real threaded history, not a
+ * glued-transcript workaround.
+ * 
+ * Pi's RPC `set_model` is the right path for provider+model changes only. If
+ * other preset fields change (url, apiKey, maxTokens, systemPrompt) the
+ * caller should fall back to `pi_update_config` which does a full restart
+ * because those are spawn-time args baked into models.json / CLI flags.
+ */
+async piSetModel(sessionId: string | null, providerConfig: PiProviderConfig) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pi_set_model", { sessionId, providerConfig }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Update Pi config and restart the chat session so the new model takes effect.
  * Without restart, Pi keeps using the provider/model from its original CLI args.
+ * 
+ * Prefer `pi_set_model` when only provider+model changed — it preserves the
+ * conversation state instead of killing the subprocess.
  */
 async piUpdateConfig(userToken: string | null, providerConfig: PiProviderConfig | null) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("pi_update_config", { userToken, providerConfig }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Locate the bundled bun binary so the frontend can write absolute-path
+ * MCP configs (e.g. `{ command: <bun>, args: ["x", "screenpipe-mcp@latest"] }`)
+ * instead of `npx -y screenpipe-mcp`. npx requires a global Node install
+ * — many Claude Desktop users don't have it, and the silent first-run
+ * `npx` download often blows past Claude's MCP startup timeout. Using
+ * the bun we already ship sidesteps both failure modes.
+ */
+async bunCheck() : Promise<Result<PiCheckResult, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("bun_check") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -689,10 +977,6 @@ async chatgptOauthStatus() : Promise<Result<ChatGptOAuthStatus, string>> {
     else return { status: "error", error: e  as any };
 }
 },
-/**
- * Return the current valid access token (auto-refreshing if needed).
- * Used by the frontend to call OpenAI APIs directly (e.g. /v1/models).
- */
 async chatgptOauthGetToken() : Promise<Result<string, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("chatgpt_oauth_get_token") };
@@ -709,12 +993,69 @@ async chatgptOauthLogout() : Promise<Result<boolean, string>> {
     else return { status: "error", error: e  as any };
 }
 },
-/**
- * Fetch available models from OpenAI using the stored OAuth token.
- */
 async chatgptOauthModels() : Promise<Result<string[], string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("chatgpt_oauth_models") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Start the OAuth flow for any integration that has `oauth_config()` set.
+ * `integration_id` must match the integration's `def().id`.
+ * `instance` is an optional name for multi-account support (e.g. email address).
+ */
+async oauthConnect(integrationId: string, instance: string | null) : Promise<Result<OAuthStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("oauth_connect", { integrationId, instance }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Cancel any in-flight OAuth flow(s) for the given integration.
+ * Dropping the stored sender makes the awaiting `oauth_connect` call fail fast
+ * with "OAuth channel closed before code was received" instead of hanging for
+ * the full 120s timeout.
+ */
+async oauthCancel(integrationId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("oauth_cancel", { integrationId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Check whether a valid (non-expired) OAuth token exists for the given integration.
+ */
+async oauthStatus(integrationId: string, instance: string | null) : Promise<Result<OAuthStatus, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("oauth_status", { integrationId, instance }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Remove the stored OAuth token for the given integration instance.
+ */
+async oauthDisconnect(integrationId: string, instance: string | null) : Promise<Result<boolean, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("oauth_disconnect", { integrationId, instance }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * List all connected OAuth instances for a given integration.
+ */
+async oauthListInstances(integrationId: string) : Promise<Result<OAuthInstanceInfo[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("oauth_list_instances", { integrationId }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -760,6 +1101,32 @@ async calendarStatus() : Promise<Result<CalendarStatus, string>> {
 async calendarAuthorize() : Promise<Result<string, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("calendar_authorize") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Reset TCC (privacy) permission for Calendars on this app's bundle ID.
+ * 
+ * Why: users (Mike, Jarad, Ruark, Louis's own Mac mini) clicked
+ * "Fix Calendar Permission" → macOS opened the Calendars privacy pane
+ * with an EMPTY app list, so they had no way to grant access. Root cause
+ * is a stale TCC record (dev-build → prod-build reinstall, OS update,
+ * user previously revoked etc.) where macOS silently refuses to re-add
+ * the app on subsequent requestFullAccessToEventsWithCompletion calls.
+ * 
+ * `tccutil reset Calendars <bundle_id>` clears that stale record. Next
+ * call to requestFullAccessToEventsWithCompletion then shows the native
+ * consent popup again and registers the app in Privacy → Calendars.
+ * 
+ * Bundle ID is read at runtime from the running app (not hard-coded), so
+ * this works for both `screenpi.pe` (prod) and `screenpi.pe.dev` (dev).
+ * No sudo required — tccutil's per-app user scope is user-writable.
+ */
+async calendarResetPermission() : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("calendar_reset_permission") };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -832,7 +1199,8 @@ async trainVoice(name: string, startTime: string, endTime: string) : Promise<Res
 }
 },
 /**
- * Return cached suggestions or default idle suggestions if cache is empty.
+ * Return cached suggestions. If cache is empty (first load), generate
+ * template suggestions from current activity data so the UI is never generic.
  */
 async getCachedSuggestions() : Promise<Result<CachedSuggestions, string>> {
     try {
@@ -855,6 +1223,17 @@ async forceRegenerateSuggestions() : Promise<Result<CachedSuggestions, string>> 
 }
 },
 /**
+ * Enable or disable enhanced AI suggestions (uses screenpipe cloud).
+ */
+async setEnhancedAiSuggestions(enabled: boolean, token: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_enhanced_ai_suggestions", { enabled, token }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Tauri command: validate that a path is usable as a data directory.
  * Called from the frontend before saving the setting.
  */
@@ -868,6 +1247,17 @@ async validateDataDir(path: string) : Promise<Result<null, string>> {
 },
 async getHardwareCapability() : Promise<HardwareCapability> {
     return await TAURI_INVOKE("get_hardware_capability");
+},
+/**
+ * Tauri command: re-encrypt store.bin after frontend saves.
+ */
+async reencryptStore() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("reencrypt_store") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -884,7 +1274,32 @@ async getHardwareCapability() : Promise<HardwareCapability> {
 export type AIPreset = { id: string; prompt: string; provider: AIProviderType; url?: string; model?: string; defaultPreset: boolean; apiKey: string | null; maxContextChars: number; maxTokens?: number }
 export type AIProviderType = "openai" | "openai-chatgpt" | "native-ollama" | "custom" | "screenpipe-cloud" | "pi" | "anthropic"
 export type AudioDeviceInfo = { name: string; isDefault: boolean }
+export type BootPhaseSnapshot = { 
+/**
+ * One of: idle | starting | migrating_database | building_audio |
+ * starting_pipes | ready | error
+ */
+phase: string; 
+/**
+ * Human-readable detail to show the user (may be long-running hint)
+ */
+message: string | null; 
+/**
+ * Present only when phase == "error"
+ */
+error: string | null; 
+/**
+ * Unix epoch seconds when the current phase was entered. Lets the UI
+ * show "X minutes" on slow migrations.
+ */
+sinceEpochSecs: bigint }
+/**
+ * Per-browser automation status: "granted", "denied", or "not_asked".
+ * Also includes whether the browser is currently running.
+ */
+export type BrowserAutomationStatus = { name: string; status: string; running: boolean }
 export type BrowserLogEntry = { level: string; message: string }
+export type CacheFile = { path: string; label: string; size_bytes: bigint }
 export type CachedSuggestions = { suggestions: Suggestion[]; generatedAt: string; mode: string; aiGenerated: boolean; tags: string[] }
 export type CalendarEventItem = { id: string; title: string; 
 /**
@@ -912,11 +1327,14 @@ export type CalendarStatus = { available: boolean; authorized: boolean; authoriz
 export type ChatGptOAuthStatus = { logged_in: boolean }
 export type Credits = { amount: number }
 export type EmbeddedLLM = { enabled: boolean; model: string; port: number }
-export type HardwareCapability = { hasGpu: boolean; cpuCores: bigint; totalMemoryGb: number; isWeakForLargeModel: boolean; recommendedEngine: string; reason: string }
+export type HardwareCapability = { hasGpu: boolean; cpuCores: bigint; totalMemoryGb: number; recommendedEngine: string; reason: string }
 export type IcsCalendarEntry = { name: string; url: string; enabled: boolean }
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key in string]: JsonValue }
+export type KeychainStatus = { state: string }
 export type LogFile = { name: string; path: string; modified_at: bigint }
 export type MonitorDevice = { id: number; stableId: string; name: string; isDefault: boolean; width: number; height: number }
+export type OAuthInstanceInfo = { instance: string | null; display_name: string | null }
+export type OAuthStatus = { connected: boolean; display_name: string | null }
 export type OSPermission = "screenRecording" | "microphone" | "accessibility" | "automation"
 export type OSPermissionStatus = "notNeeded" | "empty" | "granted" | "denied"
 export type OSPermissionsCheck = { screenRecording: OSPermissionStatus; microphone: OSPermissionStatus; accessibility: OSPermissionStatus }
@@ -955,51 +1373,336 @@ apiKey: string | null;
 /**
  * Max output tokens (default 4096)
  */
-maxTokens?: number }
+maxTokens?: number; 
+/**
+ * Optional system prompt from AI preset (appended to Pi's built-in system prompt)
+ */
+systemPrompt?: string | null }
+/**
+ * A user prompt that's been enqueued but not yet written to Pi's stdin.
+ * Surfaced to the UI so the chat can render "queued" cards while a prior
+ * prompt is still streaming. Once the queue's drain loop pulls a prompt and
+ * writes it to stdin, the entry is removed (it's now in-flight, not queued).
+ */
+export type PiQueuedPrompt = { 
+/**
+ * Stable id assigned at enqueue time. Used to remove the entry on
+ * dequeue / abort / write-failure.
+ */
+id: string; 
+/**
+ * First ~200 chars of the user message — enough for the UI to show a
+ * readable preview without round-tripping the full prompt over IPC.
+ */
+preview: string; 
+/**
+ * Unix epoch milliseconds for "queued at" — drives the relative-time
+ * label in the UI ("queued 4s ago").
+ */
+queuedAtMs: bigint }
 export type PipeSuggestionsSettings = { enabled: boolean; frequencyHours: number }
+/**
+ * A single schedule rule: a day-of-week + time range + what to record.
+ */
+export type ScheduleRule = { 
+/**
+ * Day of week: 0 = Monday, 6 = Sunday
+ */
+dayOfWeek: number; 
+/**
+ * Start time in "HH:MM" (24h format, local time)
+ */
+startTime: string; 
+/**
+ * End time in "HH:MM" (24h format, local time)
+ */
+endTime: string; 
+/**
+ * What to record: "all", "audio_only", "screen_only"
+ */
+recordMode: string }
 export type SettingsStore = 
 /**
- * Catch-all for fields added by the frontend (e.g. chatHistory, deviceId)
+ * All recording/capture config lives here. Flattened so the JSON shape
+ * is unchanged — `disableAudio`, `port`, `fps`, etc. stay at the top level.
+ */
+({ 
+/**
+ * Disable all audio capture and transcription.
+ */
+disableAudio: boolean; 
+/**
+ * Audio transcription engine identifier.
+ * Values: "whisper-large-v3-turbo", "whisper-large-v3-turbo-quantized",
+ * "deepgram", "screenpipe-cloud", etc.
+ */
+audioTranscriptionEngine: string; 
+/**
+ * Transcription mode: "realtime" or "batch".
+ * Previously stored in SettingsStore.extra["transcriptionMode"].
+ */
+transcriptionMode: string; 
+/**
+ * Audio device names/IDs to capture from.
+ */
+audioDevices: string[]; 
+/**
+ * Automatically follow the system default audio devices.
+ */
+useSystemDefaultAudio: boolean; 
+/**
+ * Experimental: capture System Audio via the CoreAudio Process Tap API
+ * (macOS 14.4+) instead of ScreenCaptureKit. Avoids SCK's display
+ * enumeration failures after sleep/wake, the GPU/compositor wake
+ * overhead, and — most importantly — captures audio that's been
+ * routed to a Bluetooth headset via HFP (which SCK can't see; see
+ * Ruark Ferreira's 2026-04-24 Zoom call where AirPods-as-input
+ * silently routed output away from the SCK-visible mixer).
+ * 
+ * Default `true`: if tap creation fails for any reason (permission,
+ * macOS <14.4, OS quirk), stream.rs falls back to the SCK path
+ * automatically — so flipping the default on can't regress anyone.
+ * Ignored on non-macOS platforms.
+ */
+experimentalCoreaudioSystemAudio?: boolean; 
+/**
+ * Duration of each audio chunk in seconds before transcription.
+ * Stored as i32 to match existing store.bin schema (cast to u64 by engine).
+ */
+audioChunkDuration: number; 
+/**
+ * Deepgram API key for cloud transcription.
+ * Empty string or "default" means not configured.
+ * Kept as String (not Option) to match existing store.bin schema.
+ */
+deepgramApiKey: string; 
+/**
+ * VAD sensitivity level: "low", "medium", "high".
+ */
+vadSensitivity: string; 
+/**
+ * Filter music-dominant audio before transcription using spectral analysis.
+ */
+filterMusic: boolean; 
+/**
+ * Maximum batch duration in seconds for batch transcription.
+ * None = use engine-aware defaults (Deepgram=5000s, OpenAI=3000s, Whisper=600s).
+ * Also controls the max deferral cap during active meetings.
+ */
+batchMaxDurationSecs?: bigint | null; 
+/**
+ * Custom vocabulary for transcription biasing and word replacement.
+ * Previously stored in SettingsStore.extra["vocabularyWords"].
+ */
+vocabularyWords?: VocabEntry[]; 
+/**
+ * Disable all screen capture.
+ */
+disableVision: boolean; 
+/**
+ * Specific monitor IDs to capture.
+ */
+monitorIds: string[]; 
+/**
+ * Capture from all connected monitors.
+ */
+useAllMonitors: boolean; 
+/**
+ * Video quality preset: "low", "balanced", "high", "max".
+ */
+videoQuality: string; 
+/**
+ * Maximum width for stored snapshots. Images wider than this are downscaled
+ * (preserving aspect ratio) before JPEG encoding. 0 = no limit (store at
+ * native resolution). Default: 1920.
+ */
+maxSnapshotWidth?: number; 
+/**
+ * Window titles to exclude from capture.
+ */
+ignoredWindows: string[]; 
+/**
+ * Window titles to exclusively capture (empty = capture all).
+ */
+includedWindows: string[]; 
+/**
+ * URLs to exclude from capture.
+ */
+ignoredUrls?: string[]; 
+/**
+ * Automatically detect and skip incognito / private browsing windows.
+ */
+ignoreIncognitoWindows: boolean; 
+/**
+ * Experimental: pause screen capture when a DRM-protected streaming app
+ * (Netflix, Disney+, etc.) or a remote-desktop client (Omnissa/VMware
+ * Horizon) is focused. These apps blank their windows while screen
+ * recording is active.
+ * Off by default; engine-only pause (no full app shutdown).
+ */
+pauseOnDrmContent?: boolean; 
+/**
+ * Skip clipboard capture in the UI recorder. Off by default; recommended
+ * when piping ~/.screenpipe data into a remote LLM or sharing it,
+ * since passwords / API keys / private keys often pass through the
+ * clipboard.
+ */
+disableClipboardCapture?: boolean; 
+/**
+ * Continue recording audio when the screen is locked.
+ * Default: false (audio pauses when screen is locked to save resources).
+ */
+recordWhileLocked?: boolean; 
+/**
+ * Automatically append text typed during a meeting to the meeting's note
+ * when the meeting ends. Groups typed text by app/window context.
+ */
+appendTypedTextToMeetingNotes?: boolean; 
+/**
+ * Languages for transcription (ISO 639-1 codes).
+ */
+languages: string[]; 
+/**
+ * Redact personally identifiable information from transcriptions.
+ */
+usePiiRemoval: boolean; 
+/**
+ * Screenpipe cloud user ID. Empty string means not logged in.
+ * Kept as String (not Option) to match existing store.bin schema.
+ */
+userId: string; 
+/**
+ * Display name for speaker identification.
+ * Fallback chain: this field → cloud auth name → cloud auth email.
+ * Previously stored in SettingsStore.extra["userName"].
+ */
+userName?: string | null; 
+/**
+ * OpenAI-compatible transcription endpoint URL.
+ * Previously stored in SettingsStore.extra["openaiCompatibleEndpoint"].
+ */
+openaiCompatibleEndpoint?: string | null; 
+/**
+ * OpenAI-compatible transcription API key.
+ * Previously stored in SettingsStore.extra["openaiCompatibleApiKey"].
+ */
+openaiCompatibleApiKey?: string | null; 
+/**
+ * OpenAI-compatible transcription model name.
+ * Previously stored in SettingsStore.extra["openaiCompatibleModel"].
+ */
+openaiCompatibleModel?: string | null; 
+/**
+ * Custom HTTP headers for OpenAI-compatible transcription requests.
+ * JSON object, e.g. {"X-Custom-Header": "value"}.
+ */
+openaiCompatibleHeaders?: { [key in string]: string } | null; 
+/**
+ * Send raw WAV audio instead of MP3 to OpenAI-compatible endpoint.
+ * Some ASR providers prefer uncompressed audio for better accuracy.
+ */
+openaiCompatibleRawAudio?: boolean; 
+/**
+ * HTTP server port for the screenpipe API.
+ */
+port: number; 
+/**
+ * Power mode preference: "auto", "performance", "battery_saver".
+ * Previously stored in SettingsStore.extra["powerMode"].
+ */
+powerMode?: string | null; 
+/**
+ * Use Chinese mirror for Hugging Face model downloads.
+ */
+useChineseMirror: boolean; 
+/**
+ * Enable anonymous analytics (PostHog).
+ */
+analyticsEnabled: boolean; 
+/**
+ * Persistent analytics ID (UUID, stable across sessions).
+ */
+analyticsId: string; 
+/**
+ * Legacy: input capture is always enabled. Kept for serde compat with
+ * existing store.bin files; deserialized but ignored.
+ * @deprecated input capture is always enabled; will be removed
+ */
+enableInputCapture?: boolean; 
+/**
+ * Legacy: accessibility capture is always enabled. Kept for serde compat
+ * with existing store.bin files; deserialized but ignored.
+ * @deprecated accessibility capture is always enabled; will be removed
+ */
+enableAccessibility?: boolean; 
+/**
+ * Enable AI workflow event detection (cloud feature, requires subscription).
+ * When enabled, classifies desktop activity and triggers event-based pipes.
+ */
+enableWorkflowEvents?: boolean; 
+/**
+ * Detected hardware tier ("high", "mid", "low").
+ * Set once on first launch; `None` for existing installs (treated as High).
+ */
+deviceTier?: string | null; 
+/**
+ * Enable work-hours schedule (when false, records 24/7 as usual)
+ */
+scheduleEnabled?: boolean; 
+/**
+ * Per-day schedule rules (only used when schedule_enabled is true)
+ */
+scheduleRules?: ScheduleRule[]; 
+/**
+ * Require authentication for remote (non-localhost) API access.
+ */
+apiAuth?: boolean; 
+/**
+ * Custom API key for remote authentication. If empty, a key is auto-generated.
+ */
+apiKey?: string; 
+/**
+ * When true, the HTTP server binds to `0.0.0.0` so other devices on the
+ * LAN can reach the screenpipe API. Off by default — the server binds
+ * `127.0.0.1` (localhost only) which is the safe choice.
+ * 
+ * `api_auth` is force-enabled whenever this is true; [`RecordingConfig::from_settings`]
+ * overrides it, so a user can't accidentally expose the API unauthenticated on their network.
+ */
+listenOnLan?: boolean }) & 
+/**
+ * Catch-all for fields added by the frontend (e.g. chatHistory)
  * that the Rust struct doesn't know about. Without this, `save()` would
  * serialize only known fields and silently wipe frontend-only data.
  */
-({ [key in string]: null | boolean | number | string | JsonValue[] | { [key in string]: JsonValue } }) & { aiPresets: AIPreset[]; deepgramApiKey: string; isLoading: boolean; userId: string; 
-/**
- * Persistent analytics ID used for PostHog tracking (both frontend and backend)
- */
-analyticsId: string; devMode: boolean; audioTranscriptionEngine: string; ocrEngine: string; monitorIds: string[]; audioDevices: string[]; 
-/**
- * When true, automatically follow system default audio devices
- */
-useSystemDefaultAudio?: boolean; usePiiRemoval: boolean; 
-/**
- * Filter music-dominant audio before transcription using spectral analysis
- */
-filterMusic?: boolean; port: number; dataDir: string; disableAudio: boolean; ignoredWindows: string[]; includedWindows: string[]; ignoredUrls?: string[]; fps: number; vadSensitivity: string; analyticsEnabled: boolean; audioChunkDuration: number; useChineseMirror: boolean; languages: string[]; embeddedLLM: EmbeddedLLM; autoStartEnabled: boolean; platform: string; disabledShortcuts: string[]; user: User; showScreenpipeShortcut: string; startRecordingShortcut: string; stopRecordingShortcut: string; startAudioShortcut: string; stopAudioShortcut: string; showChatShortcut: string; searchShortcut: string; lockVaultShortcut?: string; realtimeAudioTranscriptionEngine: string; disableVision: boolean; 
+({ [key in string]: null | boolean | number | string | JsonValue[] | { [key in string]: JsonValue } }) & { aiPresets: AIPreset[]; isLoading: boolean; devMode: boolean; ocrEngine: string; dataDir: string; embeddedLLM: EmbeddedLLM; autoStartEnabled: boolean; platform: string; disabledShortcuts: string[]; user: User; showScreenpipeShortcut: string; startRecordingShortcut: string; stopRecordingShortcut: string; startAudioShortcut: string; stopAudioShortcut: string; showChatShortcut: string; searchShortcut: string; lockVaultShortcut?: string; 
 /**
  * When true, screen capture continues but OCR text extraction is skipped.
  * Reduces CPU usage significantly while still recording video.
  */
-disableOcr?: boolean; useAllMonitors: boolean; adaptiveFps?: boolean; showShortcutOverlay?: boolean; 
+disableOcr?: boolean; showShortcutOverlay?: boolean; 
+/**
+ * Overlay size: "small" (default), "medium" (1.5x), "large" (2x)
+ */
+shortcutOverlaySize?: string; 
 /**
  * Unique device ID for AI usage tracking (generated on first launch)
  */
 deviceId?: string; 
 /**
- * Enable input event capture (keyboard, mouse, clipboard).
- * Requires input monitoring permission on macOS.
- */
-enableInputCapture?: boolean; 
-/**
- * Enable accessibility text capture (AX tree walker).
- * Requires accessibility permission on macOS.
- */
-enableAccessibility?: boolean; 
-/**
  * Auto-install updates and restart when a new version is available.
  * When disabled, users must click "update now" in the tray menu.
  */
 autoUpdate?: boolean; 
+/**
+ * Auto-update store-installed pipes that haven't been locally modified.
+ */
+autoUpdatePipes?: boolean; 
+/**
+ * Use screenpipe cloud for AI-powered features like suggestions.
+ * Better quality but sends activity context to the cloud (zero data retention).
+ */
+enhancedAI?: boolean; 
 /**
  * Timeline overlay mode: "fullscreen" (floating panel above everything) or
  * "window" (normal resizable window with title bar).
@@ -1011,23 +1714,32 @@ overlayMode?: string;
  */
 showOverlayInScreenRecording?: boolean; 
 /**
- * Video quality preset controlling storage vs quality tradeoff.
- * Affects H.265 CRF during recording and JPEG quality during frame extraction.
- * Values: "low", "balanced", "high", "max". Default: "balanced".
- */
-videoQuality?: string; 
-/**
  * When true, the chat window stays above all other windows (default: true).
  */
 chatAlwaysOnTop?: boolean; 
 /**
- * Automatically detect and skip incognito / private browsing windows.
- * Uses localized title matching (20+ languages) and on macOS, native
- * AppleScript detection for Chromium browsers.
+ * Show restart notifications when audio/vision capture stalls.
+ * Disabled by default for now until the stall detector is more reliable.
  */
-ignoreIncognitoWindows?: boolean }
+showRestartNotifications?: boolean; 
+/**
+ * When true, apply macOS vibrancy effect to the sidebar for a translucent look.
+ */
+translucentSidebar?: boolean; 
+/**
+ * UI theme: "light", "dark", or "system".
+ */
+uiTheme?: string }
 export type ShowRewindWindow = "Main" | { Home: { page: string | null } } | { Search: { query: string | null } } | "Onboarding" | "Chat" | "PermissionRecovery"
-export type Suggestion = { text: string }
+export type Suggestion = { text: string; 
+/**
+ * Short preview with real data (e.g. "1h20m in VS Code — auth.rs, api.rs")
+ */
+preview?: string | null; 
+/**
+ * Priority: 1 = hero card (most relevant), 2+ = supporting cards
+ */
+priority?: number }
 /**
  * Sync configuration.
  */
@@ -1041,6 +1753,25 @@ export type SyncDeviceInfo = { id: string; deviceId: string; deviceName: string 
  */
 export type SyncStatusResponse = { enabled: boolean; isSyncing: boolean; lastSync: string | null; lastError: string | null; storageUsed: bigint | null; storageLimit: bigint | null; deviceCount: number | null; deviceLimit: number | null; syncTier: string | null; machineId: string }
 export type User = { id: string | null; name: string | null; email: string | null; image: string | null; token: string | null; clerk_id: string | null; api_key: string | null; credits: Credits | null; stripe_connected: boolean | null; stripe_account_status: string | null; github_username: string | null; bio: string | null; website: string | null; contact: string | null; cloud_subscribed: boolean | null; credits_balance: number | null }
+export type ViewerContent = { kind: "text"; text: string; name: string; path: string; truncated: boolean; total_bytes: bigint } | { kind: "image"; data_url: string; name: string; path: string } | 
+/**
+ * Non-text, non-image file (random binary). The UI surfaces a
+ * polite "open in default app" prompt instead of rendering bytes
+ * as garbled text.
+ */
+{ kind: "binary"; name: string; path: string; total_bytes: bigint } | { kind: "error"; message: string; path: string }
+/**
+ * Custom vocabulary entry for transcription biasing and word replacement.
+ */
+export type VocabEntry = { 
+/**
+ * The word or phrase to bias toward during transcription.
+ */
+word: string; 
+/**
+ * Optional replacement — if set, the transcribed `word` is replaced with this.
+ */
+replace_with?: string | null }
 
 /** tauri-specta globals **/
 

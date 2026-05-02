@@ -1,13 +1,15 @@
 ---
-title: "screenpipe MCP server - connect to Claude, Cursor & AI assistants"
+title: "MCP server setup for Claude, Cursor, and other AI tools"
 sidebarTitle: "mcp server"
-description: "Set up screenpipe as an MCP server to give Claude, Cursor, and other AI assistants access to your screen history and context."
+description: "Set up screenpipe as a Model Context Protocol server so Claude Desktop, Cursor, and other AI assistants can search your screen history and audio transcripts."
 icon: "server"
 ---
 
 screenpipe provides an MCP (Model Context Protocol) server that lets AI assistants like Claude and Cursor search your screen recordings, audio transcriptions, and control your computer.
 
 ## claude desktop
+
+### quick setup (recommended)
 
 open the **screenpipe app** → **settings** → **connections** → click **"install extension"**
 
@@ -18,6 +20,30 @@ try asking Claude: *"what did I do in the last 5 minutes?"*
 <Tip>
 make sure screenpipe is running when you use Claude with screenpipe features.
 </Tip>
+
+### manual setup (stdio)
+
+if the one-click install doesn't appear or you prefer manual config, edit Claude's config file directly:
+
+**macOS:** `~/Library/Application\ Support/Claude/claude_desktop_config.json`
+
+**Windows:** `%AppData%\Claude\claude_desktop_config.json`
+
+add or update the `mcpServers` section:
+
+```json
+{
+  "mcpServers": {
+    "screenpipe": {
+      "command": "npx",
+      "args": ["-y", "screenpipe-mcp"],
+      "transport": "stdio"
+    }
+  }
+}
+```
+
+save, then **restart Claude Desktop completely** (force-quit from Activity Monitor / Task Manager, then reopen). verify the connection works by asking Claude: *"what's on my screen right now?"*
 
 ## claude code
 
@@ -41,6 +67,28 @@ verify with `claude mcp list` or `/mcp` inside Claude Code.
 
 or manually: open **cursor settings** → **mcp** → **add new global mcp server** → set command to `npx` with args `["-y", "screenpipe-mcp"]`.
 
+## warp
+
+Warp's Agent Mode supports MCP. Open **Settings** → **AI** → **Manage MCP servers** → **+ Add**, choose **CLI Server (Command)**, then paste:
+
+```json
+{
+  "screenpipe": {
+    "command": "npx",
+    "args": ["-y", "screenpipe-mcp@latest"],
+    "start_on_launch": true
+  }
+}
+```
+
+Save — the server should show **Running**. Then ask Warp's agent: *"what did I do in the last 5 minutes?"*
+
+<Tip>
+Warp's MCP schema is per-server (no wrapping `mcpServers` object). Don't paste the Claude/Cursor JSON shape — it won't validate.
+</Tip>
+
+You can also reach this screen via the Command Palette → *Open MCP Servers*. Or just open the screenpipe app → **settings** → **connections** → **Warp** to copy the config.
+
 ## other editors (cline, continue, windsurf, etc.)
 
 any editor that supports MCP works with screenpipe. the server command is:
@@ -52,6 +100,16 @@ npx -y screenpipe-mcp
 add this as a stdio MCP server in your editor's MCP settings. see also:
 - [continue setup](/continue)
 - [cline setup](/cline)
+
+## HTTP transport (optional)
+
+if you need remote MCP access or prefer HTTP over stdio, the `screenpipe-mcp` package also provides an HTTP server:
+
+```bash
+npx -y screenpipe-mcp-http --port 3031
+```
+
+this is useful for tools like [Msty](https://msty.studio) that support HTTP MCP transport. both `screenpipe-mcp` (stdio) and `screenpipe-mcp-http` (HTTP) come from the same npm package `screenpipe-mcp`.
 
 ## available tools
 
@@ -146,7 +204,7 @@ if the one-click methods above don't work, you can manually edit config files.
 
 ```bash
 git clone https://github.com/screenpipe/screenpipe
-cd screenpipe/crates/screenpipe-integrations/screenpipe-mcp
+cd screenpipe/packages/screenpipe-mcp
 npm install && npm run build
 ```
 

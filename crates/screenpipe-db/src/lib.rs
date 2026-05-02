@@ -7,10 +7,11 @@ pub mod text_normalizer;
 pub mod text_similarity;
 mod types;
 mod video_db;
+pub mod write_queue;
 
 pub use db::{
     find_matching_a11y_positions, parse_all_text_positions, ActiveWindowCompatRow, DatabaseManager,
-    DeleteTimeRangeResult, FrameCaptureMetadata,
+    DeleteTimeRangeResult, FrameCaptureMetadata, ImmediateTx,
 };
 pub use migration_worker::{
     create_migration_worker, MigrationCommand, MigrationConfig, MigrationResponse, MigrationStatus,
@@ -18,3 +19,4 @@ pub use migration_worker::{
 };
 pub use text_normalizer::{expand_search_query, sanitize_fts5_query};
 pub use types::*;
+pub use write_queue::{request_write_pause, request_write_resume, SyncTable};

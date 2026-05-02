@@ -10,7 +10,7 @@ use std::{
 
 use anyhow::Result;
 use tokio::{sync::Mutex, task::JoinHandle, time::sleep};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     core::device::{default_input_device, default_output_device, parse_audio_device, DeviceType},
@@ -29,6 +29,68 @@ fn is_legacy_display_output(device_name: &str) -> bool {
 }
 
 use super::{AudioManager, AudioManagerStatus};
+
+/// Exponential backoff for output device recovery.
+///
+/// Transient errors (e.g., ScreenCaptureKit not yet initialized) use a short
+/// ceiling (8s) so recovery is fast when the system is just slow to start.
+///
+/// Permanent errors (e.g., no display device exists) use a long ceiling (120s)
+/// to avoid spamming logs when recovery is impossible until hardware changes.
+struct OutputRecoveryBackoff {
+    attempts: u32,
+    is_permanent: bool,
+    last_attempt: Instant,
+}
+
+impl OutputRecoveryBackoff {
+    const TRANSIENT_MAX_SECS: u64 = 8;
+    const PERMANENT_MAX_SECS: u64 = 120;
+
+    fn new() -> Self {
+        Self {
+            attempts: 0,
+            is_permanent: false,
+            // Set to epoch-ish so the first check always fires.
+            // Use checked_sub to avoid panic on Windows when uptime < 3600s
+            // (Instant - Duration panics if result would be before boot time).
+            last_attempt: Instant::now()
+                .checked_sub(Duration::from_secs(3600))
+                .unwrap_or(Instant::now()),
+        }
+    }
+
+    fn record_failure(&mut self, permanent: bool) {
+        self.attempts += 1;
+        self.is_permanent = permanent;
+    }
+
+    fn reset(&mut self) {
+        self.attempts = 0;
+        self.is_permanent = false;
+    }
+
+    fn next_delay_secs(&self) -> u64 {
+        if self.attempts == 0 {
+            return 0;
+        }
+        let cap = if self.is_permanent {
+            Self::PERMANENT_MAX_SECS
+        } else {
+            Self::TRANSIENT_MAX_SECS
+        };
+        // 2^min(attempts, 10) capped at the ceiling
+        let exp = 2u64.saturating_pow(self.attempts.min(10));
+        exp.min(cap)
+    }
+}
+
+/// Returns true if the error from `default_output_device()` indicates a
+/// permanent condition that won't resolve without hardware changes.
+fn is_permanent_output_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("no display audio device found")
+}
 
 lazy_static::lazy_static! {
   pub static ref DEVICE_MONITOR: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
@@ -106,12 +168,18 @@ pub async fn start_device_monitor(
         // Track devices that repeatedly fail to start so we don't spam errors
         // every 2 seconds. After a failure, back off for increasing durations.
         let mut failed_devices: HashMap<String, (u32, Instant)> = HashMap::new();
-        let mut no_output_retry_count: u32 = 0;
+        let mut output_recovery_backoff = OutputRecoveryBackoff::new();
         let mut no_input_retry_count: u32 = 0;
+        let mut last_no_input_log: Option<Instant> = None;
 
         // Central handler restart cooldown: max 3 restarts in a 5-minute window
         let mut central_restart_times: Vec<Instant> = Vec::new();
         let central_restart_exhausted = std::sync::atomic::AtomicBool::new(false);
+        let mut model_restart_pending = false;
+        let model_refresh_cooldown = Duration::from_secs(30);
+        let mut last_model_refresh = Instant::now()
+            .checked_sub(model_refresh_cooldown)
+            .unwrap_or(Instant::now());
 
         // Initialize tracker with current defaults
         let _ = default_tracker.check_input_changed();
@@ -132,6 +200,27 @@ pub async fn start_device_monitor(
 
         loop {
             if audio_manager.status().await == AudioManagerStatus::Running {
+                // Check if sleep/wake or display reconfiguration requested
+                // audio stream invalidation. Force-cycle all running devices
+                // to recover from silent CoreAudio stream failures.
+                if crate::stream_invalidation::take() {
+                    info!("[DEVICE_RECOVERY] audio stream invalidation requested (wake/display change), restarting all devices");
+                    let enabled = audio_manager.enabled_devices().await;
+                    for device_name in &enabled {
+                        if let Ok(device) = parse_audio_device(device_name) {
+                            // Gracefully stop the recording: signals is_running=false,
+                            // tears down the cpal stream, then aborts the task handle.
+                            // Does NOT remove from enabled_devices so restart picks it up.
+                            let _ = audio_manager.stop_device_recording(&device).await;
+                        }
+                        disconnected_devices.insert(device_name.clone());
+                    }
+                    // Let CoreAudio settle after wake before the reconnect
+                    // logic kicks in on the next loop iteration
+                    sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+
                 let currently_available_devices = device_manager.devices().await;
                 if currently_available_devices.is_empty() {
                     warn!("[DEVICE_RECOVERY] device list returned empty (transient SCK failure?), skipping availability checks this cycle");
@@ -291,40 +380,48 @@ pub async fn start_device_monitor(
 
                     // Check if system default input changed
                     if let Some(new_default_input) = default_tracker.check_input_changed() {
-                        info!("system default input changed to: {}", new_default_input);
+                        if audio_manager
+                            .user_disabled_devices()
+                            .await
+                            .contains(&new_default_input)
+                        {
+                            debug!("[DEVICE_RECOVERY] skipping default input change: {} is user-disabled", new_default_input);
+                        } else {
+                            info!("system default input changed to: {}", new_default_input);
 
-                        // Stop all current input devices
-                        for device_name in enabled_devices.iter() {
-                            if let Ok(device) = parse_audio_device(device_name) {
-                                if device.device_type == DeviceType::Input {
-                                    let _ = audio_manager.stop_device(device_name).await;
+                            // Stop all current input devices
+                            for device_name in enabled_devices.iter() {
+                                if let Ok(device) = parse_audio_device(device_name) {
+                                    if device.device_type == DeviceType::Input {
+                                        let _ = audio_manager.stop_device(device_name).await;
+                                    }
                                 }
                             }
-                        }
 
-                        // Start the new default input device (reset cooldown on change)
-                        if let Ok(new_device) = parse_audio_device(&new_default_input) {
-                            failed_devices.remove(&new_default_input);
-                            match audio_manager.start_device(&new_device).await {
-                                Ok(()) => {
-                                    info!(
-                                        "switched to new system default input: {}",
-                                        new_default_input
-                                    );
-                                }
-                                Err(e) => {
-                                    let count = failed_devices
-                                        .entry(new_default_input.clone())
-                                        .or_insert((0, Instant::now()));
-                                    count.0 += 1;
-                                    count.1 = Instant::now();
-                                    error!(
+                            // Start the new default input device (reset cooldown on change)
+                            if let Ok(new_device) = parse_audio_device(&new_default_input) {
+                                failed_devices.remove(&new_default_input);
+                                match audio_manager.start_device(&new_device).await {
+                                    Ok(()) => {
+                                        info!(
+                                            "switched to new system default input: {}",
+                                            new_default_input
+                                        );
+                                    }
+                                    Err(e) => {
+                                        let count = failed_devices
+                                            .entry(new_default_input.clone())
+                                            .or_insert((0, Instant::now()));
+                                        count.0 += 1;
+                                        count.1 = Instant::now();
+                                        error!(
                                         "failed to start new default input {}: {} (will back off)",
                                         new_default_input, e
                                     );
+                                    }
                                 }
                             }
-                        }
+                        } // else: skip user-disabled
                     }
 
                     // Check if system default output changed.
@@ -332,59 +429,68 @@ pub async fn start_device_monitor(
                     // This ensures continuous audio capture — if the new device
                     // fails to start, the old devices keep running as fallback.
                     if let Some(new_default_output) = default_tracker.check_output_changed().await {
-                        info!(
-                            "[DEVICE_RECOVERY] system default output changed to: {}",
-                            new_default_output
-                        );
-
-                        let new_started = if let Ok(new_device) =
-                            parse_audio_device(&new_default_output)
+                        // Skip if new default is user-disabled
+                        if audio_manager
+                            .user_disabled_devices()
+                            .await
+                            .contains(&new_default_output)
                         {
-                            failed_devices.remove(&new_default_output);
-                            match audio_manager.start_device(&new_device).await {
-                                Ok(()) => {
-                                    info!(
+                            debug!("[DEVICE_RECOVERY] skipping default output change: {} is user-disabled", new_default_output);
+                        } else {
+                            info!(
+                                "[DEVICE_RECOVERY] system default output changed to: {}",
+                                new_default_output
+                            );
+
+                            let new_started = if let Ok(new_device) =
+                                parse_audio_device(&new_default_output)
+                            {
+                                failed_devices.remove(&new_default_output);
+                                match audio_manager.start_device(&new_device).await {
+                                    Ok(()) => {
+                                        info!(
                                         "[DEVICE_RECOVERY] started new system default output: {}",
                                         new_default_output
                                     );
-                                    true
-                                }
-                                Err(e) => {
-                                    warn!(
+                                        true
+                                    }
+                                    Err(e) => {
+                                        warn!(
                                             "[DEVICE_RECOVERY] failed to start new default output {}: {} — keeping old devices running",
                                             new_default_output, e
                                         );
-                                    false
+                                        false
+                                    }
                                 }
-                            }
-                        } else {
-                            false
-                        };
+                            } else {
+                                false
+                            };
 
-                        // Only stop old output devices if the new one started successfully
-                        if new_started {
-                            // Don't stop the communications output device during swap
-                            #[cfg(target_os = "windows")]
-                            let comm_name = default_tracker.last_communications_output.clone();
-                            for device_name in audio_manager.enabled_devices().await.iter() {
-                                if *device_name == new_default_output {
-                                    continue; // don't stop the one we just started
-                                }
+                            // Only stop old output devices if the new one started successfully
+                            if new_started {
+                                // Don't stop the communications output device during swap
                                 #[cfg(target_os = "windows")]
-                                if comm_name.as_deref() == Some(device_name.as_str()) {
-                                    continue; // don't stop the communications device
-                                }
-                                if let Ok(device) = parse_audio_device(device_name) {
-                                    if device.device_type == DeviceType::Output {
-                                        info!(
-                                            "[DEVICE_RECOVERY] stopping old output device: {}",
-                                            device_name
-                                        );
-                                        let _ = audio_manager.stop_device(device_name).await;
+                                let comm_name = default_tracker.last_communications_output.clone();
+                                for device_name in audio_manager.enabled_devices().await.iter() {
+                                    if *device_name == new_default_output {
+                                        continue; // don't stop the one we just started
+                                    }
+                                    #[cfg(target_os = "windows")]
+                                    if comm_name.as_deref() == Some(device_name.as_str()) {
+                                        continue; // don't stop the communications device
+                                    }
+                                    if let Ok(device) = parse_audio_device(device_name) {
+                                        if device.device_type == DeviceType::Output {
+                                            info!(
+                                                "[DEVICE_RECOVERY] stopping old output device: {}",
+                                                device_name
+                                            );
+                                            let _ = audio_manager.stop_device(device_name).await;
+                                        }
                                     }
                                 }
                             }
-                        }
+                        } // else: skip user-disabled
                     }
 
                     // Windows: check if the eCommunications output device changed.
@@ -436,21 +542,45 @@ pub async fn start_device_monitor(
                     // No backoff — missing input audio is critical.
                     {
                         let current_enabled = audio_manager.enabled_devices().await;
+                        let user_disabled = audio_manager.user_disabled_devices().await;
                         let has_input = current_enabled.iter().any(|name| {
                             parse_audio_device(name)
                                 .map(|d| d.device_type == DeviceType::Input)
                                 .unwrap_or(false)
                         });
+                        // Don't try to recover if user explicitly disabled all inputs
+                        let all_inputs_user_disabled = !has_input && {
+                            match default_input_device() {
+                                Ok(d) => user_disabled.contains(&d.to_string()),
+                                Err(_) => false,
+                            }
+                        };
 
-                        if !has_input {
+                        if !has_input && !all_inputs_user_disabled {
                             no_input_retry_count += 1;
+
+                            // Throttle logging after many retries to avoid spamming logs
+                            // (e.g. Bluetooth device disconnected permanently)
+                            let should_log = if no_input_retry_count <= 10 {
+                                true // always log first 10 attempts
+                            } else {
+                                // After 10 attempts, log once per 60s
+                                match last_no_input_log {
+                                    Some(t) => t.elapsed().as_secs() >= 60,
+                                    None => true,
+                                }
+                            };
+
                             match default_input_device() {
                                 Ok(default_input) => {
                                     let device_name = default_input.to_string();
-                                    warn!(
-                                        "[DEVICE_RECOVERY] no input device running (attempt {}), starting default: {}",
-                                        no_input_retry_count, device_name
-                                    );
+                                    if should_log {
+                                        warn!(
+                                            "[DEVICE_RECOVERY] no input device running (attempt {}), starting default: {}",
+                                            no_input_retry_count, device_name
+                                        );
+                                        last_no_input_log = Some(Instant::now());
+                                    }
                                     match audio_manager.start_device(&default_input).await {
                                         Ok(()) => {
                                             failed_devices.remove(&device_name);
@@ -461,18 +591,24 @@ pub async fn start_device_monitor(
                                             );
                                         }
                                         Err(e) => {
-                                            warn!(
-                                                "[DEVICE_RECOVERY] failed to start input device {} (attempt {}): {}",
-                                                device_name, no_input_retry_count, e
-                                            );
+                                            if should_log {
+                                                warn!(
+                                                    "[DEVICE_RECOVERY] failed to start input device {} (attempt {}): {}",
+                                                    device_name, no_input_retry_count, e
+                                                );
+                                                last_no_input_log = Some(Instant::now());
+                                            }
                                         }
                                     }
                                 }
                                 Err(e) => {
-                                    warn!(
-                                        "[DEVICE_RECOVERY] no input device running and default_input_device() failed (attempt {}): {}",
-                                        no_input_retry_count, e
-                                    );
+                                    if should_log {
+                                        warn!(
+                                            "[DEVICE_RECOVERY] no input device running and default_input_device() failed (attempt {}): {}",
+                                            no_input_retry_count, e
+                                        );
+                                        last_no_input_log = Some(Instant::now());
+                                    }
                                 }
                             }
                         } else {
@@ -483,52 +619,78 @@ pub async fn start_device_monitor(
                     // Ensure an output device is actually running.
                     // Handles the case where ScreenCaptureKit wasn't ready at startup
                     // or output device was lost during a device change.
-                    // CRITICAL: No backoff here — missing output audio is unacceptable
-                    // during calls. We retry every 2s (each loop iteration).
                     {
                         let current_enabled = audio_manager.enabled_devices().await;
+                        let user_disabled = audio_manager.user_disabled_devices().await;
                         let has_output = current_enabled.iter().any(|name| {
                             parse_audio_device(name)
                                 .map(|d| d.device_type == DeviceType::Output)
                                 .unwrap_or(false)
                         });
-
-                        if !has_output {
-                            no_output_retry_count += 1;
+                        // Don't try to recover if user explicitly disabled output
+                        let output_user_disabled = !has_output && {
                             match default_output_device().await {
-                                Ok(default_output) => {
-                                    let device_name = default_output.to_string();
-                                    // No backoff — always retry immediately when zero output devices
-                                    warn!(
-                                        "[DEVICE_RECOVERY] no output device running (attempt {}), starting default: {}",
-                                        no_output_retry_count, device_name
-                                    );
-                                    match audio_manager.start_device(&default_output).await {
-                                        Ok(()) => {
-                                            failed_devices.remove(&device_name);
-                                            default_tracker.last_output = Some(device_name.clone());
-                                            no_output_retry_count = 0;
-                                            info!(
-                                                "[DEVICE_RECOVERY] output device restored, device={}", device_name
-                                            );
+                                Ok(d) => user_disabled.contains(&d.to_string()),
+                                Err(_) => false,
+                            }
+                        };
+
+                        if !has_output && !output_user_disabled {
+                            // Apply backoff: skip this cycle if we haven't waited long enough.
+                            // Transient errors (SCK not ready) use short backoff (2-8s).
+                            // Permanent errors (no display) use longer backoff (up to 120s).
+                            let backoff_secs = output_recovery_backoff.next_delay_secs();
+                            let elapsed = output_recovery_backoff.last_attempt.elapsed();
+                            if elapsed < Duration::from_secs(backoff_secs) {
+                                // Still within backoff window — skip this cycle
+                            } else {
+                                output_recovery_backoff.last_attempt = Instant::now();
+                                match default_output_device().await {
+                                    Ok(default_output) => {
+                                        let device_name = default_output.to_string();
+                                        info!(
+                                            "[DEVICE_RECOVERY] no output device running (attempt {}), starting default: {}",
+                                            output_recovery_backoff.attempts, device_name
+                                        );
+                                        match audio_manager.start_device(&default_output).await {
+                                            Ok(()) => {
+                                                failed_devices.remove(&device_name);
+                                                default_tracker.last_output =
+                                                    Some(device_name.clone());
+                                                output_recovery_backoff.reset();
+                                                info!(
+                                                    "[DEVICE_RECOVERY] output device restored, device={}", device_name
+                                                );
+                                            }
+                                            Err(e) => {
+                                                output_recovery_backoff.record_failure(false);
+                                                warn!(
+                                                    "[DEVICE_RECOVERY] failed to start output device {} (attempt {}, next retry in {}s): {}",
+                                                    device_name, output_recovery_backoff.attempts,
+                                                    output_recovery_backoff.next_delay_secs(), e
+                                                );
+                                            }
                                         }
-                                        Err(e) => {
+                                    }
+                                    Err(e) => {
+                                        let is_permanent = is_permanent_output_error(&e);
+                                        output_recovery_backoff.record_failure(is_permanent);
+                                        if output_recovery_backoff.attempts <= 3
+                                            || output_recovery_backoff.attempts.is_multiple_of(30)
+                                        {
+                                            // Log first 3 attempts, then every 30th to avoid spam
                                             warn!(
-                                                "[DEVICE_RECOVERY] failed to start output device {} (attempt {}): {}",
-                                                device_name, no_output_retry_count, e
+                                                "[DEVICE_RECOVERY] no output device available (attempt {}, {}, next retry in {}s): {}",
+                                                output_recovery_backoff.attempts,
+                                                if is_permanent { "permanent" } else { "transient" },
+                                                output_recovery_backoff.next_delay_secs(), e
                                             );
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    warn!(
-                                        "[DEVICE_RECOVERY] no output device running and default_output_device() failed (attempt {}): {}",
-                                        no_output_retry_count, e
-                                    );
-                                }
                             }
                         } else {
-                            no_output_retry_count = 0;
+                            output_recovery_backoff.reset();
                         }
                     }
                 }
@@ -536,7 +698,17 @@ pub async fn start_device_monitor(
                 // Check for stale recording handles (tasks that have finished/crashed)
                 // This handles cases where audio stream was hijacked by another app
                 let stale_devices = audio_manager.check_stale_recording_handles().await;
+                let user_disabled_for_stale = audio_manager.user_disabled_devices().await;
                 for device_name in stale_devices {
+                    // Don't restart user-disabled devices — they're supposed to be stopped
+                    if user_disabled_for_stale.contains(&device_name) {
+                        debug!(
+                            "[DEVICE_RECOVERY] stale handle for user-disabled device {}, cleaning up only",
+                            device_name
+                        );
+                        let _ = audio_manager.cleanup_stale_device(&device_name).await;
+                        continue;
+                    }
                     warn!(
                         "[DEVICE_RECOVERY] detected stale recording handle for {}, cleaning up for restart",
                         device_name
@@ -546,6 +718,17 @@ pub async fn start_device_monitor(
                 }
 
                 // Check central handler health (audio-receiver + transcription-receiver)
+                let mut central_restarted_this_cycle = false;
+                if central_restart_exhausted.load(std::sync::atomic::Ordering::Relaxed) {
+                    let now = Instant::now();
+                    let window = Duration::from_secs(300);
+                    central_restart_times.retain(|t| now.duration_since(*t) < window);
+                    if central_restart_times.len() < 3 {
+                        central_restart_exhausted
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+
                 if !central_restart_exhausted.load(std::sync::atomic::Ordering::Relaxed) {
                     let result = audio_manager.check_and_restart_central_handlers().await;
                     if result.recording_restarted || result.transcription_restarted {
@@ -554,6 +737,7 @@ pub async fn start_device_monitor(
                         // Evict entries older than 5 minutes
                         let window = Duration::from_secs(300);
                         central_restart_times.retain(|t| now.duration_since(*t) < window);
+                        central_restarted_this_cycle = true;
                         if central_restart_times.len() >= 3 {
                             error!(
                                 "central audio handlers restarted {} times in 5 min — stopping recovery to avoid restart storm",
@@ -565,7 +749,121 @@ pub async fn start_device_monitor(
                     }
                 }
 
+                if last_model_refresh.elapsed() >= model_refresh_cooldown {
+                    last_model_refresh = Instant::now();
+                    let model_capabilities_changed =
+                        audio_manager.refresh_model_capabilities().await;
+                    if model_capabilities_changed {
+                        if central_restart_exhausted.load(std::sync::atomic::Ordering::Relaxed) {
+                            info!("model capabilities changed after background download; handler restart deferred due to cooldown");
+                            model_restart_pending = true;
+                        } else {
+                            info!("model capabilities changed after background download; restarting central handlers");
+                        }
+                        if !central_restart_exhausted.load(std::sync::atomic::Ordering::Relaxed) {
+                            if central_restarted_this_cycle {
+                                // Avoid duplicate hard restarts in the same monitor iteration.
+                                // A capability-aware restart is still needed; do it now to avoid
+                                // carrying a deferred restart into the next pass.
+                                let result = audio_manager.restart_central_handlers().await;
+                                if result.recording_restarted || result.transcription_restarted {
+                                    let now = Instant::now();
+                                    // We already restarted once this iteration, so we still
+                                    // track this additional capability-aware restart for storm
+                                    // detection.
+                                    central_restart_times.push(now);
+                                    let window = Duration::from_secs(300);
+                                    central_restart_times
+                                        .retain(|t| now.duration_since(*t) < window);
+                                    if central_restart_times.len() >= 3 {
+                                        error!(
+                                            "central handlers restarted {} times (including same-cycle capability update) in 5 min — stopping recovery to avoid restart storm",
+                                            central_restart_times.len()
+                                        );
+                                        central_restart_exhausted
+                                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    } else {
+                                        model_restart_pending = false;
+                                    }
+                                    debug!(
+                                        "model capability refresh requested; handlers were already restarted earlier this cycle, and restarted again to pick up updated model state"
+                                    );
+                                } else {
+                                    warn!(
+                                        "model capability restart requested but no handlers restarted; keeping request pending"
+                                    );
+                                    model_restart_pending = true;
+                                }
+                            } else {
+                                let result = audio_manager.restart_central_handlers().await;
+                                if result.recording_restarted || result.transcription_restarted {
+                                    central_restarted_this_cycle = true;
+                                    let now = Instant::now();
+                                    central_restart_times.push(now);
+                                    let window = Duration::from_secs(300);
+                                    central_restart_times
+                                        .retain(|t| now.duration_since(*t) < window);
+                                    if central_restart_times.len() >= 3 {
+                                        error!(
+                                            "central handlers restarted {} times in 5 min (including model refresh path) — stopping recovery to avoid restart storm",
+                                            central_restart_times.len()
+                                        );
+                                        central_restart_exhausted
+                                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                                    } else {
+                                        model_restart_pending = false;
+                                    }
+                                } else {
+                                    warn!(
+                                        "model capability restart requested but no handlers restarted; keeping request pending"
+                                    );
+                                    model_restart_pending = true;
+                                }
+                            }
+                        } else {
+                            info!(
+                                "model capabilities changed, but central handler restart is temporarily suspended"
+                            );
+                        }
+                        let _ = audio_manager.reconcile_missing_speakers(24, 50).await;
+                    }
+                }
+
+                if model_restart_pending
+                    && !central_restart_exhausted.load(std::sync::atomic::Ordering::Relaxed)
+                    && !central_restarted_this_cycle
+                {
+                    let result = audio_manager.restart_central_handlers().await;
+                    if result.recording_restarted || result.transcription_restarted {
+                        let now = Instant::now();
+                        central_restart_times.push(now);
+                        let window = Duration::from_secs(300);
+                        central_restart_times.retain(|t| now.duration_since(*t) < window);
+                        if central_restart_times.len() >= 3 {
+                            error!(
+                                "central handlers restarted {} times while applying pending model changes — stopping recovery to avoid restart storm",
+                                central_restart_times.len()
+                            );
+                            central_restart_exhausted
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        } else {
+                            model_restart_pending = false;
+                        }
+                    } else {
+                        warn!(
+                            "model capability restart was requested but handlers did not restart; keeping request pending"
+                        );
+                    }
+                }
+
+                let user_disabled_for_reconnect = audio_manager.user_disabled_devices().await;
                 for device_name in disconnected_devices.clone() {
+                    // Skip user-disabled devices — they're intentionally stopped
+                    if user_disabled_for_reconnect.contains(&device_name) {
+                        disconnected_devices.remove(&device_name);
+                        continue;
+                    }
+
                     let device = match parse_audio_device(&device_name) {
                         Ok(device) => device,
                         Err(e) => {
@@ -636,6 +934,15 @@ pub async fn start_device_monitor(
                             continue;
                         }
 
+                        // Skip user-disabled (paused) devices — don't restart them
+                        if audio_manager
+                            .user_disabled_devices()
+                            .await
+                            .contains(device_name)
+                        {
+                            continue;
+                        }
+
                         match audio_manager.start_device(&device).await {
                             Ok(()) => {
                                 //
@@ -644,6 +951,13 @@ pub async fn start_device_monitor(
                                 let e_str = e.to_string();
                                 if e_str.contains("already running") || e_str.contains("not found")
                                 {
+                                    continue;
+                                }
+                                // SCK transiently fails during device switches ("callback never
+                                // fired") — downgrade to warn so it doesn't reach Sentry; the
+                                // monitor will retry on the next 2-second tick.
+                                if e_str.contains("callback never fired") {
+                                    warn!("device check transient error (will retry): {e}");
                                     continue;
                                 }
                                 error!("device check error: {e}");
@@ -731,6 +1045,95 @@ mod tests {
         cd.record_restart();
         cd.record_restart(); // exhausted
         assert!(cd.record_restart()); // still exhausted
+    }
+
+    // --- OutputRecoveryBackoff tests ---
+
+    #[test]
+    fn test_backoff_initial_state() {
+        let b = OutputRecoveryBackoff::new();
+        assert_eq!(b.attempts, 0);
+        assert!(!b.is_permanent);
+        assert_eq!(b.next_delay_secs(), 0); // no delay on first try
+    }
+
+    #[test]
+    fn test_backoff_transient_capped_at_8s() {
+        let mut b = OutputRecoveryBackoff::new();
+        // Simulate transient failures
+        b.record_failure(false); // attempt 1 → 2^1 = 2s
+        assert_eq!(b.next_delay_secs(), 2);
+        b.record_failure(false); // attempt 2 → 2^2 = 4s
+        assert_eq!(b.next_delay_secs(), 4);
+        b.record_failure(false); // attempt 3 → 2^3 = 8s (cap)
+        assert_eq!(b.next_delay_secs(), 8);
+        b.record_failure(false); // attempt 4 → still 8s (capped)
+        assert_eq!(b.next_delay_secs(), 8);
+    }
+
+    #[test]
+    fn test_backoff_permanent_capped_at_120s() {
+        let mut b = OutputRecoveryBackoff::new();
+        b.record_failure(true); // 2s
+        assert_eq!(b.next_delay_secs(), 2);
+        b.record_failure(true); // 4s
+        assert_eq!(b.next_delay_secs(), 4);
+        b.record_failure(true); // 8s
+        assert_eq!(b.next_delay_secs(), 8);
+        b.record_failure(true); // 16s
+        assert_eq!(b.next_delay_secs(), 16);
+        b.record_failure(true); // 32s
+        assert_eq!(b.next_delay_secs(), 32);
+        b.record_failure(true); // 64s
+        assert_eq!(b.next_delay_secs(), 64);
+        b.record_failure(true); // 120s (capped, not 128)
+        assert_eq!(b.next_delay_secs(), 120);
+        b.record_failure(true); // still 120s
+        assert_eq!(b.next_delay_secs(), 120);
+    }
+
+    #[test]
+    fn test_backoff_reset_clears_state() {
+        let mut b = OutputRecoveryBackoff::new();
+        b.record_failure(true);
+        b.record_failure(true);
+        b.record_failure(true);
+        assert_eq!(b.attempts, 3);
+        assert!(b.is_permanent);
+
+        b.reset();
+        assert_eq!(b.attempts, 0);
+        assert!(!b.is_permanent);
+        assert_eq!(b.next_delay_secs(), 0);
+    }
+
+    #[test]
+    fn test_backoff_transient_then_permanent_escalates() {
+        let mut b = OutputRecoveryBackoff::new();
+        b.record_failure(false); // transient
+        b.record_failure(false); // transient, 4s
+        assert_eq!(b.next_delay_secs(), 4); // capped at transient max
+
+        b.record_failure(true); // now permanent — cap goes to 120s
+        assert_eq!(b.next_delay_secs(), 8); // 2^3 = 8, under 120 cap
+        b.record_failure(true);
+        assert_eq!(b.next_delay_secs(), 16);
+    }
+
+    #[test]
+    fn test_is_permanent_output_error() {
+        let permanent = anyhow::anyhow!(
+            "ScreenCaptureKit available but no display audio device found — \
+             output audio capture requires a display device"
+        );
+        assert!(is_permanent_output_error(&permanent));
+
+        let transient =
+            anyhow::anyhow!("ScreenCaptureKit unavailable for output audio capture: timeout");
+        assert!(!is_permanent_output_error(&transient));
+
+        let other = anyhow::anyhow!("some random error");
+        assert!(!is_permanent_output_error(&other));
     }
 
     #[test]

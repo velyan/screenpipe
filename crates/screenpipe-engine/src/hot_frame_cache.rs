@@ -288,6 +288,30 @@ impl HotFrameCache {
 }
 
 impl HotFrameCache {
+    /// Drop every cached frame and audio entry whose timestamp falls in
+    /// `[start, end]`. Called after a destructive delete in the storage UI
+    /// so the timeline streamer doesn't re-emit ghost frames pointing at
+    /// files we just removed (which is what made the timeline "jump
+    /// backward" right after the user clicked delete-last-15-min).
+    pub async fn evict_range(&self, start: DateTime<Utc>, end: DateTime<Utc>) {
+        {
+            let mut frames = self.frames.write().await;
+            frames.retain(|(ts, _), _| *ts < start || *ts > end);
+        }
+        {
+            let mut audio = self.audio.write().await;
+            audio.retain(|ts, _| *ts < start || *ts > end);
+        }
+        // Push warm_start forward if it now points inside the evicted range.
+        let mut ws = self.cache_warm_start.write().await;
+        if let Some(existing) = *ws {
+            if existing >= start && existing <= end {
+                let frames = self.frames.read().await;
+                *ws = frames.keys().next().map(|(t, _)| *t);
+            }
+        }
+    }
+
     /// Public wrapper: find audio entries near a given timestamp.
     /// Used by the streaming handler to attach audio to live frames.
     pub async fn find_audio_near(&self, frame_ts: DateTime<Utc>) -> Vec<AudioEntry> {

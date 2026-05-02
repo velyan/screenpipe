@@ -34,6 +34,7 @@ import {
   EyeOff,
   Key,
 } from "lucide-react";
+import { localFetch } from "@/lib/api";
 import { toast } from "@/components/ui/use-toast";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -55,7 +56,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
-import { useSettings, getStore } from "@/lib/hooks/use-settings";
+import { useSettings, getStore, saveAndEncrypt } from "@/lib/hooks/use-settings";
 import { motion } from "framer-motion";
 import Lottie from "lottie-react";
 import cloudSyncAnimation from "@/public/animations/cloud-sync.json";
@@ -214,13 +215,13 @@ function SyncOnboarding({ onSubscribe, onRefresh, isLoading, isRefreshing, isLog
           </div>
           <div className="text-right">
             <div className="text-lg font-bold">
-              ${isAnnual ? "49" : "99"}
+              ${isAnnual ? "19" : "29"}
               <span className="text-sm font-normal text-muted-foreground">
                 /mo
               </span>
             </div>
             {isAnnual && (
-              <p className="text-xs text-primary">$588/year - Save 50%</p>
+              <p className="text-xs text-primary">$228/year - Save 34%</p>
             )}
           </div>
         </div>
@@ -438,6 +439,7 @@ function EncryptionKeyReveal() {
 function ActiveSyncSettings({
   status,
   devices,
+  deviceCounts,
   onToggleSync,
   onTriggerSync,
   onRemoveDevice,
@@ -447,6 +449,7 @@ function ActiveSyncSettings({
 }: {
   status: SyncStatus;
   devices: SyncDevice[];
+  deviceCounts: Record<string, { frames: number; audioChunks: number }>;
   onToggleSync: (enabled: boolean) => void;
   onTriggerSync: () => void;
   onRemoveDevice: (deviceId: string) => void;
@@ -599,20 +602,39 @@ function ActiveSyncSettings({
                         <p className="text-xs text-muted-foreground">
                           {device.deviceOs}
                           {device.lastSyncAt &&
-                            ` - last synced ${formatRelativeTime(device.lastSyncAt)}`}
+                            ` · synced ${formatRelativeTime(device.lastSyncAt)}`}
+                          {deviceCounts[device.deviceId] && (
+                            <span className="ml-1">
+                              · {deviceCounts[device.deviceId].frames.toLocaleString()} frames
+                            </span>
+                          )}
                         </p>
                       </div>
                     </div>
                     {!device.isCurrent && (
                       <div className="flex items-center gap-1">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => onDeleteDeviceLocalData(device.deviceId)}
-                          title="delete synced data from this device"
-                        >
-                          <span className="text-xs text-muted-foreground">clean local data</span>
-                        </Button>
+                        <AlertDialog>
+                          <AlertDialogTrigger asChild>
+                            <Button variant="ghost" size="sm" title="delete synced data from this device">
+                              <span className="text-xs text-muted-foreground">clean local data</span>
+                            </Button>
+                          </AlertDialogTrigger>
+                          <AlertDialogContent>
+                            <AlertDialogHeader>
+                              <AlertDialogTitle>Clean local data?</AlertDialogTitle>
+                              <AlertDialogDescription>
+                                This will delete all data synced from {device.deviceName || device.deviceId} on this machine.
+                                To re-sync, disable and re-enable cloud sync.
+                              </AlertDialogDescription>
+                            </AlertDialogHeader>
+                            <AlertDialogFooter>
+                              <AlertDialogCancel>Cancel</AlertDialogCancel>
+                              <AlertDialogAction onClick={() => onDeleteDeviceLocalData(device.deviceId)}>
+                                Delete
+                              </AlertDialogAction>
+                            </AlertDialogFooter>
+                          </AlertDialogContent>
+                        </AlertDialog>
                         <Button
                           variant="ghost"
                           size="sm"
@@ -687,6 +709,7 @@ export function SyncSettings() {
   const [subscription, setSubscription] = useState<SubscriptionStatus | null>(null);
   const [status, setStatus] = useState<SyncStatus | null>(null);
   const [devices, setDevices] = useState<SyncDevice[]>([]);
+  const [deviceCounts, setDeviceCounts] = useState<Record<string, { frames: number; audioChunks: number }>>({});
   const [config, setConfig] = useState<SyncConfig | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isSyncing, setIsSyncing] = useState(false);
@@ -736,7 +759,7 @@ export function SyncSettings() {
 
     // 1. Check if the server-side sync service is already running (same session, navigated away and back)
     try {
-      const serverStatus = await fetch("http://localhost:3030/sync/status");
+      const serverStatus = await localFetch("/sync/status");
       if (serverStatus.ok) {
         const serverData = await serverStatus.json();
         console.log("[sync] step 1 - server status:", serverData);
@@ -775,7 +798,7 @@ export function SyncSettings() {
         // Migration: save to store.bin, remove from localStorage
         const store = await getStore();
         await store.set("sync_password", password);
-        await store.save();
+        await saveAndEncrypt(store);
         localStorage.removeItem("sync_password");
         console.log("[sync] step 2b - migration succeeded");
         return true;
@@ -804,7 +827,7 @@ export function SyncSettings() {
       console.log("[sync] step 3 - legacy password worked, saving to store.bin");
       const store = await getStore();
       await store.set("sync_password", legacyDerived);
-      await store.save();
+      await saveAndEncrypt(store);
       return true;
     } catch (e) {
       console.log("[sync] step 3 - legacy deterministic password failed:", e);
@@ -818,7 +841,7 @@ export function SyncSettings() {
       console.log("[sync] step 4 - init_sync with random password succeeded");
       const store = await getStore();
       await store.set("sync_password", randomPassword);
-      await store.save();
+      await saveAndEncrypt(store);
       return true;
     } catch (e) {
       console.log("[sync] step 4 - init_sync failed, showing password prompt:", e);
@@ -828,6 +851,19 @@ export function SyncSettings() {
 
     console.log("[sync] tryAutoInitSync returning false");
     return false;
+  };
+
+  const fetchDeviceCounts = () => {
+    localFetch("/data/device-storage")
+      .then((r) => r.ok ? r.json() : [])
+      .then((data: { machine_id: string; frames: number; audio_chunks: number }[]) => {
+        const map: Record<string, { frames: number; audioChunks: number }> = {};
+        for (const d of data) {
+          map[d.machine_id] = { frames: d.frames, audioChunks: d.audio_chunks };
+        }
+        setDeviceCounts(map);
+      })
+      .catch(() => {});
   };
 
   const initSyncBackend = async (): Promise<boolean> => {
@@ -841,6 +877,7 @@ export function SyncSettings() {
       setStatus(statusResult);
       setConfig(configResult);
       setDevices(devicesResult);
+      fetchDeviceCounts();
 
       if (statusResult.enabled) {
         setStep("active");
@@ -855,6 +892,7 @@ export function SyncSettings() {
           setStatus(newStatus);
           setConfig(newConfig);
           setDevices(newDevices);
+          fetchDeviceCounts();
           setStep("active");
         } else {
           setStep("password");
@@ -875,6 +913,7 @@ export function SyncSettings() {
           setStatus(newStatus);
           setConfig(newConfig);
           setDevices(newDevices);
+          fetchDeviceCounts();
           setStep("active");
           return true;
         } catch {
@@ -914,8 +953,7 @@ export function SyncSettings() {
         const subscriptionStatus = data.subscription?.status;
         const hasSubscription = data.hasSubscription ||
           subscriptionStatus === "trialing" ||
-          subscriptionStatus === "active" ||
-          !!settings.user?.cloud_subscribed;
+          subscriptionStatus === "active";
         setSubscription({
           hasSubscription,
           tier: data.subscription?.tier || null,
@@ -924,12 +962,32 @@ export function SyncSettings() {
 
         if (hasSubscription) {
           if (settings.user && !settings.user.cloud_subscribed) {
-            await updateSettings({
+            const engineUpdate: Record<string, any> = {
               user: { ...settings.user, cloud_subscribed: true },
-            });
+            };
+            // Auto-switch to cloud transcription for new subscribers
+            if (settings.audioTranscriptionEngine !== "screenpipe-cloud") {
+              engineUpdate.audioTranscriptionEngine = "screenpipe-cloud";
+            }
+            await updateSettings(engineUpdate);
           }
           return await initSyncBackend();
         } else {
+          // Subscription expired/cancelled — clear cloud flag and revert engine
+          // only if it's still set to cloud (don't touch disabled or other engines)
+          if (settings.user?.cloud_subscribed) {
+            const revertUpdate: Record<string, any> = {
+              user: { ...settings.user, cloud_subscribed: false },
+            };
+            if (settings.audioTranscriptionEngine === "screenpipe-cloud") {
+              const { platform: getPlatform } = await import("@tauri-apps/plugin-os");
+              const os = getPlatform();
+              revertUpdate.audioTranscriptionEngine = os === "macos"
+                ? "whisper-large-v3-turbo-quantized"
+                : "parakeet";
+            }
+            await updateSettings(revertUpdate);
+          }
           setStep("onboarding");
           return false;
         }
@@ -1037,7 +1095,7 @@ export function SyncSettings() {
       try {
         const store = await getStore();
         await store.set("sync_password", password);
-        await store.save();
+        await saveAndEncrypt(store);
         // Clean up any old localStorage entry
         localStorage.removeItem("sync_password");
       } catch {
@@ -1148,13 +1206,6 @@ export function SyncSettings() {
   };
 
   const handleDeleteDeviceLocalData = async (deviceId: string) => {
-    const confirmed = window.confirm(
-      "this will delete all data synced from this device on your local machine.\n\n" +
-      "to re-sync, disable and re-enable cloud sync.\n\n" +
-      "continue?"
-    );
-    if (!confirmed) return;
-
     try {
       const result = await invoke("delete_device_local_data", { machineId: deviceId });
       const parsed = typeof result === "string" ? JSON.parse(result) : result;
@@ -1195,7 +1246,7 @@ export function SyncSettings() {
     try {
       const store = await getStore();
       await store.delete("sync_password");
-      await store.save();
+      await saveAndEncrypt(store);
     } catch {
       // Non-critical
     }
@@ -1234,6 +1285,7 @@ export function SyncSettings() {
       <ActiveSyncSettings
         status={status}
         devices={devices}
+        deviceCounts={deviceCounts}
         onToggleSync={handleToggleSync}
         onTriggerSync={handleTriggerSync}
         onRemoveDevice={handleRemoveDevice}

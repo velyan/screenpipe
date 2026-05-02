@@ -107,6 +107,33 @@ export function useTimelineKeyboard(opts: {
 		return () => window.removeEventListener("keydown", handleKeyDown);
 	}, [showSearchModal]);
 
+	// Cmd+G / Cmd+Shift+G (mac) or Ctrl+G / Ctrl+Shift+G (other) —
+	// jump to next/previous search match while in search review mode.
+	// Mirrors the chevron buttons: G = forward in time (newer), Shift+G = backward.
+	useEffect(() => {
+		const handleFindNav = (e: KeyboardEvent) => {
+			if (!inSearchReviewMode) return;
+			if (showSearchModal) return;
+			const target = e.target as HTMLElement;
+			if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target?.isContentEditable) {
+				return;
+			}
+			const mod = isMac ? e.metaKey : e.ctrlKey;
+			if (!mod) return;
+			if (e.key.toLowerCase() !== "g") return;
+			e.preventDefault();
+			if (isPlaying) pausePlayback();
+			const newIndex = e.shiftKey
+				? Math.min(searchResultIndex + 1, searchResults.length - 1) // older
+				: Math.max(searchResultIndex - 1, 0); // newer
+			if (newIndex !== searchResultIndex) {
+				navigateToSearchResultRef.current(newIndex);
+			}
+		};
+		window.addEventListener("keydown", handleFindNav);
+		return () => window.removeEventListener("keydown", handleFindNav);
+	}, [inSearchReviewMode, showSearchModal, isMac, isPlaying, pausePlayback, searchResultIndex, searchResults.length, navigateToSearchResultRef]);
+
 	// Cmd+Shift+C / Ctrl+Shift+C — copy current frame image
 	useEffect(() => {
 		const handleCopyFrame = (e: KeyboardEvent) => {
@@ -153,7 +180,8 @@ export function useTimelineKeyboard(opts: {
 	// In embedded mode, only handle closing the search modal (don't close the window)
 	useEffect(() => {
 		if (embedded) return;
-		const unlisten = listen("escape-pressed", () => {
+
+		const handleEscape = () => {
 			// Exit search-result review mode first
 			if (inSearchReviewMode) {
 				clearSearchHighlight();
@@ -171,9 +199,38 @@ export function useTimelineKeyboard(opts: {
 			}
 			pausePlayback();
 			commands.closeWindow("Main");
-		});
-		return () => { unlisten.then((fn) => fn()); };
-	}, [showSearchModal, embedded, resetFilters, inSearchReviewMode, clearSearchHighlight]);
+		};
+
+		// Listen for Rust global-shortcut Escape event
+		const unlisten = listen("escape-pressed", handleEscape);
+
+		// Fallback: direct keydown listener for Escape and Alt+S.
+		// On Windows, global shortcut registrations can be lost due to
+		// focus races (unregister/register happen in separate threads)
+		// or the OS intercepting Alt as a menu-bar activator.
+		// These direct listeners work whenever the webview has focus.
+		const handleKeyDown = (e: KeyboardEvent) => {
+			if (e.key === "Escape") {
+				e.preventDefault();
+				handleEscape();
+			}
+			// Alt+S (Windows) / Ctrl+Cmd+S (macOS) — close timeline
+			const isToggleShortcut = isMac
+				? e.metaKey && e.ctrlKey && e.key.toLowerCase() === "s"
+				: e.altKey && e.key.toLowerCase() === "s";
+			if (isToggleShortcut) {
+				e.preventDefault();
+				pausePlayback();
+				commands.closeWindow("Main");
+			}
+		};
+		window.addEventListener("keydown", handleKeyDown);
+
+		return () => {
+			unlisten.then((fn) => fn());
+			window.removeEventListener("keydown", handleKeyDown);
+		};
+	}, [showSearchModal, embedded, resetFilters, inSearchReviewMode, clearSearchHighlight, isMac, pausePlayback]);
 
 	// Handle arrow key navigation via JS keydown (no global hotkey stealing)
 	useEffect(() => {

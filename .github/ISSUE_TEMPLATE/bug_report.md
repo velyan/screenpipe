@@ -10,6 +10,8 @@ assignees: ''
 **describe the bug**
 brief description of the bug.
 
+please click the "send logs" button in the help section of the app (don't share the link here, we'll receive the logs)
+
 **system info**
 - os: [e.g. macos 10.15.7, windows 10, ubuntu 20.04]
 - screenpipe version: [e.g. 1.2.3]

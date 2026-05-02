@@ -8,8 +8,13 @@
 //! per-record `synced_at` tracking. The cleanup loop only deletes data before
 //! `min(watermark, now - retention_days)`.
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{
+    extract::{Json, State},
+    http::StatusCode,
+    response::Json as JsonResponse,
+};
 use chrono::{DateTime, Duration, Utc};
+use oasgen::{oasgen, OaSchema};
 use screenpipe_core::sync::{BlobType, SyncClientConfig, SyncManager};
 use screenpipe_db::DatabaseManager;
 use serde::{Deserialize, Serialize};
@@ -96,25 +101,25 @@ impl Default for ArchiveConfig {
 // Request / Response types
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, OaSchema)]
 pub struct ArchiveInitRequest {
     pub token: String,
     pub retention_days: Option<u32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, OaSchema)]
 pub struct ArchiveInitResponse {
     pub success: bool,
     pub machine_id: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, OaSchema)]
 pub struct ArchiveConfigureRequest {
     pub enabled: Option<bool>,
     pub retention_days: Option<u32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, OaSchema)]
 pub struct ArchiveStatusResponse {
     pub enabled: bool,
     pub retention_days: u32,
@@ -135,17 +140,18 @@ pub struct ArchiveStatusResponse {
 // ============================================================================
 
 /// POST /archive/init — initialize the archive system.
+#[oasgen]
 pub async fn archive_init(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ArchiveInitRequest>,
-) -> Result<Json<ArchiveInitResponse>, (StatusCode, Json<Value>)> {
+) -> Result<JsonResponse<ArchiveInitResponse>, (StatusCode, JsonResponse<Value>)> {
     // Check if already initialized
     {
         let guard = state.archive_state.inner.read().await;
         if guard.is_some() {
             return Err((
                 StatusCode::CONFLICT,
-                Json(json!({"error": "archive already initialized"})),
+                JsonResponse(json!({"error": "archive already initialized"})),
             ));
         }
     }
@@ -155,53 +161,46 @@ pub async fn archive_init(
     // Use persistent machine ID
     let machine_id = screenpipe_core::sync::get_or_create_machine_id();
 
-    // Reuse the sync manager if sync is already initialized (same encryption keys).
-    // This avoids the AEAD decryption failure that occurs when archive derives a
-    // different password than what sync used to encrypt the master key.
+    // Archive uses its OWN encryption keys, completely independent of cloud sync.
+    // Keys are derived deterministically from the user's token so they're
+    // consistent across restarts without needing server-side key storage.
     let manager = {
-        let sync_guard = state.sync_state.read().await;
-        if let Some(ref sync_rt) = *sync_guard {
-            info!("archive: reusing sync manager (already initialized)");
-            sync_rt.manager.clone()
-        } else {
-            drop(sync_guard);
+        let device_name = hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "Unknown".to_string());
+        let device_os = std::env::consts::OS.to_string();
 
-            let device_name = hostname::get()
-                .map(|h| h.to_string_lossy().to_string())
-                .unwrap_or_else(|_| "Unknown".to_string());
-            let device_os = std::env::consts::OS.to_string();
+        let config = SyncClientConfig::new(
+            request.token.clone(),
+            machine_id.clone(),
+            device_name,
+            device_os,
+        );
 
-            let config = SyncClientConfig::new(
-                request.token.clone(),
-                machine_id.clone(),
-                device_name,
-                device_os,
-            );
+        let mgr = SyncManager::new(config).map_err(|e| {
+            error!("archive: failed to create sync manager: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonResponse(json!({"error": format!("failed to create sync manager: {}", e)})),
+            )
+        })?;
 
-            let mgr = SyncManager::new(config).map_err(|e| {
-                error!("archive: failed to create sync manager: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("failed to create sync manager: {}", e)})),
-                )
-            })?;
+        // Derive encryption keys locally from the token — no server call,
+        // no dependency on sync's key storage.
+        let password = format!(
+            "screenpipe-archive-{:x}",
+            md5::compute(request.token.as_bytes())
+        );
 
-            // Derive encryption password from the token (only used when sync is not active)
-            let password = format!(
-                "screenpipe-archive-{:x}",
-                md5::compute(request.token.as_bytes())
-            );
+        mgr.initialize_local(&password).await.map_err(|e| {
+            error!("archive: failed to derive encryption keys: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonResponse(json!({"error": format!("failed to initialize encryption: {}", e)})),
+            )
+        })?;
 
-            mgr.initialize(&password).await.map_err(|e| {
-                error!("archive: failed to initialize encryption: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("failed to initialize encryption: {}", e)})),
-                )
-            })?;
-
-            Arc::new(mgr)
-        }
+        Arc::new(mgr)
     };
 
     let archive_config = ArchiveConfig {
@@ -244,24 +243,39 @@ pub async fn archive_init(
 
     info!("archive: initialized, retention={}d", retention_days);
 
-    Ok(Json(ArchiveInitResponse {
+    Ok(JsonResponse(ArchiveInitResponse {
         success: true,
         machine_id,
     }))
 }
 
 /// POST /archive/configure — update retention or disable.
+#[oasgen]
 pub async fn archive_configure(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ArchiveConfigureRequest>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<JsonResponse<Value>, (StatusCode, JsonResponse<Value>)> {
     let mut guard = state.archive_state.inner.write().await;
-    let runtime = guard.as_mut().ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "archive not initialized"})),
-        )
-    })?;
+
+    let runtime = match guard.as_mut() {
+        Some(rt) => rt,
+        None => {
+            // Archive not initialized — if caller wants to disable, that's a no-op
+            let wants_enabled = request.enabled.unwrap_or(false);
+            if !wants_enabled {
+                info!("archive: configure(disable) on uninitialized state — no-op");
+                return Ok(JsonResponse(json!({
+                    "success": true,
+                    "enabled": false,
+                    "retention_days": request.retention_days.unwrap_or(7),
+                })));
+            }
+            return Err((
+                StatusCode::BAD_REQUEST,
+                JsonResponse(json!({"error": "archive not initialized, call /archive/init first"})),
+            ));
+        }
+    };
 
     if let Some(days) = request.retention_days {
         runtime.config.retention_days = days;
@@ -290,7 +304,7 @@ pub async fn archive_configure(
         }
     }
 
-    Ok(Json(json!({
+    Ok(JsonResponse(json!({
         "success": true,
         "enabled": runtime.config.enabled,
         "retention_days": runtime.config.retention_days,
@@ -298,38 +312,40 @@ pub async fn archive_configure(
 }
 
 /// POST /archive/run — trigger an immediate archive run.
+#[oasgen]
 pub async fn archive_run(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<JsonResponse<Value>, (StatusCode, JsonResponse<Value>)> {
     let guard = state.archive_state.inner.read().await;
     let runtime = guard.as_ref().ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "archive not initialized"})),
+            JsonResponse(json!({"error": "archive not initialized"})),
         )
     })?;
 
     if !runtime.config.enabled {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "archive is disabled"})),
+            JsonResponse(json!({"error": "archive is disabled"})),
         ));
     }
 
     runtime.run_now.notify_one();
     info!("archive: manual run triggered");
 
-    Ok(Json(json!({"success": true})))
+    Ok(JsonResponse(json!({"success": true})))
 }
 
 /// GET /archive/status — return current state.
+#[oasgen]
 pub async fn archive_status(
     State(state): State<Arc<AppState>>,
-) -> Result<Json<ArchiveStatusResponse>, (StatusCode, Json<Value>)> {
+) -> Result<JsonResponse<ArchiveStatusResponse>, (StatusCode, JsonResponse<Value>)> {
     let guard = state.archive_state.inner.read().await;
 
     match guard.as_ref() {
-        None => Ok(Json(ArchiveStatusResponse {
+        None => Ok(JsonResponse(ArchiveStatusResponse {
             enabled: false,
             retention_days: 7,
             watermark: None,
@@ -354,7 +370,7 @@ pub async fn archive_status(
                 0
             };
 
-            Ok(Json(ArchiveStatusResponse {
+            Ok(JsonResponse(ArchiveStatusResponse {
                 enabled: runtime.config.enabled,
                 retention_days: runtime.config.retention_days,
                 watermark: if runtime.watermark == DateTime::<Utc>::MIN_UTC {
@@ -750,7 +766,8 @@ async fn get_archive_chunk(
 
     // Get OCR for frames (include app_name/window_name for cross-machine sync)
     let ocr_records = if !frame_ids.is_empty() {
-        let ocr_results: Vec<(i64, String, bool, Option<String>, Option<String>)> = sqlx::query_as(
+        type OcrRow = (i64, String, bool, Option<String>, Option<String>);
+        let ocr_results: Vec<OcrRow> = sqlx::query_as(
             r#"
             SELECT frame_id, text, focused, app_name, window_name
             FROM ocr_text
@@ -904,32 +921,83 @@ async fn count_records_in_range(
 /// Delete data before cutoff and remove orphan media files from disk.
 /// Only deletes video/snapshot files that have been uploaded to cloud
 /// (cloud_blob_id IS NOT NULL).
+///
+/// Batches deletes into 1-hour chunks. Each batch only deletes time-bounded
+/// rows (fast). The expensive orphan cleanup (full-table NOT IN scans) runs
+/// once at the end.
 async fn do_cleanup(db: &Arc<DatabaseManager>, cutoff: DateTime<Utc>) -> anyhow::Result<()> {
-    let epoch = DateTime::<Utc>::MIN_UTC;
-    let result = db.delete_time_range(epoch, cutoff).await?;
+    let batch_size = Duration::hours(1);
 
-    info!(
-        "archive: deleted frames={} ocr={} audio={} accessibility={} ui_events={} \
-         (video_files={} snapshot_files={} audio_files={})",
-        result.frames_deleted,
-        result.ocr_deleted,
-        result.audio_transcriptions_deleted,
-        result.accessibility_deleted,
-        result.ui_events_deleted,
-        result.video_files.len(),
-        result.snapshot_files.len(),
-        result.audio_files.len(),
-    );
+    let oldest = match db.get_oldest_timestamp().await {
+        Ok(Some(ts)) => ts,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            warn!("archive: failed to get oldest timestamp: {}", e);
+            return Ok(());
+        }
+    };
 
-    // Delete orphan media files from disk (only those confirmed uploaded)
-    for path in result
-        .video_files
-        .iter()
-        .chain(result.audio_files.iter())
-        .chain(result.snapshot_files.iter())
-    {
-        if let Err(e) = tokio::fs::remove_file(path).await {
-            warn!("archive: failed to delete file {}: {}", path, e);
+    let mut batch_start = oldest;
+    let mut any_deleted = false;
+
+    while batch_start < cutoff {
+        let batch_end = (batch_start + batch_size).min(cutoff);
+
+        match db
+            .delete_time_range_batch(batch_start, batch_end, false)
+            .await
+        {
+            Ok(result) => {
+                let batch_total = result.frames_deleted
+                    + result.ocr_deleted
+                    + result.audio_transcriptions_deleted
+                    + result.ui_events_deleted;
+
+                if batch_total > 0 {
+                    any_deleted = true;
+                    info!(
+                        "archive: batch deleted frames={} ocr={} audio={} ui_events={} \
+                         (video_files={} snapshot_files={} audio_files={})",
+                        result.frames_deleted,
+                        result.ocr_deleted,
+                        result.audio_transcriptions_deleted,
+                        result.ui_events_deleted,
+                        result.video_files.len(),
+                        result.snapshot_files.len(),
+                        result.audio_files.len(),
+                    );
+                }
+
+                // Delete media files from disk
+                for path in result
+                    .video_files
+                    .iter()
+                    .chain(result.audio_files.iter())
+                    .chain(result.snapshot_files.iter())
+                {
+                    if let Err(e) = tokio::fs::remove_file(path).await {
+                        warn!("archive: failed to delete file {}: {}", path, e);
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "archive: batch delete failed for range {} to {}: {}",
+                    batch_start, batch_end, e
+                );
+            }
+        }
+
+        batch_start = batch_end;
+
+        // Yield between batches so other writes can acquire the semaphore
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // One-time orphan cleanup after all batches
+    if any_deleted {
+        if let Err(e) = db.cleanup_orphaned_chunks().await {
+            warn!("archive: orphan chunk cleanup failed: {}", e);
         }
     }
 
