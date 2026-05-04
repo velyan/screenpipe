@@ -512,6 +512,17 @@ fn parse_focused_accessibility_context(raw: Option<&str>) -> Option<FocusedEleme
     serde_json::from_str::<FocusedElementContext>(raw).ok()
 }
 
+fn focused_accessibility_response(
+    focused: Option<FocusedElementContext>,
+) -> Option<FocusedAccessibilityResponse> {
+    focused.map(|focused| FocusedAccessibilityResponse {
+        role: focused.role,
+        name: focused.name,
+        input_text: focused.input_text,
+        selected_text: focused.selected_text,
+    })
+}
+
 #[derive(Debug, Clone)]
 struct StructuredBuildOptions {
     include_structured_messages: bool,
@@ -667,6 +678,87 @@ async fn build_capture_response(
     }))
 }
 
+async fn capture_active_window_accessibility_only(
+    req: &CaptureActiveWindowRequest,
+    tree_walker_config: TreeWalkerConfig,
+) -> Result<JsonResponse<ActiveWindowCaptureResponse>, (StatusCode, JsonResponse<Value>)> {
+    let config = tree_walker_config.clone();
+    let tree_walk_result = tokio::task::spawn_blocking(move || walk_accessibility_tree(&config))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonResponse(json!({
+                    "error": "active_window_capture_failed",
+                    "message": error.to_string(),
+                })),
+            )
+        })?;
+
+    let tree_snapshot = match tree_walk_result {
+        TreeWalkResult::Found(snapshot) => snapshot,
+        TreeWalkResult::Skipped(_) | TreeWalkResult::NotFound => {
+            return Err((
+                StatusCode::CONFLICT,
+                JsonResponse(json!({
+                    "error": "active_window_unavailable",
+                    "reason": "no_tree_snapshot",
+                })),
+            ));
+        }
+    };
+
+    let now = Utc::now();
+    let age_ms = (now - tree_snapshot.timestamp).num_milliseconds().max(0);
+    let text = tree_snapshot.text_content.clone();
+    let text = if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    };
+    let focused_accessibility =
+        focused_accessibility_response(tree_snapshot.focused_element.clone());
+
+    let (content_kind, structured_messages, structured_meta) = if req.include_structured_messages {
+        (
+            Some("unknown".to_string()),
+            Some(vec![]),
+            Some(StructuredMetaResponse {
+                status: "partial".to_string(),
+                reason: Some("accessibility_only_capture".to_string()),
+                confidence: 0.0,
+                warnings: vec![],
+                ui_noise_removed: vec![],
+                latency_ms: 0,
+            }),
+        )
+    } else {
+        (None, None, None)
+    };
+
+    Ok(Json(ActiveWindowCaptureResponse {
+        frame_id: -1,
+        captured_at: tree_snapshot.timestamp,
+        age_ms,
+        capture_provenance: PROVENANCE_FOCUSED_WINDOW.to_string(),
+        focused: true,
+        snapshot_path: None,
+        app_name: Some(tree_snapshot.app_name),
+        window_name: Some(tree_snapshot.window_name),
+        browser_url: tree_snapshot.browser_url,
+        text_source: Some("accessibility".to_string()),
+        accessibility_text: text.clone(),
+        main_body_text: text,
+        main_body_meta: None,
+        ocr_text: None,
+        ocr_text_json: None,
+        focused_accessibility,
+        content_kind,
+        structured_messages,
+        structured_meta,
+    }))
+}
+
 #[oasgen]
 pub(crate) async fn capture_active_window(
     State(state): State<Arc<AppState>>,
@@ -678,6 +770,10 @@ pub(crate) async fn capture_active_window(
         &tree_walker_config.included_windows,
         &[],
     );
+    if !req.include_ocr {
+        return capture_active_window_accessibility_only(&req, tree_walker_config).await;
+    }
+
     let resolution = resolve_active_window(&tree_walker_config)
         .await
         .map_err(|error| {
