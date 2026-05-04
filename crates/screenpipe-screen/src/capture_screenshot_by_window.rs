@@ -256,6 +256,7 @@ pub struct FocusedWindowTarget {
     pub bounds: Rect,
 }
 
+#[derive(Clone)]
 pub struct WindowFilters {
     ignore_set: HashSet<String>,
     include_set: HashSet<String>,

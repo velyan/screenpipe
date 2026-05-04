@@ -41,6 +41,8 @@ use crate::server::AppState;
 const PROVENANCE_FOCUSED_WINDOW: &str = "focused_window";
 const PROVENANCE_MONITOR_FALLBACK: &str = "monitor_fallback";
 const CAPTURE_TRIGGER_API: &str = "api_capture_active_window";
+const FOCUSED_WINDOW_CAPTURE_TIMEOUT_REASON: &str = "capture_focused_window_timeout";
+const FOCUSED_WINDOW_CAPTURE_TIMEOUT_MS: u64 = 1_250;
 
 fn default_true() -> bool {
     true
@@ -385,6 +387,29 @@ fn select_best_fallback_window_target(
     best_candidate.map(|(target, monitor_id, _)| (target, monitor_id))
 }
 
+async fn capture_focused_window_bounded(
+    target: &FocusedWindowTarget,
+    window_filters: &WindowFilters,
+) -> Result<Option<CapturedWindow>, String> {
+    let target = target.clone();
+    let window_filters = window_filters.clone();
+    let handle = tokio::task::spawn_blocking(move || {
+        capture_focused_window(&target, &window_filters).map_err(|error| error.to_string())
+    });
+
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(FOCUSED_WINDOW_CAPTURE_TIMEOUT_MS),
+        handle,
+    )
+    .await
+    {
+        Ok(Ok(Ok(window))) => Ok(window),
+        Ok(Ok(Err(error))) => Err(error),
+        Ok(Err(error)) => Err(format!("capture_focused_window_join_error:{error}")),
+        Err(_) => Err(FOCUSED_WINDOW_CAPTURE_TIMEOUT_REASON.to_string()),
+    }
+}
+
 async fn resolve_active_window(
     tree_walker_config: &TreeWalkerConfig,
 ) -> Result<ActiveWindowResolution> {
@@ -457,13 +482,24 @@ async fn resolve_active_window(
         bounds: target_bounds,
     };
 
-    let captured_window = match capture_focused_window(&target, &window_filters) {
+    let captured_window = match capture_focused_window_bounded(&target, &window_filters).await {
         Ok(Some(captured_window)) => captured_window,
         Ok(None) => {
             return Ok(ActiveWindowResolution::Fallback {
                 tree_snapshot: Some(tree_snapshot),
                 monitor_id: Some(owner_monitor_id),
                 reason: "capture_focused_window_failed",
+            });
+        }
+        Err(error) if error == FOCUSED_WINDOW_CAPTURE_TIMEOUT_REASON => {
+            debug!(
+                "focused window capture timed out after {}ms, falling back to accessibility",
+                FOCUSED_WINDOW_CAPTURE_TIMEOUT_MS
+            );
+            return Ok(ActiveWindowResolution::Fallback {
+                tree_snapshot: Some(tree_snapshot),
+                monitor_id: Some(owner_monitor_id),
+                reason: FOCUSED_WINDOW_CAPTURE_TIMEOUT_REASON,
             });
         }
         Err(error) => {
@@ -520,6 +556,61 @@ fn focused_accessibility_response(
         name: focused.name,
         input_text: focused.input_text,
         selected_text: focused.selected_text,
+    })
+}
+
+fn active_window_response_from_tree_snapshot(
+    req: &CaptureActiveWindowRequest,
+    tree_snapshot: TreeSnapshot,
+) -> JsonResponse<ActiveWindowCaptureResponse> {
+    let now = Utc::now();
+    let age_ms = (now - tree_snapshot.timestamp).num_milliseconds().max(0);
+    let text = tree_snapshot.text_content.clone();
+    let text = if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    };
+    let focused_accessibility =
+        focused_accessibility_response(tree_snapshot.focused_element.clone());
+
+    let (content_kind, structured_messages, structured_meta) = if req.include_structured_messages {
+        (
+            Some("unknown".to_string()),
+            Some(vec![]),
+            Some(StructuredMetaResponse {
+                status: "partial".to_string(),
+                reason: Some("accessibility_only_capture".to_string()),
+                confidence: 0.0,
+                warnings: vec![],
+                ui_noise_removed: vec![],
+                latency_ms: 0,
+            }),
+        )
+    } else {
+        (None, None, None)
+    };
+
+    Json(ActiveWindowCaptureResponse {
+        frame_id: -1,
+        captured_at: tree_snapshot.timestamp,
+        age_ms,
+        capture_provenance: PROVENANCE_FOCUSED_WINDOW.to_string(),
+        focused: true,
+        snapshot_path: None,
+        app_name: Some(tree_snapshot.app_name),
+        window_name: Some(tree_snapshot.window_name),
+        browser_url: tree_snapshot.browser_url,
+        text_source: Some("accessibility".to_string()),
+        accessibility_text: text.clone(),
+        main_body_text: text,
+        main_body_meta: None,
+        ocr_text: None,
+        ocr_text_json: None,
+        focused_accessibility,
+        content_kind,
+        structured_messages,
+        structured_meta,
     })
 }
 
@@ -708,55 +799,10 @@ async fn capture_active_window_accessibility_only(
         }
     };
 
-    let now = Utc::now();
-    let age_ms = (now - tree_snapshot.timestamp).num_milliseconds().max(0);
-    let text = tree_snapshot.text_content.clone();
-    let text = if text.trim().is_empty() {
-        None
-    } else {
-        Some(text)
-    };
-    let focused_accessibility =
-        focused_accessibility_response(tree_snapshot.focused_element.clone());
-
-    let (content_kind, structured_messages, structured_meta) = if req.include_structured_messages {
-        (
-            Some("unknown".to_string()),
-            Some(vec![]),
-            Some(StructuredMetaResponse {
-                status: "partial".to_string(),
-                reason: Some("accessibility_only_capture".to_string()),
-                confidence: 0.0,
-                warnings: vec![],
-                ui_noise_removed: vec![],
-                latency_ms: 0,
-            }),
-        )
-    } else {
-        (None, None, None)
-    };
-
-    Ok(Json(ActiveWindowCaptureResponse {
-        frame_id: -1,
-        captured_at: tree_snapshot.timestamp,
-        age_ms,
-        capture_provenance: PROVENANCE_FOCUSED_WINDOW.to_string(),
-        focused: true,
-        snapshot_path: None,
-        app_name: Some(tree_snapshot.app_name),
-        window_name: Some(tree_snapshot.window_name),
-        browser_url: tree_snapshot.browser_url,
-        text_source: Some("accessibility".to_string()),
-        accessibility_text: text.clone(),
-        main_body_text: text,
-        main_body_meta: None,
-        ocr_text: None,
-        ocr_text_json: None,
-        focused_accessibility,
-        content_kind,
-        structured_messages,
-        structured_meta,
-    }))
+    Ok(active_window_response_from_tree_snapshot(
+        req,
+        tree_snapshot,
+    ))
 }
 
 #[oasgen]
@@ -827,7 +873,7 @@ pub(crate) async fn capture_active_window(
             )
         }
         ActiveWindowResolution::Fallback {
-            tree_snapshot: _tree_snapshot,
+            tree_snapshot,
             monitor_id,
             reason,
         } => {
@@ -841,29 +887,61 @@ pub(crate) async fn capture_active_window(
                 ));
             }
 
+            if reason == FOCUSED_WINDOW_CAPTURE_TIMEOUT_REASON {
+                if let Some(tree_snapshot) = tree_snapshot.clone() {
+                    return Ok(active_window_response_from_tree_snapshot(
+                        &req,
+                        tree_snapshot,
+                    ));
+                }
+            }
+
             if let Some((target, selected_monitor_id)) =
                 best_fallback_window_across_monitors(&window_filters, monitor_id).await
             {
                 let fallback_app = target.app_name.clone();
                 let fallback_window = target.window_name.clone();
-                let fallback_window_capture = match capture_focused_window(&target, &window_filters)
+                let fallback_window_capture = match capture_focused_window_bounded(
+                    &target,
+                    &window_filters,
+                )
+                .await
                 {
                     Ok(Some(window)) => Some(window),
                     Ok(None) => {
                         debug!(
-                            "active-window strict=false fallback target capture missed (reason={reason}, monitor={}, app={}, window={})",
-                            selected_monitor_id, fallback_app, fallback_window
-                        );
+                                "active-window strict=false fallback target capture missed (reason={reason}, monitor={}, app={}, window={})",
+                                selected_monitor_id, fallback_app, fallback_window
+                            );
+                        None
+                    }
+                    Err(error) if error == FOCUSED_WINDOW_CAPTURE_TIMEOUT_REASON => {
+                        debug!(
+                                "active-window strict=false fallback target capture timed out (reason={reason}, monitor={}, app={}, window={})",
+                                selected_monitor_id, fallback_app, fallback_window
+                            );
                         None
                     }
                     Err(error) => {
                         debug!(
-                            "active-window strict=false fallback target capture error (reason={reason}, monitor={}, app={}, window={}): {}",
-                            selected_monitor_id, fallback_app, fallback_window, error
-                        );
+                                "active-window strict=false fallback target capture error (reason={reason}, monitor={}, app={}, window={}): {}",
+                                selected_monitor_id, fallback_app, fallback_window, error
+                            );
                         None
                     }
                 };
+
+                if fallback_window_capture.is_none() {
+                    if let Some(tree_snapshot) = tree_snapshot {
+                        debug!(
+                            "active-window strict=false returning accessibility-only fallback (reason={reason})"
+                        );
+                        return Ok(active_window_response_from_tree_snapshot(
+                            &req,
+                            tree_snapshot,
+                        ));
+                    }
+                }
 
                 if let Some(window) = fallback_window_capture {
                     debug!(
