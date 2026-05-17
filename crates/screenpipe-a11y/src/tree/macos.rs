@@ -350,11 +350,16 @@ fn extract_browser_url(
         }
     }
 
-    // Tier 2: For Arc, use AppleScript (AXDocument may not be set)
+    // Tier 2: For Arc, use AppleScript (AXDocument may not be set). Require the
+    // reported active tab title to match the focused window so a stale Arc tab
+    // URL is not attached to the wrong capture.
     let app_lower = app_name.to_lowercase();
     if app_lower.contains("arc") {
-        if let Some(url) = get_arc_url() {
-            debug!("browser_url: tier2 Arc AppleScript hit: {}", url);
+        if let Some(url) = get_arc_url_for_window(window_name) {
+            debug!(
+                "browser_url: tier2 Arc title-matched AppleScript hit: {}",
+                url
+            );
             return Some(url);
         }
     }
@@ -375,14 +380,45 @@ fn extract_browser_url(
     None
 }
 
-/// Get Arc browser's current URL via AppleScript.
-fn get_arc_url() -> Option<String> {
-    let script = r#"tell application "Arc" to return URL of active tab of front window"#;
+fn normalize_title_for_match(title: &str) -> String {
+    title
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c.is_whitespace() {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn browser_titles_match(window_title: &str, tab_title: &str) -> bool {
+    let window = normalize_title_for_match(window_title);
+    let tab = normalize_title_for_match(tab_title);
+    if window.is_empty() || tab.is_empty() {
+        return false;
+    }
+    window == tab || window.contains(&tab) || tab.contains(&window)
+}
+
+/// Get Arc browser's current URL via AppleScript only when the reported tab
+/// title matches the focused window title.
+fn get_arc_url_for_window(window_name: &str) -> Option<String> {
+    let script = r#"tell application "Arc"
+    set t to title of active tab of front window
+    set u to URL of active tab of front window
+    return t & "|||" & u
+end tell"#;
 
     let output = match Command::new("osascript").arg("-e").arg(script).output() {
         Ok(o) => o,
         Err(e) => {
-            debug!("get_arc_url: osascript spawn failed: {}", e);
+            debug!("get_arc_url_for_window: osascript spawn failed: {}", e);
             return None;
         }
     };
@@ -390,19 +426,31 @@ fn get_arc_url() -> Option<String> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         debug!(
-            "get_arc_url: osascript failed (exit={}): {}",
+            "get_arc_url_for_window: osascript failed (exit={}): {}",
             output.status,
             stderr.trim()
         );
         return None;
     }
 
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let Some((title, url)) = raw.split_once("|||") else {
+        debug!("get_arc_url_for_window: unexpected output: {}", raw);
+        return None;
+    };
+
+    if !browser_titles_match(window_name, title) {
+        debug!(
+            "get_arc_url_for_window: title mismatch window='{}' tab='{}'",
+            window_name, title
+        );
+        return None;
+    }
 
     if url.starts_with("http://") || url.starts_with("https://") {
-        Some(url)
+        Some(url.to_string())
     } else {
-        debug!("get_arc_url: URL not http(s): {}", url);
+        debug!("get_arc_url_for_window: URL not http(s): {}", url);
         None
     }
 }
@@ -1484,6 +1532,38 @@ mod tests {
             percent_decode_path("/Users/me/a%2Fb.md").as_deref(),
             Some("/Users/me/a/b.md")
         );
+    }
+
+    #[test]
+    fn test_browser_titles_match_allows_window_suffixes() {
+        assert!(browser_titles_match(
+            "Owning the Workflow in B2B AI Apps | Andreessen Horowitz",
+            "Owning the Workflow in B2B AI Apps"
+        ));
+        assert!(!browser_titles_match(
+            "Owning the Workflow in B2B AI Apps | Andreessen Horowitz",
+            "AI Agents: Their Potential and Challenges"
+        ));
+    }
+
+    #[test]
+    fn test_should_retry_focused_app_lookup_only_for_no_value() {
+        assert!(should_retry_focused_app_lookup(ax::err::NO_VALUE.into()));
+        assert!(!should_retry_focused_app_lookup(
+            ax::err::API_DISABLED.into()
+        ));
+    }
+
+    #[test]
+    fn test_should_retry_empty_text_walk_only_for_non_empty_node_tree() {
+        let mut state = WalkState::new(&TreeWalkerConfig::default(), Instant::now());
+        assert!(!should_retry_empty_text_walk(&state));
+
+        state.node_count = 3;
+        assert!(should_retry_empty_text_walk(&state));
+
+        state.text_buffer = "ready".into();
+        assert!(!should_retry_empty_text_walk(&state));
     }
 
     #[test]

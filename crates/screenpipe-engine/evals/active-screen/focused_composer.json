@@ -1,0 +1,130 @@
+{
+  "name": "focused_composer",
+  "app_name": "Chrome",
+  "window_name": "Launch Notes - Docs",
+  "browser_url": "https://docs.example.com/launch-notes",
+  "raw_text": "File\nEdit\nView\nComments\nLaunch Notes\nThe release should explain the customer problem before listing implementation details.\nKeep the rollout checklist short enough for an operator to scan.\nPlease make the launch notes concise and keep the privacy section explicit.\nRevision history\nShare",
+  "nodes": [
+    {
+      "role": "AXMenuItem",
+      "text": "File",
+      "depth": 1,
+      "bounds": {
+        "left": 0.02,
+        "top": 0.03,
+        "width": 0.04,
+        "height": 0.03
+      }
+    },
+    {
+      "role": "AXMenuItem",
+      "text": "Edit",
+      "depth": 1,
+      "bounds": {
+        "left": 0.07,
+        "top": 0.03,
+        "width": 0.04,
+        "height": 0.03
+      }
+    },
+    {
+      "role": "AXHeading",
+      "text": "Launch Notes",
+      "depth": 2,
+      "bounds": {
+        "left": 0.27,
+        "top": 0.16,
+        "width": 0.34,
+        "height": 0.05
+      }
+    },
+    {
+      "role": "AXStaticText",
+      "text": "The release should explain the customer problem before listing implementation details.",
+      "depth": 3,
+      "bounds": {
+        "left": 0.27,
+        "top": 0.28,
+        "width": 0.52,
+        "height": 0.07
+      }
+    },
+    {
+      "role": "AXStaticText",
+      "text": "Keep the rollout checklist short enough for an operator to scan.",
+      "depth": 3,
+      "bounds": {
+        "left": 0.27,
+        "top": 0.39,
+        "width": 0.50,
+        "height": 0.06
+      }
+    },
+    {
+      "role": "AXTextArea",
+      "text": "Please make the launch notes concise and keep the privacy section explicit.",
+      "depth": 3,
+      "bounds": {
+        "left": 0.27,
+        "top": 0.62,
+        "width": 0.50,
+        "height": 0.08
+      },
+      "is_focused": true,
+      "value": "Please make the launch notes concise and keep the privacy section explicit."
+    },
+    {
+      "role": "AXStaticText",
+      "text": "Revision history",
+      "depth": 2,
+      "bounds": {
+        "left": 0.84,
+        "top": 0.32,
+        "width": 0.12,
+        "height": 0.04
+      }
+    },
+    {
+      "role": "AXButton",
+      "text": "Share",
+      "depth": 2,
+      "bounds": {
+        "left": 0.86,
+        "top": 0.06,
+        "width": 0.08,
+        "height": 0.04
+      }
+    }
+  ],
+  "focused_element": {
+    "role": "AXTextArea",
+    "name": "Comment composer",
+    "input_text": "Please make the launch notes concise and keep the privacy section explicit.",
+    "bounds": {
+      "left": 0.27,
+      "top": 0.62,
+      "width": 0.50,
+      "height": 0.08
+    }
+  },
+  "expected": {
+    "must_include": [
+      "Launch Notes",
+      "customer problem",
+      "operator to scan",
+      "privacy section explicit"
+    ],
+    "must_exclude": [
+      "File",
+      "Edit",
+      "Revision history",
+      "Share"
+    ],
+    "focus_must_include": [
+      "Comment composer",
+      "launch notes concise"
+    ],
+    "requires_focus_bounds": true,
+    "min_score": 1.0
+  }
+}

@@ -1,0 +1,137 @@
+{
+  "name": "article_with_sidebar",
+  "app_name": "Arc",
+  "window_name": "Owning the Workflow in B2B AI Apps | Example",
+  "browser_url": "https://example.com/workflow",
+  "raw_text": "Home\nNewsletter\nShare\nOwning the Workflow in B2B AI Apps\nThe best AI products do not wait for a prompt. They keep track of the user's work and carry context forward.\nA useful local agent needs the full document context, not just the navigation labels around it.\nThis paragraph appears lower in the reading column and should still be preserved as page content.\nRelated article card\nSubscribe now",
+  "nodes": [
+    {
+      "role": "AXStaticText",
+      "text": "Home",
+      "depth": 2,
+      "bounds": {
+        "left": 0.04,
+        "top": 0.16,
+        "width": 0.12,
+        "height": 0.03
+      }
+    },
+    {
+      "role": "AXStaticText",
+      "text": "Newsletter",
+      "depth": 2,
+      "bounds": {
+        "left": 0.04,
+        "top": 0.22,
+        "width": 0.16,
+        "height": 0.03
+      }
+    },
+    {
+      "role": "AXButton",
+      "text": "Share",
+      "depth": 2,
+      "bounds": {
+        "left": 0.74,
+        "top": 0.10,
+        "width": 0.08,
+        "height": 0.04
+      }
+    },
+    {
+      "role": "AXHeading",
+      "text": "Owning the Workflow in B2B AI Apps",
+      "depth": 3,
+      "bounds": {
+        "left": 0.30,
+        "top": 0.18,
+        "width": 0.45,
+        "height": 0.05
+      }
+    },
+    {
+      "role": "AXStaticText",
+      "text": "The best AI products do not wait for a prompt. They keep track of the user's work and carry context forward.",
+      "depth": 3,
+      "bounds": {
+        "left": 0.30,
+        "top": 0.28,
+        "width": 0.48,
+        "height": 0.08
+      }
+    },
+    {
+      "role": "AXStaticText",
+      "text": "A useful local agent needs the full document context, not just the navigation labels around it.",
+      "depth": 3,
+      "bounds": {
+        "left": 0.30,
+        "top": 0.40,
+        "width": 0.47,
+        "height": 0.08
+      }
+    },
+    {
+      "role": "AXStaticText",
+      "text": "This paragraph appears lower in the reading column and should still be preserved as page content.",
+      "depth": 3,
+      "bounds": {
+        "left": 0.30,
+        "top": 0.74,
+        "width": 0.47,
+        "height": 0.08
+      }
+    },
+    {
+      "role": "AXStaticText",
+      "text": "Related article card",
+      "depth": 3,
+      "bounds": {
+        "left": 0.83,
+        "top": 0.30,
+        "width": 0.12,
+        "height": 0.05
+      }
+    },
+    {
+      "role": "AXButton",
+      "text": "Subscribe now",
+      "depth": 3,
+      "bounds": {
+        "left": 0.83,
+        "top": 0.42,
+        "width": 0.12,
+        "height": 0.04
+      }
+    }
+  ],
+  "focused_element": {
+    "role": "AXWebArea",
+    "name": "Owning the Workflow in B2B AI Apps article",
+    "bounds": {
+      "left": 0.28,
+      "top": 0.12,
+      "width": 0.52,
+      "height": 0.82
+    }
+  },
+  "expected": {
+    "must_include": [
+      "Owning the Workflow in B2B AI Apps",
+      "carry context forward",
+      "full document context",
+      "preserved as page content"
+    ],
+    "must_exclude": [
+      "Newsletter",
+      "Share",
+      "Related article card",
+      "Subscribe now"
+    ],
+    "focus_must_include": [
+      "B2B AI Apps article"
+    ],
+    "requires_focus_bounds": true,
+    "min_score": 1.0
+  }
+}

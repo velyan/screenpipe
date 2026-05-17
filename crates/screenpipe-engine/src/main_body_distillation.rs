@@ -308,6 +308,7 @@ fn normalize_for_match(text: &str) -> String {
 #[derive(Debug, Clone)]
 struct AxCandidate {
     line: String,
+    role: String,
     bounds: Option<screenpipe_a11y::tree::NodeBounds>,
     original_index: usize,
 }
@@ -490,10 +491,77 @@ fn infer_browser_primary_band(ocr_lines: &[OcrLine]) -> Option<(f32, f32)> {
     ))
 }
 
+fn ax_candidate_center_x(candidate: &AxCandidate) -> Option<f32> {
+    let bounds = candidate.bounds.as_ref()?;
+    Some((bounds.left + bounds.width * 0.5).clamp(0.0, 0.999))
+}
+
+fn ax_primary_candidate_score(candidate: &AxCandidate) -> f32 {
+    let Some(bounds) = candidate.bounds.as_ref() else {
+        return 0.0;
+    };
+    let normalized = normalize_for_match(&candidate.line);
+    if normalized.is_empty() {
+        return 0.0;
+    }
+
+    let text_weight = normalized.len().min(220) as f32;
+    let width_weight = (0.55 + bounds.width).clamp(0.55, 1.55);
+    let role_weight = match candidate.role.as_str() {
+        "AXHeading" => 1.25,
+        "AXStaticText" | "AXTextArea" | "AXTextField" | "AXWebArea" => 1.0,
+        _ => 0.75,
+    };
+
+    text_weight * width_weight * role_weight
+}
+
+fn infer_browser_primary_band_from_ax_candidates(candidates: &[AxCandidate]) -> Option<(f32, f32)> {
+    if candidates.is_empty() {
+        return None;
+    }
+
+    const BUCKET_COUNT: usize = 20;
+    const BUCKET_WIDTH: f32 = 1.0 / BUCKET_COUNT as f32;
+    let mut bucket_scores = [0.0_f32; BUCKET_COUNT];
+
+    for candidate in candidates {
+        let Some(center) = ax_candidate_center_x(candidate) else {
+            continue;
+        };
+        let idx = ((center / BUCKET_WIDTH).floor() as usize).min(BUCKET_COUNT - 1);
+        bucket_scores[idx] += ax_primary_candidate_score(candidate);
+    }
+
+    let (best_idx, best_score) = bucket_scores
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))?;
+
+    if best_score < BROWSER_MIN_PRIMARY_SCORE {
+        return None;
+    }
+
+    let center = (best_idx as f32 + 0.5) * BUCKET_WIDTH;
+    Some((
+        (center - BROWSER_PRIMARY_BAND_HALF_WIDTH).clamp(0.0, 1.0),
+        (center + BROWSER_PRIMARY_BAND_HALF_WIDTH).clamp(0.0, 1.0),
+    ))
+}
+
 fn line_overlaps_band(bounds: &screenpipe_a11y::tree::NodeBounds, band: (f32, f32)) -> bool {
     let left = bounds.left;
     let right = bounds.left + bounds.width;
     right >= band.0 && left <= band.1
+}
+
+fn ax_candidate_overlaps_band(candidate: &AxCandidate, band: (f32, f32)) -> bool {
+    candidate
+        .bounds
+        .as_ref()
+        .map(|bounds| line_overlaps_band(bounds, band))
+        .unwrap_or(true)
 }
 
 fn filter_browser_shell_ocr_lines(
@@ -866,6 +934,7 @@ fn heuristic_main_body(input: &DistillationInput<'_>) -> HeuristicMainBody {
                 if !node_overlaps_focus_band(node, band) {
                     out_of_focus_candidates.push(AxCandidate {
                         line,
+                        role: node.role.clone(),
                         bounds: node.bounds.clone(),
                         original_index: idx,
                     });
@@ -875,6 +944,7 @@ fn heuristic_main_body(input: &DistillationInput<'_>) -> HeuristicMainBody {
 
             in_focus_candidates.push(AxCandidate {
                 line,
+                role: node.role.clone(),
                 bounds: node.bounds.clone(),
                 original_index: idx,
             });
@@ -883,6 +953,28 @@ fn heuristic_main_body(input: &DistillationInput<'_>) -> HeuristicMainBody {
         // Guard rail: if focus-band gating was too aggressive, restore base-filtered lines.
         if in_focus_candidates.is_empty() && !out_of_focus_candidates.is_empty() {
             in_focus_candidates = out_of_focus_candidates;
+        }
+
+        if browser_shell && ocr_lines.is_empty() {
+            if let Some(primary_band) =
+                infer_browser_primary_band_from_ax_candidates(&in_focus_candidates)
+            {
+                let mut primary_candidates = Vec::with_capacity(in_focus_candidates.len());
+                let mut secondary_candidates = Vec::new();
+                for candidate in in_focus_candidates {
+                    if ax_candidate_overlaps_band(&candidate, primary_band) {
+                        primary_candidates.push(candidate);
+                    } else {
+                        push_excluded(&mut excluded, &candidate.line);
+                        secondary_candidates.push(candidate);
+                    }
+                }
+                in_focus_candidates = if primary_candidates.is_empty() {
+                    secondary_candidates
+                } else {
+                    primary_candidates
+                };
+            }
         }
 
         // Stable visual order for deterministic output if we need pure AX fallback.
@@ -1269,6 +1361,90 @@ mod tests {
         assert!(out.main_body_text.contains("Main content line"));
         assert!(!out.main_body_text.contains("Side pane row 1"));
         assert!(!out.main_body_text.contains("Side pane row 2"));
+    }
+
+    #[test]
+    fn heuristic_main_body_browser_ax_only_prefers_primary_column() {
+        let nodes = vec![
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Example navigation row".to_string(),
+                depth: 2,
+                bounds: Some(NodeBounds {
+                    left: 0.04,
+                    top: 0.24,
+                    width: 0.18,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXHeading".to_string(),
+                text: "Example Article".to_string(),
+                depth: 3,
+                bounds: Some(NodeBounds {
+                    left: 0.31,
+                    top: 0.18,
+                    width: 0.38,
+                    height: 0.04,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "This is the primary article body with enough detail to dominate the main reading column.".to_string(),
+                depth: 3,
+                bounds: Some(NodeBounds {
+                    left: 0.31,
+                    top: 0.28,
+                    width: 0.46,
+                    height: 0.08,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Another article paragraph continues the main idea with useful context.".to_string(),
+                depth: 3,
+                bounds: Some(NodeBounds {
+                    left: 0.31,
+                    top: 0.38,
+                    width: 0.45,
+                    height: 0.06,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Recommended article card".to_string(),
+                depth: 3,
+                bounds: Some(NodeBounds {
+                    left: 0.80,
+                    top: 0.28,
+                    width: 0.16,
+                    height: 0.04,
+                }),
+                ..Default::default()
+            },
+        ];
+
+        let input = DistillationInput {
+            raw_text: "Example navigation row\nExample Article\nThis is the primary article body with enough detail to dominate the main reading column.\nAnother article paragraph continues the main idea with useful context.\nRecommended article card",
+            ocr_text_json: None,
+            app_name: Some("Arc"),
+            window_name: Some("Example Article"),
+            browser_url: Some("https://example.com/article"),
+            content_hash: Some(126),
+            nodes: Some(&nodes),
+            focused_element: None,
+        };
+
+        let out = heuristic_main_body(&input);
+        assert!(out.main_body_text.contains("Example Article"));
+        assert!(out.main_body_text.contains("primary article body"));
+        assert!(out.main_body_text.contains("Another article paragraph"));
+        assert!(!out.main_body_text.contains("Example navigation row"));
+        assert!(!out.main_body_text.contains("Recommended article card"));
     }
 
     #[test]
