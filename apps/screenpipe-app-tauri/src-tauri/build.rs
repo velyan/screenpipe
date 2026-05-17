@@ -419,6 +419,29 @@ fn main() {
         }
     }
 
+    // Windows MSVC: provide the GCC `__builtin_bswap{16,32,64}` intrinsics
+    // as real functions. aws-lc-sys (pulled in by rustls 0.23) ships C
+    // that calls them, but cl.exe doesn't recognize the names, so it
+    // emits them as unresolved externals and the link fails:
+    //
+    //   libaws_lc_sys-...md4.o : error LNK2001: unresolved external
+    //       symbol __builtin_bswap32
+    //
+    // c/bswap_shim.c provides them as wrappers around MSVC's
+    // `_byteswap_*` intrinsics; cl.exe inlines those, so the runtime
+    // cost is zero. No-op on non-MSVC targets.
+    //
+    // Note: `cfg(target_env = "msvc")` in build.rs evaluates against
+    // the *build host*, not the build target. For cross-compiles
+    // (CI builds for Windows MSVC from a macOS or Linux runner) we
+    // have to read CARGO_CFG_TARGET_ENV instead.
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rerun-if-changed=c/bswap_shim.c");
+        cc::Build::new()
+            .file("c/bswap_shim.c")
+            .compile("bswap_shim");
+    }
+
     tauri_build::build()
 }
 

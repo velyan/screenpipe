@@ -70,6 +70,8 @@ export interface SessionRecord {
   lastUserMessageAt?: number;
   /** User pinned this conversation to the top of the sidebar. */
   pinned: boolean;
+  /** Archived conversation hidden from recents. */
+  hidden?: boolean;
   /** True when there's new assistant activity (delta or completion) that
    *  the user hasn't seen yet. Set by the event router when content lands
    *  for a session that is NOT the currently-viewed one; cleared the
@@ -127,6 +129,8 @@ export interface SessionRecord {
 interface ChatStoreState {
   /** All known sessions, keyed by id. Includes both alive and on-disk-only. */
   sessions: Record<string, SessionRecord>;
+  /** True once the initial `~/.screenpipe/chats` scan has finished. */
+  diskHydrated: boolean;
   /** Currently FOCUSED session — i.e. the chat the user is actively
    *  looking at. Cleared when the user navigates away from the chat
    *  view (Pipes/Memories/...) so the sidebar row stops being
@@ -142,6 +146,8 @@ interface ChatStoreState {
 interface ChatStoreActions {
   /** Replace the whole map (used by the on-disk loader). */
   hydrateFromDisk: (records: SessionRecord[]) => void;
+  /** Mark the initial disk scan complete even when storage read fails. */
+  markDiskHydrated: () => void;
   /** Insert / overwrite a single session record. */
   upsert: (record: SessionRecord) => void;
   /** Patch fields on an existing record. No-op if id is unknown. */
@@ -235,6 +241,7 @@ export type ChatStore = ChatStoreState & { actions: ChatStoreActions };
 
 export const useChatStore = create<ChatStore>((set) => ({
   sessions: {},
+  diskHydrated: false,
   currentId: null,
   panelSessionId: null,
   actions: {
@@ -254,13 +261,17 @@ export const useChatStore = create<ChatStore>((set) => ({
                 preview: r.preview,
                 messageCount: r.messageCount,
                 pinned: existing.pinned || r.pinned,
+                hidden: existing.hidden ?? r.hidden ?? false,
                 // updatedAt: take the larger so memory doesn't get clobbered
                 updatedAt: Math.max(existing.updatedAt, r.updatedAt),
               }
             : r;
         }
-        return { sessions: next };
+        return { sessions: next, diskHydrated: true };
       }),
+
+    markDiskHydrated: () =>
+      set((s) => (s.diskHydrated ? {} : { diskHydrated: true })),
 
     upsert: (record) =>
       set((s) => {
@@ -495,6 +506,16 @@ export const useChatStore = create<ChatStore>((set) => ({
         const incomingMsgs = snapshot.messages ?? [];
         const messages =
           incomingMsgs.length >= existingMsgs.length ? incomingMsgs : existingMsgs;
+        // Guard: never let a stale React closure re-enable streaming that
+        // endTurn() already cleared. endTurn writes synchronously into
+        // Zustand, but setIsStreaming/setIsLoading are async React state
+        // updates — a fast nav right after agent_end can snapshot
+        // isStreaming=true from the old render while the store already
+        // holds false. If the store says false, it wins.
+        const isStreaming =
+          existing.isStreaming === false ? false : snapshot.isStreaming;
+        const isLoading =
+          existing.isLoading === false ? false : snapshot.isLoading;
         return {
           sessions: {
             ...s.sessions,
@@ -505,8 +526,8 @@ export const useChatStore = create<ChatStore>((set) => ({
               streamingText: snapshot.streamingText,
               streamingMessageId: snapshot.streamingMessageId,
               contentBlocks: snapshot.contentBlocks,
-              isStreaming: snapshot.isStreaming,
-              isLoading: snapshot.isLoading,
+              isStreaming,
+              isLoading,
               hydratedAt: existing.hydratedAt ?? Date.now(),
               // No updatedAt bump — snapshot is plumbing, not user activity.
             },
@@ -582,14 +603,23 @@ function sortKey(s: SessionRecord): number {
   return s.lastUserMessageAt ?? s.createdAt;
 }
 
+/** Tier: user-touched chats (any lastUserMessageAt set) sit above
+ *  auto-generated rows (pipe-watch / pipe-run completions). Without
+ *  this, a pipe that finished 30 s ago would outrank a chat the user
+ *  typed in 2 min ago — `createdAt` of a fresh pipe session is more
+ *  recent than the user's last bump. Lower tier = higher in list. */
+function tier(s: SessionRecord): number {
+  return s.lastUserMessageAt ? 0 : 1;
+}
+
+function compareForSidebar(a: SessionRecord, b: SessionRecord): number {
+  return tier(a) - tier(b) || sortKey(b) - sortKey(a);
+}
+
 export function selectOrderedSessions(state: ChatStore): SessionRecord[] {
   const all = Object.values(state.sessions);
-  const pinned = all
-    .filter((s) => s.pinned)
-    .sort((a, b) => sortKey(b) - sortKey(a));
-  const recents = all
-    .filter((s) => !s.pinned)
-    .sort((a, b) => sortKey(b) - sortKey(a));
+  const pinned = all.filter((s) => s.pinned).sort(compareForSidebar);
+  const recents = all.filter((s) => !s.pinned).sort(compareForSidebar);
   return [...pinned, ...recents];
 }
 
@@ -604,12 +634,8 @@ export function useOrderedSessions(): SessionRecord[] {
   const sessionsMap = useChatStore((s) => s.sessions);
   return useMemo(() => {
     const all = Object.values(sessionsMap);
-    const pinned = all
-      .filter((s) => s.pinned)
-      .sort((a, b) => sortKey(b) - sortKey(a));
-    const recents = all
-      .filter((s) => !s.pinned)
-      .sort((a, b) => sortKey(b) - sortKey(a));
+    const pinned = all.filter((s) => s.pinned).sort(compareForSidebar);
+    const recents = all.filter((s) => !s.pinned).sort(compareForSidebar);
     return [...pinned, ...recents];
   }, [sessionsMap]);
 }

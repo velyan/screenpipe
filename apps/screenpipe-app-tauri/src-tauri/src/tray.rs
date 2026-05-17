@@ -184,23 +184,8 @@ fn format_remaining(d: std::time::Duration) -> String {
     }
 }
 
-/// Fire-and-forget POST to the local /notify endpoint. Used for pause /
-/// auto-resume notifications; failures are swallowed (notifications are
-/// best-effort UI fluff, not load-bearing).
 fn send_notify(title: impl Into<String>, body: impl Into<String>) {
-    let payload = serde_json::json!({
-        "title": title.into(),
-        "body": body.into(),
-        "type": "system",
-    });
-    tauri::async_runtime::spawn(async move {
-        let client = reqwest::Client::new();
-        let _ = client
-            .post("http://127.0.0.1:11435/notify")
-            .json(&payload)
-            .send()
-            .await;
-    });
+    crate::notifications::client::send(title, body);
 }
 
 /// Immediately rebuild the tray menu (called from main thread after optimistic status set).
@@ -768,7 +753,7 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
         "show" => {
             let app = app_handle.clone();
             let _ = app_handle.run_on_main_thread(move || {
-                show_main_window(&app, false);
+                show_main_window(app.clone());
                 let _ = app.emit("tray-show-timeline", ());
             });
         }
@@ -776,7 +761,7 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
             // Show floating Search bar only (hide timeline, it reopens when user picks a result)
             let app = app_handle.clone();
             let _ = app_handle.run_on_main_thread(move || {
-                hide_main_window(&app);
+                hide_main_window(app.clone());
                 let _ = ShowRewindWindow::Search { query: None }.show(&app);
                 let _ = app.emit("tray-show-search", ());
             });
@@ -960,8 +945,15 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
                         });
                     });
                 } else {
-                    // For production builds, emit event to trigger update
-                    let _ = app.emit("update-now-clicked", ());
+                    // For production builds, run the authenticated update flow.
+                    tauri::async_runtime::spawn(async move {
+                        let state = app.state::<std::sync::Arc<crate::updates::UpdatesManager>>();
+                        if state.has_update_installed().await {
+                            let _ = app.emit("update-now-clicked", ());
+                        } else if let Err(e) = state.check_for_updates(true).await {
+                            tracing::error!("tray menu: check for updates failed: {}", e);
+                        }
+                    });
                 }
             });
         }
@@ -1005,7 +997,7 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
                     let _ = win.close();
                 }
                 // Show the main window
-                show_main_window(&app, false);
+                show_main_window(app.clone());
             });
         }
         "onboarding" => {

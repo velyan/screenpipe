@@ -21,18 +21,54 @@ on:
       - '.github/scripts/**'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.sha || github.ref }}
   # Cancel superseded runs on PR branches (saves minutes when a contributor
-  # rapidly re-pushes), but let main runs always finish — pushes to main
-  # land faster than this workflow's longest job (cargo test on ubuntu, ~30
-  # min), so cancelling-in-progress on main means CI never reports a single
-  # green/red signal for any commit (we hit 30 consecutive cancellations).
+  # rapidly re-pushes). Main pushes use the commit SHA in the group so a
+  # newer merge does not sit pending behind a stale long-running commit.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   GIT_LFS_SKIP_SMUDGE: 1
 
 jobs:
+  cpal-pin-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Guard cpal Windows audio pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          manifest="crates/screenpipe-audio/Cargo.toml"
+          expected_url='git = "https://github.com/divanshu-go/cpal.git"'
+          expected_branch='branch = "windows-aec"'
+          expected_lock_source='source = "git+https://github.com/divanshu-go/cpal.git?branch=windows-aec#eeae0269bec7b4fc6e21c461624a0fa0e7acdc82"'
+          cpal_line="$(grep -E '^cpal = ' "$manifest" || true)"
+
+          if [[ "$cpal_line" != *"$expected_url"* || "$cpal_line" != *"$expected_branch"* ]]; then
+            echo "::error file=${manifest},line=25::cpal source changed. Run the Windows audio RMS smoke on Win11 24H2 Communications-class hardware before merging, then update this guard with the verified source."
+            echo "current cpal line: ${cpal_line:-<missing>}"
+            exit 1
+          fi
+
+          cpal_lock_source() {
+            local lockfile="$1"
+            awk '
+              $0 == "[[package]]" { in_package = 1; is_cpal = 0 }
+              in_package && $0 == "name = \"cpal\"" { is_cpal = 1 }
+              in_package && is_cpal && /^source = / { print; exit }
+            ' "$lockfile"
+          }
+
+          for lockfile in Cargo.lock apps/screenpipe-app-tauri/src-tauri/Cargo.lock; do
+            lock_source="$(cpal_lock_source "$lockfile")"
+            if [[ "$lock_source" != "$expected_lock_source" ]]; then
+              echo "::error file=${lockfile}::cpal lock source changed. Run the Windows audio RMS smoke on Win11 24H2 Communications-class hardware before merging, then update this guard with the verified lock source."
+              echo "current cpal lock source: ${lock_source:-<missing>}"
+              exit 1
+            fi
+          done
+
   test-ubuntu:
     runs-on: ubuntu-latest
     env:
@@ -70,7 +106,7 @@ jobs:
           cp crates/screenpipe-screen/tests/testing_OCR.png target/debug/deps/
 
       - name: Run cargo tests
-        run: cargo test
+        run: cargo test --workspace --exclude screenpipe-rfdetr-mlx
 
   test-windows:
     # windows-2019 reached end-of-life on the GitHub-hosted runner fleet
@@ -126,9 +162,9 @@ jobs:
       - name: Download ONNX Runtime (CPU)
         shell: pwsh
         run: |
-          $url = "https://github.com/microsoft/onnxruntime/releases/download/v1.19.2/onnxruntime-win-x64-1.19.2.zip"
-          $zipFile = "onnxruntime-win-x64-1.19.2.zip"
-          $extractDir = "apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.19.2"
+          $url = "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-win-x64-1.22.0.zip"
+          $zipFile = "onnxruntime-win-x64-1.22.0.zip"
+          $extractDir = "apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.22.0"
           Invoke-WebRequest -Uri $url -OutFile $zipFile
           if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
           7z x $zipFile -o"apps/screenpipe-app-tauri/src-tauri/" -y
@@ -145,20 +181,96 @@ jobs:
           mkdir -p target/debug/deps || true
           cp crates/screenpipe-screen/tests/testing_OCR.png target/debug/deps/
 
+      # ORT_STRATEGY=system tells ort to LINK against onnxruntime.lib but
+      # does NOT copy onnxruntime*.dll next to the test binary. Without
+      # the DLLs adjacent to the .exe at runtime, the Windows DLL loader
+      # exits with STATUS_DLL_NOT_FOUND (0xc0000135) on the first
+      # ort::api() call — which is exactly what test_process_ocr_task_windows
+      # hits inside accuracy_test. Stage them before any cargo test that
+      # touches ort. Run this once for both --release/--target builds —
+      # cargo test --release --target x86_64-pc-windows-msvc puts test
+      # binaries under target/x86_64-pc-windows-msvc/release/deps/.
+      - name: Stage ONNX Runtime DLLs next to test binary
+        shell: pwsh
+        run: |
+          $src = "${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.22.0/lib"
+          $dst = "${{ github.workspace }}/target/x86_64-pc-windows-msvc/release/deps"
+          if (-not (Test-Path $dst)) {
+            New-Item -ItemType Directory -Path $dst -Force | Out-Null
+          }
+          # Always remove + re-copy. Prior cancelled runs could leave
+          # 0-byte stubs that Swatinem/rust-cache preserves across runs;
+          # once cached, every subsequent test binary fails ORT load.
+          # See e2e-test.yml for the same fix in the e2e-windows job.
+          Get-ChildItem -Path $src -Filter "onnxruntime*.dll" | ForEach-Object {
+            $dest = Join-Path $dst $_.Name
+            if (Test-Path $dest) { Remove-Item -Path $dest -Force }
+            [System.IO.File]::Copy($_.FullName, $dest, $true)
+          }
+          # ALSO stage VC++ runtime DLLs that onnxruntime.dll links
+          # against. STATUS_DLL_NOT_FOUND on this job (4ea93ee75) was
+          # NOT a missing onnxruntime.dll — the staging above produced
+          # the right files (verified non-zero) and adding the lib dir
+          # to PATH didn't help either. The missing DLL was a
+          # transitive dep: onnxruntime.dll → vcruntime140{,_1}.dll +
+          # msvcp140.dll. They live in C:\Windows\System32 on the
+          # runner, but the Windows DLL loader's default search puts
+          # the .exe's directory FIRST and there's a known case where
+          # a different vcruntime alongside the binary (e.g. shipped
+          # by a build dep) shadows the System32 one with an
+          # incompatible version. release-cli.yml line 397 ships
+          # these alongside screenpipe.exe for the same reason. Belt-
+          # and-suspenders: stage them next to the test binary too.
+          $crtSrc = "C:\Windows\System32"
+          foreach ($crt in @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll")) {
+            $crtPath = Join-Path $crtSrc $crt
+            if (Test-Path $crtPath) {
+              $dest = Join-Path $dst $crt
+              if (Test-Path $dest) { Remove-Item -Path $dest -Force }
+              [System.IO.File]::Copy($crtPath, $dest, $true)
+            } else {
+              Write-Host "WARNING: $crt not in System32 — runner image may have changed"
+            }
+          }
+          Get-ChildItem -Path $dst -Filter "*.dll" | Where-Object { $_.Name -match "(onnxruntime|vcruntime|msvcp)" } | ForEach-Object {
+            if ($_.Length -eq 0) {
+              throw "Staged DLL is 0 bytes: $($_.Name) — source likely corrupt"
+            }
+            Write-Host "$($_.Name)  $($_.Length) bytes"
+          }
+
+      # Add the ONNX lib dir to PATH for ALL cargo-test steps below.
+      # The DLL staging step above does put onnxruntime*.dll next to the
+      # test binaries (verified via Get-ChildItem), but accuracy_test
+      # still exits 0xc0000135 (STATUS_DLL_NOT_FOUND) — the loader
+      # resolves the .exe's adjacent dir BEFORE PATH only on the
+      # primary DLL; transitive deps still go through standard search,
+      # and on a sccache-restored deps/ at least one of those misses.
+      # Prepending the lib dir to PATH makes the Windows DLL loader
+      # find onnxruntime.dll + its providers via search regardless of
+      # adjacent-file presence — same approach Tauri's release bundle
+      # uses via resourcesMap on `--no-bundle`-skipped paths.
+      - name: Add ONNX lib dir to PATH for cargo tests
+        shell: pwsh
+        run: |
+          $ortLib = "${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.22.0/lib"
+          echo $ortLib | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "PATH appended: $ortLib"
+
       - name: Run specific Windows OCR cargo test
         env:
           RUSTFLAGS: "-C link-arg=/LTCG"
           ORT_STRATEGY: system
-          ORT_LIB_LOCATION: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.19.2
+          ORT_LIB_LOCATION: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.22.0
           # Use prebuilt NASM objects on Windows: https://aws.github.io/aws-lc-rs/requirements/windows.html#prebuilt-nasm-objects
           AWS_LC_SYS_PREBUILT_NASM: "1"
-        run: cargo test test_process_ocr_task_windows --release --target x86_64-pc-windows-msvc
+        run: cargo test -p screenpipe-screen test_process_ocr_task_windows --release --target x86_64-pc-windows-msvc
 
       - name: Run PII removal tests
         env:
           RUSTFLAGS: "-C link-arg=/LTCG"
           ORT_STRATEGY: system
-          ORT_LIB_LOCATION: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.19.2
+          ORT_LIB_LOCATION: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.22.0
           # Use prebuilt NASM objects on Windows: https://aws.github.io/aws-lc-rs/requirements/windows.html#prebuilt-nasm-objects
           AWS_LC_SYS_PREBUILT_NASM: "1"
         run: cargo test -p screenpipe-core pii_removal --release --target x86_64-pc-windows-msvc
@@ -167,7 +279,7 @@ jobs:
         env:
           RUSTFLAGS: "-C link-arg=/LTCG"
           ORT_STRATEGY: system
-          ORT_LIB_LOCATION: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.19.2
+          ORT_LIB_LOCATION: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.22.0
           # Use prebuilt NASM objects on Windows: https://aws.github.io/aws-lc-rs/requirements/windows.html#prebuilt-nasm-objects
           AWS_LC_SYS_PREBUILT_NASM: "1"
         run: cargo test -p screenpipe-engine --lib pii_redaction_tests --release --target x86_64-pc-windows-msvc
@@ -181,8 +293,11 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: |
-            ~\AppData\Local\cargo\
-            target\
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Set up Rust
@@ -193,15 +308,37 @@ jobs:
           cache: true
           rustflags: ""
 
+      - name: Verify Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.cargo/bin:$PATH"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+          cargo_output="$(cargo --version 2>&1 || true)"
+          if [[ "$cargo_output" == *"rustup-init"* || "$cargo_output" != cargo* ]]; then
+            curl --proto '=https' --tlsv1.2 --retry 5 --retry-connrefused -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+            . "$HOME/.cargo/env"
+          fi
+
+          rustup default stable
+          rustup override set stable
+          cargo --version
+          rustc --version
+
       - name: setup Bun
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.2.2
 
+      - name: Install macOS media sidecars
+        run: brew list ffmpeg >/dev/null 2>&1 || brew install ffmpeg
+
       - name: Run pre_build.js
         shell: bash
         env:
           SKIP_SCREENPIPE_SETUP: true # avoid trying to copy screenpipe binaries, not yet built (next step)
+          SCREENPIPE_RELEASE_TARGET: ${{ runner.arch == 'ARM64' && 'aarch64-apple-darwin' || 'x86_64-apple-darwin' }}
         run: bun ./scripts/pre_build.js
         working-directory: ./apps/screenpipe-app-tauri
 

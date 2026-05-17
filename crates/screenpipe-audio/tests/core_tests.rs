@@ -65,7 +65,7 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(true));
         let is_running_clone = Arc::clone(&is_running);
 
-        let audio_stream = AudioStream::from_device(device_spec, is_running_clone, false)
+        let audio_stream = AudioStream::from_device(device_spec, is_running_clone, false, false)
             .await
             .unwrap();
 
@@ -126,9 +126,10 @@ mod tests {
         let is_running = Arc::new(AtomicBool::new(true));
         let is_running_clone = Arc::clone(&is_running);
 
-        let audio_stream = AudioStream::from_device(device_spec, is_running_clone.clone(), false)
-            .await
-            .unwrap();
+        let audio_stream =
+            AudioStream::from_device(device_spec, is_running_clone.clone(), false, false)
+                .await
+                .unwrap();
 
         // interrupt in 10 seconds
         tokio::spawn(async move {
@@ -389,5 +390,43 @@ mod tests {
         let elapsed_time = start_time.elapsed();
 
         debug!("Transcription completed in {:?}", elapsed_time);
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires audio device access
+    async fn test_audio_stream_stop_no_race_condition() {
+        // Test for issue #3261: ensure stream.stop() properly waits for
+        // the audio thread to exit instead of aborting it, preventing
+        // use-after-free races with the CoreAudio IO callback.
+        // See: https://github.com/screenpipe/screenpipe/issues/3261
+        setup();
+
+        let device = default_input_device().expect("should find default input device");
+        let is_running = Arc::new(AtomicBool::new(true));
+
+        // Create an audio stream
+        let stream = AudioStream::from_device(Arc::new(device), is_running.clone(), false, false)
+            .await
+            .expect("should create audio stream");
+
+        // Let it run for a bit to ensure the audio thread is active
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Stop the stream. This should wait for the thread to cleanly exit
+        // without aborting it. If the fix is working, this should complete
+        // without crashes, and the thread should have properly paused and
+        // dropped the cpal stream.
+        let stop_result = stream.stop().await;
+        assert!(
+            stop_result.is_ok(),
+            "stream.stop() should complete without error"
+        );
+
+        // A small delay to ensure no deferred crashes happen
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // If we got here without a panic, the fix is working correctly.
+        // The thread exited cleanly without the CoreAudio IO callback
+        // attempting to access freed memory.
     }
 }

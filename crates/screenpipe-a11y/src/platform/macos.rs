@@ -11,6 +11,7 @@ use chrono::Utc;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use parking_lot::Mutex;
 use screenpipe_core::pii_removal::remove_pii;
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -30,6 +31,65 @@ static AX_QUERY_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 const KEY_C: u16 = 8;
 const KEY_X: u16 = 7;
 const KEY_V: u16 = 9;
+
+#[repr(C)]
+struct UCKeyboardLayout {
+    _private: [u8; 0],
+}
+
+type OptionBits = u32;
+type UniCharCount = std::os::raw::c_ulong;
+type UniChar = u16;
+type OSStatus = i32;
+type TISInputSourceRef = *const c_void;
+
+const K_UC_KEY_ACTION_DISPLAY: u16 = 3;
+const K_UC_KEY_TRANSLATE_NO_DEAD_KEYS_MASK: OptionBits = 1;
+
+const CARBON_COMMAND_KEY: u32 = 1 << 8;
+const CARBON_SHIFT_KEY: u32 = 1 << 9;
+const CARBON_ALPHA_LOCK: u32 = 1 << 10;
+const CARBON_OPTION_KEY: u32 = 1 << 11;
+const CARBON_CONTROL_KEY: u32 = 1 << 12;
+
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+    #[allow(non_upper_case_globals)]
+    static kTISPropertyUnicodeKeyLayoutData: *const c_void;
+
+    fn TISCopyCurrentKeyboardLayoutInputSource() -> TISInputSourceRef;
+
+    fn TISGetInputSourceProperty(
+        input_source: TISInputSourceRef,
+        property_key: *const c_void,
+    ) -> *const c_void;
+
+    fn LMGetKbdType() -> u8;
+
+    fn UCKeyTranslate(
+        key_layout_ptr: *const UCKeyboardLayout,
+        virtual_key_code: u16,
+        key_action: u16,
+        modifier_key_state: u32,
+        keyboard_type: u32,
+        key_translate_options: OptionBits,
+        dead_key_state: *mut u32,
+        max_string_length: UniCharCount,
+        actual_string_length: *mut UniCharCount,
+        unicode_string: *mut UniChar,
+    ) -> OSStatus;
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFRelease(cf: *const c_void);
+    fn CFDataGetBytePtr(the_data: *const c_void) -> *const u8;
+}
+
+#[link(name = "System")]
+extern "C" {
+    fn pthread_main_np() -> i32;
+}
 
 /// Permission status for UI capture
 #[derive(Debug, Clone)]
@@ -1147,25 +1207,82 @@ fn get_focused_element_context(config: &UiCaptureConfig) -> Option<ElementContex
     })
 }
 
-// Dedicated serial queue for all NSPasteboard access. NSPasteboard / NSPasteboardItem
-// are not thread-safe — calling `[NSPasteboard stringForType:]` from a worker thread
-// races AppKit's internal type-cache invalidation when another app mutates the
-// pasteboard mid-read, segfaulting in `_updateTypeCacheIfNeeded` (seen on macOS 26.x,
-// crash report 57E6EDAB-D2D1-44D3-9BD0-82DCA482DBFF). The queue serializes every
-// pasteboard read through one thread; the `_with_ar_pool` variant wraps each block
-// in an autorelease pool so AppKit's per-call temp objects drain immediately.
+// All NSPasteboard access dispatches to the main thread. NSPasteboard /
+// NSPasteboardItem have undocumented main-thread-only semantics — calling
+// `[NSPasteboard stringForType:]` from any other thread races AppKit's
+// internal type-cache invalidation when another app mutates the pasteboard
+// mid-read, segfaulting in `_updateTypeCacheIfNeeded` (seen on macOS 26.x;
+// crash keys 57E6EDAB-D2D1-44D3-9BD0-82DCA482DBFF, 56416840-0903-4FAB-8869-5D471B78335C,
+// 5D2F76EF-BA4A-46EB-85F3-5126EE0C9B51). Confirmed by the arboard maintainer
+// in 1Password/arboard#218 — even a private serial queue with autorelease
+// pool isn't enough; the only safe place is the main thread, where AppKit's
+// pasteboard observers are already serialized.
 //
-// We use a private serial queue rather than the main queue so heavy main-thread
-// activity (UI hitches, modal dialogs) can't stall clipboard capture.
-static CLIPBOARD_QUEUE: std::sync::OnceLock<cidre::arc::R<cidre::dispatch::Queue>> =
-    std::sync::OnceLock::new();
+// We hop onto the main queue via `dispatch_sync`. The clipboard worker is a
+// dedicated `std::thread` (not a tokio worker), so blocking it for the
+// duration of a sync hop is fine. Main-thread cost is microseconds per read
+// (one `string(forType:)` call); it doesn't compete meaningfully with the
+// tao event loop.
+//
+// The dead-man-switch below is kept as defense-in-depth: even with main-
+// thread dispatch, a future macOS regression or a bug in AppKit/arboard
+// could still SIGSEGV the read. SIGSEGV can't be caught in-process, so we
+// write a marker file before each read and delete it after. On startup, if
+// the marker exists, we know the previous run crashed mid-read and we
+// disable clipboard capture permanently for this install. The user can
+// re-enable by deleting `~/.screenpipe/clipboard-disabled-after-crash`.
+const CLIPBOARD_INFLIGHT_FILE: &str = "clipboard-read-inflight";
+const CLIPBOARD_DISABLED_FILE: &str = "clipboard-disabled-after-crash";
 
-fn clipboard_queue() -> &'static cidre::dispatch::Queue {
-    CLIPBOARD_QUEUE.get_or_init(cidre::dispatch::Queue::serial_with_ar_pool)
+static CLIPBOARD_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static CLIPBOARD_CRASH_CHECK: std::sync::Once = std::sync::Once::new();
+
+fn check_clipboard_crash_marker() {
+    CLIPBOARD_CRASH_CHECK.call_once(|| {
+        let dir = screenpipe_core::paths::default_screenpipe_data_dir();
+        let inflight = dir.join(CLIPBOARD_INFLIGHT_FILE);
+        let disabled = dir.join(CLIPBOARD_DISABLED_FILE);
+
+        if disabled.exists() {
+            CLIPBOARD_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                "clipboard capture disabled — prior NSPasteboard crash detected. \
+                 delete {} to re-enable",
+                disabled.display()
+            );
+            // Best-effort cleanup of any stale inflight marker
+            let _ = std::fs::remove_file(&inflight);
+        } else if inflight.exists() {
+            // Previous run died mid-clipboard read — promote to permanent disable.
+            CLIPBOARD_DISABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = std::fs::write(&disabled, "");
+            let _ = std::fs::remove_file(&inflight);
+            tracing::warn!(
+                "clipboard capture disabled for this session — previous run crashed \
+                 during NSPasteboard read. delete {} to re-enable",
+                disabled.display()
+            );
+        }
+    });
 }
 
 fn get_clipboard() -> Option<String> {
-    clipboard_queue().sync_once(|| {
+    check_clipboard_crash_marker();
+    if CLIPBOARD_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+
+    let dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    let inflight = dir.join(CLIPBOARD_INFLIGHT_FILE);
+    // Best-effort marker — if write fails (e.g., disk full) we proceed; the worst
+    // case is we don't detect a crash next startup.
+    let _ = std::fs::write(&inflight, std::process::id().to_string());
+
+    // dispatch_sync onto the main queue — the only thread where NSPasteboard
+    // is documented to behave. AppKit serializes pasteboard observers on
+    // main, so this side-steps the cache-invalidation race entirely.
+    let result = cidre::dispatch::Queue::main().sync_once(|| {
         let mut clipboard = arboard::Clipboard::new().ok()?;
         let text = clipboard.get_text().ok()?;
         if text.is_empty() {
@@ -1173,7 +1290,10 @@ fn get_clipboard() -> Option<String> {
         } else {
             Some(text)
         }
-    })
+    });
+
+    let _ = std::fs::remove_file(&inflight);
+    result
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1194,7 +1314,91 @@ fn truncate(s: &str, max: usize) -> String {
 // ============================================================================
 
 fn keycode_to_char(keycode: u16, mods: Modifiers) -> Option<char> {
-    let shift = mods.0 & Modifiers::SHIFT != 0 || mods.0 & Modifiers::CAPS != 0;
+    // macOS 26.5 asserts if Text Input Source APIs are called from the event-tap thread.
+    let layout_char = if unsafe { pthread_main_np() != 0 } {
+        layout_keycode_to_char(keycode, mods)
+    } else {
+        None
+    };
+    layout_char.or_else(|| us_keycode_to_char(keycode, mods))
+}
+
+fn layout_keycode_to_char(keycode: u16, mods: Modifiers) -> Option<char> {
+    let input_source = unsafe { TISCopyCurrentKeyboardLayoutInputSource() };
+    if input_source.is_null() {
+        return None;
+    }
+
+    let layout_data =
+        unsafe { TISGetInputSourceProperty(input_source, kTISPropertyUnicodeKeyLayoutData) };
+    if layout_data.is_null() {
+        unsafe { CFRelease(input_source) };
+        return None;
+    }
+
+    let layout = unsafe { CFDataGetBytePtr(layout_data) } as *const UCKeyboardLayout;
+    if layout.is_null() {
+        unsafe { CFRelease(input_source) };
+        return None;
+    }
+
+    let mut chars = [0u16; 8];
+    let mut actual_len: UniCharCount = 0;
+    let mut dead_keys = 0u32;
+    let keyboard_type = unsafe { LMGetKbdType() } as u32;
+    let status = unsafe {
+        UCKeyTranslate(
+            layout,
+            keycode,
+            K_UC_KEY_ACTION_DISPLAY,
+            carbon_modifier_state(mods),
+            keyboard_type,
+            K_UC_KEY_TRANSLATE_NO_DEAD_KEYS_MASK,
+            &mut dead_keys,
+            chars.len() as UniCharCount,
+            &mut actual_len,
+            chars.as_mut_ptr(),
+        )
+    };
+    unsafe { CFRelease(input_source) };
+
+    if status != 0 || actual_len == 0 {
+        return None;
+    }
+
+    let text = String::from_utf16_lossy(&chars[..actual_len as usize]);
+    let c = text.chars().next()?;
+    if c == '\0' || (c.is_control() && !matches!(c, '\n' | '\t' | '\x08')) {
+        None
+    } else {
+        Some(c)
+    }
+}
+
+fn carbon_modifier_state(mods: Modifiers) -> u32 {
+    let mut carbon_modifiers = 0u32;
+    if mods.0 & Modifiers::CMD != 0 {
+        carbon_modifiers |= CARBON_COMMAND_KEY;
+    }
+    if mods.0 & Modifiers::SHIFT != 0 {
+        carbon_modifiers |= CARBON_SHIFT_KEY;
+    }
+    if mods.0 & Modifiers::CAPS != 0 {
+        carbon_modifiers |= CARBON_ALPHA_LOCK;
+    }
+    if mods.0 & Modifiers::OPT != 0 {
+        carbon_modifiers |= CARBON_OPTION_KEY;
+    }
+    if mods.0 & Modifiers::CTRL != 0 {
+        carbon_modifiers |= CARBON_CONTROL_KEY;
+    }
+    (carbon_modifiers >> 8) & 0xff
+}
+
+fn us_keycode_to_char(keycode: u16, mods: Modifiers) -> Option<char> {
+    let shift = mods.0 & Modifiers::SHIFT != 0;
+    let caps = mods.0 & Modifiers::CAPS != 0;
+    let letter_shift = shift ^ caps;
 
     let c = match keycode {
         // Letters
@@ -1382,8 +1586,8 @@ fn keycode_to_char(keycode: u16, mods: Modifiers) -> Option<char> {
         _ => return None,
     };
 
-    // Handle shift for letters
-    if shift && c.is_ascii_lowercase() {
+    // Handle shift/caps for letters. Caps does not shift punctuation.
+    if letter_shift && c.is_ascii_lowercase() {
         Some(c.to_ascii_uppercase())
     } else {
         Some(c)
@@ -1498,10 +1702,30 @@ mod tests {
 
     #[test]
     fn test_keycode_mapping() {
-        assert_eq!(keycode_to_char(0, Modifiers::new()), Some('a'));
-        assert_eq!(keycode_to_char(0, Modifiers(Modifiers::SHIFT)), Some('A'));
-        assert_eq!(keycode_to_char(49, Modifiers::new()), Some(' '));
-        assert_eq!(keycode_to_char(36, Modifiers::new()), Some('\n'));
+        assert_eq!(us_keycode_to_char(0, Modifiers::new()), Some('a'));
+        assert_eq!(
+            us_keycode_to_char(0, Modifiers(Modifiers::SHIFT)),
+            Some('A')
+        );
+        assert_eq!(
+            us_keycode_to_char(0, Modifiers(Modifiers::SHIFT | Modifiers::CAPS)),
+            Some('a')
+        );
+        assert_eq!(us_keycode_to_char(49, Modifiers::new()), Some(' '));
+        assert_eq!(us_keycode_to_char(36, Modifiers::new()), Some('\n'));
+    }
+
+    #[test]
+    fn test_carbon_modifier_state() {
+        assert_eq!(carbon_modifier_state(Modifiers::new()), 0);
+        assert_eq!(
+            carbon_modifier_state(Modifiers(Modifiers::SHIFT)),
+            CARBON_SHIFT_KEY >> 8
+        );
+        assert_eq!(
+            carbon_modifier_state(Modifiers(Modifiers::OPT)),
+            CARBON_OPTION_KEY >> 8
+        );
     }
 
     #[test]

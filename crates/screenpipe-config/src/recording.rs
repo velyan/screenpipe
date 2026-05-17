@@ -62,6 +62,17 @@ pub struct RecordingSettings {
     #[serde(rename = "transcriptionMode")]
     pub transcription_mode: String,
 
+    /// Stream live notes only while a meeting is active. This is separate
+    /// from 24/7 background transcription: the recorder still writes durable
+    /// chunks, while this powers the low-latency meeting note UI.
+    #[serde(rename = "meetingLiveTranscriptionEnabled")]
+    pub meeting_live_transcription_enabled: bool,
+
+    /// Provider for meeting-only live notes. Defaults to the selected audio
+    /// transcription engine so local/custom engines work without Cloud.
+    #[serde(rename = "meetingLiveTranscriptionProvider")]
+    pub meeting_live_transcription_provider: String,
+
     /// Audio device names/IDs to capture from.
     #[serde(rename = "audioDevices")]
     pub audio_devices: Vec<String>,
@@ -88,6 +99,11 @@ pub struct RecordingSettings {
     )]
     pub experimental_coreaudio_system_audio: bool,
 
+    /// Experimental: request Windows WASAPI microphone Acoustic Echo Cancellation.
+    /// Ignored on non-Windows platforms and fail-open when unsupported by device/driver.
+    #[serde(rename = "windowsInputAecEnabled", default)]
+    pub windows_input_aec_enabled: bool,
+
     /// Duration of each audio chunk in seconds before transcription.
     /// Stored as i32 to match existing store.bin schema (cast to u64 by engine).
     #[serde(rename = "audioChunkDuration")]
@@ -98,10 +114,6 @@ pub struct RecordingSettings {
     /// Kept as String (not Option) to match existing store.bin schema.
     #[serde(rename = "deepgramApiKey")]
     pub deepgram_api_key: String,
-
-    /// VAD sensitivity level: "low", "medium", "high".
-    #[serde(rename = "vadSensitivity")]
-    pub vad_sensitivity: String,
 
     /// Filter music-dominant audio before transcription using spectral analysis.
     #[serde(rename = "filterMusic")]
@@ -141,6 +153,22 @@ pub struct RecordingSettings {
     #[serde(rename = "maxSnapshotWidth", default = "default_max_snapshot_width")]
     pub max_snapshot_width: u32,
 
+    /// Skip the background JPEG->MP4 snapshot compaction worker.
+    /// Use when the MP4 timeline UI is not used, e.g. task-mining tools
+    /// that consume accessibility_text / ui_events only.
+    /// Side effect: JPEGs are not compacted, so disk usage depends on retention.
+    #[serde(rename = "disableSnapshotCompaction", default)]
+    pub disable_snapshot_compaction: bool,
+
+    /// Skip the v2 meeting detector watcher (5s-interval process / AX scan).
+    /// Use when meeting detection is not consumed (task-mining, headless analysis,
+    /// agents that read accessibility_text and ui_events only) — avoids the
+    /// constant process enumeration + AX tree walk cost.
+    /// Side effect: meeting-related DB rows are not generated; the audio pipeline's
+    /// in_meeting override flag stays false.
+    #[serde(rename = "disableMeetingDetector", default)]
+    pub disable_meeting_detector: bool,
+
     // ── Filters ────────────────────────────────────────────────────────
     /// Window titles to exclude from capture.
     #[serde(rename = "ignoredWindows")]
@@ -178,11 +206,6 @@ pub struct RecordingSettings {
     #[serde(rename = "recordWhileLocked", default)]
     pub record_while_locked: bool,
 
-    /// Automatically append text typed during a meeting to the meeting's note
-    /// when the meeting ends. Groups typed text by app/window context.
-    #[serde(rename = "appendTypedTextToMeetingNotes", default = "default_true")]
-    pub append_typed_text_to_meeting_notes: bool,
-
     /// Languages for transcription (ISO 639-1 codes).
     pub languages: Vec<String>,
 
@@ -190,6 +213,52 @@ pub struct RecordingSettings {
     /// Redact personally identifiable information from transcriptions.
     #[serde(rename = "usePiiRemoval")]
     pub use_pii_removal: bool,
+
+    /// Enable the async PII reconciliation worker. When `true`, a
+    /// background task runs after capture and OVERWRITES PII in the
+    /// source columns of `ocr_text`, `audio_transcriptions`,
+    /// `frames.accessibility_text`, and `ui_events.text_content`. Raw
+    /// secrets are gone after the worker processes the row — that's
+    /// the contract of the user-facing "AI PII removal" toggle.
+    /// Off by default; capture path is unaffected either way. See
+    /// `screenpipe-redact` for the full design.
+    #[serde(rename = "asyncPiiRedaction", default)]
+    pub async_pii_redaction: bool,
+
+    /// Enable image-PII redaction on captured screen frames. When
+    /// `true`, the `screenpipe_redact::image::worker` runs alongside
+    /// the text reconciliation worker, scans the `frames` table, runs
+    /// the RF-DETR-Nano detector, and blacks out detected PII regions
+    /// in each JPG (atomic overwrite of the source file). Off by
+    /// default — orthogonal to `async_pii_redaction` (text path),
+    /// independently togglable. Requires the `screenpipe-redact`
+    /// crate to be built with one of the `onnx-*` cargo features and
+    /// the `rfdetr_v8.onnx` model present at `~/.screenpipe/models/`.
+    #[serde(rename = "asyncImagePiiRedaction", default)]
+    pub async_image_pii_redaction: bool,
+
+    /// Where the AI PII redaction actually runs. One switch flips
+    /// BOTH modalities (text + image) because the user-facing
+    /// "AI PII removal" toggle is one knob.
+    ///
+    /// - `"local"` (default): on-device ONNX models. Privacy by
+    ///   construction — pixels and text never leave the box. Slower,
+    ///   especially on weak hardware (~1-3 s per text row, ~60-180 ms
+    ///   per frame).
+    /// - `"tinfoil"`: send to the screenpipe Tinfoil enclave (H200,
+    ///   confidential compute). Much faster (~30-100 ms per row /
+    ///   frame). Data leaves the device but is end-to-end encrypted
+    ///   into an attested confidential-compute enclave that even
+    ///   Tinfoil ops can't read into. Requires network +
+    ///   `SCREENPIPE_PRIVACY_FILTER_API_KEY` (or the cloud auth key).
+    ///
+    /// Note on attestation: the proper attested-transport client
+    /// (Tinfoil's secure-client SDK) is Go/Python/JS-only at time of
+    /// writing. The Rust adapter currently uses plain HTTPS — which
+    /// gives confidentiality vs. the network but NOT vs. a malicious
+    /// Tinfoil operator. Tracked separately; structured for swap-in.
+    #[serde(rename = "piiBackend", default = "default_pii_backend")]
+    pub pii_backend: String,
 
     // ── Cloud / Auth ───────────────────────────────────────────────────
     /// Screenpipe cloud user ID. Empty string means not logged in.
@@ -248,22 +317,6 @@ pub struct RecordingSettings {
     /// Persistent analytics ID (UUID, stable across sessions).
     #[serde(rename = "analyticsId")]
     pub analytics_id: String,
-
-    /// Legacy: input capture is always enabled. Kept for serde compat with
-    /// existing store.bin files; deserialized but ignored.
-    #[serde(rename = "enableInputCapture", default = "default_true")]
-    #[deprecated(note = "input capture is always enabled; will be removed")]
-    pub enable_input_capture: bool,
-
-    /// Legacy: accessibility capture is always enabled. Kept for serde compat
-    /// with existing store.bin files; deserialized but ignored.
-    #[serde(
-        rename = "enableAccessibility",
-        alias = "enableUiEvents",
-        default = "default_true"
-    )]
-    #[deprecated(note = "accessibility capture is always enabled; will be removed")]
-    pub enable_accessibility: bool,
 
     /// Enable AI workflow event detection (cloud feature, requires subscription).
     /// When enabled, classifies desktop activity and triggers event-based pipes.
@@ -326,6 +379,14 @@ impl RecordingSettings {
             Some(id)
         }
     }
+
+    /// Returns the display name/email used to label the local microphone speaker.
+    pub fn effective_user_name(&self) -> Option<&str> {
+        self.user_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+    }
 }
 
 impl Default for RecordingSettings {
@@ -335,12 +396,14 @@ impl Default for RecordingSettings {
             audio_transcription_engine: crate::best_engine_for_platform(crate::detect_tier())
                 .to_string(),
             transcription_mode: "batch".to_string(),
+            meeting_live_transcription_enabled: true,
+            meeting_live_transcription_provider: "selected-engine".to_string(),
             audio_devices: vec![],
             use_system_default_audio: true,
             experimental_coreaudio_system_audio: false,
+            windows_input_aec_enabled: false,
             audio_chunk_duration: 30,
             deepgram_api_key: String::new(),
-            vad_sensitivity: "high".to_string(),
             filter_music: false,
             batch_max_duration_secs: None,
             vocabulary: vec![],
@@ -349,6 +412,8 @@ impl Default for RecordingSettings {
             use_all_monitors: true,
             video_quality: "balanced".to_string(),
             max_snapshot_width: default_max_snapshot_width(),
+            disable_snapshot_compaction: false,
+            disable_meeting_detector: false,
             ignored_windows: vec![],
             included_windows: vec![],
             ignored_urls: vec![],
@@ -356,9 +421,11 @@ impl Default for RecordingSettings {
             pause_on_drm_content: false,
             disable_clipboard_capture: false,
             record_while_locked: false,
-            append_typed_text_to_meeting_notes: true,
             languages: vec![],
             use_pii_removal: false,
+            async_pii_redaction: false,
+            async_image_pii_redaction: false,
+            pii_backend: default_pii_backend(),
             user_id: String::new(),
             user_name: None,
             openai_compatible_endpoint: None,
@@ -371,10 +438,6 @@ impl Default for RecordingSettings {
             use_chinese_mirror: false,
             analytics_enabled: true,
             analytics_id: String::new(),
-            #[allow(deprecated)]
-            enable_input_capture: true,
-            #[allow(deprecated)]
-            enable_accessibility: true,
             enable_workflow_events: false,
             device_tier: None,
             schedule_enabled: false,
@@ -403,6 +466,10 @@ fn default_experimental_coreaudio_system_audio() -> bool {
 
 fn default_max_snapshot_width() -> u32 {
     1920
+}
+
+fn default_pii_backend() -> String {
+    "local".to_string()
 }
 
 #[cfg(test)]

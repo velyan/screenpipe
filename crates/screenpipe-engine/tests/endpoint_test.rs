@@ -281,6 +281,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -302,6 +303,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -323,6 +325,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -344,6 +347,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -365,6 +369,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -386,6 +391,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -407,6 +413,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -499,6 +506,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -523,6 +531,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -548,6 +557,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -577,6 +587,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -603,6 +614,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -623,6 +635,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -712,6 +725,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -745,6 +759,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -794,6 +809,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();
@@ -820,6 +836,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None, // on_screen — issue #2436
             )
             .await
             .unwrap();

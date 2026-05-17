@@ -50,13 +50,37 @@ const MODEL_FALLBACKS: Record<string, string[]> = {
 // 524 = Cloudflare "origin didn't respond" (also returned by Vertex MaaS
 // when the model is slow to first byte). 502/503/504 = gateway noise.
 // 408 = request timeout. 429 = rate limit. 500 = generic upstream error.
-const TRANSIENT_STATUSES = new Set([408, 429, 500, 502, 503, 504, 524]);
+// 404 = model not provisioned in this project/region (Vertex MaaS returns
+// this when a Publisher Model is withdrawn or never granted — we want to
+// fall through to the next entry in the chain instead of 404'ing the user).
+// 403 = caller lacks IAM permission for the specific model — same shape:
+// cascade to a model we *can* call rather than block the request.
+export const TRANSIENT_STATUSES = new Set([403, 404, 408, 429, 500, 502, 503, 504, 524]);
 
 // Statuses we don't want in Sentry — they're upstream gateway noise that
-// we already cascade around. Keeps the dashboard signal:noise usable.
-const SENTRY_SKIP_STATUSES = new Set([429, 502, 503, 504, 524]);
+// we already cascade around. 404 joins the noise set because once we
+// cascade past it, the user gets a working response and an alert per
+// request would drown the dashboard. 403 stays loud: an unexpected 403
+// usually means an IAM regression we DO want to know about.
+const SENTRY_SKIP_STATUSES = new Set([404, 429, 502, 503, 504, 524]);
 
-function isTransient(status: number, msg: string): boolean {
+// Upstream 400s that are caused by the client sending too much input,
+// not a server bug — re-classify as 413 to the user and skip Sentry.
+// Anthropic: "prompt is too long: N tokens > MAX maximum" (SCREENPIPE-AI-PROXY-D).
+// OpenAI / Gemini variants use slightly different phrasing.
+const USER_INPUT_TOO_LARGE_PATTERNS = [
+  /prompt is too long/i,
+  /maximum context length/i,
+  /context length.*exceeded/i,
+  /request payload size exceeds/i,
+];
+
+export function isUserInputTooLarge(status: number, msg: string): boolean {
+  if (status !== 400 && status !== 413) return false;
+  return USER_INPUT_TOO_LARGE_PATTERNS.some((re) => re.test(msg));
+}
+
+export function isTransient(status: number, msg: string): boolean {
   if (TRANSIENT_STATUSES.has(status)) return true;
   if (status >= 500) return true;
   // Legacy fallback for providers that don't preserve .status on Error
@@ -105,6 +129,10 @@ async function tryModel(
     model = resolveModelAlias(model);
     const provider = createProvider(model, env);
     const reqBody = { ...body, model };
+    if (!provider.supportsTools) {
+      delete (reqBody as Partial<RequestBody>).tools;
+      delete (reqBody as Partial<RequestBody>).tool_choice;
+    }
 
     if (body.stream) {
       const stream = await provider.createStreamingCompletion(reqBody);
@@ -131,6 +159,17 @@ async function tryModel(
     error.status = status;
     error.transient = transient;
 
+    // Re-classify "your prompt is too long" as a 413 client error.
+    // Upstream Anthropic returns 400; Sentry was treating it as a server
+    // bug (SCREENPIPE-AI-PROXY-D — 83 users, 194 events) when it's really
+    // the client over-stuffing the context window. Skip Sentry entirely.
+    if (isUserInputTooLarge(status, msg)) {
+      error.status = 413;
+      console.warn(`${ctx}: ${model} rejected oversized prompt (413)`);
+      logModelOutcome(env, { model, outcome: 'error' }).catch(() => {});
+      throw error;
+    }
+
     if (transient) {
       console.warn(`${ctx}: ${model} failed (${status}), cascading`);
       const outcome = status === 429 ? 'rate_limited' : status === 408 ? 'timeout' : 'error';
@@ -144,7 +183,7 @@ async function tryModel(
         } catch {}
       }
     } else {
-      // Non-transient (400/401/403) — real client/config bug, always log.
+      // Non-transient (400/401) — real client/config bug, always log.
       try {
         captureException(error, {
           tags: { model, error_path: `${ctx}_fatal`, status: String(status) },

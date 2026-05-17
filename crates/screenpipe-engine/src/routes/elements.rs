@@ -41,6 +41,14 @@ pub(crate) struct ElementsQuery {
     end_time: Option<DateTime<Utc>>,
     #[serde(default)]
     app_name: Option<String>,
+    /// Restrict results to elements that were visually present in the
+    /// captured screenshot. The accessibility tree captures off-screen
+    /// text (terminal scroll buffers, scrolled-off IDE editor lines)
+    /// that the user never saw — passing `on_screen=true` filters those
+    /// out. Default (omitted): match everything, matching pre-fix
+    /// behavior. See issue #2436.
+    #[serde(default)]
+    on_screen: Option<bool>,
     #[serde(default = "default_limit")]
     limit: u32,
     #[serde(default)]
@@ -63,6 +71,11 @@ pub(crate) struct ElementResponse {
     pub bounds: Option<BoundsResponse>,
     pub confidence: Option<f64>,
     pub sort_order: i32,
+    /// True iff this element was visually present in the captured frame.
+    /// `None` for legacy rows captured before the on-screen detector
+    /// landed — see issue #2436.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub on_screen: Option<bool>,
 }
 
 #[derive(OaSchema, Serialize)]
@@ -104,6 +117,7 @@ impl From<Element> for ElementResponse {
             }),
             confidence: e.confidence,
             sort_order: e.sort_order,
+            on_screen: e.on_screen,
         }
     }
 }
@@ -130,6 +144,7 @@ pub(crate) async fn search_elements(
             query.start_time,
             query.end_time,
             query.app_name.as_deref(),
+            query.on_screen,
             query.limit,
             query.offset,
         )

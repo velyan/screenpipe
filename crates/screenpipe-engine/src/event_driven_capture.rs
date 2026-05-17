@@ -341,6 +341,12 @@ pub async fn event_driven_capture_loop(
                         "startup capture for monitor {}: frame_id={}, dur={}ms",
                         monitor_id, result.frame_id, result.duration_ms
                     );
+                } else {
+                    // Symmetry with the live loop — startup capture rarely
+                    // hits dedup (no prior hash on first frame) but if it
+                    // does, treat it the same way: pipeline cycled fine,
+                    // nothing new to write.
+                    vision_metrics.record_dedup_skip();
                 }
             }
             Err(e) => {
@@ -743,7 +749,17 @@ pub async fn event_driven_capture_loop(
                                 monitor_id
                             );
                         } else {
-                            // Content dedup or window filter — capture skipped
+                            // Content dedup or window filter — capture skipped.
+                            // Tick last_db_write_ts anyway so the health check
+                            // doesn't flag a stall just because the screen is
+                            // static. The pipeline IS healthy; there's just
+                            // nothing new worth writing. Without this, sitting
+                            // on a Zoom call / slide deck / IDE waiting for
+                            // 60+ seconds emits a false-alarm "vision DB
+                            // writes stalled" WARN and (if the user has
+                            // showRestartNotifications enabled) a Tauri
+                            // notification claiming screen capture is broken.
+                            vision_metrics.record_dedup_skip();
                             debug!(
                                 "capture skipped DB write for monitor {} (trigger={})",
                                 monitor_id,
@@ -865,14 +881,20 @@ fn resolve_capture_metadata(
     tree_snapshot: Option<&screenpipe_a11y::tree::TreeSnapshot>,
     trigger: &CaptureTrigger,
     lightweight_app_name: Option<&str>,
-) -> (Option<String>, Option<String>, Option<String>) {
-    let (mut app_name, mut window_name, browser_url) = match tree_snapshot {
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let (mut app_name, mut window_name, browser_url, document_path) = match tree_snapshot {
         Some(snap) => (
             Some(snap.app_name.clone()),
             Some(snap.window_name.clone()),
             snap.browser_url.clone(),
+            snap.document_path.clone(),
         ),
-        None => (None, None, None),
+        None => (None, None, None, None),
     };
 
     // Fallback to the lightweight focused-app query when the tree walk returned
@@ -913,7 +935,7 @@ fn resolve_capture_metadata(
         _ => {}
     }
 
-    (app_name, window_name, browser_url)
+    (app_name, window_name, browser_url, document_path)
 }
 
 /// Rate-limit OCR-heavy apps. Two groups:
@@ -1180,7 +1202,7 @@ async fn do_capture(
 
     // Use tree metadata by default, but for focus-change triggers prefer the
     // event payload when the tree lags or reports the wrong frontmost target.
-    let (app_name_owned, window_name_owned, browser_url_owned) =
+    let (app_name_owned, window_name_owned, browser_url_owned, document_path_owned) =
         resolve_capture_metadata(tree_snapshot.as_ref(), trigger, trigger_app.as_deref());
 
     // Skip lock screen / screensaver — these waste disk and pollute timeline.
@@ -1276,6 +1298,7 @@ async fn do_capture(
         app_name: app_name_owned.as_deref(),
         window_name: window_name_owned.as_deref(),
         browser_url: browser_url_owned.as_deref(),
+        document_path: document_path_owned.as_deref(),
         focused: true, // event-driven captures are always for the focused window
         capture_trigger: trigger.as_str(),
         capture_provenance: None,

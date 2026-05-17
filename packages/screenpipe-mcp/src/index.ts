@@ -28,33 +28,136 @@ for (let i = 0; i < args.length; i++) {
 
 const SCREENPIPE_API = `http://localhost:${port}`;
 
-// Discover API key: env var > db.sqlite direct read > npx fallbacks
+// Discover the local API key, in priority order:
+//
+//   1. env vars set by the launcher (Claude Desktop config, terminal, etc.)
+//   2. CLI via bundled `bun` from screenpipe.app at a deterministic absolute
+//      path. Runs `bun x screenpipe@latest auth token` → goes through the
+//      Rust CLI's `find_api_auth_key` resolver, which handles the encrypted
+//      keychain-backed secret store. This is the canonical path: same
+//      contract as `screenpipe auth token` in a terminal, no PATH needed.
+//   3. CLI via node-adjacent npx — for dev environments that have node but
+//      not the desktop app.
+//   4. CLI via PATH-based npx — last CLI fallback.
+//   5. Direct sqlite3 read of ~/.screenpipe/db.sqlite — plaintext entries
+//      only (encrypted entries need the keychain, which only the CLI can
+//      reach). Kept as a final last-resort for users who have screenpipe
+//      *data* but no working CLI install (rare). Demoted below the CLI
+//      paths because it reimplements logic that lives in `auth_key.rs` and
+//      can silently drift on storage-format changes.
+//
+// If all 5 miss we log a loud stderr warning so it surfaces in the host's
+// MCP log instead of the user just seeing 403s with no explanation.
 function discoverApiKey(): string {
   const envKey = process.env.SCREENPIPE_LOCAL_API_KEY || process.env.SCREENPIPE_API_KEY;
   if (envKey) return envKey;
 
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
   const os = require("os");
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
   const path = require("path");
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
   const fs = require("fs");
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { execFileSync, execSync } = require("child_process");
 
-  // Read api_auth_key directly from ~/.screenpipe/db.sqlite.
-  // The key may be stored as plaintext base64 (nonce=zeros, keychain unavailable)
-  // or encrypted (non-zero nonce, keychain was available at write time).
-  // If plaintext: decode and return. If encrypted: skip, fall through to CLI.
-  try {
-    const dbPath = path.join(os.homedir(), ".screenpipe", "db.sqlite");
-    if (fs.existsSync(dbPath)) {
-      const sqliteBin = process.platform === "win32" ? "sqlite3.exe" : "sqlite3";
-      // Check nonce — all zeros means plaintext base64, non-zero means encrypted
-      const row = execFileSync(sqliteBin, [
-        dbPath,
-        "SELECT hex(nonce), value FROM secrets WHERE key = 'api_auth_key';",
-      ], {
-        timeout: 5000,
+  const home = os.homedir();
+
+  // 2. CLI via bundled `bun` shipped with the desktop app. The Tauri
+  //    externalBin config places `bun` next to the main app exe at a
+  //    deterministic install path on each OS, so we don't need PATH —
+  //    which Claude Desktop's MCP launcher strips. The CLI's `auth
+  //    token` goes through `find_api_auth_key` and decrypts via
+  //    keychain when needed.
+  const bunCandidates: string[] =
+    process.platform === "darwin"
+      ? [
+          // Standard system-wide install
+          "/Applications/screenpipe.app/Contents/MacOS/bun",
+          // Per-user install
+          path.join(home, "Applications", "screenpipe.app", "Contents", "MacOS", "bun"),
+        ]
+      : process.platform === "win32"
+      ? [
+          // NSIS per-user (default on Windows)
+          path.join(home, "AppData", "Local", "screenpipe", "bun.exe"),
+          // Per-user under "screenpipe-app" (older builds)
+          path.join(home, "AppData", "Local", "screenpipe-app", "bun.exe"),
+          // System-wide install
+          "C:\\Program Files\\screenpipe\\bun.exe",
+        ]
+      : [
+          // Linux .deb
+          "/opt/screenpipe/bun",
+          "/usr/lib/screenpipe/bun",
+          "/usr/bin/bun",
+        ];
+  for (const bunPath of bunCandidates) {
+    if (!fs.existsSync(bunPath)) continue;
+    try {
+      const token = execFileSync(bunPath, ["x", "screenpipe@latest", "auth", "token"], {
+        timeout: 30000, // first run downloads the package; subsequent runs are cached
         encoding: "utf-8",
         stdio: ["pipe", "pipe", "pipe"],
       }).trim();
+      if (token && token.startsWith("sp-")) return token;
+    } catch {
+      // try next candidate
+    }
+  }
+
+  // 3. CLI via npx adjacent to the running node. Works for dev
+  //    environments without the desktop app.
+  try {
+    const npxName = process.platform === "win32" ? "npx.cmd" : "npx";
+    const npxPath = path.join(path.dirname(process.execPath), npxName);
+    if (fs.existsSync(npxPath)) {
+      const token = execFileSync(npxPath, ["screenpipe@latest", "auth", "token"], {
+        timeout: 30000,
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      }).trim();
+      if (token && token.startsWith("sp-")) return token;
+    }
+  } catch {}
+
+  // 4. CLI via PATH-based npx. Last CLI try; works on raw shells with
+  //    npx on PATH.
+  try {
+    const token = execSync("npx screenpipe@latest auth token", {
+      timeout: 30000,
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+    if (token && token.startsWith("sp-")) return token;
+  } catch {}
+
+  // 5. Direct sqlite3 read of the secret store (last-resort). Plaintext
+  //    entries only — encrypted ones live behind the keychain, which the
+  //    CLI paths above already cover. Used when the user has screenpipe
+  //    data on disk but no working CLI install.
+  const sqliteCandidates: string[] =
+    process.platform === "win32"
+      ? ["sqlite3.exe", "C:\\Windows\\System32\\sqlite3.exe"]
+      : process.platform === "darwin"
+      ? ["sqlite3", "/usr/bin/sqlite3", "/opt/homebrew/bin/sqlite3", "/usr/local/bin/sqlite3"]
+      : ["sqlite3", "/usr/bin/sqlite3", "/usr/local/bin/sqlite3"];
+  try {
+    const dbPath = path.join(home, ".screenpipe", "db.sqlite");
+    if (fs.existsSync(dbPath)) {
+      let row: string | null = null;
+      for (const candidate of sqliteCandidates) {
+        try {
+          row = execFileSync(
+            candidate,
+            [dbPath, "SELECT hex(nonce), value FROM secrets WHERE key = 'api_auth_key';"],
+            { timeout: 5000, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
+          ).trim();
+          break;
+        } catch {
+          // try next candidate
+        }
+      }
       if (row) {
         const sepIdx = row.indexOf("|");
         const nonceHex = sepIdx >= 0 ? row.substring(0, sepIdx) : "";
@@ -65,32 +168,27 @@ function discoverApiKey(): string {
           if (decoded && decoded.startsWith("sp-")) return decoded;
           if (value.startsWith("sp-")) return value;
         }
-        // Non-zero nonce = encrypted — fall through to CLI which can decrypt via keychain
+        // Encrypted — only the CLI paths above can decrypt this; we
+        // already tried them.
       }
     }
   } catch {}
 
-  // Fallback: use the current Node binary to find npx (no PATH dependency)
-  try {
-    const npxPath = path.join(path.dirname(process.execPath), "npx");
-    const token = execFileSync(npxPath, ["screenpipe@latest", "auth", "token"], {
-      timeout: 15000,
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-    }).trim();
-    if (token) return token;
-  } catch {}
-
-  // Last resort: npx on PATH
-  try {
-    const token = execSync("npx screenpipe@latest auth token", {
-      timeout: 15000,
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-    }).trim();
-    if (token) return token;
-  } catch {}
-
+  // All five paths missed. Log loudly to stderr so the host's MCP
+  // panel surfaces this instead of the user seeing cryptic 403s from
+  // the screenpipe server on every tool call.
+  process.stderr.write(
+    [
+      "[screenpipe-mcp] could not discover SCREENPIPE_LOCAL_API_KEY from any source.",
+      "  - env vars (SCREENPIPE_LOCAL_API_KEY / SCREENPIPE_API_KEY) not set",
+      "  - bundled `bun` from screenpipe.app not found at any known install path",
+      "  - npx fallback unavailable",
+      "  - direct sqlite3 read of ~/.screenpipe/db.sqlite failed",
+      "Fix: set SCREENPIPE_LOCAL_API_KEY in your MCP launcher's env block,",
+      "or install the screenpipe desktop app (https://screenpi.pe).",
+      "",
+    ].join("\n"),
+  );
   return "";
 }
 
@@ -422,6 +520,32 @@ const TOOLS: Tool[] = [
       type: "object",
       properties: {
         id: { type: "integer", description: "Meeting ID" },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "update-meeting",
+    description:
+      "Update a meeting's mutable fields (title, attendees, note, app, start/end). Partial: only the fields you pass are written, " +
+      "others stay as-is. Use this to save an AI-generated summary into the meeting note — read the current note first via get-meeting " +
+      "and pass the existing notes plus your additions so you don't overwrite the user's writing. " +
+      "Convention: append AI-generated summary text under a `## Summary` heading at the bottom of the existing note.",
+    annotations: { title: "Update Meeting", readOnlyHint: false, destructiveHint: false, openWorldHint: false, idempotentHint: true },
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "integer", description: "Meeting ID" },
+        title: { type: "string", description: "Meeting title" },
+        attendees: { type: "string", description: "Comma-separated attendee names" },
+        note: {
+          type: "string",
+          description:
+            "Full new note body. To preserve existing notes, fetch them first via get-meeting and concatenate before passing.",
+        },
+        meeting_app: { type: "string", description: "App / source name (e.g. 'meet.google.com', 'manual')" },
+        meeting_start: { type: "string", description: "ISO 8601 start time (rarely needed)" },
+        meeting_end: { type: "string", description: "ISO 8601 end time (rarely needed)" },
       },
       required: ["id"],
     },
@@ -1293,6 +1417,38 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const meeting = await response.json();
         return {
           content: [{ type: "text", text: JSON.stringify(meeting, null, 2) }],
+        };
+      }
+
+      case "update-meeting": {
+        const meetingId = args.id as number;
+        if (!meetingId) {
+          return { content: [{ type: "text", text: "Error: id is required" }] };
+        }
+        // Build partial body — only forward fields the caller provided.
+        const body: Record<string, unknown> = {};
+        for (const k of ["title", "attendees", "note", "meeting_app", "meeting_start", "meeting_end"] as const) {
+          if (args[k] !== undefined && args[k] !== null) body[k] = args[k];
+        }
+        if (Object.keys(body).length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Error: pass at least one field to update (title, attendees, note, meeting_app, meeting_start, meeting_end).",
+              },
+            ],
+          };
+        }
+        const response = await fetchAPI(`/meetings/${meetingId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!response.ok) throw new Error(`HTTP error: ${response.status}`);
+        const updated = await response.json();
+        return {
+          content: [{ type: "text", text: JSON.stringify(updated, null, 2) }],
         };
       }
 

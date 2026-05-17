@@ -10,8 +10,6 @@ import {
   importTeamKey,
   encryptConfig,
   decryptConfig,
-  generatePassphrase,
-  wrapKeyWithPassphrase,
   unwrapKeyWithPassphrase,
 } from "../team-crypto";
 
@@ -125,6 +123,28 @@ export function useTeam() {
     };
   }, [token]);
 
+  const createInviteLink = useCallback(
+    async (teamName: string, key: CryptoKey, forceNew = false) => {
+      const tokenRes = await fetch(`${API}/invite`, {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify({
+          delivery: "link",
+          team_name: teamName,
+          force_new: forceNew,
+        }),
+      });
+      if (!tokenRes.ok) {
+        const err = await tokenRes.json().catch(() => ({}));
+        throw new Error(err.error || "failed to generate invite link");
+      }
+      const tokenData = await tokenRes.json();
+      const base64Key = await exportTeamKey(key);
+      return `https://screenpi.pe/join/${tokenData.invite_token}#key=${encodeURIComponent(base64Key)}`;
+    },
+    [headers]
+  );
+
   // fetch team info
   const fetchTeam = useCallback(async () => {
     if (!token) {
@@ -164,24 +184,9 @@ export function useTeam() {
       let invitePassphrase: string | null = null;
       if (data.role === "admin" && key) {
         try {
-          // 1. generate invite token
-          const tokenRes = await fetch(`${API}/invite`, {
-            method: "POST",
-            headers: headers(),
-            body: JSON.stringify({
-              email: "link-invite@placeholder.local",
-              team_name: data.team.name,
-            }),
-          });
-          if (tokenRes.ok) {
-            const tokenData = await tokenRes.json();
-
-            // 2. export key to base64 and build web URL with key in fragment
-            const base64Key = await exportTeamKey(key);
-            inviteLink = `https://screenpi.pe/join/${tokenData.invite_token}#key=${encodeURIComponent(base64Key)}`;
-            // no passphrase needed in new flow
-            invitePassphrase = null;
-          }
+          inviteLink = await createInviteLink(data.team.name, key);
+          // no passphrase needed in new flow
+          invitePassphrase = null;
         } catch {
           // invite generation failed — user can retry
         }
@@ -207,7 +212,7 @@ export function useTeam() {
       }));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token]);
+  }, [token, createInviteLink]);
 
   const fetchMembers = useCallback(
     async (teamId?: string) => {
@@ -283,6 +288,47 @@ export function useTeam() {
     [token, fetchTeam]
   );
 
+  // bootstrap secure sharing for teams created on web/checkout before the
+  // desktop app had a chance to generate the local encryption key.
+  const initializeTeamKey = useCallback(async () => {
+    if (!token) throw new Error("not logged in");
+    if (!state.team) throw new Error("no team");
+    if (state.role !== "admin") {
+      throw new Error("only team admins can initialize secure sharing");
+    }
+    if (state.configs.length > 0 && !teamKeyRef.current) {
+      throw new Error(
+        "this team already has shared configs. paste a secure invite link from another admin device to sync the existing key."
+      );
+    }
+
+    const key = teamKeyRef.current ?? (await generateTeamKey());
+    await saveTeamKeyToStore(state.team.id, key);
+    teamKeyRef.current = key;
+
+    const inviteLink =
+      state.inviteLink ?? (await createInviteLink(state.team.name, key, true));
+
+    setState((s) => ({
+      ...s,
+      inviteLink,
+      invitePassphrase: null,
+      missingKey: false,
+      error: null,
+    }));
+    await fetchConfigs(state.team.id, key);
+
+    return inviteLink;
+  }, [
+    token,
+    state.team,
+    state.role,
+    state.configs.length,
+    state.inviteLink,
+    createInviteLink,
+    fetchConfigs,
+  ]);
+
   // join team via:
   // 1. new flow: claim token + passphrase (key fetched from server, unwrapped locally)
   // 2. legacy flow: raw base64 key in URL (backwards compat for old invite links)
@@ -329,7 +375,9 @@ export function useTeam() {
           throw new Error("incorrect passphrase — could not decrypt team key");
         }
       } else {
-        throw new Error("invite link is missing key information");
+        throw new Error(
+          "this looks like a notification-only invite link (no encryption key). ask your admin to open their desktop app → settings → team → copy invite link, and share that link directly with you (slack/imessage as plain text)."
+        );
       }
 
       await saveTeamKeyToStore(teamId, key);
@@ -486,38 +534,14 @@ export function useTeam() {
     [token, fetchConfigs]
   );
 
-  // send email invite — server generates a token, email contains token only (no key)
-  // the admin must share the encryption key separately via secure channel
-  const sendInviteEmail = useCallback(
-    async (email: string): Promise<{ invite_token: string }> => {
-      if (!token || !state.team)
-        throw new Error("no team");
-      let res: Response;
-      try {
-        res = await fetch(`${API}/invite`, {
-          method: "POST",
-          headers: headers(),
-          body: JSON.stringify({
-            email,
-            team_name: state.team.name,
-          }),
-        });
-      } catch {
-        throw new Error("network error — could not reach server");
-      }
-      if (!res.ok) {
-        let msg = "failed to send invite";
-        try {
-          const err = await res.json();
-          msg = err.error || msg;
-        } catch {}
-        throw new Error(msg);
-      }
-      return res.json();
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [token, state.team]
-  );
+  const refreshInviteLink = useCallback(async () => {
+    if (!token || !state.team) throw new Error("no team");
+    if (!teamKeyRef.current) throw new Error("team encryption key missing on this device");
+
+    const inviteLink = await createInviteLink(state.team.name, teamKeyRef.current, true);
+    setState((s) => ({ ...s, inviteLink }));
+    return inviteLink;
+  }, [token, state.team, createInviteLink]);
 
   // generate an invite token (without sending email)
   const generateInviteToken = useCallback(
@@ -529,8 +553,9 @@ export function useTeam() {
         method: "POST",
         headers: headers(),
         body: JSON.stringify({
-          email: "manual-invite@placeholder.local",
+          delivery: "link",
           team_name: state.team.name,
+          force_new: true,
         }),
       });
       if (!res.ok) {
@@ -553,13 +578,14 @@ export function useTeam() {
     ...state,
     fetchTeam,
     createTeam,
+    initializeTeamKey,
     joinTeam,
     leaveTeam,
     deleteTeam,
     removeMember,
     pushConfig,
     deleteConfig,
-    sendInviteEmail,
+    refreshInviteLink,
     generateInviteToken,
   };
 }

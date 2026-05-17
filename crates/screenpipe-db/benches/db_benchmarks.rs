@@ -96,6 +96,7 @@ fn bench_search(c: &mut Criterion) {
                                 None,
                                 None,
                                 None,
+                                None, // on_screen — issue #2436
                             )
                             .await
                             .unwrap()

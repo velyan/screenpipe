@@ -27,9 +27,12 @@ static DEF: IntegrationDef = IntegrationDef {
 
 static OAUTH: OAuthConfig = OAuthConfig {
     auth_url: "https://appcenter.intuit.com/connect/oauth2",
-    client_id: "ABNRiJAvFPuyXbm2qHmb6RHdKCjvlNIDJWqc31JNMxyC44aIdr",
+    // Production Intuit OAuth client. Production tab requires HTTPS public
+    // redirect — relayed through the website at screenpi.pe/api/oauth/callback,
+    // same pattern as Zoom/Calendly.
+    client_id: "ABICNYWw4y8ZaOr7cU8gbN9V4x8O6pGVewh4viZ1cpMzt2Ir3C",
     extra_auth_params: &[("scope", "com.intuit.quickbooks.accounting")],
-    redirect_uri_override: None,
+    redirect_uri_override: Some("https://screenpi.pe/api/oauth/callback"),
 };
 
 pub struct QuickBooks;

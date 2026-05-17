@@ -47,13 +47,21 @@ mod commands;
 mod disk_usage;
 mod embedded_server;
 mod enterprise_policy;
+mod enterprise_sync;
 mod hardware;
 mod ics_calendar;
 mod livetext;
 #[cfg(target_os = "macos")]
 mod livetext_ffi;
+mod meeting_live_notes;
 mod oauth;
 mod owned_browser;
+// Cross-platform shape: macOS reads Arc/Chrome/Brave/Edge cookies and
+// injects via WKHTTPCookieStore; other platforms compile to a stub
+// `cookies_for_host` that returns empty until Windows (DPAPI + AES-256-
+// GCM + WebView2) and Linux (libsecret + webkit2gtk) readers land.
+mod monitor_events;
+mod owned_browser_cookies;
 mod permission_events;
 mod permissions;
 mod pi;
@@ -77,6 +85,8 @@ mod window;
 mod windows_ca_bundle;
 #[cfg(target_os = "windows")]
 mod windows_overlay;
+#[cfg(target_os = "windows")]
+mod windows_webview_env;
 
 pub use server::*;
 
@@ -319,6 +329,9 @@ async fn is_server_running(app: AppHandle) -> Result<bool, String> {
 async fn main() {
     let _ = fix_path_env::fix();
 
+    #[cfg(target_os = "windows")]
+    windows_webview_env::install_user_data_dir();
+
     // Refuse to launch while a `screenpipe db recover|cleanup` operation is in
     // progress. The CLI writes ~/.screenpipe/.db_recovery.lock before doing
     // anything destructive; if the user double-clicks the app icon mid-recovery,
@@ -446,13 +459,9 @@ async fn main() {
     let telemetry_disabled = store_bool("analyticsEnabled")
         .map(|enabled| !enabled)
         .unwrap_or(false);
-    let offline_mode = store_bool("offlineMode").unwrap_or(false);
-    // PostHog is disabled by either telemetry toggle or offline mode
-    // Sentry stays enabled in offline mode (crash reports still sent)
-    let _posthog_disabled = telemetry_disabled || offline_mode;
+    let _posthog_disabled = telemetry_disabled;
 
     let app_version = env!("CARGO_PKG_VERSION");
-    // Sentry disabled only when telemetry is explicitly off, NOT for offline mode
     let sentry_guard = if !telemetry_disabled {
         Some(sentry::init((
             "https://da4edafe2c8e5e8682505945695ecad7@o4505591122886656.ingest.us.sentry.io/4510761355116544",
@@ -559,12 +568,16 @@ async fn main() {
     // hit `panic_cannot_unwind` → `abort()`, and the default hook's output may be lost.
     // By logging here we capture the actual panic message for diagnosis.
     //
-    // Truncate the crash log at startup so it only contains panics from THIS launch.
-    // The hook appends (not truncates) so that both the original panic and the
-    // subsequent panic_cannot_unwind are preserved in the same file.
+    // Rotate the crash log on startup (don't truncate). Relaunch after a crash
+    // is the common case — truncating loses the message we most need to diagnose.
+    // Previous panic moves to last-panic.log.prev; new file starts empty.
     {
         let log_dir = screenpipe_core::paths::default_screenpipe_data_dir();
-        let _ = std::fs::File::create(log_dir.join("last-panic.log")); // truncate
+        let cur = log_dir.join("last-panic.log");
+        let prev = log_dir.join("last-panic.log.prev");
+        if cur.exists() {
+            let _ = std::fs::rename(&cur, &prev);
+        }
     }
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -585,6 +598,23 @@ async fn main() {
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_default();
+
+        // Suppress "tokio context being shutdown" panics from background
+        // tasks (redact workers, etc.) — these fire when a task is mid-
+        // sqlx/timer poll at the moment the runtime tears down on app
+        // quit. ServerCore::shutdown signals workers to exit cleanly, but
+        // a residual race is possible if the worker is inside an await
+        // that doesn't include the shutdown future. Either way, this is
+        // orderly-shutdown noise — not a crash — and logging it to
+        // last-panic.log + Sentry makes the app look unstable to users
+        // and skews crash-rate dashboards.
+        if payload.contains("Tokio 1.x context was found, but it is being shutdown") {
+            eprintln!(
+                "(suppressed tokio shutdown-time panic on thread '{}' at {})",
+                thread_name, location
+            );
+            return;
+        }
 
         // Force-capture a backtrace before abort() kills us
         let backtrace = std::backtrace::Backtrace::force_capture();
@@ -703,6 +733,7 @@ async fn main() {
                 recording::get_boot_phase,
                 // Commands from commands.rs
                 commands::is_enterprise_build_cmd,
+                commands::set_cloud_media_analysis_skill,
                 commands::get_enterprise_license_key,
                 commands::save_enterprise_license_key,
                 enterprise_policy::set_enterprise_policy,
@@ -713,6 +744,8 @@ async fn main() {
                 commands::update_show_screenpipe_shortcut,
                 commands::show_window,
                 commands::show_window_activated,
+                commands::show_main_window,
+                commands::hide_main_window,
                 commands::open_login_window,
                 commands::open_google_calendar_auth_window,
                 commands::ensure_webview_focus,
@@ -775,6 +808,7 @@ async fn main() {
                 pi::pi_check,
                 pi::pi_install,
                 pi::pi_prompt,
+                pi::pi_steer,
                 pi::pi_pending,
                 pi::pi_cancel_queued,
                 pi::pi_abort,
@@ -862,7 +896,9 @@ async fn main() {
         server: Arc::new(tokio::sync::Mutex::new(None)),
         capture: Arc::new(tokio::sync::Mutex::new(None)),
         is_starting: Arc::new(AtomicBool::new(false)),
+        is_starting_capture: Arc::new(AtomicBool::new(false)),
         last_spawn_epoch: Arc::new(AtomicU64::new(0)),
+        interrupted_meeting: Arc::new(tokio::sync::Mutex::new(None)),
     };
     let pi_state = pi::PiState(Arc::new(tokio::sync::Mutex::new(pi::PiPool::new())));
     let suggestions_state = suggestions::SuggestionsState::new();
@@ -922,7 +958,7 @@ async fn main() {
         let args_clone = args.clone();
         let _ = app.run_on_main_thread(move || {
             // Focus the existing window
-            show_main_window(&app_for_closure, false);
+            show_main_window(app_for_closure.clone());
 
             // Forward deep-link URL from args
             if let Some(url) = args_clone.iter().find(|a| a.starts_with("screenpipe://")) {
@@ -962,6 +998,8 @@ async fn main() {
             commands::is_enterprise_build_cmd,
             commands::get_local_api_config,
             commands::regenerate_api_auth_key,
+            commands::set_api_auth_key,
+            commands::set_cloud_media_analysis_skill,
             commands::get_enterprise_license_key,
             enterprise_policy::set_enterprise_policy,
             commands::save_enterprise_license_key,
@@ -981,6 +1019,7 @@ async fn main() {
             owned_browser::owned_browser_set_bounds,
             owned_browser::owned_browser_navigate,
             owned_browser::owned_browser_hide,
+            owned_browser::owned_browser_resolve_session_access,
             permissions::reset_and_request_permission,
             permissions::get_missing_permissions,
             permissions::check_arc_installed,
@@ -998,6 +1037,8 @@ async fn main() {
             commands::open_pipe_window,
             commands::show_window,
             commands::show_window_activated,
+            commands::show_main_window,
+            commands::hide_main_window,
             commands::open_login_window,
             commands::ensure_webview_focus,
             commands::close_window,
@@ -1031,6 +1072,7 @@ async fn main() {
             commands::copy_deeplink_to_clipboard,
             commands::copy_text_to_clipboard,
             commands::open_note_path,
+            commands::open_windows_shell_target,
             // In-app file viewer
             viewer::open_viewer_window,
             viewer::read_viewer_file,
@@ -1047,6 +1089,7 @@ async fn main() {
             resume_global_shortcuts,
             get_env,
             get_e2e_seed_flags,
+            commands::e2e_main_overlay_visible,
             vault_status,
             vault_unlock,
             // Sync commands
@@ -1068,6 +1111,7 @@ async fn main() {
             pi::pi_check,
             pi::pi_install,
             pi::pi_prompt,
+            pi::pi_steer,
             pi::pi_pending,
             pi::pi_cancel_queued,
             pi::pi_abort,
@@ -1260,6 +1304,9 @@ async fn main() {
                 registry.init();
             }
 
+            #[cfg(target_os = "windows")]
+            windows_webview_env::log_diagnostics();
+
             // Windows-specific setup
             if cfg!(windows) {
                 let exe_dir = env::current_exe()
@@ -1271,24 +1318,18 @@ async fn main() {
                 env::set_var("TESSDATA_PREFIX", tessdata_path);
             }
 
-            // Ensure mlx.metallib is discoverable by MLX (parakeet-mlx).
-            // Tauri bundles it in Contents/Resources/ but MLX looks next to the binary
-            // (Contents/MacOS/). Create a symlink so both paths work.
-            #[cfg(target_os = "macos")]
-            {
-                if let Ok(exe) = std::env::current_exe() {
-                    let macos_dir = exe.parent().unwrap_or(std::path::Path::new("."));
-                    let target = macos_dir.join("mlx.metallib");
-                    if !target.exists() {
-                        // Try Contents/Resources/mlx.metallib (Tauri resource)
-                        let resource = macos_dir.parent()
-                            .map(|contents| contents.join("Resources/mlx.metallib"));
-                        if let Some(src) = resource.filter(|p| p.exists()) {
-                            let _ = std::os::unix::fs::symlink(&src, &target);
-                        }
-                    }
-                }
-            }
+            // mlx.metallib is now placed at Contents/MacOS/mlx.metallib at
+            // build time (see "Inject mlx.metallib into Contents/MacOS/" step
+            // in .github/workflows/release-app.yml), then signed as part of
+            // the normal codesign pass.
+            //
+            // Previously this block created a symlink at Contents/MacOS/mlx.metallib
+            // pointing at Contents/Resources/mlx.metallib on first launch. Apple
+            // seals every entry inside Contents/ at signing time — adding even a
+            // symlink at runtime invalidates the cdhash, which on macOS 26.4+
+            // triggers the "screenpipe is damaged" Gatekeeper popup and can
+            // leave the app running while the embedded server (port 3030) is
+            // killed by the system. See incident: feedback-bot 2026-05-07.
 
             // Autostart setup
             let autostart_manager = app.autolaunch();
@@ -1307,10 +1348,36 @@ async fn main() {
             // Note: StoreBuilder handles file creation internally — pre-creating
             // store.bin here caused TOCTOU race conditions ("File exists" os error 17).
             // Use unwrap_or_default to prevent crashes from corrupted stores
-            let store = store::init_store(&app.handle()).unwrap_or_else(|e| {
+            let mut store = store::init_store(&app.handle()).unwrap_or_else(|e| {
                 error!("Failed to init settings store, using defaults: {}", e);
                 store::SettingsStore::default()
             });
+
+            // E2E seed: when SCREENPIPE_E2E_SEED contains "no-recording", flip
+            // disable_vision + disable_audio so the e2e harness can drive the
+            // app without granting Screen Recording / Microphone TCC. The
+            // server (DB + HTTP) still boots; only SCK + audio capture skip.
+            // See get_e2e_seed_flags above for parsing.
+            let e2e_flags = get_e2e_seed_flags();
+            if e2e_flags.iter().any(|f| f == "no-recording") {
+                store.recording.disable_audio = true;
+                store.recording.disable_vision = true;
+                info!("E2E seed: recording disabled (vision + audio)");
+            }
+            if e2e_flags.iter().any(|f| f == "cloud-audio-fallback") {
+                store.recording.disable_audio = false;
+                store.recording.disable_vision = true;
+                store.recording.audio_transcription_engine = "screenpipe-cloud".to_string();
+                store.user = store::User::default();
+                store
+                    .extra
+                    .insert("_parakeetDefaultMigrationDone".to_string(), json!(true));
+                store
+                    .extra
+                    .insert("_proCloudMigrationDone".to_string(), json!(true));
+                info!("E2E seed: screenpipe cloud audio fallback");
+            }
+
             app.manage(store.clone());
 
             // Set Chinese HuggingFace mirror early — before any model downloads
@@ -1352,8 +1419,6 @@ async fn main() {
                         map.insert("languages".into(), serde_json::json!(store.recording.languages));
                         map.insert("use_pii_removal".into(), serde_json::json!(store.recording.use_pii_removal));
                         map.insert("disable_vision".into(), serde_json::json!(store.recording.disable_vision));
-                        map.insert("enable_input_capture".into(), serde_json::json!(true));
-                        map.insert("enable_accessibility".into(), serde_json::json!(true));
                         map.insert("auto_start_enabled".into(), serde_json::json!(store.auto_start_enabled));
                         map.insert("platform".into(), serde_json::json!(store.platform));
                         map.insert("embedded_llm_enabled".into(), serde_json::json!(store.embedded_llm.enabled));
@@ -1663,8 +1728,15 @@ async fn main() {
                             // Permissions check
                             let permissions_check = permissions::do_permissions_check(false);
                             let disable_audio = store_clone.recording.disable_audio;
+                            let disable_vision = store_clone.recording.disable_vision;
 
-                            if !permissions_check.screen_recording.permitted() {
+                            // Only block server start on missing screen-recording
+                            // perms when vision is actually requested. With
+                            // `disable_vision = true` (set by E2E seed
+                            // `no-recording`, or by user choice in the future)
+                            // the SCK code path is never exercised, so we can
+                            // boot the server + HTTP API + DB without TCC.
+                            if !disable_vision && !permissions_check.screen_recording.permitted() {
                                 warn!("Screen recording permission not granted: {:?}. Server will not start.", permissions_check.screen_recording);
                                 is_starting_clone.store(false, std::sync::atomic::Ordering::SeqCst);
                                 return;
@@ -1673,6 +1745,8 @@ async fn main() {
                             if !disable_audio && !permissions_check.microphone.permitted() {
                                 warn!("Microphone permission not granted: {:?}. Audio recording will not work.", permissions_check.microphone);
                             }
+
+                            crate::recording::notify_audio_engine_fallback(&store_clone);
 
                             info!("Starting server core + capture on dedicated runtime...");
 
@@ -1710,7 +1784,7 @@ async fn main() {
                             };
 
                             // Phase 2: Start capture session
-                            let capture = match capture_session::CaptureSession::start(&server, &config).await {
+                            let capture = match capture_session::CaptureSession::start(&server, &config, true).await {
                                 Ok(c) => c,
                                 Err(e) => {
                                     error!("Failed to start capture: {}", e);
@@ -1770,9 +1844,7 @@ async fn main() {
                 });
             }
 
-            // Check analytics settings from store
-            // Offline mode disables PostHog analytics but keeps Sentry
-            let is_analytics_enabled = store.recording.analytics_enabled && !offline_mode;
+            let is_analytics_enabled = store.recording.analytics_enabled;
 
             let is_autostart_enabled = store
                 .auto_start_enabled;
@@ -1844,6 +1916,9 @@ async fn main() {
                     sleep(Duration::from_millis(500)).await;
                 }
             });
+
+            crate::monitor_events::start(app_handle.clone());
+            crate::meeting_live_notes::start(app_handle.clone());
 
             #[cfg(target_os = "macos")]
             crate::window::reset_to_regular_and_refresh_tray(&app_handle);
@@ -1919,6 +1994,11 @@ async fn main() {
                 tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
                 ics_calendar::start_ics_calendar_poller(ics_app_handle).await;
             });
+
+            // Enterprise telemetry sync (no-op stub on consumer builds).
+            // Runs forever in background; only takes effect on enterprise-
+            // telemetry builds with SCREENPIPE_ENTERPRISE_LICENSE_KEY env set.
+            let _enterprise_shutdown_tx = enterprise_sync::spawn(&app_handle);
 
             // Auto-start cloud sync if it was enabled
             let app_handle_clone = app_handle.clone();

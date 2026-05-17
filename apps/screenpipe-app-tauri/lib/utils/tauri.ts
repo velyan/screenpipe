@@ -256,6 +256,32 @@ async isEnterpriseBuildCmd() : Promise<boolean> {
     return await TAURI_INVOKE("is_enterprise_build_cmd");
 },
 /**
+ * Toggle the "Cloud audio + video + image analysis" capability
+ * in the screenpipe-api skill that Pi installs on every run.
+ * 
+ * Mechanism: the screenpipe-core `Pi::ensure_screenpipe_skill` reads
+ * `~/.screenpipe/cloud_media_analysis.disabled` at install time and
+ * conditionally appends the Gemma 4 E4B confidential-enclave section
+ * to `<project>/.pi/skills/screenpipe-api/SKILL.md`. Default (no
+ * marker) = enabled. This command just creates or removes the marker.
+ * 
+ * Why a marker file instead of editing the rendered skill: Pi rewrites
+ * the rendered skill from a compiled-in template on every run, so any
+ * post-install edits get overwritten on the next pipe execution. The
+ * only stable seam is at install time.
+ * 
+ * Idempotent. Effect takes hold on the next Pi run (next pipe
+ * execution or new pi-chat session).
+ */
+async setCloudMediaAnalysisSkill(enabled: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_cloud_media_analysis_skill", { enabled }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Read the enterprise license key from `enterprise.json`.
  * Checks in order:
  * 1. Next to executable (pushed via Intune/MDM to Program Files / .app bundle)
@@ -354,6 +380,12 @@ async showWindowActivated(window: ShowRewindWindow) : Promise<Result<null, strin
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+async showMainWindow() : Promise<void> {
+    await TAURI_INVOKE("show_main_window");
+},
+async hideMainWindow() : Promise<void> {
+    await TAURI_INVOKE("hide_main_window");
 },
 /**
  * Open the screenpi.pe login page.
@@ -861,6 +893,19 @@ async piPrompt(sessionId: string | null, message: string, images: PiImageContent
 }
 },
 /**
+ * Steer the active Pi reply using Pi's native steering command.
+ * Unlike `pi_prompt`, this is intentionally not added to the follow-up queue:
+ * Pi interrupts the current stream and resumes with the steering instruction.
+ */
+async piSteer(sessionId: string | null, message: string, images: PiImageContent[] | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("pi_steer", { sessionId, message, images }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Read the current queued-prompt list for a session. Useful for an initial
  * render before the first `pi-queue-changed` event arrives, and for new
  * chat windows opening on top of an in-progress queue.
@@ -1317,7 +1362,7 @@ startDisplay: string;
 /**
  * Pre-formatted local time, e.g. "5:00 PM" — for display.
  */
-endDisplay: string; attendees: string[]; location: string | null; calendarName: string; isAllDay: boolean; 
+endDisplay: string; attendees: string[]; location: string | null; meetingUrl: string | null; calendarName: string; isAllDay: boolean; 
 /**
  * Source identifier: "native" for OS calendar, "ics" for ICS feeds.
  * Used by meeting detector to merge events from multiple publishers.
@@ -1443,6 +1488,17 @@ audioTranscriptionEngine: string;
  */
 transcriptionMode: string; 
 /**
+ * Stream live notes only while a meeting is active. This is separate
+ * from 24/7 background transcription: the recorder still writes durable
+ * chunks, while this powers the low-latency meeting note UI.
+ */
+meetingLiveTranscriptionEnabled: boolean; 
+/**
+ * Provider for meeting-only live notes. Defaults to the selected audio
+ * transcription engine so local/custom engines work without Cloud.
+ */
+meetingLiveTranscriptionProvider: string; 
+/**
  * Audio device names/IDs to capture from.
  */
 audioDevices: string[]; 
@@ -1476,10 +1532,6 @@ audioChunkDuration: number;
  * Kept as String (not Option) to match existing store.bin schema.
  */
 deepgramApiKey: string; 
-/**
- * VAD sensitivity level: "low", "medium", "high".
- */
-vadSensitivity: string; 
 /**
  * Filter music-dominant audio before transcription using spectral analysis.
  */
@@ -1518,6 +1570,22 @@ videoQuality: string;
  */
 maxSnapshotWidth?: number; 
 /**
+ * Skip the background JPEG->MP4 snapshot compaction worker.
+ * Use when the MP4 timeline UI is not used, e.g. task-mining tools
+ * that consume accessibility_text / ui_events only.
+ * Side effect: JPEGs are not compacted, so disk usage depends on retention.
+ */
+disableSnapshotCompaction?: boolean; 
+/**
+ * Skip the v2 meeting detector watcher (5s-interval process / AX scan).
+ * Use when meeting detection is not consumed (task-mining, headless analysis,
+ * agents that read accessibility_text and ui_events only) — avoids the
+ * constant process enumeration + AX tree walk cost.
+ * Side effect: meeting-related DB rows are not generated; the audio pipeline's
+ * in_meeting override flag stays false.
+ */
+disableMeetingDetector?: boolean; 
+/**
  * Window titles to exclude from capture.
  */
 ignoredWindows: string[]; 
@@ -1554,11 +1622,6 @@ disableClipboardCapture?: boolean;
  */
 recordWhileLocked?: boolean; 
 /**
- * Automatically append text typed during a meeting to the meeting's note
- * when the meeting ends. Groups typed text by app/window context.
- */
-appendTypedTextToMeetingNotes?: boolean; 
-/**
  * Languages for transcription (ISO 639-1 codes).
  */
 languages: string[]; 
@@ -1566,6 +1629,52 @@ languages: string[];
  * Redact personally identifiable information from transcriptions.
  */
 usePiiRemoval: boolean; 
+/**
+ * Enable the async PII reconciliation worker. When `true`, a
+ * background task runs after capture and OVERWRITES PII in the
+ * source columns of `ocr_text`, `audio_transcriptions`,
+ * `frames.accessibility_text`, and `ui_events.text_content`. Raw
+ * secrets are gone after the worker processes the row — that's
+ * the contract of the user-facing "AI PII removal" toggle.
+ * Off by default; capture path is unaffected either way. See
+ * `screenpipe-redact` for the full design.
+ */
+asyncPiiRedaction?: boolean; 
+/**
+ * Enable image-PII redaction on captured screen frames. When
+ * `true`, the `screenpipe_redact::image::worker` runs alongside
+ * the text reconciliation worker, scans the `frames` table, runs
+ * the RF-DETR-Nano detector, and blacks out detected PII regions
+ * in each JPG (atomic overwrite of the source file). Off by
+ * default — orthogonal to `async_pii_redaction` (text path),
+ * independently togglable. Requires the `screenpipe-redact`
+ * crate to be built with one of the `onnx-*` cargo features and
+ * the `rfdetr_v8.onnx` model present at `~/.screenpipe/models/`.
+ */
+asyncImagePiiRedaction?: boolean; 
+/**
+ * Where the AI PII redaction actually runs. One switch flips
+ * BOTH modalities (text + image) because the user-facing
+ * "AI PII removal" toggle is one knob.
+ * 
+ * - `"local"` (default): on-device ONNX models. Privacy by
+ * construction — pixels and text never leave the box. Slower,
+ * especially on weak hardware (~1-3 s per text row, ~60-180 ms
+ * per frame).
+ * - `"tinfoil"`: send to the screenpipe Tinfoil enclave (H200,
+ * confidential compute). Much faster (~30-100 ms per row /
+ * frame). Data leaves the device but is end-to-end encrypted
+ * into an attested confidential-compute enclave that even
+ * Tinfoil ops can't read into. Requires network +
+ * `SCREENPIPE_PRIVACY_FILTER_API_KEY` (or the cloud auth key).
+ * 
+ * Note on attestation: the proper attested-transport client
+ * (Tinfoil's secure-client SDK) is Go/Python/JS-only at time of
+ * writing. The Rust adapter currently uses plain HTTPS — which
+ * gives confidentiality vs. the network but NOT vs. a malicious
+ * Tinfoil operator. Tracked separately; structured for swap-in.
+ */
+piiBackend?: string; 
 /**
  * Screenpipe cloud user ID. Empty string means not logged in.
  * Kept as String (not Option) to match existing store.bin schema.
@@ -1623,18 +1732,6 @@ analyticsEnabled: boolean;
  * Persistent analytics ID (UUID, stable across sessions).
  */
 analyticsId: string; 
-/**
- * Legacy: input capture is always enabled. Kept for serde compat with
- * existing store.bin files; deserialized but ignored.
- * @deprecated input capture is always enabled; will be removed
- */
-enableInputCapture?: boolean; 
-/**
- * Legacy: accessibility capture is always enabled. Kept for serde compat
- * with existing store.bin files; deserialized but ignored.
- * @deprecated accessibility capture is always enabled; will be removed
- */
-enableAccessibility?: boolean; 
 /**
  * Enable AI workflow event detection (cloud feature, requires subscription).
  * When enabled, classifies desktop activity and triggers event-based pipes.
@@ -1726,6 +1823,12 @@ showRestartNotifications?: boolean;
  * When true, apply macOS vibrancy effect to the sidebar for a translucent look.
  */
 translucentSidebar?: boolean; 
+/**
+ * When true (default), hide model "thinking" reasoning blocks in the chat
+ * transcript. The model still emits them server-side; we just don't
+ * render the collapsible block in the UI.
+ */
+hideThinkingBlocks?: boolean; 
 /**
  * UI theme: "light", "dark", or "system".
  */

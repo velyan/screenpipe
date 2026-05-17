@@ -10,8 +10,9 @@ use axum::{
 use oasgen::{oasgen, OaSchema};
 
 use screenpipe_db::DatabaseManager;
-use screenpipe_db::MeetingRecord;
+use screenpipe_db::{MeetingRecord, MeetingTranscriptSegment};
 
+use crate::meeting_telemetry::{capture_detection_decision, capture_detection_feedback};
 use crate::server::AppState;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -35,12 +36,26 @@ pub struct MergeMeetingsRequest {
 }
 
 #[derive(OaSchema, Deserialize, Debug)]
+pub struct SplitMeetingRequest {
+    /// RFC3339 timestamp strictly between the meeting's start and end.
+    /// The original row keeps `[start, at]`; a new row is created for `[at, end]`.
+    pub at: String,
+}
+
+#[derive(OaSchema, Serialize, Debug)]
+pub struct SplitMeetingResponse {
+    pub before: MeetingRecord,
+    pub after: MeetingRecord,
+}
+
+#[derive(OaSchema, Deserialize, Debug)]
 pub struct BulkDeleteMeetingsRequest {
     pub ids: Vec<i64>,
 }
 
 #[derive(OaSchema, Deserialize, Debug)]
 pub struct StartMeetingRequest {
+    pub id: Option<i64>,
     pub app: Option<String>,
     pub title: Option<String>,
     pub attendees: Option<String>,
@@ -216,16 +231,49 @@ pub(crate) async fn get_meeting_handler(
 }
 
 #[oasgen]
+pub(crate) async fn get_meeting_transcript_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+) -> Result<JsonResponse<Vec<MeetingTranscriptSegment>>, (StatusCode, JsonResponse<Value>)> {
+    state.db.get_meeting_by_id(id).await.map_err(|e| {
+        (
+            StatusCode::NOT_FOUND,
+            JsonResponse(json!({"error": format!("meeting not found: {}", e)})),
+        )
+    })?;
+
+    let segments = state
+        .db
+        .list_meeting_transcript_segments(id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonResponse(json!({"error": e.to_string()})),
+            )
+        })?;
+
+    Ok(JsonResponse(segments))
+}
+
+#[oasgen]
 pub(crate) async fn delete_meeting_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<i64>,
 ) -> Result<JsonResponse<Value>, (StatusCode, JsonResponse<Value>)> {
+    let meeting_before = state.db.get_meeting_by_id(id).await.ok();
     let rows_affected = state.db.delete_meeting(id).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             JsonResponse(json!({"error": e.to_string()})),
         )
     })?;
+
+    if rows_affected > 0 {
+        if let Some(meeting) = meeting_before {
+            capture_detection_feedback("delete", "likely_false_positive", &[meeting], None);
+        }
+    }
 
     Ok(JsonResponse(json!({"deleted": rows_affected})))
 }
@@ -277,6 +325,13 @@ pub(crate) async fn bulk_delete_meetings_handler(
         ));
     }
 
+    let mut meetings_before = Vec::new();
+    for id in &body.ids {
+        if let Ok(meeting) = state.db.get_meeting_by_id(*id).await {
+            meetings_before.push(meeting);
+        }
+    }
+
     let mut total_deleted = 0u64;
     for id in &body.ids {
         match state.db.delete_meeting(*id).await {
@@ -290,6 +345,15 @@ pub(crate) async fn bulk_delete_meetings_handler(
                 ));
             }
         }
+    }
+
+    if total_deleted > 0 {
+        capture_detection_feedback(
+            "bulk_delete",
+            "likely_false_positive",
+            &meetings_before,
+            None,
+        );
     }
 
     Ok(JsonResponse(json!({"deleted": total_deleted})))
@@ -307,6 +371,13 @@ pub(crate) async fn merge_meetings_handler(
         ));
     }
 
+    let mut meetings_before = Vec::new();
+    for id in &body.ids {
+        if let Ok(meeting) = state.db.get_meeting_by_id(*id).await {
+            meetings_before.push(meeting);
+        }
+    }
+
     let meeting = state.db.merge_meetings(&body.ids).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -314,7 +385,48 @@ pub(crate) async fn merge_meetings_handler(
         )
     })?;
 
+    capture_detection_feedback("merge", "false_split", &meetings_before, Some(&meeting));
+
     Ok(JsonResponse(meeting))
+}
+
+#[oasgen]
+pub(crate) async fn split_meeting_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i64>,
+    axum::Json(body): axum::Json<SplitMeetingRequest>,
+) -> Result<JsonResponse<SplitMeetingResponse>, (StatusCode, JsonResponse<Value>)> {
+    // Validate the timestamp at the edge so callers get a clean 400, not the
+    // generic 500 we'd return on a Protocol error from the DB layer.
+    if DateTime::parse_from_rfc3339(&body.at).is_err() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            JsonResponse(json!({"error": format!("'at' must be RFC3339, got: {}", body.at)})),
+        ));
+    }
+
+    let meeting_before = state.db.get_meeting_by_id(id).await.ok();
+
+    let (before, after) = state.db.split_meeting(id, &body.at).await.map_err(|e| {
+        // Distinguish "bad split point" (400) and "no such meeting" (404) from
+        // genuine 500s. RowNotFound is what split_meeting returns when the id
+        // doesn't exist or the meeting hasn't ended yet.
+        let msg = e.to_string();
+        let status = if msg.contains("must be strictly between") {
+            StatusCode::BAD_REQUEST
+        } else if msg.contains("no rows returned") || msg.contains("RowNotFound") {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        (status, JsonResponse(json!({"error": msg})))
+    })?;
+
+    if let Some(meeting) = meeting_before {
+        capture_detection_feedback("split", "false_merge", &[meeting], Some(&before));
+    }
+
+    Ok(JsonResponse(SplitMeetingResponse { before, after }))
 }
 
 #[oasgen]
@@ -330,37 +442,63 @@ pub(crate) async fn start_meeting_handler(
     axum::Json(body): axum::Json<StartMeetingRequest>,
 ) -> Result<JsonResponse<MeetingRecord>, (StatusCode, JsonResponse<Value>)> {
     let app = body.app.as_deref().unwrap_or("manual");
-    let id = state
-        .db
-        .insert_meeting(
-            app,
-            "manual",
-            body.title.as_deref(),
-            body.attendees.as_deref(),
-        )
-        .await
-        .map_err(|e| {
+    let resumed_existing = body.id.is_some();
+    let id = if let Some(id) = body.id {
+        let status = resolve_meeting_status(&state).await?;
+        if status.active && status.active_meeting_id != Some(id) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                JsonResponse(json!({"error": "another meeting is already active"})),
+            ));
+        }
+
+        // Fetch first so a bad id is reported as a clean 404 before we try to
+        // reopen it. Reopening keeps the original note row and restarts the
+        // live meeting lifecycle for streaming transcription.
+        state.db.get_meeting_by_id(id).await.map_err(|e| {
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                JsonResponse(json!({"error": e.to_string()})),
+                StatusCode::NOT_FOUND,
+                JsonResponse(json!({"error": format!("meeting not found: {}", e)})),
             )
         })?;
+
+        if status.active_meeting_id != Some(id) {
+            state.db.reopen_meeting(id).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    JsonResponse(json!({"error": e.to_string()})),
+                )
+            })?;
+        }
+        id
+    } else {
+        state
+            .db
+            .insert_meeting(
+                app,
+                "manual",
+                body.title.as_deref(),
+                body.attendees.as_deref(),
+            )
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    JsonResponse(json!({"error": e.to_string()})),
+                )
+            })?
+    };
 
     {
         let mut lock = state.manual_meeting.write().await;
         *lock = Some(id);
     }
+    if let Some(detector) = state.audio_manager.meeting_detector().await {
+        detector.set_v2_in_meeting(true);
+    }
 
     if let Ok(status) = resolve_meeting_status(&state).await {
         emit_meeting_status_changed(&status);
-    }
-
-    // Emit event so triggered pipes can react
-    if let Err(e) = screenpipe_events::send_event(
-        "meeting_started",
-        serde_json::json!({ "meeting_id": id, "app": app, "title": body.title }),
-    ) {
-        tracing::warn!("failed to emit meeting_started event: {}", e);
     }
 
     let meeting = state.db.get_meeting_by_id(id).await.map_err(|e| {
@@ -369,6 +507,31 @@ pub(crate) async fn start_meeting_handler(
             JsonResponse(json!({"error": format!("meeting not found: {}", e)})),
         )
     })?;
+
+    capture_detection_decision(&meeting, "manual_start", None);
+    capture_detection_feedback(
+        "manual_start",
+        "manual_start_possible_missed_detection",
+        std::slice::from_ref(&meeting),
+        None,
+    );
+
+    // Emit event so triggered pipes can react
+    if let Err(e) = screenpipe_events::send_event(
+        "meeting_started",
+        serde_json::json!({
+            "meeting_id": id,
+            "app": meeting.meeting_app,
+            "title": meeting.title,
+            "detection_source": if resumed_existing {
+                "manual"
+            } else {
+                meeting.detection_source.as_str()
+            }
+        }),
+    ) {
+        tracing::warn!("failed to emit meeting_started event: {}", e);
+    }
 
     Ok(JsonResponse(meeting))
 }
@@ -418,6 +581,9 @@ pub(crate) async fn stop_meeting_handler(
             *lock = None;
         }
     }
+    if let Some(detector) = state.audio_manager.meeting_detector().await {
+        detector.set_v2_in_meeting(false);
+    }
 
     if let Ok(status) = resolve_meeting_status(&state).await {
         emit_meeting_status_changed(&status);
@@ -436,6 +602,13 @@ pub(crate) async fn stop_meeting_handler(
             JsonResponse(json!({"error": format!("meeting not found: {}", e)})),
         )
     })?;
+
+    capture_detection_feedback(
+        "stop",
+        "user_stopped_meeting",
+        std::slice::from_ref(&meeting),
+        None,
+    );
 
     // Signal detector to stop tracking this meeting immediately (skip grace period)
     if let Err(e) = screenpipe_events::send_event(

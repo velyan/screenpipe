@@ -12,6 +12,7 @@ import posthog from "posthog-js";
 import { User } from "../utils/tauri";
 import { SettingsStore } from "../utils/tauri";
 import { installAuthInterceptor } from "../auth-guard";
+import type { SourceCitation } from "@/lib/source-citations";
 export type VadSensitivity = "low" | "medium" | "high";
 
 export type AIProviderType =
@@ -80,6 +81,7 @@ export interface ChatMessage {
 	content: string;
 	timestamp: number;
 	contentBlocks?: any[];
+	sourceCitations?: SourceCitation[];
 	model?: string;
 	provider?: string;
 	/** UI override — when set, the sidebar / panel header renders this
@@ -168,14 +170,14 @@ export type Settings = SettingsStore & {
 	lockVaultShortcut?: string;
 	/** When true, audio devices follow system default and auto-switch on changes */
 	useSystemDefaultAudio?: boolean;
-	/** @deprecated Always true — kept for serde compat */
-	enableInputCapture?: boolean;
-	/** @deprecated Always true — kept for serde compat */
-	enableAccessibility?: boolean;
 	/** Enable AI workflow event detection (cloud, triggers event-based pipes) */
 	enableWorkflowEvents?: boolean;
 	/** Audio transcription scheduling: "realtime" (default) or "batch" (longer chunks for quality) */
 	transcriptionMode?: "realtime" | "smart" | "batch";
+	/** Meeting-only live notes. Separate from background 24/7 transcription. */
+	meetingLiveTranscriptionEnabled?: boolean;
+	/** Provider for meeting-only live notes. Defaults to the selected transcription engine. */
+	meetingLiveTranscriptionProvider?: "selected-engine" | "screenpipe-cloud" | "disabled" | "openai-realtime" | "deepgram-live";
 	/** User's name for speaker identification — input device audio will be labeled with this name */
 	userName?: string;
 	/** When true, screen capture continues but OCR text extraction is skipped (saves CPU) */
@@ -194,6 +196,15 @@ export type Settings = SettingsStore & {
 	cloudArchiveRetentionDays?: number;
 	/** Sync pipe configurations across devices (requires cloud sync subscription) */
 	pipeSyncEnabled?: boolean;
+	/** Slug of the pipe used to summarize meetings. Drives both the manual
+	 * "Summarize with AI" button (its body becomes the chat prompt) and the
+	 * auto-fire on meeting_ended (the picked pipe owns the trigger). Default:
+	 * "meeting-summary" (the built-in pipe). */
+	meetingSummaryPipeSlug?: string;
+	/** Sync memories (facts, preferences, decisions, insights) across devices.
+	 * Independent of pipeSyncEnabled — a user might want their memories on
+	 * every device but keep pipes device-local, or vice versa. Pro-gated. */
+	memoriesSyncEnabled?: boolean;
 	/** OpenAI-compatible transcription endpoint URL */
 	openaiCompatibleEndpoint?: string;
 	/** OpenAI-compatible transcription API key */
@@ -204,6 +215,13 @@ export type Settings = SettingsStore & {
 	openaiCompatibleHeaders?: Record<string, string>;
 	/** Send raw WAV audio instead of MP3 to OpenAI-compatible endpoint */
 	openaiCompatibleRawAudio?: boolean;
+	/** Let Pi / Claude Code call the confidential cloud enclave
+	 * (Gemma 4 E4B inside an attested Tinfoil CVM) to analyze audio,
+	 * video frames, and images from screenpipe data. Default true. When
+	 * false, the "Cloud audio + video + image analysis" section is
+	 * stripped from `~/.claude/skills/screenpipe-api/SKILL.md` so agents
+	 * literally cannot see the endpoint and won't try to call it. */
+	cloudMediaAnalysisEnabled?: boolean;
 	/** Filter music-dominant audio before transcription (reduces Spotify/YouTube music noise) */
 	filterMusic?: boolean;
 	/** Maximum batch transcription duration in seconds (0 = engine default: Deepgram 5000s, OpenAI 3000s, Whisper 600s) */
@@ -219,8 +237,6 @@ export type Settings = SettingsStore & {
 	powerMode?: "auto" | "performance" | "battery_saver";
 	/** Show restart notifications when audio/vision capture stalls (default: false for now) */
 	showRestartNotifications?: boolean;
-	/** Offline mode — blocks all external network from pipes, disables PostHog telemetry, keeps Sentry crash reports */
-	offlineMode?: boolean;
 	/** Pause all screen capture when a DRM-protected streaming app (Netflix, Disney+, etc.) or a remote-desktop client (Omnissa/VMware Horizon) is focused — they blank their windows during screen recording */
 	pauseOnDrmContent?: boolean;
 	/** Skip clipboard capture in the UI recorder (events + content). Recommended when piping ~/.screenpipe to a remote LLM since passwords / API keys often pass through the clipboard. */
@@ -228,10 +244,10 @@ export type Settings = SettingsStore & {
 	/** Experimental: capture System Audio via CoreAudio Process Tap (macOS 14.4+) instead of ScreenCaptureKit.
 	 *  Off by default. Ignored on macOS <14.4 and non-macOS — falls back to SCK. */
 	experimentalCoreaudioSystemAudio?: boolean;
+	/** Experimental: request Windows WASAPI microphone AEC when supported. */
+	windowsInputAecEnabled?: boolean;
 	/** Continue recording audio when the screen is locked (default: false) */
 	recordWhileLocked?: boolean;
-	/** Auto-append typed text to meeting notes when a meeting ends */
-	appendTypedTextToMeetingNotes?: boolean;
 	/** Auto-delete local data older than retention days (free alternative to cloud archive) */
 	localRetentionEnabled?: boolean;
 	/** Days to keep data locally before auto-deleting (default: 14) */
@@ -241,12 +257,16 @@ export type Settings = SettingsStore & {
 	localRetentionMode?: "media" | "all";
 	/** Apply macOS vibrancy effect to sidebar for a translucent glass look */
 	translucentSidebar?: boolean;
+	/** Hide model "thinking" reasoning blocks in chat (default: true) */
+	hideThinkingBlocks?: boolean;
 	/** Notification preferences — which notification sources are enabled */
 	notificationPrefs?: {
 		captureStalls: boolean;
 		appUpdates: boolean;
 		pipeSuggestions: boolean;
 		pipeNotifications: boolean;
+		/** Toast when a monitor is plugged, unplugged, or switched (clamshell, dock). Default true. */
+		displayChanges?: boolean;
 		mutedPipes: string[];
 	};
 	/** Remote devices to monitor pipes on (LAN addresses) */
@@ -392,6 +412,8 @@ let DEFAULT_SETTINGS: Settings = {
 			analyticsId: "",
 			devMode: false,
 			audioTranscriptionEngine: "whisper-large-v3-turbo-quantized",
+			meetingLiveTranscriptionEnabled: true,
+			meetingLiveTranscriptionProvider: "selected-engine",
 			ocrEngine: "default",
 			monitorIds: ["default"],
 			audioDevices: ["default"],
@@ -406,7 +428,6 @@ let DEFAULT_SETTINGS: Settings = {
 			ignoredUrls: [],
 			teamFilters: { ignoredWindows: [], includedWindows: [], ignoredUrls: [] },
 
-			vadSensitivity: "medium",
 			analyticsEnabled: true,
 			audioChunkDuration: 30,
 			useChineseMirror: false,
@@ -455,21 +476,20 @@ let DEFAULT_SETTINGS: Settings = {
 				activeConversationId: null,
 				historyEnabled: true,
 			},
-			enableInputCapture: true,
-			enableAccessibility: true,
 			overlayMode: "fullscreen",
 			showOverlayInScreenRecording: false,
 			videoQuality: "balanced",
 			transcriptionMode: "batch",
 			cloudArchiveEnabled: false,
 			cloudArchiveRetentionDays: 7,
+			meetingSummaryPipeSlug: "meeting-summary",
 			filterMusic: false,
 			ignoreIncognitoWindows: true,
 			pauseOnDrmContent: false,
 			disableClipboardCapture: false,
 			experimentalCoreaudioSystemAudio: false,
+			windowsInputAecEnabled: false,
 			recordWhileLocked: false,
-			appendTypedTextToMeetingNotes: true,
 			localRetentionEnabled: false,
 			localRetentionDays: 14,
 			localRetentionMode: "media",
@@ -564,6 +584,15 @@ function createSettingsStore() {
 		if (!(settings as any).coreaudioTapMigrationV2) {
 			settings.experimentalCoreaudioSystemAudio = false;
 			(settings as any).coreaudioTapMigrationV2 = true;
+			needsUpdate = true;
+		}
+
+		if (settings.meetingLiveTranscriptionEnabled === undefined) {
+			settings.meetingLiveTranscriptionEnabled = true;
+			needsUpdate = true;
+		}
+		if (!settings.meetingLiveTranscriptionProvider) {
+			settings.meetingLiveTranscriptionProvider = "selected-engine";
 			needsUpdate = true;
 		}
 

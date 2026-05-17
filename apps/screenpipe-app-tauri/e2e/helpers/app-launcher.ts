@@ -47,7 +47,20 @@ function killPort(port: number): void {
 
 // e2e/helpers/ → ../.. = app root (Bun runs from source, no dist)
 const APP_ROOT = resolve(__dirname, '../..');
-const E2E_SEED_FLAGS = 'onboarding';
+// `onboarding` marks the onboarding store complete so the app drops straight
+// into the home window. `no-recording` disables vision + audio so the server
+// boots without Screen Recording / Microphone TCC — without it, an unsigned
+// debug build (`--no-sign`) on a host without granted permissions would have
+// the server early-return at the permission gate and `/health` would never
+// respond. See get_e2e_seed_flags + the recording boot path in main.rs.
+//
+// Override with `SCREENPIPE_E2E_SEED=onboarding` (or any custom value) when
+// running on a host that DOES have TCC granted and you want to exercise the
+// real capture pipeline. `cloud-audio-fallback` is an opt-in macOS seed that
+// leaves audio UI enabled, disables vision, and saves Screenpipe Cloud while
+// logged out so the fallback UX can be asserted. The same env var is read by
+// specs (e.g. timeline) to skip when recording is off.
+export const E2E_SEED_FLAGS = process.env.SCREENPIPE_E2E_SEED ?? 'onboarding,no-recording';
 
 export function getAppPath(): string {
   const base = resolve(APP_ROOT, 'src-tauri/target/debug');
@@ -92,6 +105,10 @@ export async function startApp(port = WEBDRIVER_PORT): Promise<ReturnType<typeof
       SCREENPIPE_DATA_DIR: e2eDataDir,
       SCREENPIPE_E2E_SEED: E2E_SEED_FLAGS,
       TAURI_WEBDRIVER_PORT: String(port),
+      // When the app panics under E2E (common during early platform bring-up),
+      // a backtrace in CI logs is far more actionable than the default "run with
+      // RUST_BACKTRACE=1" hint.
+      RUST_BACKTRACE: process.env.RUST_BACKTRACE ?? '1',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });

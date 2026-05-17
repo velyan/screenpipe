@@ -13,13 +13,17 @@ import {
   type RefObject,
   type MutableRefObject,
 } from "react";
+import { emit, listen } from "@tauri-apps/api/event";
 import { ChatConversation } from "@/lib/hooks/use-settings";
 import { commands } from "@/lib/utils/tauri";
 import {
   saveConversationFile,
   deleteConversationFile,
-  loadAllConversations,
+  listConversations,
+  searchConversations,
   migrateFromStoreBin,
+  CHAT_HISTORY_INITIAL_LIMIT,
+  type ConversationMeta,
 } from "@/lib/chat-storage";
 
 
@@ -74,6 +78,11 @@ interface UseChatConversationsOpts {
   settings: any;
 }
 
+interface SaveConversationOptions {
+  refreshHistory?: boolean;
+  syncActiveConversation?: boolean;
+}
+
 export function useChatConversations(opts: UseChatConversationsOpts) {
   const {
     messages,
@@ -107,27 +116,196 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     });
   }, []);
   const [historySearch, setHistorySearch] = useState("");
-  const [fileConversations, setFileConversations] = useState<ChatConversation[]>([]);
+  const [fileConversations, setFileConversations] = useState<ConversationMeta[]>([]);
 
   // Run migration from store.bin on mount, then load conversations from files
   const migrationDoneRef = useRef(false);
+  const historyRequestRef = useRef(0);
+  const lastHistoryQueryRef = useRef<string | null>(null);
+  const [historyReady, setHistoryReady] = useState(false);
+  const historyRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const loadConversationMetas = useCallback(async (query: string) => {
+    const options = {
+      limit: CHAT_HISTORY_INITIAL_LIMIT,
+      includeHidden: false,
+    } as const;
+    const q = query.trim();
+    return q ? searchConversations(q, options) : listConversations(options);
+  }, []);
+
   useEffect(() => {
     if (migrationDoneRef.current) return;
     migrationDoneRef.current = true;
     (async () => {
-      await migrateFromStoreBin();
-      const convs = await loadAllConversations();
-      setFileConversations(convs);
+      try {
+        await migrateFromStoreBin();
+        const convs = await loadConversationMetas("");
+        setFileConversations(convs);
+        lastHistoryQueryRef.current = "";
+      } catch {
+        setFileConversations([]);
+        lastHistoryQueryRef.current = "";
+      } finally {
+        setHistoryReady(true);
+      }
     })();
+  }, [loadConversationMetas]);
+
+  useEffect(() => {
+    if (!historyReady) return;
+    const q = historySearch.trim();
+    if (lastHistoryQueryRef.current === q) return;
+    const requestId = ++historyRequestRef.current;
+    const timer = setTimeout(() => {
+      loadConversationMetas(q)
+        .then((convs) => {
+          if (historyRequestRef.current === requestId) {
+            setFileConversations(convs);
+            lastHistoryQueryRef.current = q;
+          }
+        })
+        .catch(() => {
+          if (historyRequestRef.current === requestId) {
+            setFileConversations([]);
+          }
+        });
+    }, q ? 200 : 0);
+
+    return () => clearTimeout(timer);
+  }, [historyReady, historySearch, loadConversationMetas]);
+
+  const refreshFileConversations = useCallback(async () => {
+    const q = historySearch.trim();
+    const convs = await loadConversationMetas(q);
+    setFileConversations(convs);
+    lastHistoryQueryRef.current = q;
+  }, [historySearch, loadConversationMetas]);
+
+  const scheduleHistoryRefresh = useCallback((delayMs = 80) => {
+    if (historyRefreshTimerRef.current) {
+      clearTimeout(historyRefreshTimerRef.current);
+    }
+    historyRefreshTimerRef.current = setTimeout(() => {
+      historyRefreshTimerRef.current = null;
+      void refreshFileConversations().catch(() => {});
+    }, delayMs);
+  }, [refreshFileConversations]);
+
+  useEffect(() => {
+    return () => {
+      if (historyRefreshTimerRef.current) {
+        clearTimeout(historyRefreshTimerRef.current);
+        historyRefreshTimerRef.current = null;
+      }
+    };
   }, []);
 
-  const refreshFileConversations = async () => {
-    const convs = await loadAllConversations();
-    setFileConversations(convs);
+  // Cross-window history sync. The overlay and home windows keep separate
+  // React states, so sidebar archive/delete actions in one window won't
+  // update the other's file-backed history list unless we listen for the
+  // broadcast events and refresh locally.
+  useEffect(() => {
+    let cancelled = false;
+    const unlistenFns: Array<() => void> = [];
+
+    (async () => {
+      const unlistenDeleted = await listen<{ id: string }>(
+        "chat-deleted",
+        (event) => {
+          if (cancelled) return;
+          const id = event.payload?.id;
+          if (!id) return;
+          setFileConversations((prev) => prev.filter((c) => c.id !== id));
+          if (conversationId === id) {
+            setMessages([]);
+            setConversationId(null);
+          }
+          scheduleHistoryRefresh();
+        },
+      );
+      unlistenFns.push(unlistenDeleted);
+
+      const unlistenVisibility = await listen<{ id: string; hidden: boolean }>(
+        "chat-visibility-changed",
+        (event) => {
+          if (cancelled) return;
+          const { id, hidden } = event.payload ?? {};
+          if (!id) return;
+          if (hidden) {
+            setFileConversations((prev) => prev.filter((c) => c.id !== id));
+          }
+          scheduleHistoryRefresh();
+        },
+      );
+      unlistenFns.push(unlistenVisibility);
+
+      const unlistenSaved = await listen<{ id: string; title?: string }>(
+        "chat-conversation-saved",
+        (event) => {
+          if (cancelled) return;
+          const { id } = event.payload ?? {};
+          if (!id) return;
+          scheduleHistoryRefresh();
+        },
+      );
+      unlistenFns.push(unlistenSaved);
+    })().catch(() => {
+      // ignore: chat still works without cross-window sync listeners
+    });
+
+    return () => {
+      cancelled = true;
+      for (const unlisten of unlistenFns) unlisten();
+    };
+  }, [conversationId, scheduleHistoryRefresh, setConversationId, setMessages]);
+
+  const upsertFileConversationMeta = (conversation: ChatConversation) => {
+    if (historySearch.trim()) return;
+
+    const msgs = Array.isArray(conversation.messages) ? conversation.messages : [];
+    let lastUserMessageAt = conversation.lastUserMessageAt;
+    if (lastUserMessageAt == null) {
+      for (const m of msgs) {
+        if (m?.role === "user" && typeof m.timestamp === "number") {
+          if (lastUserMessageAt == null || m.timestamp > lastUserMessageAt) {
+            lastUserMessageAt = m.timestamp;
+          }
+        }
+      }
+    }
+
+    const meta: ConversationMeta = {
+      id: conversation.id,
+      title: typeof conversation.title === "string" ? conversation.title : "untitled",
+      createdAt: typeof conversation.createdAt === "number" ? conversation.createdAt : 0,
+      updatedAt: typeof conversation.updatedAt === "number" ? conversation.updatedAt : 0,
+      messageCount: msgs.length,
+      pinned: conversation.pinned === true,
+      hidden: conversation.hidden === true,
+      lastUserMessageAt,
+      kind: conversation.kind ?? "chat",
+      pipeContext: conversation.pipeContext,
+    };
+
+    setFileConversations((prev) => {
+      const existing = prev.find((c) => c.id === meta.id);
+      const nextMeta = existing
+        ? { ...existing, ...meta, pinned: existing.pinned || meta.pinned }
+        : meta;
+      const without = prev.filter((c) => c.id !== meta.id);
+      const next = nextMeta.hidden ? without : [nextMeta, ...without];
+      return next
+        .sort((a, b) => b.updatedAt - a.updatedAt)
+        .slice(0, CHAT_HISTORY_INITIAL_LIMIT);
+    });
+    lastHistoryQueryRef.current = "";
   };
 
   // ---- saveConversation ----
-  const saveConversation = async (msgs: Message[]) => {
+  const saveConversation = async (
+    msgs: Message[],
+    options: SaveConversationOptions = {}
+  ) => {
     if (msgs.length === 0) return;
 
     const historyEnabled = settings?.chatHistory?.historyEnabled ?? true;
@@ -182,6 +360,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
           role: m.role,
           content,
           timestamp: m.timestamp,
+          ...(m.displayContent ? { displayContent: m.displayContent } : {}),
           ...(blocks?.length ? { contentBlocks: blocks } : {}),
           ...(m.images?.length ? { images: m.images } : {}),
           ...(m.model ? { model: m.model } : {}),
@@ -224,7 +403,19 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     }
 
     await saveConversationFile(conversation);
-    await refreshFileConversations();
+    if (options.refreshHistory) {
+      await refreshFileConversations();
+    } else {
+      upsertFileConversationMeta(conversation);
+    }
+    try {
+      await emit("chat-conversation-saved", {
+        id: conversation.id,
+        title: conversation.title,
+      });
+    } catch {
+      // ignore broadcast failures; local save already succeeded
+    }
 
     // Sync the persisted title back into the in-memory chat-store so the
     // sidebar (which reads `sessions[id].title` directly) updates immediately.
@@ -237,6 +428,12 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
         useChatStore.getState().actions.patch(convId, {
           title: conversation.title,
           messageCount: conversation.messages.length,
+          // Clear the draft flag on every save (including the 1.5s auto-save
+          // during streaming). Without this, the sidebar hides the chat for
+          // the entire streaming duration because the auto-save writes the
+          // file to disk but never clears draft:true in the store — so the
+          // chat appears on refresh (file exists) but not in the live sidebar.
+          draft: false,
           ...(conversation.lastUserMessageAt
             ? { lastUserMessageAt: conversation.lastUserMessageAt }
             : {}),
@@ -247,22 +444,24 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     }
 
     // Update activeConversationId in store (lightweight — no conversation data)
-    try {
-      const { getStore } = await import("@/lib/hooks/use-settings");
-      const store = await getStore();
-      const freshSettings = await store.get<any>("settings");
-      await store.set("settings", {
-        ...freshSettings,
-        chatHistory: {
-          ...(freshSettings?.chatHistory || {}),
-          activeConversationId: convId,
-          historyEnabled: true,
-          conversations: [], // keep empty — data lives in files now
-        },
-      });
-      await store.save();
-    } catch (e) {
-      console.warn("[chat] failed to update activeConversationId:", e);
+    if (options.syncActiveConversation !== false) {
+      try {
+        const { getStore } = await import("@/lib/hooks/use-settings");
+        const store = await getStore();
+        const freshSettings = await store.get<any>("settings");
+        await store.set("settings", {
+          ...freshSettings,
+          chatHistory: {
+            ...(freshSettings?.chatHistory || {}),
+            activeConversationId: convId,
+            historyEnabled: true,
+            conversations: [], // keep empty — data lives in files now
+          },
+        });
+        await store.save();
+      } catch (e) {
+        console.warn("[chat] failed to update activeConversationId:", e);
+      }
     }
 
     if (!conversationId) {
@@ -336,7 +535,10 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     streamingSaveTimerRef.current = setTimeout(() => {
       streamingSaveTimerRef.current = null;
       // Snapshot inside the timeout so we save the latest, not stale closure.
-      saveConversation(messages);
+      saveConversation(messages, {
+        refreshHistory: false,
+        syncActiveConversation: false,
+      });
     }, 1500);
 
     return () => {
@@ -375,7 +577,6 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     // vice versa) until the next on-disk hydration. Listeners in
     // standalone-chat.tsx patch their local store on receipt.
     try {
-      const { emit } = await import("@tauri-apps/api/event");
       await emit("chat-renamed", { id: convId, title: trimmed });
     } catch (e) {
       console.warn("[chat] failed to broadcast rename:", e);
@@ -408,6 +609,13 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     } catch (e) {
       console.warn("[chat] failed to clear activeConversationId:", e);
     }
+
+    // Broadcast so other windows (home sidebar / overlay) update immediately.
+    try {
+      await emit("chat-deleted", { id: convId });
+    } catch (e) {
+      console.warn("[chat] failed to broadcast delete:", e);
+    }
   };
 
   // ---- loadConversation ----
@@ -431,7 +639,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
   //      the pi-event router has been accumulating its background
   //      tokens). Fall back to disk only when the store is cold for
   //      this id.
-  const loadConversation = async (conv: ChatConversation) => {
+  const loadConversation = async (conv: ChatConversation | ConversationMeta) => {
     const { useChatStore } = await import("@/lib/stores/chat-store");
     const store = useChatStore.getState();
     const outgoingSid = piSessionIdRef.current;
@@ -518,12 +726,22 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     } else {
       // Cold session — load from disk and seed the store.
       const { loadConversationFile } = await import("@/lib/chat-storage");
-      const full = (await loadConversationFile(conv.id)) || conv;
+      const loaded = await loadConversationFile(conv.id);
+      const full =
+        loaded ||
+        (Array.isArray((conv as ChatConversation).messages)
+          ? (conv as ChatConversation)
+          : null);
+      if (!full) {
+        await refreshFileConversations();
+        return;
+      }
       messagesForPanel = full.messages.map((m) => ({
         id: m.id,
         role: m.role,
         content: m.content,
         timestamp: m.timestamp,
+        ...(m.displayContent ? { displayContent: m.displayContent } : {}),
         ...(m.contentBlocks?.length ? { contentBlocks: m.contentBlocks } : {}),
         ...((m as any).images?.length
           ? { images: (m as any).images }
@@ -726,28 +944,20 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
   };
 
   // ---- filteredConversations ----
-  const filteredConversations = useMemo(() => {
-    if (!historySearch.trim()) return fileConversations;
-
-    const search = historySearch.toLowerCase();
-    return fileConversations.filter((c: ChatConversation) =>
-      c.title.toLowerCase().includes(search) ||
-      c.messages.some(m => m.content.toLowerCase().includes(search))
-    );
-  }, [fileConversations, historySearch]);
+  const filteredConversations = fileConversations;
 
   // ---- groupedConversations ----
   const groupedConversations = useMemo(() => {
-    const groups: { label: string; conversations: ChatConversation[] }[] = [];
+    const groups: { label: string; conversations: ConversationMeta[] }[] = [];
     const now = new Date();
     const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
     const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000);
     const lastWeek = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
 
-    const todayConvs: ChatConversation[] = [];
-    const yesterdayConvs: ChatConversation[] = [];
-    const lastWeekConvs: ChatConversation[] = [];
-    const olderConvs: ChatConversation[] = [];
+    const todayConvs: ConversationMeta[] = [];
+    const yesterdayConvs: ConversationMeta[] = [];
+    const lastWeekConvs: ConversationMeta[] = [];
+    const olderConvs: ConversationMeta[] = [];
 
     for (const conv of filteredConversations) {
       const convDate = new Date(conv.updatedAt);

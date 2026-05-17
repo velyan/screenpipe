@@ -82,6 +82,7 @@ export interface RequestBody {
 	tools?: any[];
 	temperature?: number;
 	max_tokens?: number;
+	max_completion_tokens?: number;
 	tool_choice?: string | { type: 'function'; function: { name: string } };
 	response_format?: ResponseFormat;
 }
@@ -130,8 +131,10 @@ export interface GeminiResponse {
 
 export interface Env {
 	OPENAI_API_KEY: string;
+	OPENAI_REALTIME_TRANSCRIPTION_COST_PER_HOUR?: string;
 	ANTHROPIC_API_KEY: string;
 	DEEPGRAM_API_KEY: string;
+	DEEPGRAM_LIVE_TRANSCRIPTION_COST_PER_HOUR?: string;
 	RATE_LIMITER: DurableObjectNamespace;
 	CLERK_SECRET_KEY: string;
 	GEMINI_API_KEY: string;
@@ -146,6 +149,10 @@ export interface Env {
 	DB: D1Database;
 	// Sentry error tracking
 	SENTRY_DSN: string;
+	// Release identifier passed at deploy time so Sentry can resolve uploaded
+	// source maps to a specific build (`bun run deploy` sets this to the git
+	// short SHA via wrangler --var).
+	SENTRY_RELEASE?: string;
 	// Event classifier (self-hosted vLLM)
 	EVENT_CLASSIFIER_URL: string;
 	// Auto-reload settings
@@ -155,6 +162,12 @@ export interface Env {
 	OPENROUTER_API_KEY: string;
 	// Tinfoil — confidential inference in secure enclaves
 	TINFOIL_API_KEY: string;
+	// Screenpipe's own Tinfoil-hosted enclave (privacy-filter + Gemma 4 E4B
+	// audio/vision/chat) at pii.screenpipe.containers.tinfoil.dev.
+	// Optional — Tinfoil tokens are org-scoped, so TINFOIL_API_KEY is the
+	// fallback. Set this separately only if you need to rotate it
+	// independently of the gemma4-31b path.
+	SCREENPIPE_ENCLAVE_API_KEY?: string;
 	// Admin API auth
 	ADMIN_SECRET: string;
 	// Transcription A/B/C test routing

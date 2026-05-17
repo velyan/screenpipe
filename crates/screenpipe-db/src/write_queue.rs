@@ -104,6 +104,10 @@ pub(crate) enum WriteOp {
         app_name: Option<String>,
         window_name: Option<String>,
         browser_url: Option<String>,
+        /// Absolute filesystem path of the document the focused window is
+        /// editing, when the platform exposes one (macOS via AXDocument).
+        /// Distinct from `browser_url` — this is for editor file paths.
+        document_path: Option<String>,
         focused: bool,
         capture_trigger: Option<String>,
         accessibility_text: Option<String>,
@@ -314,6 +318,7 @@ pub enum SyncTable {
 
 /// Result returned to callers. Each variant matches the return type
 /// of the original public method.
+#[derive(Debug)]
 pub(crate) enum WriteResult {
     /// An inserted row ID (i64). Used by most insert operations.
     Id(i64),
@@ -396,7 +401,7 @@ async fn drain_loop(
                     batch.len()
                 );
             }
-            let notify = RESUME_NOTIFY.get_or_init(|| tokio::sync::Notify::new());
+            let notify = RESUME_NOTIFY.get_or_init(tokio::sync::Notify::new);
             tokio::select! {
                 _ = notify.notified() => {
                     info!("write_queue: resumed after sleep, {} pending", batch.len());
@@ -729,6 +734,7 @@ async fn execute_single_write(
             app_name,
             window_name,
             browser_url,
+            document_path,
             focused,
             capture_trigger,
             accessibility_text,
@@ -748,13 +754,13 @@ async fn execute_single_write(
                     browser_url, app_name, window_name, focused, device_name,
                     snapshot_path, capture_trigger, accessibility_text, text_source,
                     accessibility_tree_json, content_hash, simhash, full_text,
-                    elements_ref_frame_id
+                    elements_ref_frame_id, document_path
                 ) VALUES (
                     NULL, 0, ?1, ?2,
                     ?3, ?4, ?5, ?6, ?7,
                     ?8, ?9, ?10, ?11,
                     ?12, ?13, ?14, ?15,
-                    ?16
+                    ?16, ?17
                 )"#,
             )
             .bind(timestamp)
@@ -773,6 +779,7 @@ async fn execute_single_write(
             .bind(simhash)
             .bind(full_text.as_deref())
             .bind(elements_ref_frame_id)
+            .bind(document_path.as_deref())
             .execute(&mut **conn)
             .await?
             .last_insert_rowid();
@@ -1336,8 +1343,9 @@ async fn execute_single_write(
 // ── Helpers ──────────────────────────────────────────────────────────────
 
 fn send_error_to_all(batch: &mut Vec<PendingWrite>, error: sqlx::Error) {
+    let err_str = error.to_string();
     for pw in batch.drain(..) {
-        let _ = pw.respond.send(Err(sqlx::Error::PoolTimedOut));
+        let _ = pw.respond.send(Err(sqlx::Error::Protocol(err_str.clone())));
     }
     // Log the original error that caused the batch failure
     error!("write_queue: batch failed: {}", error);
@@ -1470,7 +1478,8 @@ mod tests {
                 content_hash INTEGER,
                 simhash INTEGER,
                 full_text TEXT,
-                elements_ref_frame_id INTEGER DEFAULT NULL
+                elements_ref_frame_id INTEGER DEFAULT NULL,
+                document_path TEXT
             )",
         )
         .execute(&pool)
@@ -1732,6 +1741,7 @@ mod tests {
                 app_name: Some("Firefox".to_string()),
                 window_name: Some("GitHub".to_string()),
                 browser_url: Some("https://github.com".to_string()),
+                document_path: None,
                 focused: true,
                 capture_trigger: Some("click".to_string()),
                 accessibility_text: Some("page content".to_string()),
@@ -1935,5 +1945,46 @@ mod tests {
             .unwrap_err();
         assert!(matches!(per_row, sqlx::Error::Database(_)));
         assert!(!is_connection_error(&per_row));
+    }
+
+    /// Regression test for issue #7331781144:
+    /// send_error_to_all() must preserve the original error instead of
+    /// masking it with PoolTimedOut. This allows clients to diagnose
+    /// the real failure (e.g., disk full, locked, corrupt) rather than
+    /// a spurious pool exhaustion.
+    #[test]
+    fn test_send_error_to_all_propagates_actual_error() {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let pw = PendingWrite {
+            op: WriteOp::InsertAudioChunk {
+                file_path: "/tmp/test".into(),
+                timestamp: None,
+            },
+            respond: tx,
+        };
+
+        let mut batch = vec![pw];
+        let disk_error = sqlx::Error::Protocol("disk i/o error".into());
+
+        send_error_to_all(&mut batch, disk_error);
+
+        // The error sent to the handler must contain the original message,
+        // NOT be PoolTimedOut. We decode the Protocol error to verify.
+        match rx.blocking_recv() {
+            Ok(Err(err)) => {
+                let err_msg = err.to_string();
+                assert!(
+                    err_msg.contains("disk i/o error"),
+                    "Error message should contain original error, got: {}",
+                    err_msg
+                );
+                assert!(
+                    !err_msg.contains("PoolTimedOut"),
+                    "Error message should not be PoolTimedOut, got: {}",
+                    err_msg
+                );
+            }
+            other => panic!("Expected error, got: {:?}", other),
+        }
     }
 }

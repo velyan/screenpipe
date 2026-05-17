@@ -20,6 +20,7 @@ screenpipe-screen = { path = "../screenpipe-screen" }
 screenpipe-audio = { path = "../screenpipe-audio" }
 screenpipe-core = { path = "../screenpipe-core", features = ["security", "cloud-sync", "secrets"] }
 screenpipe-db = { path = "../screenpipe-db" }
+screenpipe-redact = { path = "../screenpipe-redact", features = ["opf-text"] }
 screenpipe-a11y = { path = "../screenpipe-a11y", features = ["db"] }
 screenpipe-apple-intelligence = { path = "../screenpipe-apple-intelligence", optional = true }
 screenpipe-config = { path = "../screenpipe-config" }
@@ -82,6 +83,13 @@ rpassword = "5"
 
 # Client http
 reqwest = { workspace = true }
+
+# Tinfoil enclave attestation: AMD SEV-SNP attestation + Sigstore code-provenance
+# verification + TLS cert pinning for the privacy-filter PII redaction service
+# (see src/privacy_filter.rs). Without this, a MITM or compromised CA could
+# observe unredacted text on its way to the enclave.
+# Upstream tinfoilsh/tinfoil-rs main, post-#21 (the ring-backend fix).
+tinfoil = { git = "https://github.com/tinfoilsh/tinfoil-rs" }
 
 # Concurrency
 crossbeam = { workspace = true }
@@ -152,6 +160,10 @@ apple-intelligence = ["dep:screenpipe-apple-intelligence"]
 qwen3-asr = ["screenpipe-audio/qwen3-asr"]
 parakeet = ["screenpipe-audio/parakeet"]
 parakeet-mlx = ["screenpipe-audio/parakeet-mlx"]
+# Image-PII detector via MLX (Apple Silicon-only). Off by default;
+# Mac release builds opt in to pick up the ~6× speedup over the ONNX
+# CoreML EP path.
+rfdetr-mlx = ["screenpipe-redact/mlx-mac"]
 jemalloc = ["tikv-jemallocator"]
 
 [[bin]]
@@ -177,3 +189,8 @@ socket2 = "0.5"
 [target.'cfg(target_os = "macos")'.dependencies]
 cidre = { git = "https://github.com/yury/cidre.git", features = ["ax", "ns", "av", "blocks"] }
 tracing-oslog = { workspace = true }
+
+[package.metadata.cargo-machete]
+# screenpipe-redact is wired into the engine binary (image-PII
+# reconciliation worker, screenpipe-engine.rs:1571).
+ignored = []

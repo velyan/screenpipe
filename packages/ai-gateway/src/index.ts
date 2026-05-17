@@ -3,10 +3,11 @@ import { Env, RequestBody, AuthResult } from './types';
 import { handleOptions, createSuccessResponse, createErrorResponse, addCorsHeaders } from './utils/cors';
 import { validateAuth } from './utils/auth';
 import { RateLimiter, checkRateLimit } from './utils/rate-limiter';
-import { trackUsage, getUsageStatus, isModelAllowed, getTierConfig } from './services/usage-tracker';
+import { trackUsage, getUsageStatus, isModelAllowed, getTierConfig, getCreditBalance } from './services/usage-tracker';
 import { handleChatCompletions } from './handlers/chat';
 import { handleModelListing } from './handlers/models';
 import { handleFileTranscription, handleABTestAdmin } from './handlers/transcription';
+import { handleRealtimeTranscriptionUpgrade } from './handlers/realtime-transcription';
 import { handleVoiceTranscription, handleVoiceQuery, handleTextToSpeech, handleVoiceChat } from './handlers/voice';
 import { handleVertexProxy, handleVertexModels } from './handlers/vertex-proxy';
 import { handleWebSearch } from './handlers/web-search';
@@ -51,11 +52,14 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 			const status = await getUsageStatus(env, authResult.deviceId, authResult.tier, authResult.userId);
 			// Enrich with cost-based limit flag (NOT the raw $ numbers — those
 			// are our internal margin and shouldn't leak to any client/user).
+			// Credits extend the cap 1:1 (1 credit = $1 of headroom) so that the
+			// /billing top-up button actually lifts the limit it advertises.
 			const dailyCost = await getDailyUserCost(env, authResult.deviceId);
 			const maxCost = getTierDailyCostCap(authResult.tier, env);
+			const credits = authResult.userId ? await getCreditBalance(env, authResult.userId) : 0;
 			const enriched = {
 				...status,
-				cost_limit_reached: dailyCost >= maxCost,
+				cost_limit_reached: dailyCost >= maxCost + credits,
 			};
 			return addCorsHeaders(createSuccessResponse(enriched));
 		}
@@ -84,7 +88,15 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 
 		// Chat completions - main AI endpoint
 		if (path === '/v1/chat/completions' && request.method === 'POST') {
-			const body = (await request.json()) as RequestBody;
+			let body: RequestBody;
+			try {
+				body = (await request.json()) as RequestBody;
+			} catch {
+				return addCorsHeaders(createErrorResponse(400, JSON.stringify({
+					error: 'invalid_json',
+					message: 'Request body must be valid JSON.',
+				})));
+			}
 
 			// Check if model is allowed for this tier
 			if (!isModelAllowed(body.model, authResult.tier, env)) {
@@ -101,11 +113,18 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 			// Cheap models (weight 0-1) like qwen3.5-flash, haiku, deepseek-chat
 			// should not trigger cost caps — they're affordable and pipes need them.
 			// Subscribed users get 5x higher cap.
+			//
+			// Credits extend the cap 1:1: a user with a $50 credit balance gets
+			// $50 more headroom for today before this 429 fires. Required to make
+			// the /billing one-click top-up actually unblock the user it sold to.
+			// (The credits are separately consumed per-query in the trackUsage
+			// path below, so this is just the ceiling check.)
 			const modelWeight = getModelWeight(body.model);
 			if (!isZeroCostModel(body.model) && modelWeight >= 3) {
 				const dailyCost = await getDailyUserCost(env, authResult.deviceId);
 				const maxCost = getTierDailyCostCap(authResult.tier, env);
-				if (dailyCost >= maxCost) {
+				const credits = authResult.userId ? await getCreditBalance(env, authResult.userId) : 0;
+				if (dailyCost >= maxCost + credits) {
 					const resetsAt = new Date();
 					resetsAt.setUTCHours(24, 0, 0, 0);
 					return addCorsHeaders(createErrorResponse(429, JSON.stringify({
@@ -275,6 +294,10 @@ async function handleRequest(request: Request, env: Env, ctx: ExecutionContext):
 			}
 
 			return response;
+		}
+
+		if (path === '/v1/realtime' && request.method === 'GET') {
+			return await handleRealtimeTranscriptionUpgrade(request, env, ctx, authResult);
 		}
 
 		if (path === '/v1/models' && request.method === 'GET') {
@@ -619,6 +642,11 @@ export default {
 					dsn: env.SENTRY_DSN,
 					tracesSampleRate: 0.1,
 					beforeSend: scrubSentryEvent,
+					// release must match the value passed to `sentry-cli sourcemaps
+					// upload --release=<R>` at deploy time, otherwise Sentry can't
+					// symbolicate stack frames and every event shows `index.js:NNN`
+					// instead of the real provider .ts file + line number.
+					release: env.SENTRY_RELEASE,
 				},
 				request: request as any,
 				context: ctx,

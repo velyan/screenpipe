@@ -7,8 +7,11 @@ use anyhow::anyhow;
 use anyhow::Result;
 #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
 use cpal::traits::{DeviceTrait, StreamTrait};
+// The current cpal 0.15-compatible fork names its error type
+// `StreamError`. cpal 0.18 renamed it to `Error`. We alias to
+// `CpalError` here so call sites don't carry the version-specific name.
 #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
-use cpal::StreamError;
+use cpal::StreamError as CpalError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -57,6 +60,8 @@ impl AudioStreamConfig {
 #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
 impl From<&cpal::SupportedStreamConfig> for AudioStreamConfig {
     fn from(config: &cpal::SupportedStreamConfig) -> Self {
+        // cpal 0.15.3 wraps the sample rate in `SampleRate(pub u32)`;
+        // unwrap to a raw u32 here.
         Self {
             sample_rate: config.sample_rate().0,
             channels: config.channels(),
@@ -91,6 +96,7 @@ impl AudioStream {
         device: Arc<AudioDevice>,
         is_running: Arc<AtomicBool>,
         #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] use_coreaudio_tap: bool,
+        #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] windows_input_aec: bool,
     ) -> Result<Self> {
         let (tx, _) = broadcast::channel::<Vec<f32>>(1000);
         let tx_clone = tx.clone();
@@ -150,6 +156,7 @@ impl AudioStream {
                                 &is_running,
                                 &is_disconnected,
                                 &stream_control_tx,
+                                windows_input_aec,
                             )
                             .await?
                         }
@@ -167,6 +174,7 @@ impl AudioStream {
                     &is_running,
                     &is_disconnected,
                     &stream_control_tx,
+                    windows_input_aec,
                 )
                 .await?
             }
@@ -192,11 +200,13 @@ impl AudioStream {
         is_running: &Arc<AtomicBool>,
         is_disconnected: &Arc<AtomicBool>,
         stream_control_tx: &mpsc::Sender<StreamControl>,
+        windows_input_aec: bool,
     ) -> Result<(AudioStreamConfig, tokio::task::JoinHandle<()>)> {
         let (cpal_audio_device, config) = get_cpal_device_and_config(device).await?;
         let audio_config = AudioStreamConfig::from(&config);
         let channels = config.channels();
         let is_running_weak = Arc::downgrade(is_running);
+        let input_aec = windows_input_aec && device.device_type == super::device::DeviceType::Input;
 
         let thread = Self::spawn_audio_thread(
             cpal_audio_device,
@@ -207,6 +217,7 @@ impl AudioStream {
             is_running_weak,
             is_disconnected.clone(),
             stream_control_tx.clone(),
+            input_aec,
         )
         .await?;
         Ok((audio_config, thread))
@@ -223,34 +234,92 @@ impl AudioStream {
         is_running_weak: std::sync::Weak<AtomicBool>,
         is_disconnected: Arc<AtomicBool>,
         stream_control_tx: mpsc::Sender<StreamControl>,
+        windows_input_aec: bool,
     ) -> Result<tokio::task::JoinHandle<()>> {
         let device_name = device.name()?;
 
         Ok(tokio::task::spawn_blocking(move || {
-            let error_callback = create_error_callback(
+            // Primary attempt: the "best" config get_cpal_device_and_config
+            // picked (highest sample rate × most channels from
+            // supported_input_configs). On Windows 11 24H2 WASAPI sometimes
+            // over-reports what the shared-mode engine actually accepts and
+            // initialization returns AUDCLNT_E_UNSUPPORTED_FORMAT (0x88890008,
+            // surfaced as `OS error -2004287480`) — SCREENPIPE-CLI-S2.
+            // Recover by falling back to `default_input_config()` which is
+            // exactly the device's current shared-mode mix format, so it
+            // can't be rejected for shape reasons.
+            let primary_cb = create_error_callback(
                 device_name.clone(),
-                is_running_weak,
-                is_disconnected,
-                stream_control_tx,
+                is_running_weak.clone(),
+                is_disconnected.clone(),
+                stream_control_tx.clone(),
             );
-
-            let stream = build_input_stream(&device, &config, channels, tx, error_callback);
-
-            match stream {
-                Ok(stream) => {
-                    if let Err(e) = stream.play() {
-                        error!("failed to play stream for {}: {}", device_name, e);
-                        return;
-                    }
-
-                    if let Ok(StreamControl::Stop(response)) = stream_control_rx.recv() {
-                        stream.pause().ok();
-                        drop(stream);
-                        response.send(()).ok();
+            let stream = match build_input_stream(
+                &device,
+                &config,
+                channels,
+                tx.clone(),
+                primary_cb,
+                windows_input_aec,
+            ) {
+                Ok(s) => Some(s),
+                Err(primary_err) if is_wasapi_unsupported_format(&primary_err) => {
+                    warn!(
+                        "primary input config rejected for {} ({}), retrying with default_input_config",
+                        device_name, primary_err
+                    );
+                    match device.default_input_config() {
+                        Ok(fallback) => {
+                            let fb_channels = fallback.channels();
+                            let fallback_cb = create_error_callback(
+                                device_name.clone(),
+                                is_running_weak,
+                                is_disconnected,
+                                stream_control_tx,
+                            );
+                            match build_input_stream(
+                                &device,
+                                &fallback,
+                                fb_channels,
+                                tx,
+                                fallback_cb,
+                                windows_input_aec,
+                            ) {
+                                Ok(s) => Some(s),
+                                Err(fallback_err) => {
+                                    error!(
+                                        "default_input_config also rejected for {}: {} (primary: {})",
+                                        device_name, fallback_err, primary_err
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!(
+                                "could not get default_input_config for {}: {} (primary: {})",
+                                device_name, e, primary_err
+                            );
+                            None
+                        }
                     }
                 }
                 Err(e) => {
                     error!("Failed to build input stream: {}", e);
+                    None
+                }
+            };
+
+            if let Some(stream) = stream {
+                if let Err(e) = stream.play() {
+                    error!("failed to play stream for {}: {}", device_name, e);
+                    return;
+                }
+
+                if let Ok(StreamControl::Stop(response)) = stream_control_rx.recv() {
+                    stream.pause().ok();
+                    drop(stream);
+                    response.send(()).ok();
                 }
             }
         }))
@@ -270,8 +339,7 @@ impl AudioStream {
             // Sources without a cpal control channel (e.g. `from_wav`,
             // `from_sender_for_test`) drop the receiver, so the send/recv
             // here will error. That's expected — `is_disconnected` already
-            // signals the playback task to exit, and the JoinHandle abort
-            // below cleans up the spawned task. Don't propagate this error.
+            // signals the playback task to exit. Don't propagate this error.
             let (tx, rx) = oneshot::channel();
             if self.stream_control.send(StreamControl::Stop(tx)).is_ok() {
                 let _ = rx.await;
@@ -280,14 +348,34 @@ impl AudioStream {
 
         if let Some(thread_arc) = self.stream_thread.as_ref() {
             let thread_arc_clone = thread_arc.clone();
-            let thread_handle = tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
                 let mut thread_guard = thread_arc_clone.blocking_lock();
                 if let Some(join_handle) = thread_guard.take() {
-                    join_handle.abort();
+                    // Wait up to 3s for the playback task to exit naturally so cpal
+                    // stream.pause()+drop() can run before the stream resources go
+                    // away — aborting mid-callback is what races the CoreAudio IO
+                    // thread into UAF (issue #3261). If the task is wedged in cpal
+                    // / CoreAudio though, fall back to abort() so stop() can't hang
+                    // forever on quit/device-switch.
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(3);
+                    while !join_handle.is_finished()
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    if !join_handle.is_finished() {
+                        // Fully-qualified — `use tracing::{error, warn}` above
+                        // is cfg-gated to non-pulseaudio builds, so on linux+
+                        // pulseaudio CI (Release CLI) `warn!` is out of scope.
+                        tracing::warn!(
+                            "audio stream thread did not exit within 3s; aborting (potential cpal/CoreAudio wedge)"
+                        );
+                        join_handle.abort();
+                    }
                 }
-            });
-
-            thread_handle.await?;
+            })
+            .await?;
         }
 
         Ok(())
@@ -408,8 +496,8 @@ fn create_error_callback(
     is_running_weak: std::sync::Weak<AtomicBool>,
     is_disconnected: Arc<AtomicBool>,
     stream_control_tx: mpsc::Sender<StreamControl>,
-) -> impl FnMut(StreamError) + Send + 'static {
-    move |err: StreamError| {
+) -> impl FnMut(CpalError) + Send + 'static {
+    move |err: CpalError| {
         if err
             .to_string()
             .contains("The requested device is no longer available")
@@ -440,70 +528,133 @@ fn create_error_callback(
     }
 }
 
+/// Detect WASAPI's `AUDCLNT_E_UNSUPPORTED_FORMAT` (HRESULT 0x88890008)
+/// surfaced through cpal as `failed to initialize audio client: OS Error
+/// -2004287480 (FormatMessageW() returned error 317)`. The HRESULT has
+/// no system message string, hence error 317 (`ERROR_MR_MID_NOT_FOUND`)
+/// from `FormatMessageW` — we recognize the numeric form instead. Also
+/// match a few text forms so we keep catching this if cpal's wrapper
+/// changes its formatting.
+#[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
+fn is_wasapi_unsupported_format(err: &anyhow::Error) -> bool {
+    let s = err.to_string();
+    s.contains("-2004287480")
+        || s.contains("0x88890008")
+        || s.to_lowercase().contains("unsupported format")
+}
+
 #[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
 fn build_input_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
     channels: u16,
     tx: broadcast::Sender<Vec<f32>>,
-    error_callback: impl FnMut(StreamError) + Send + 'static,
+    error_callback: impl FnMut(CpalError) + Send + 'static,
+    windows_input_aec: bool,
 ) -> Result<cpal::Stream> {
+    let stream_config = cpal_stream_config(config, windows_input_aec);
     match config.sample_format() {
-        cpal::SampleFormat::F32 => device
-            .build_input_stream(
-                &config.config(),
-                move |data: &[f32], _: &_| {
-                    let mono = audio_to_mono(data, channels);
-                    let _ = tx.send(mono);
-                },
-                error_callback,
-                None,
-            )
-            .map_err(|e| anyhow!(e)),
-        cpal::SampleFormat::I16 => device
-            .build_input_stream(
-                &config.config(),
-                move |data: &[i16], _: &_| {
-                    let f32_data: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
-                    let mono = audio_to_mono(&f32_data, channels);
-                    let _ = tx.send(mono);
-                },
-                error_callback,
-                None,
-            )
-            .map_err(|e| anyhow!(e)),
-        cpal::SampleFormat::I32 => device
-            .build_input_stream(
-                &config.config(),
-                move |data: &[i32], _: &_| {
-                    let f32_data: Vec<f32> = data
-                        .iter()
-                        .map(|&s| (s as f64 / 2147483648.0) as f32)
-                        .collect();
-                    let mono = audio_to_mono(&f32_data, channels);
-                    let _ = tx.send(mono);
-                },
-                error_callback,
-                None,
-            )
-            .map_err(|e| anyhow!(e)),
-        cpal::SampleFormat::I8 => device
-            .build_input_stream(
-                &config.config(),
-                move |data: &[i8], _: &_| {
-                    let f32_data: Vec<f32> = data.iter().map(|&s| s as f32 / 128.0).collect();
-                    let mono = audio_to_mono(&f32_data, channels);
-                    let _ = tx.send(mono);
-                },
-                error_callback,
-                None,
-            )
-            .map_err(|e| anyhow!(e)),
+        cpal::SampleFormat::F32 => build_cpal_input_stream::<f32, _, _>(
+            device,
+            &stream_config,
+            move |data: &[f32], _: &_| {
+                let mono = audio_to_mono(data, channels);
+                let _ = tx.send(mono);
+            },
+            error_callback,
+        ),
+        cpal::SampleFormat::I16 => build_cpal_input_stream::<i16, _, _>(
+            device,
+            &stream_config,
+            move |data: &[i16], _: &_| {
+                let f32_data: Vec<f32> = data.iter().map(|&s| s as f32 / 32768.0).collect();
+                let mono = audio_to_mono(&f32_data, channels);
+                let _ = tx.send(mono);
+            },
+            error_callback,
+        ),
+        cpal::SampleFormat::I32 => build_cpal_input_stream::<i32, _, _>(
+            device,
+            &stream_config,
+            move |data: &[i32], _: &_| {
+                let f32_data: Vec<f32> = data
+                    .iter()
+                    .map(|&s| (s as f64 / 2147483648.0) as f32)
+                    .collect();
+                let mono = audio_to_mono(&f32_data, channels);
+                let _ = tx.send(mono);
+            },
+            error_callback,
+        ),
+        cpal::SampleFormat::I8 => build_cpal_input_stream::<i8, _, _>(
+            device,
+            &stream_config,
+            move |data: &[i8], _: &_| {
+                let f32_data: Vec<f32> = data.iter().map(|&s| s as f32 / 128.0).collect();
+                let mono = audio_to_mono(&f32_data, channels);
+                let _ = tx.send(mono);
+            },
+            error_callback,
+        ),
         _ => Err(anyhow!(
             "unsupported sample format: {}",
             config.sample_format()
         )),
     }
+}
+
+#[cfg(all(
+    not(all(target_os = "linux", feature = "pulseaudio")),
+    target_os = "macos"
+))]
+fn build_cpal_input_stream<T, D, E>(
+    device: &cpal::Device,
+    stream_config: &cpal::StreamConfig,
+    data_callback: D,
+    error_callback: E,
+) -> Result<cpal::Stream>
+where
+    T: cpal::SizedSample,
+    D: FnMut(&[T], &cpal::InputCallbackInfo) + Send + 'static,
+    E: FnMut(CpalError) + Send + 'static,
+{
+    device
+        .build_input_stream(stream_config, data_callback, error_callback, None, None)
+        .map_err(|e| anyhow!(e))
+}
+
+#[cfg(all(
+    not(all(target_os = "linux", feature = "pulseaudio")),
+    not(target_os = "macos")
+))]
+fn build_cpal_input_stream<T, D, E>(
+    device: &cpal::Device,
+    stream_config: &cpal::StreamConfig,
+    data_callback: D,
+    error_callback: E,
+) -> Result<cpal::Stream>
+where
+    T: cpal::SizedSample,
+    D: FnMut(&[T], &cpal::InputCallbackInfo) + Send + 'static,
+    E: FnMut(CpalError) + Send + 'static,
+{
+    device
+        .build_input_stream(stream_config, data_callback, error_callback, None)
+        .map_err(|e| anyhow!(e))
+}
+
+#[cfg(not(all(target_os = "linux", feature = "pulseaudio")))]
+fn cpal_stream_config(
+    config: &cpal::SupportedStreamConfig,
+    #[cfg_attr(not(target_os = "windows"), allow(unused_variables))] windows_input_aec: bool,
+) -> cpal::StreamConfig {
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    let mut stream_config = config.config();
+    #[cfg(target_os = "windows")]
+    {
+        stream_config.windows_input_aec = windows_input_aec;
+    }
+    stream_config
 }
 
 impl Drop for AudioStream {

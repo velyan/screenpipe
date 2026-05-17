@@ -18,7 +18,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 use tauri_plugin_opener::OpenerExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, info, warn};
@@ -48,6 +48,16 @@ pub struct ChatGptOAuthStatus {
 }
 
 /// Open a connection to the secrets store (same DB as the screenpipe server).
+///
+/// Uses the same `?mode=rwc` URI pattern as `oauth.rs` and the engine's
+/// `auth_key.rs` — that path is known to coexist with the engine's own
+/// pool on the busy main `db.sqlite`. The previous `SqliteConnectOptions`
+/// builder path failed intermittently with "failed to create secrets
+/// table" against a healthy on-disk schema, hiding the real sqlx error
+/// behind anyhow's single-line Display. Errors here use `{:#}` so the
+/// full chain (e.g. `database is locked`, `connection refused`, `unable
+/// to open database file`) reaches the log instead of the generic
+/// top-level wrapper.
 async fn open_secret_store() -> Result<screenpipe_secrets::SecretStore, String> {
     let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
     let db_path = data_dir.join("db.sqlite");
@@ -55,7 +65,7 @@ async fn open_secret_store() -> Result<screenpipe_secrets::SecretStore, String> 
 
     let pool = sqlx::SqlitePool::connect(&db_url)
         .await
-        .map_err(|e| format!("failed to open db: {}", e))?;
+        .map_err(|e| format!("failed to open db at {}: {}", db_path.display(), e))?;
 
     let secret_key = match crate::secrets::get_key_if_encryption_enabled() {
         crate::secrets::KeyResult::Found(k) => Some(k),
@@ -64,7 +74,7 @@ async fn open_secret_store() -> Result<screenpipe_secrets::SecretStore, String> 
 
     screenpipe_secrets::SecretStore::new(pool, secret_key)
         .await
-        .map_err(|e| format!("failed to init secret store: {}", e))
+        .map_err(|e| format!("failed to init secret store: {:#}", e))
 }
 
 async fn read_tokens_from_store() -> Option<OAuthTokens> {
@@ -74,12 +84,28 @@ async fn read_tokens_from_store() -> Option<OAuthTokens> {
 }
 
 async fn write_tokens_to_store(tokens: &OAuthTokens) -> Result<(), String> {
-    let store = open_secret_store().await?;
     let json = serde_json::to_vec(tokens).map_err(|e| format!("serialize: {}", e))?;
-    store
-        .set(SECRET_KEY, &json)
-        .await
-        .map_err(|e| format!("failed to save token: {}", e))
+    // Retry up to 3 times — the screenpipe server may hold a brief write lock.
+    let mut last_err = String::new();
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(200 * (attempt as u64))).await;
+        }
+        match open_secret_store().await {
+            Ok(store) => match store.set(SECRET_KEY, &json).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = format!("failed to save token: {}", e);
+                    warn!("write_tokens_to_store attempt {}: {}", attempt + 1, last_err);
+                }
+            },
+            Err(e) => {
+                last_err = e;
+                warn!("open_secret_store attempt {}: {}", attempt + 1, last_err);
+            }
+        }
+    }
+    Err(last_err)
 }
 
 async fn delete_tokens_from_store() -> Result<(), String> {
@@ -349,27 +375,30 @@ pub async fn chatgpt_oauth_login(app_handle: AppHandle) -> Result<bool, String> 
     write_tokens_to_store(&tokens).await?;
     info!("ChatGPT OAuth login successful — token saved to secret store");
 
+    // Bring screenpipe back to the foreground so the user sees the preset form
+    // waiting for them — without this they stay on the browser "Login successful" tab.
+    if let Some(window) = app_handle.get_webview_window("main") {
+        let _ = tauri::WebviewWindow::set_focus(&window);
+        let _ = tauri::WebviewWindow::unminimize(&window);
+    }
+
     Ok(true)
 }
 
 #[tauri::command]
 #[specta::specta]
 pub async fn chatgpt_oauth_status() -> Result<ChatGptOAuthStatus, String> {
-    match read_tokens_from_store().await {
-        Some(tokens) => {
-            if is_token_expired(&tokens) {
-                match do_refresh_token(&tokens.refresh_token).await {
-                    Ok(_) => Ok(ChatGptOAuthStatus { logged_in: true }),
-                    Err(e) => {
-                        error!("ChatGPT token refresh failed: {}", e);
-                        Ok(ChatGptOAuthStatus { logged_in: false })
-                    }
-                }
-            } else {
-                Ok(ChatGptOAuthStatus { logged_in: true })
-            }
-        }
-        None => Ok(ChatGptOAuthStatus { logged_in: false }),
+    // Only check token existence — no network refresh here.
+    // Refresh happens lazily in chatgpt_oauth_get_token when actually needed.
+    // 3-second timeout guards against a locked/slow SQLite DB.
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        read_tokens_from_store(),
+    )
+    .await
+    {
+        Ok(Some(_)) => Ok(ChatGptOAuthStatus { logged_in: true }),
+        Ok(None) | Err(_) => Ok(ChatGptOAuthStatus { logged_in: false }),
     }
 }
 

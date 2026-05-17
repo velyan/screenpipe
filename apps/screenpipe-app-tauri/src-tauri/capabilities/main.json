@@ -161,6 +161,14 @@
           "requireLiteralLeadingDot": false
         },
         {
+          "path": "$HOME/.codex",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/.codex/**",
+          "requireLiteralLeadingDot": false
+        },
+        {
           "path": "$HOME/Library/Application Support/Claude",
           "requireLiteralLeadingDot": false
         },
@@ -182,6 +190,46 @@
         },
         {
           "path": "$HOME/AppData/Roaming/Claude/**",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Roaming/Claude/**",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$APPDATA/Obsidian",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$APPDATA/Obsidian/**",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/AppData/Roaming/Obsidian",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/AppData/Roaming/Obsidian/**",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/Library/Application Support/obsidian",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/Library/Application Support/obsidian/**",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/.config/obsidian",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/.config/obsidian/**",
           "requireLiteralLeadingDot": false
         }
       ]

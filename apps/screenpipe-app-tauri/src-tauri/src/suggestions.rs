@@ -1246,7 +1246,7 @@ async fn fetch_accessibility_snippets(api: &LocalApiContext) -> Vec<Accessibilit
     let resp = api
         .apply_auth(client.post(api.url("/raw_sql")))
         .json(&serde_json::json!({
-            "query": "SELECT app_name, window_name, SUBSTR(text_content, 1, 200) as snippet FROM accessibility WHERE datetime(timestamp) > datetime('now', '-15 minutes') AND LENGTH(text_content) > 30 AND app_name != 'screenpipe' ORDER BY timestamp DESC LIMIT 8"
+            "query": "SELECT app_name, window_name, SUBSTR(full_text, 1, 200) as snippet FROM frames WHERE datetime(timestamp) > datetime('now', '-15 minutes') AND LENGTH(full_text) > 30 AND app_name != 'screenpipe' AND full_text IS NOT NULL ORDER BY timestamp DESC LIMIT 8"
         }))
         .timeout(std::time::Duration::from_secs(5))
         .send()
@@ -1308,7 +1308,7 @@ async fn count_accessibility_rows(api: &LocalApiContext) -> i64 {
     let resp = api
         .apply_auth(client.post(api.url("/raw_sql")))
         .json(&serde_json::json!({
-            "query": "SELECT COUNT(*) as cnt FROM accessibility WHERE datetime(timestamp) > datetime('now', '-30 minutes')"
+            "query": "SELECT COUNT(*) as cnt FROM frames WHERE datetime(timestamp) > datetime('now', '-30 minutes') AND full_text IS NOT NULL"
         }))
         .timeout(std::time::Duration::from_secs(3))
         .send()

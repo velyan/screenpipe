@@ -5,6 +5,8 @@
 use screenpipe_audio::audio_manager::builder::TranscriptionMode;
 use screenpipe_audio::audio_manager::AudioManagerBuilder;
 use screenpipe_audio::core::engine::AudioTranscriptionEngine;
+use screenpipe_audio::meeting_streaming::MeetingStreamingConfig;
+use screenpipe_audio::transcription::deepgram::DeepgramTranscriptionConfig;
 use screenpipe_audio::transcription::VocabularyEntry;
 use screenpipe_audio::vad::VadEngineEnum;
 use screenpipe_config::{ChannelConfig, DbConfig};
@@ -29,21 +31,39 @@ pub struct RecordingConfig {
     pub disable_audio: bool,
     pub disable_vision: bool,
     pub use_pii_removal: bool,
+    /// Async text PII redaction: runs the background reconciliation
+    /// worker over OCR / transcripts / accessibility / ui_events and
+    /// overwrites the source columns with the redacted text. Off by
+    /// default.
+    pub async_pii_redaction: bool,
+    /// Async image PII redaction: runs rfdetr_v8 on each captured
+    /// frame and blacks out detected PII regions, atomically
+    /// overwriting the source JPG. Off by default. First-run
+    /// downloads ~108 MB from huggingface.co/screenpipe/pii-image-redactor.
+    pub async_image_pii_redaction: bool,
+    /// "local" or "tinfoil" — flips both async-PII workers between
+    /// on-device ONNX and the screenpipe-hosted Tinfoil enclave.
+    /// One toggle covers both modalities; the user-facing UI is a
+    /// single radio under the AI PII removal switch.
+    pub pii_backend: String,
     /// Filter music-dominant audio before transcription using spectral analysis
     pub filter_music: bool,
-    // enable_input_capture and enable_accessibility removed — always true
+    // Input capture and accessibility capture are always enabled in the local engine.
     pub enable_main_body_distillation: bool,
     pub main_body_distillation_threshold: f32,
 
     // Engines (typed, not strings)
     pub audio_transcription_engine: AudioTranscriptionEngine,
     pub transcription_mode: TranscriptionMode,
+    pub meeting_streaming: MeetingStreamingConfig,
 
     // Devices & monitors
     pub audio_devices: Vec<String>,
     pub use_system_default_audio: bool,
     /// Experimental: use CoreAudio Process Tap for System Audio on macOS 14.4+.
     pub experimental_coreaudio_system_audio: bool,
+    /// Experimental: request Windows WASAPI microphone AEC when supported.
+    pub windows_input_aec_enabled: bool,
     pub monitor_ids: Vec<String>,
     pub use_all_monitors: bool,
 
@@ -67,6 +87,7 @@ pub struct RecordingConfig {
 
     // Cloud/auth
     pub deepgram_api_key: Option<String>,
+    pub deepgram_config: Option<DeepgramTranscriptionConfig>,
     pub user_id: Option<String>,
 
     // OpenAI Compatible transcription
@@ -122,6 +143,14 @@ pub struct RecordingConfig {
     /// Maximum width for stored snapshots (0 = no limit). Default: 1920.
     pub max_snapshot_width: u32,
 
+    /// Skip the background JPEG->MP4 snapshot compaction worker.
+    /// See `RecordingSettings.disable_snapshot_compaction` for details.
+    pub disable_snapshot_compaction: bool,
+
+    /// Skip the v2 meeting detector watcher.
+    /// See `RecordingSettings.disable_meeting_detector` for details.
+    pub disable_meeting_detector: bool,
+
     /// Require authentication for remote (non-localhost) API access.
     /// When true, requests from other devices must include
     /// `Authorization: Bearer <SCREENPIPE_API_KEY>`.
@@ -168,8 +197,10 @@ impl RecordingConfig {
             disable_audio: settings.disable_audio,
             disable_vision: settings.disable_vision,
             use_pii_removal: settings.use_pii_removal,
+            async_pii_redaction: settings.async_pii_redaction,
+            async_image_pii_redaction: settings.async_image_pii_redaction,
+            pii_backend: settings.pii_backend.clone(),
             filter_music: settings.filter_music,
-            // enable_input_capture / enable_accessibility removed — always true
             enable_main_body_distillation: false,
             main_body_distillation_threshold: 0.60,
             enable_workflow_events: settings.enable_workflow_events,
@@ -180,9 +211,25 @@ impl RecordingConfig {
                 "smart" | "batch" => TranscriptionMode::Batch,
                 _ => TranscriptionMode::Realtime,
             },
+            meeting_streaming: MeetingStreamingConfig::from_settings(
+                settings.meeting_live_transcription_enabled,
+                &settings.meeting_live_transcription_provider,
+                settings.effective_user_id().map(str::to_string),
+                match settings.meeting_live_transcription_provider.as_str() {
+                    "deepgram-live" | "deepgram_live" => Some(settings.deepgram_api_key.clone()),
+                    _ => None,
+                },
+                settings
+                    .languages
+                    .iter()
+                    .find(|s| s.as_str() != "default")
+                    .cloned(),
+                settings.effective_user_name().map(str::to_string),
+            ),
             audio_devices: settings.audio_devices.clone(),
             use_system_default_audio: settings.use_system_default_audio,
             experimental_coreaudio_system_audio: settings.experimental_coreaudio_system_audio,
+            windows_input_aec_enabled: settings.windows_input_aec_enabled,
             monitor_ids: settings.monitor_ids.clone(),
             use_all_monitors: settings.use_all_monitors,
             ignored_windows: settings.ignored_windows.clone(),
@@ -201,6 +248,15 @@ impl RecordingConfig {
                 .collect(),
             user_identities: Vec::new(),
             deepgram_api_key: settings.effective_deepgram_key().map(|s| s.to_string()),
+            deepgram_config: match engine_str {
+                "screenpipe-cloud" => settings
+                    .effective_user_id()
+                    .map(|s| DeepgramTranscriptionConfig::screenpipe_cloud(s.to_string())),
+                "deepgram" => settings
+                    .effective_deepgram_key()
+                    .map(|s| DeepgramTranscriptionConfig::direct(s.to_string())),
+                _ => None,
+            },
             user_id: settings.effective_user_id().map(|s| s.to_string()),
             openai_compatible_endpoint: settings.openai_compatible_endpoint.clone(),
             openai_compatible_api_key: settings.openai_compatible_api_key.clone(),
@@ -237,6 +293,8 @@ impl RecordingConfig {
             schedule_enabled: settings.schedule_enabled,
             schedule_rules: settings.schedule_rules.clone(),
             max_snapshot_width: settings.max_snapshot_width,
+            disable_snapshot_compaction: settings.disable_snapshot_compaction,
+            disable_meeting_detector: settings.disable_meeting_detector,
             // LAN exposure is opt-in. We force `api_auth` on whenever
             // `listen_on_lan` is true so a user can never accidentally
             // publish an unauthenticated API on their local network. The
@@ -286,11 +344,13 @@ impl RecordingConfig {
             .enabled_devices(audio_devices)
             .use_system_default_audio(self.use_system_default_audio)
             .experimental_coreaudio_system_audio(self.experimental_coreaudio_system_audio)
-            .deepgram_api_key(self.deepgram_api_key.clone())
+            .windows_input_aec_enabled(self.windows_input_aec_enabled)
+            .deepgram_config(self.deepgram_config.clone())
             .output_path(output_path)
             .use_pii_removal(self.use_pii_removal)
             .filter_music(self.filter_music)
             .transcription_mode(self.transcription_mode.clone())
+            .meeting_streaming(self.meeting_streaming.clone())
             .vocabulary(self.vocabulary.clone())
             .batch_max_duration_secs(self.batch_max_duration_secs)
             .channel_config(self.channel_config.clone())

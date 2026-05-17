@@ -222,28 +222,54 @@ impl PipeStore for SqlitePipeStore {
         &self,
         limit_per_pipe: i32,
     ) -> Result<std::collections::HashMap<String, Vec<PipeExecution>>> {
-        let rows = sqlx::query_as::<_, PipeExecutionRow>(
-            r#"SELECT id, pipe_name, status, trigger_type, pid, model, provider,
-                      started_at, finished_at, stdout, stderr, exit_code,
-                      error_type, error_message, duration_ms, session_path
-               FROM (
-                   SELECT *, ROW_NUMBER() OVER (
-                       PARTITION BY pipe_name ORDER BY id DESC
-                   ) AS rn
+        // List view: skip stdout/stderr — they're MB-scale per row (observed avg
+        // ~1.2 MB, max 112 MB). Use get_executions(name, limit) when the UI
+        // expands a row and actually needs the output text.
+        //
+        // The previous ROW_NUMBER() OVER (PARTITION BY pipe_name) form forced
+        // SQLite to scan every row of pipe_executions through the sorter on
+        // each call (ran every ~30s from the UI poll, observed 1.3–4.7s per
+        // call on a real user's machine). SQLite cannot push the per-pipe
+        // LIMIT into the window scan, so the existing
+        // idx_pipe_exec_name_time(pipe_name, id DESC) index goes unused.
+        //
+        // Two-step instead: list the distinct pipe names, then for each name
+        // do `WHERE pipe_name = ? ORDER BY id DESC LIMIT ?` — that one is a
+        // direct index seek. Per-pipe queries run concurrently against the
+        // read pool so wall time is the slowest single query, not the sum.
+        let names: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT pipe_name FROM pipe_executions")
+                .fetch_all(&self.db.pool)
+                .await?;
+
+        if names.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+
+        let pool = &self.db.pool;
+        let per_pipe = futures::future::try_join_all(names.into_iter().map(|name| async move {
+            let rows = sqlx::query_as::<_, PipeExecutionRow>(
+                r#"SELECT id, pipe_name, status, trigger_type, pid, model, provider,
+                          started_at, finished_at,
+                          '' AS stdout, '' AS stderr,
+                          exit_code, error_type, error_message, duration_ms, session_path
                    FROM pipe_executions
-               )
-               WHERE rn <= ?
-               ORDER BY pipe_name, id DESC"#,
-        )
-        .bind(limit_per_pipe)
-        .fetch_all(&self.db.pool)
+                   WHERE pipe_name = ?
+                   ORDER BY id DESC
+                   LIMIT ?"#,
+            )
+            .bind(&name)
+            .bind(limit_per_pipe)
+            .fetch_all(pool)
+            .await?;
+            Ok::<_, anyhow::Error>((name, rows))
+        }))
         .await?;
 
         let mut map: std::collections::HashMap<String, Vec<PipeExecution>> =
-            std::collections::HashMap::new();
-        for row in rows {
-            let name = row.pipe_name.clone();
-            map.entry(name).or_default().push(row.into());
+            std::collections::HashMap::with_capacity(per_pipe.len());
+        for (name, rows) in per_pipe {
+            map.insert(name, rows.into_iter().map(Into::into).collect());
         }
         Ok(map)
     }

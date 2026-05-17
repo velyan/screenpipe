@@ -4,8 +4,21 @@
 "use client";
 
 import React from "react";
-import { FileText, Phone } from "lucide-react";
+import { FileText, Phone, Trash2 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { localFetch } from "@/lib/api";
+import { useToast } from "@/components/ui/use-toast";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import {
   formatClock,
   formatDuration,
@@ -16,6 +29,7 @@ interface PastMeetingsProps {
   meetings: MeetingRecord[];
   activeId: number | null;
   onSelect: (id: number) => void;
+  onDelete: (id: number) => void;
 }
 
 interface Bucket {
@@ -61,6 +75,7 @@ export function PastMeetings({
   meetings,
   activeId,
   onSelect,
+  onDelete,
 }: PastMeetingsProps) {
   const buckets = bucketByRelativeDay(meetings);
   if (buckets.length === 0) return null;
@@ -80,6 +95,7 @@ export function PastMeetings({
                 bucket={b.label}
                 isActive={m.id === activeId}
                 onClick={() => onSelect(m.id)}
+                onDelete={onDelete}
               />
             ))}
           </ul>
@@ -94,22 +110,51 @@ function PastMeetingRow({
   bucket,
   isActive,
   onClick,
+  onDelete,
 }: {
   meeting: MeetingRecord;
   bucket: string;
   isActive: boolean;
   onClick: () => void;
+  onDelete: (id: number) => void;
 }) {
+  const { toast } = useToast();
+
+  const handleDelete = async () => {
+    try {
+      const res = await localFetch(`/meetings/${meeting.id}`, {
+        method: "DELETE",
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      onDelete(meeting.id);
+    } catch (err) {
+      toast({
+        title: "couldn't delete meeting",
+        description: String(err),
+        variant: "destructive",
+      });
+    }
+  };
+
   const title = meeting.title?.trim() || titleFromApp(meeting.meeting_app);
   const hasNote = Boolean(meeting.note?.trim());
   const Icon = isActive ? Phone : hasNote ? FileText : Phone;
   const stamp = formatRowStamp(meeting.meeting_start, bucket);
+
   return (
-    <li className="border-b border-border">
-      <button
+    <li className="group border-b border-border">
+      <div
+        role="button"
+        tabIndex={0}
         onClick={onClick}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onClick();
+          }
+        }}
         className={cn(
-          "group w-full flex items-center gap-3 py-2 px-1 transition-colors text-left",
+          "w-full flex items-center gap-3 py-2 px-1 transition-colors text-left cursor-pointer",
           "hover:bg-muted/30",
           isActive && "bg-muted/20",
         )}
@@ -124,6 +169,7 @@ function PastMeetingRow({
             <Icon className="h-3 w-3 text-muted-foreground" />
           )}
         </div>
+
         <div className="flex-1 min-w-0 flex items-baseline gap-2">
           <span className="text-sm text-foreground truncate">{title}</span>
           {meeting.attendees && (
@@ -132,11 +178,48 @@ function PastMeetingRow({
             </span>
           )}
         </div>
+
         <div className="shrink-0 flex items-center gap-3 text-[11px] text-muted-foreground tabular-nums">
           <span>{formatDuration(meeting.meeting_start, meeting.meeting_end)}</span>
           <span className="w-16 text-right">{stamp}</span>
         </div>
-      </button>
+
+        {/* Fixed slot keeps all rows pixel-aligned; trash appears on hover */}
+        <div
+          className="shrink-0 w-7 flex items-center justify-center"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {!isActive && (
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <button
+                  className="opacity-0 group-hover:opacity-100 transition-opacity h-7 w-7 flex items-center justify-center bg-transparent text-muted-foreground hover:text-destructive"
+                  title="delete meeting"
+                >
+                  <Trash2 className="h-3 w-3" />
+                </button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>delete meeting</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    your notes and transcript will be permanently deleted.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>cancel</AlertDialogCancel>
+                  <AlertDialogAction
+                    variant="destructive"
+                    onClick={() => void handleDelete()}
+                  >
+                    delete
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+          )}
+        </div>
+      </div>
     </li>
   );
 }

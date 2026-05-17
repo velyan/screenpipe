@@ -175,6 +175,11 @@ pub struct AudioResultRaw {
     pub speaker_id: Option<i64>,
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
+    pub diarization_mode: Option<String>,
+    pub diarization_speaker_label: Option<String>,
+    pub diarization_provider: Option<String>,
+    pub diarization_source: Option<String>,
+    pub diarization_confidence: Option<f64>,
 }
 
 #[derive(OaSchema, Debug, Serialize, Deserialize, FromRow, Clone)]
@@ -182,6 +187,26 @@ pub struct Speaker {
     pub id: i64,
     pub name: String,
     pub metadata: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewDiarizationSegment {
+    pub provider_speaker_label: String,
+    pub speaker_id: Option<i64>,
+    pub source: String,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub confidence: Option<f64>,
+    pub overlap: bool,
+    pub metadata: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplacementAudioTranscription {
+    pub transcription: String,
+    pub speaker_id: Option<i64>,
+    pub start_time: f64,
+    pub end_time: f64,
 }
 
 /// A persistent memory: fact, preference, decision, or insight.
@@ -198,6 +223,24 @@ pub struct MemoryRecord {
     pub updated_at: String,
 }
 
+/// A memory row + the columns the cross-device sync layer needs.
+/// Used only by [`DatabaseManager::list_memories_for_sync`] — the
+/// HTTP/UI surface keeps using [`MemoryRecord`] to avoid leaking
+/// sync state into the public API.
+#[derive(Debug, FromRow, Clone)]
+pub struct MemorySyncRow {
+    pub id: i64,
+    pub sync_uuid: Option<String>,
+    pub content: String,
+    pub source: String,
+    pub source_context: Option<String>,
+    pub tags: Option<String>,
+    pub importance: f64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub sync_modified_by: Option<String>,
+}
+
 #[derive(OaSchema, Debug, Serialize, Deserialize, FromRow, Clone)]
 pub struct MeetingRecord {
     pub id: i64,
@@ -208,6 +251,27 @@ pub struct MeetingRecord {
     pub attendees: Option<String>,
     pub note: Option<String>,
     pub detection_source: String,
+    pub created_at: String,
+}
+
+#[derive(OaSchema, Debug, Serialize, Deserialize, FromRow, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingTranscriptSegment {
+    pub id: i64,
+    pub meeting_id: i64,
+    pub source: String,
+    pub provider: String,
+    pub model: Option<String>,
+    pub item_id: String,
+    pub device_name: String,
+    pub device_type: String,
+    pub audio_transcription_id: Option<i64>,
+    pub audio_chunk_id: Option<i64>,
+    pub audio_file_path: Option<String>,
+    pub speaker_id: Option<i64>,
+    pub speaker_name: Option<String>,
+    pub transcript: String,
+    pub captured_at: String,
     pub created_at: String,
 }
 
@@ -237,8 +301,16 @@ pub struct AudioResult {
     pub device_name: String,
     pub device_type: DeviceType,
     pub speaker: Option<Speaker>,
+    pub speaker_label: Option<String>,
+    pub speaker_source: Option<String>,
+    pub speaker_confidence: Option<f64>,
+    pub speaker_provisional: bool,
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
+    pub source: Option<String>,
+    pub meeting_id: Option<i64>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(OaSchema, Debug, Deserialize, PartialEq)]
@@ -722,6 +794,12 @@ pub struct Element {
     pub bounds: Option<ElementBounds>,
     pub confidence: Option<f64>,
     pub sort_order: i32,
+    /// True when this element was visually present on the captured frame.
+    /// `None` for elements captured before the on-screen check landed
+    /// (legacy rows) — search filters treat that as "unknown" rather than
+    /// implicitly true/false. See issue #2436.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_screen: Option<bool>,
 }
 
 /// Flat row for bulk insert (parent_id assigned after insert)
@@ -753,6 +831,10 @@ pub struct ElementRow {
     pub height_bound: Option<f64>,
     pub confidence: Option<f64>,
     pub sort_order: i32,
+    /// SQLite INTEGER (1/0/NULL) decoded as Option<bool>. NULL = unknown
+    /// (legacy rows pre-issue-#2436 fix); search treats unknown as
+    /// neither on- nor off-screen.
+    pub on_screen: Option<bool>,
 }
 
 impl From<ElementRow> for Element {
@@ -782,6 +864,7 @@ impl From<ElementRow> for Element {
             bounds,
             confidence: row.confidence,
             sort_order: row.sort_order,
+            on_screen: row.on_screen,
         }
     }
 }

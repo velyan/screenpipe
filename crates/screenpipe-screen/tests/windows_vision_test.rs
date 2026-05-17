@@ -3,16 +3,18 @@
 mod tests {
     use chrono::Utc;
     use screenpipe_screen::capture_screenshot_by_window::{CapturedWindow, WindowFilters};
-    use screenpipe_screen::core::RawCaptureResult;
+    // `process_ocr_task` and `continuous_capture` are not re-exported at
+    // the crate root — import them via the `core` module to match how the
+    // crate actually exposes them (see screenpipe-screen/src/lib.rs which
+    // re-exports `RealtimeVisionEvent` from `core` but not the helpers).
+    use screenpipe_screen::core::{continuous_capture, process_ocr_task, RawCaptureResult};
     use screenpipe_screen::monitor::get_default_monitor;
     use screenpipe_screen::ocr_cache::WindowOcrCache;
-    use screenpipe_screen::{process_ocr_task, OcrEngine};
+    use screenpipe_screen::{OcrEngine, PipelineMetrics};
     use std::sync::Arc;
+    use std::time::Duration;
     use std::{path::PathBuf, time::Duration as StdDuration, time::Instant};
     use tokio::sync::{mpsc, Mutex};
-
-    use screenpipe_screen::{continuous_capture, PipelineMetrics};
-    use std::time::Duration;
     use tokio::time::timeout;
 
     #[cfg(target_os = "windows")]

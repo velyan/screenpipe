@@ -82,6 +82,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -134,6 +135,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -145,6 +147,7 @@ mod tests {
                 ContentType::Audio,
                 100,
                 0,
+                None,
                 None,
                 None,
                 None,
@@ -217,6 +220,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -228,6 +232,7 @@ mod tests {
                 ContentType::Audio,
                 100,
                 0,
+                None,
                 None,
                 None,
                 None,
@@ -340,6 +345,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -351,6 +357,7 @@ mod tests {
                 ContentType::All,
                 100,
                 0,
+                None,
                 None,
                 None,
                 None,
@@ -555,6 +562,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -582,6 +590,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -597,6 +606,7 @@ mod tests {
                 0,
                 Some(mid_time),
                 Some(end_time),
+                None,
                 None,
                 None,
                 None,
@@ -638,6 +648,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -652,6 +663,7 @@ mod tests {
                 0,
                 Some(start_time),
                 Some(end_time),
+                None,
                 None,
                 None,
                 None,
@@ -792,6 +804,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -810,6 +823,7 @@ mod tests {
                 ContentType::Audio,
                 Some(start_time),
                 Some(end_time),
+                None,
                 None,
                 None,
                 None,
@@ -912,16 +926,16 @@ mod tests {
                 "neural networks process natural language understanding efficiently",
             ],
         ];
-        for n in 0..3 {
+        for (n, speaker_transcriptions) in transcriptions.iter().enumerate() {
             let speaker = db.insert_speaker(&vec![n as f32; 512]).await.unwrap();
-            for i in 0..=n {
+            for (i, transcription) in speaker_transcriptions.iter().enumerate() {
                 let audio_chunk_id = db
                     .insert_audio_chunk(&format!("audio{}{}", n, i), None)
                     .await
                     .unwrap();
                 db.insert_audio_transcription(
                     audio_chunk_id,
-                    transcriptions[n][i],
+                    transcription,
                     0,
                     "",
                     &AudioDevice {
@@ -993,16 +1007,16 @@ mod tests {
                 "ribosomes assemble protein chains from messenger templates",
             ],
         ];
-        for n in 0..3 {
+        for (n, speaker_transcriptions) in transcriptions_ids.iter().enumerate() {
             let speaker = db.insert_speaker(&vec![n as f32; 512]).await.unwrap();
-            for i in 0..=n {
+            for (i, transcription) in speaker_transcriptions.iter().enumerate() {
                 let audio_chunk_id = db
                     .insert_audio_chunk(&format!("audio_ids_{}{}", n, i), None)
                     .await
                     .unwrap();
                 db.insert_audio_transcription(
                     audio_chunk_id,
-                    transcriptions_ids[n][i],
+                    transcription,
                     0,
                     "",
                     &AudioDevice {
@@ -1278,6 +1292,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1303,6 +1318,7 @@ mod tests {
                 None,
                 None,
                 Some("non_existent"),
+                None,
                 None,
                 None,
                 None,
@@ -1338,6 +1354,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1353,6 +1370,7 @@ mod tests {
             .count_search_results(
                 "Hello",
                 ContentType::OCR,
+                None,
                 None,
                 None,
                 None,
@@ -1441,6 +1459,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1465,6 +1484,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1478,6 +1498,7 @@ mod tests {
             .count_search_results(
                 "nonexistent",
                 ContentType::All,
+                None,
                 None,
                 None,
                 None,
@@ -1568,6 +1589,7 @@ mod tests {
                 ContentType::Accessibility,
                 100,
                 0,
+                None,
                 None,
                 None,
                 None,
@@ -1679,6 +1701,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1693,6 +1716,7 @@ mod tests {
                 0,
                 Some(mid),
                 Some(after),
+                None,
                 None,
                 None,
                 None,
@@ -1752,6 +1776,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1780,6 +1805,7 @@ mod tests {
                 ContentType::Accessibility,
                 100,
                 0,
+                None,
                 None,
                 None,
                 None,
@@ -1828,6 +1854,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1850,6 +1877,7 @@ mod tests {
                 ContentType::All,
                 100,
                 0,
+                None,
                 None,
                 None,
                 None,
@@ -1890,6 +1918,7 @@ mod tests {
                 ContentType::All,
                 100,
                 0,
+                None,
                 None,
                 None,
                 None,
@@ -1948,6 +1977,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1989,6 +2019,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2001,6 +2032,7 @@ mod tests {
             .count_search_results(
                 "nonexistent",
                 ContentType::Accessibility,
+                None,
                 None,
                 None,
                 None,

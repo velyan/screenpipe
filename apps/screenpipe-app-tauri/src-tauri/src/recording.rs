@@ -17,6 +17,7 @@ use screenpipe_engine::RecordingConfig;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager, State};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -70,6 +71,24 @@ fn build_config(app: &tauri::AppHandle) -> Result<RecordingConfig, String> {
     Ok(store.to_recording_config(data_dir))
 }
 
+pub fn notify_audio_engine_fallback(store: &SettingsStore) {
+    if store.recording.disable_audio {
+        return;
+    }
+
+    let resolution = store.audio_engine_resolution();
+    let Some(reason) = resolution.fallback_reason else {
+        return;
+    };
+
+    crate::notifications::client::send_typed(
+        reason.notification_title(),
+        reason.notification_body(),
+        "system",
+        Some(20000),
+    );
+}
+
 pub fn local_api_context_from_app(app: &tauri::AppHandle) -> LocalApiContext {
     if let Some(state) = app.try_state::<RecordingState>() {
         if let Ok(guard) = state.server.try_lock() {
@@ -92,6 +111,17 @@ pub fn local_api_context_from_app(app: &tauri::AppHandle) -> LocalApiContext {
 
 /// Minimum seconds between consecutive stop→spawn cycles.
 const RESTART_COOLDOWN_SECS: u64 = 30;
+const CAPTURE_RESTART_MEETING_REATTACH_WINDOW: Duration = Duration::from_secs(120);
+
+#[derive(Clone, Debug)]
+pub(crate) struct InterruptedMeeting {
+    id: i64,
+    app: String,
+    title: Option<String>,
+    detection_source: String,
+    manual: bool,
+    captured_at: Instant,
+}
 
 /// Two-phase state: server (long-lived) + capture (togglable).
 ///
@@ -106,8 +136,19 @@ pub struct RecordingState {
     pub capture: Arc<Mutex<Option<CaptureSession>>>,
     /// True while a server start is in progress (prevents race between main.rs boot and frontend)
     pub is_starting: Arc<AtomicBool>,
+    /// True while a `start_capture` invocation is in flight. The frontend
+    /// mounts `<DeeplinkHandler />` in every webview window, and the tray
+    /// emits `shortcut-start-recording` app-wide — every listening window
+    /// fires `commands.startCapture()` simultaneously. Without this guard,
+    /// concurrent calls both pass the is_some() check, both build a
+    /// CaptureSession, and the second clobbers the first — dropping the
+    /// first runs its shutdown handlers and tears down workers shared with
+    /// the second, surfacing as a PoolClosed cascade and lost audio chunks.
+    pub is_starting_capture: Arc<AtomicBool>,
     /// Epoch seconds of last successful spawn — enforces cooldown between restarts
     pub last_spawn_epoch: Arc<AtomicU64>,
+    /// Recently active meeting to revive when capture is immediately restarted.
+    pub(crate) interrupted_meeting: Arc<Mutex<Option<InterruptedMeeting>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -225,6 +266,8 @@ pub async fn stop_capture(
 ) -> Result<(), String> {
     info!("Stopping capture session (server stays alive)");
 
+    remember_active_meeting_for_capture_restart(&state).await;
+
     let mut capture_guard = state.capture.lock().await;
     if let Some(session) = capture_guard.take() {
         session.stop().await;
@@ -232,6 +275,92 @@ pub async fn stop_capture(
     } else {
         debug!("No capture session running");
     }
+    Ok(())
+}
+
+async fn remember_active_meeting_for_capture_restart(state: &RecordingState) {
+    let server_guard = state.server.lock().await;
+    let Some(server) = server_guard.as_ref() else {
+        return;
+    };
+
+    let manual_id = *server.manual_meeting.read().await;
+    let meeting = match manual_id {
+        Some(id) => server.db.get_active_meeting_by_id(id).await.ok().flatten(),
+        None => server.db.get_most_recent_active_meeting().await.ok().flatten(),
+    };
+
+    let Some(meeting) = meeting else {
+        *state.interrupted_meeting.lock().await = None;
+        return;
+    };
+
+    let meeting_id = meeting.id;
+    let interrupted = InterruptedMeeting {
+        id: meeting_id,
+        app: meeting.meeting_app,
+        title: meeting.title,
+        detection_source: meeting.detection_source,
+        manual: manual_id == Some(meeting_id),
+        captured_at: Instant::now(),
+    };
+    info!(
+        "remembering active meeting across capture restart (id={}, app={}, manual={})",
+        interrupted.id, interrupted.app, interrupted.manual
+    );
+    *state.interrupted_meeting.lock().await = Some(interrupted);
+}
+
+async fn restore_interrupted_meeting_for_capture_restart(
+    state: &RecordingState,
+) -> Result<(), String> {
+    let interrupted = {
+        let mut guard = state.interrupted_meeting.lock().await;
+        guard.take()
+    };
+    let Some(interrupted) = interrupted else {
+        return Ok(());
+    };
+
+    if interrupted.captured_at.elapsed() > CAPTURE_RESTART_MEETING_REATTACH_WINDOW {
+        debug!(
+            "skipping stale interrupted meeting restore (id={}, app={})",
+            interrupted.id, interrupted.app
+        );
+        return Ok(());
+    }
+
+    let server_guard = state.server.lock().await;
+    let Some(server) = server_guard.as_ref() else {
+        return Ok(());
+    };
+
+    let already_active = server
+        .db
+        .get_active_meeting_by_id(interrupted.id)
+        .await
+        .map_err(|e| e.to_string())?
+        .is_some();
+    if !already_active {
+        server
+            .db
+            .reopen_meeting(interrupted.id)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    if interrupted.manual {
+        let mut manual = server.manual_meeting.write().await;
+        *manual = Some(interrupted.id);
+    }
+    if let Some(detector) = server.audio_manager.meeting_detector().await {
+        detector.set_v2_in_meeting(true);
+    }
+
+    info!(
+        "restored active meeting across capture restart (id={}, app={}, source={}, title={:?})",
+        interrupted.id, interrupted.app, interrupted.detection_source, interrupted.title
+    );
     Ok(())
 }
 
@@ -244,25 +373,79 @@ pub async fn start_capture(
 ) -> Result<(), String> {
     info!("Starting capture session");
 
-    // Check if already capturing
-    {
-        let capture_guard = state.capture.lock().await;
-        if capture_guard.is_some() {
-            info!("Capture session already running");
-            return Ok(());
+    // Race guard: short-circuit duplicate invocations.
+    //
+    // `<DeeplinkHandler />` is mounted in every non-overlay webview, and the
+    // tray emits `shortcut-start-recording` app-wide — every listening window
+    // fires `commands.startCapture()` simultaneously. Without this guard, two
+    // concurrent calls both pass the `is_some()` check, both build a
+    // CaptureSession (~290ms), and the second clobbers the first. Dropping
+    // the first runs its shutdown handlers, which tear down workers shared
+    // with the second — surfacing as a PoolClosed cascade and silently lost
+    // audio chunks.
+    if state.is_starting_capture.swap(true, Ordering::SeqCst) {
+        info!("Capture start already in progress, skipping duplicate");
+        return Ok(());
+    }
+    struct ResetGuard<'a>(&'a AtomicBool);
+    impl Drop for ResetGuard<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
         }
     }
+    let _reset = ResetGuard(&state.is_starting_capture);
+
+    // Hold the capture lock from the is_some check through the assign so a
+    // concurrent `start_capture_internal` (called from spawn_screenpipe's
+    // existing-server path, not gated by is_starting_capture) can't race us.
+    let mut capture_guard = state.capture.lock().await;
+    if capture_guard.is_some() {
+        info!("Capture session already running");
+        return Ok(());
+    }
+
+    // `state.server.is_some()` only means ServerCore was constructed once; it
+    // does NOT mean the HTTP serve task is still alive. Long-running sessions
+    // can lose the HTTP server across sleep/wake while ServerCore stays in
+    // state. Starting capture on a corpse leaves the timeline UI showing
+    // "connection error" forever — escalate to a full restart instead.
+    let (port, api_key) = {
+        let server_guard = state.server.lock().await;
+        let Some(ref core) = *server_guard else {
+            return Err("Server not running — cannot start capture".to_string());
+        };
+        (core.port, core.local_api_key.clone())
+    };
+
+    let mut req = reqwest::Client::new()
+        .get(format!("http://localhost:{}/health", port))
+        .timeout(std::time::Duration::from_secs(2));
+    if let Some(ref key) = api_key {
+        req = req.header("Authorization", format!("Bearer {}", key));
+    }
+    let healthy = matches!(req.send().await, Ok(r) if r.status().is_success());
+    if !healthy {
+        warn!(
+            "Server unresponsive on port {} — requesting full restart",
+            port
+        );
+        let _ = app.emit("request-server-restart", ());
+        return Err(format!(
+            "Server not responding on port {} — full restart requested",
+            port
+        ));
+    }
+
+    restore_interrupted_meeting_for_capture_restart(&state).await?;
 
     let server_guard = state.server.lock().await;
     let server = server_guard
         .as_ref()
         .ok_or_else(|| "Server not running — cannot start capture".to_string())?;
-
     let config = build_config(&app)?;
-    let session = CaptureSession::start(server, &config).await?;
+    let session = CaptureSession::start(server, &config, false).await?;
     drop(server_guard);
 
-    let mut capture_guard = state.capture.lock().await;
     *capture_guard = Some(session);
 
     info!("Capture session started");
@@ -286,6 +469,7 @@ pub async fn stop_screenpipe(
 
     // Stop capture first
     {
+        *state.interrupted_meeting.lock().await = None;
         let mut capture_guard = state.capture.lock().await;
         if let Some(session) = capture_guard.take() {
             session.stop().await;
@@ -596,6 +780,7 @@ pub async fn spawn_screenpipe(
         }
     }
 
+    notify_audio_engine_fallback(&store);
     let recording_config = store.to_recording_config(data_dir);
 
     let server_arc = state.server.clone();
@@ -673,7 +858,7 @@ pub async fn spawn_screenpipe(
                     };
 
                 // Phase 2: Start capture
-                let capture = match CaptureSession::start(&server, &recording_config).await {
+                let capture = match CaptureSession::start(&server, &recording_config, true).await {
                     Ok(c) => c,
                     Err(e) => {
                         error!("Failed to start capture session: {}", e);
@@ -734,20 +919,32 @@ pub async fn spawn_screenpipe(
 }
 
 /// Internal helper: start capture on an already-running server.
+///
+/// Lock-first pattern matches `start_capture` so a concurrent `start_capture`
+/// can't build a parallel session and clobber ours.
 async fn start_capture_internal(
     state: &RecordingState,
     app: &tauri::AppHandle,
 ) -> Result<(), String> {
+    let mut capture_guard = state.capture.lock().await;
+    if capture_guard.is_some() {
+        // A concurrent start_capture beat us to it.
+        state.is_starting.store(false, Ordering::SeqCst);
+        info!("Capture already started by concurrent caller");
+        return Ok(());
+    }
+
+    restore_interrupted_meeting_for_capture_restart(state).await?;
+
     let server_guard = state.server.lock().await;
     let server = server_guard
         .as_ref()
         .ok_or_else(|| "Server not running".to_string())?;
 
     let config = build_config(app)?;
-    let session = CaptureSession::start(server, &config).await?;
+    let session = CaptureSession::start(server, &config, false).await?;
     drop(server_guard);
 
-    let mut capture_guard = state.capture.lock().await;
     *capture_guard = Some(session);
     state.is_starting.store(false, Ordering::SeqCst);
 

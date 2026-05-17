@@ -12,19 +12,40 @@ import { SyncSettings } from "./sync-settings";
 import { LockedSetting } from "@/components/enterprise-locked-setting";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Folder } from "lucide-react";
+import { Folder, Trash2 } from "lucide-react";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { useToast } from "@/components/ui/use-toast";
 import { open } from "@tauri-apps/plugin-dialog";
-import { commands } from "@/lib/utils/tauri";
+import { commands, CacheFile } from "@/lib/utils/tauri";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 
 type StorageTab = "local" | "archive" | "sync";
+
+function formatBytes(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const k = 1024;
+  const sizes = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+}
 
 export function StorageSection() {
   const [activeTab, setActiveTab] = useState<StorageTab>("local");
   const posthog = usePostHog();
   const { settings, updateSettings, getDataDir } = useSettings();
   const { toast } = useToast();
+  const [cacheFiles, setCacheFiles] = useState<CacheFile[]>([]);
+  const [showCacheDialog, setShowCacheDialog] = useState(false);
+  const [isClearing, setIsClearing] = useState(false);
   const showCloudSync = useMemo(
     () => posthog?.isFeatureEnabled("cloud-sync") ?? false,
     [posthog]
@@ -127,6 +148,94 @@ export function StorageSection() {
           </CardContent>
         </Card>
       </LockedSetting>
+
+      {/* Clear Cache */}
+      <Card className="border-border bg-card">
+        <CardContent className="px-3 py-2.5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-2.5">
+              <Trash2 className="h-4 w-4 text-muted-foreground shrink-0" />
+              <div>
+                <h3 className="text-sm font-medium text-foreground">Clear Cache</h3>
+                <p className="text-xs text-muted-foreground">
+                  Remove AI agent cache, old logs, and recovery artifacts
+                </p>
+              </div>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              className="ml-4 h-7 text-xs"
+              disabled={isClearing}
+              onClick={async () => {
+                try {
+                  const result = await commands.listCacheFiles();
+                  if (result.status === "error") throw new Error(result.error);
+                  if (result.data.length === 0) {
+                    toast({ title: "nothing to clean up" });
+                    return;
+                  }
+                  setCacheFiles(result.data);
+                  setShowCacheDialog(true);
+                } catch (e: any) {
+                  toast({ title: "failed to scan cache", description: e?.toString(), variant: "destructive" });
+                }
+              }}
+            >
+              {isClearing ? "clearing..." : "scan"}
+            </Button>
+          </div>
+        </CardContent>
+      </Card>
+
+      <AlertDialog open={showCacheDialog} onOpenChange={setShowCacheDialog}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>clear cache?</AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-2">
+                <p>the following files will be deleted ({formatBytes(cacheFiles.reduce((s, f) => s + Number(f.size_bytes), 0))} total):</p>
+                <ul className="text-xs space-y-1 max-h-48 overflow-y-auto">
+                  {cacheFiles.map((f) => (
+                    <li key={f.path} className="flex justify-between gap-2">
+                      <span className="truncate">{f.label}</span>
+                      <span className="text-muted-foreground shrink-0">{formatBytes(Number(f.size_bytes))}</span>
+                    </li>
+                  ))}
+                </ul>
+                <p className="text-xs text-muted-foreground">
+                  AI agent will reinstall automatically on next use.
+                </p>
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={async () => {
+                setIsClearing(true);
+                setShowCacheDialog(false);
+                try {
+                  const paths = cacheFiles.map((f) => f.path);
+                  const result = await commands.deleteCacheFiles(paths);
+                  if (result.status === "error") throw new Error(result.error);
+                  toast({
+                    title: "cache cleared",
+                    description: `freed ${formatBytes(Number(result.data))}`,
+                  });
+                } catch (e: any) {
+                  toast({ title: "failed to clear cache", description: e?.toString(), variant: "destructive" });
+                } finally {
+                  setIsClearing(false);
+                  setCacheFiles([]);
+                }
+              }}
+            >
+              delete all
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Tabs */}
       <div className="flex items-center gap-4 border-b border-border">

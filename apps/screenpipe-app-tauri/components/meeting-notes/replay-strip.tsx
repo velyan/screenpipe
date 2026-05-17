@@ -19,6 +19,7 @@ import {
 } from "@/lib/utils/meeting-context";
 
 interface ReplayStripProps {
+  meetingId: number;
   /** "Notable quotes" sample from the activity summary — used purely to
    * derive the meeting time bounds when the full transcript is empty. */
   segments: AudioSegment[];
@@ -31,7 +32,7 @@ interface ReplayStripProps {
 
 const THUMB_COUNT = 12;
 
-export function ReplayStrip({ segments, timeRange }: ReplayStripProps) {
+export function ReplayStrip({ meetingId, segments, timeRange }: ReplayStripProps) {
   // Bounds from notable-quotes sample (cheap, already loaded).
   const sampleSorted = useMemo(
     () =>
@@ -116,7 +117,7 @@ export function ReplayStrip({ segments, timeRange }: ReplayStripProps) {
     setChunksLoading(true);
     const start = new Date(rangeStartMs).toISOString();
     const end = new Date(rangeEndMs).toISOString();
-    void fetchMeetingAudio(start, end, 1000).then((rows) => {
+    void fetchMeetingAudio(start, end, 1000, meetingId).then((rows) => {
       if (cancelled) return;
       setChunks(rows);
       setChunksLoading(false);
@@ -124,7 +125,7 @@ export function ReplayStrip({ segments, timeRange }: ReplayStripProps) {
     return () => {
       cancelled = true;
     };
-  }, [rangeStartMs, rangeEndMs]);
+  }, [meetingId, rangeStartMs, rangeEndMs]);
 
   // Frames across the meeting span.
   const [frames, setFrames] = useState<FrameSample[]>([]);
@@ -135,7 +136,7 @@ export function ReplayStrip({ segments, timeRange }: ReplayStripProps) {
     void fetchFrameSamples(
       new Date(rangeStartMs).toISOString(),
       new Date(rangeEndMs).toISOString(),
-      200,
+      500,
     ).then((s) => {
       if (cancelled) return;
       setFrames(s);
@@ -276,7 +277,7 @@ export function ReplayStrip({ segments, timeRange }: ReplayStripProps) {
 
   if (sampleSorted.length === 0) return null;
 
-  const speakerLabel = activeChunk?.speakerName || "unknown";
+  const speakerLabel = activeChunk?.speakerName || (activeChunk?.isInput ? "me" : "speaker");
   const showSpeakerPopover = !!activeChunk?.audioChunkId && !!activeChunk?.audioFilePath;
 
   return (
@@ -315,12 +316,16 @@ export function ReplayStrip({ segments, timeRange }: ReplayStripProps) {
           )}
         </div>
 
-        {/* Caption: closest transcript chunk + clickable speaker label */}
-        <div className="px-3 py-2 border-b border-border min-h-[44px] flex items-start gap-3">
+        {/* Caption: closest transcript chunk + clickable speaker label.
+            Fixed height — transcript chunks vary wildly in length (a few
+            words to a paragraph), and a min-height made the whole replay
+            block jump as the user scrubs. Locked at 3 lines with line-clamp;
+            the underlying chunk is still navigable via the rest of the UI. */}
+        <div className="px-3 py-2 border-b border-border h-[96px] flex items-start gap-3 overflow-hidden">
           <span className="text-[11px] text-muted-foreground tabular-nums w-14 shrink-0 mt-0.5">
             {formatClock(new Date(cursorMs).toISOString())}
           </span>
-          <div className="flex-1 min-w-0">
+          <div className="flex-1 min-w-0 overflow-hidden">
             {showSpeakerPopover ? (
               <SpeakerAssignPopover
                 key={`speaker-${activeChunk!.audioChunkId}`}
@@ -347,11 +352,11 @@ export function ReplayStrip({ segments, timeRange }: ReplayStripProps) {
                 </span>
               )
             )}
-            <span className="text-sm text-foreground/90">
+            <span className="text-sm text-foreground/90 line-clamp-3">
               {chunksLoading
                 ? "loading transcript…"
                 : activeChunk
-                ? activeChunk.transcription.replace(/\s+/g, " ").trim().slice(0, 280)
+                ? activeChunk.transcription.replace(/\s+/g, " ").trim()
                 : "no transcript at this moment"}
             </span>
           </div>

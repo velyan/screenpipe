@@ -1077,10 +1077,12 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 							isArrowNav={isArrowNav}
 							adjacentFrames={frames.slice(Math.max(0, currentIndex - 3), currentIndex + 4).filter(Boolean)}
 							onNavigate={(direction) => {
-								// newer = lower index (-1), older = higher index (+1)
+								// frames are sorted newest-first: newer = lower index (-1),
+								// older = higher index (+1). Match the keyboard convention
+								// (ArrowLeft = prev = older, ArrowRight = next = newer).
 								const newIndex = direction === "next"
-									? findNextDevice(currentIndex, 1)
-									: findNextDevice(currentIndex, -1);
+									? findNextDevice(currentIndex, -1)
+									: findNextDevice(currentIndex, 1);
 								setCurrentIndex(newIndex);
 								if (frames[newIndex]) {
 									setCurrentFrame(frames[newIndex]);

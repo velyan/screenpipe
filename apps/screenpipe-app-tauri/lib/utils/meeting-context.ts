@@ -37,8 +37,45 @@ export interface MeetingAudioChunk {
   audioFilePath: string;
   speakerId: number | null;
   speakerName: string;
+  deviceType: string;
+  isInput: boolean;
   transcription: string;
   timestamp: string;
+  source?: "background" | "live";
+}
+
+interface MeetingTranscriptSegment {
+  id: number;
+  meetingId: number;
+  source?: "background" | "live";
+  provider: string;
+  model?: string | null;
+  itemId: string;
+  deviceName: string;
+  deviceType: string;
+  audioTranscriptionId?: number | null;
+  audioChunkId?: number | null;
+  audioFilePath?: string | null;
+  speakerId?: number | null;
+  speakerName?: string | null;
+  transcript: string;
+  capturedAt: string;
+}
+
+function timestampMs(iso: string): number {
+  const ms = new Date(iso).getTime();
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function sortAudioChunks(chunks: MeetingAudioChunk[]): MeetingAudioChunk[] {
+  return [...chunks].sort((a, b) => {
+    const byTime = timestampMs(a.timestamp) - timestampMs(b.timestamp);
+    if (byTime !== 0) return byTime;
+    const rank = (source?: string) => (source === "live" ? 0 : 1);
+    const bySource = rank(a.source) - rank(b.source);
+    if (bySource !== 0) return bySource;
+    return a.audioChunkId - b.audioChunkId;
+  });
 }
 
 export interface SpeakerSummary {
@@ -52,9 +89,21 @@ export interface AudioSummary {
   top_transcriptions: AudioSegment[];
 }
 
+export interface EditedFile {
+  /** Absolute filesystem path (macOS via AXDocument). UI renders as a
+   *  clickable file:// link. */
+  path: string;
+  /** How many distinct frames in the window referenced this path. */
+  frame_count: number;
+}
+
 export interface ActivitySummary {
   apps: AppUsage[];
   windows: WindowActivity[];
+  /** Files the user had open in editors during the time range. Empty on
+   *  Windows/Linux until those platforms grow AXDocument-equivalent
+   *  capture, and absent from older API responses (default to []). */
+  edited_files?: EditedFile[];
   audio_summary: AudioSummary;
   total_frames: number;
   time_range: { start: string; end: string };
@@ -220,6 +269,11 @@ export function pathFromUrl(url: string): string {
 interface SummarizeInput {
   meeting: MeetingRecord;
   context: MeetingContext;
+  transcript?: MeetingAudioChunk[] | null;
+  /** Replace the built-in directive with the body of a user-chosen summary
+   * pipe (e.g. one selected from the Meeting summary pipe picker). The
+   * meeting id is prepended so the pipe body doesn't have to look it up. */
+  directiveOverride?: string;
 }
 
 /**
@@ -231,6 +285,8 @@ interface SummarizeInput {
 export function buildEnrichedSummarizePrompt({
   meeting,
   context,
+  transcript,
+  directiveOverride,
 }: SummarizeInput): string {
   const start = new Date(meeting.meeting_start);
   const end = meeting.meeting_end ? new Date(meeting.meeting_end) : null;
@@ -281,7 +337,10 @@ export function buildEnrichedSummarizePrompt({
       );
     }
 
-    if (a.audio_summary.top_transcriptions.length > 0) {
+    if (
+      !transcript?.length &&
+      a.audio_summary.top_transcriptions.length > 0
+    ) {
       const lines = a.audio_summary.top_transcriptions.slice(0, 8).map((t) => {
         const ts = formatTimeShort(t.timestamp);
         const txt = t.transcription.replace(/\s+/g, " ").trim().slice(0, 240);
@@ -292,14 +351,67 @@ export function buildEnrichedSummarizePrompt({
     }
   }
 
+  const transcriptText = renderTranscript(transcript ?? null, null);
+  if (transcriptText) {
+    const segmentCount = transcript?.length ?? 0;
+    sections.push(
+      `meeting transcript (chronological${segmentCount > 0 ? `, ${segmentCount} segments` : ""}):\n${transcriptText}`,
+    );
+  }
+
   if (context.clipboardCount > 0) {
     sections.push(`clipboard activity: ${context.clipboardCount} copy/paste events during meeting`);
   }
 
-  const directive =
-    "search screenpipe for what happened during this meeting and summarize it: key topics, decisions, action items. then suggest which of my connected integrations would be useful to share this with and draft a message for each.";
+  // If the user picked a custom summary pipe, use its prompt body verbatim as
+  // the directive — prepend the meeting id so it skips any "find the meeting
+  // that just ended" lookup the pipe was written for (the chat path knows
+  // the id already).
+  const directive = directiveOverride
+    ? `the meeting you should summarize has id: ${meeting.id}. you can skip any "find which meeting ended" step.\n\n${directiveOverride}`
+    : buildMeetingSummarizeInstructions(meeting.id, { followUpAsk: true });
 
   return `${directive}\n\n${sections.join("\n\n")}`;
+}
+
+/**
+ * Static instructions for "summarize this meeting and patch it back onto the
+ * record". Used by:
+ *   - the in-app "summarize with AI" button (chat path) — passes the known
+ *     meeting id and asks for the speaker/connector follow-up
+ *   - the bundled meeting-summary pipe (background event-triggered path) —
+ *     keep the wording in sync with crates/screenpipe-core/assets/pipes/meeting-summary/pipe.md
+ *
+ * The agent decides whether to PATCH. Empty transcript / nothing worth saving
+ * → say so out loud, skip the PATCH. Useful summary → append under "## Summary"
+ * preserving the user's existing notes via the same endpoint the autosave uses.
+ */
+export function buildMeetingSummarizeInstructions(
+  meetingId: number | string,
+  options?: { followUpAsk?: boolean },
+): string {
+  const lines = [
+    `search screenpipe for what happened during this meeting and summarize it: key topics, decisions, action items.`,
+    ``,
+    `meeting id: ${meetingId}`,
+    `primary transcript source: GET "http://localhost:3030/meetings/${meetingId}/transcript" and use each row's "transcript", "speakerName", "capturedAt", and "source" fields. sort rows by capturedAt before summarizing.`,
+    `fallback transcript source: /search?content_type=audio for the meeting time window. audio rows use content.transcription (not content.text); content.text may be missing for audio and should not be treated as an empty transcript.`,
+    `if your summary is worth saving, append it to the meeting note (and refresh the title in the same call) via:`,
+    `  curl -s -X PATCH "http://localhost:3030/meetings/${meetingId}" \\`,
+    `    -H "Authorization: Bearer $SCREENPIPE_API_AUTH_KEY" \\`,
+    `    -H "Content-Type: application/json" \\`,
+    `    -d '{"title": "<NEW_TITLE_OR_OMIT>", "note": "<EXISTING_NOTE>\\n\\n## Summary\\n<YOUR_SUMMARY>"}'`,
+    `replace <EXISTING_NOTE> with the meeting's current notes (shown above as "notes:" — empty string if none) so you don't overwrite the user's work; just append your summary under a "## Summary" heading. for the title: if the current "title:" is missing, generic ("untitled", "meeting", just the app name) or doesn't capture what actually happened, replace it with a 5-8 word plain-english title (no quotes, no "meeting about…" prefix) — otherwise omit the field so a user-set title is left alone. if there's nothing useful to summarize (empty transcript, irrelevant audio), say so out loud and skip the PATCH — don't write a placeholder.`,
+  ];
+
+  if (options?.followUpAsk) {
+    lines.push(
+      ``,
+      `after the PATCH, ask the user — in one short message — whether they'd like you to (a) update speaker assignments for any of the audio segments above, or (b) push this summary into one of the apps they were using during the meeting (use the "apps used during meeting" + "tabs/docs visited" sections to list 2-3 plausible targets like Notion, Linear, GitHub, etc.). don't act on either until they reply.`,
+    );
+  }
+
+  return lines.join("\n");
 }
 
 function formatTimeShort(iso: string): string {
@@ -311,16 +423,178 @@ function formatTimeShort(iso: string): string {
   });
 }
 
+// ─── Clipboard markdown ──────────────────────────────────────────────────
+
+interface MeetingMarkdownInput {
+  meeting: MeetingRecord;
+  context: MeetingContext | null;
+  /** Full transcript chunks for the meeting time range. Pass `null` if not
+   *  fetched yet — the bundle falls back to the top fragments from context. */
+  transcript: MeetingAudioChunk[] | null;
+}
+
+/**
+ * Render a meeting + its context as a single markdown document fit for the
+ * clipboard. Pasteable into Notion, Obsidian, Linear, etc.
+ *
+ * Sections are emitted only when they have data — an empty meeting yields a
+ * lean header without empty "## Apps" stubs. Transcript is preferred from
+ * the full chunk list when supplied; otherwise falls back to the curated
+ * top fragments from the context bundle.
+ */
+export function buildMeetingMarkdown({
+  meeting,
+  context,
+  transcript,
+}: MeetingMarkdownInput): string {
+  const start = new Date(meeting.meeting_start);
+  const end = meeting.meeting_end ? new Date(meeting.meeting_end) : null;
+  const durationMin = end
+    ? Math.max(1, Math.round((end.getTime() - start.getTime()) / 60000))
+    : null;
+
+  const parts: string[] = [];
+
+  // Header
+  parts.push(`# ${meeting.title?.trim() || "untitled meeting"}`);
+
+  const meta: string[] = [];
+  meta.push(`**Time:** ${formatHumanRange(start, end)}`);
+  if (durationMin !== null) meta.push(`**Duration:** ${durationMin} min`);
+  if (meeting.attendees) meta.push(`**Attendees:** ${meeting.attendees}`);
+  if (meeting.meeting_app && meeting.meeting_app !== "manual") {
+    meta.push(`**App:** ${meeting.meeting_app}`);
+  }
+  parts.push(meta.join("  \n"));
+
+  // Notes
+  if (meeting.note?.trim()) {
+    parts.push(`## Notes\n\n${meeting.note.trim()}`);
+  }
+
+  // Activity-derived sections
+  const activity = context?.activity ?? null;
+  if (activity) {
+    const apps = topAppSummary(activity.apps, 6);
+    if (apps) parts.push(`## Apps used\n\n${formatAppsLines(activity.apps, 6)}`);
+
+    const urls = pickReceiptUrls(activity.windows, 10);
+    if (urls.length > 0) {
+      parts.push(
+        `## Tabs / docs visited\n\n${urls
+          .map(
+            (u) =>
+              `- [${u.window_name || hostFromUrl(u.browser_url)}](${u.browser_url}) — ${u.minutes}m`,
+          )
+          .join("\n")}`,
+      );
+    }
+
+    if (activity.audio_summary.speakers.length > 0) {
+      parts.push(
+        `## Speakers\n\n${activity.audio_summary.speakers
+          .map((s) => `- ${s.name} (${s.segment_count} segments)`)
+          .join("\n")}`,
+      );
+    }
+  }
+
+  // Transcript — prefer full chunk list, fall back to top fragments
+  const transcriptLines = renderTranscript(transcript, activity);
+  if (transcriptLines) parts.push(`## Transcript\n\n${transcriptLines}`);
+
+  if (context && context.clipboardCount > 0) {
+    parts.push(
+      `_${context.clipboardCount} clipboard event${
+        context.clipboardCount === 1 ? "" : "s"
+      } during meeting._`,
+    );
+  }
+
+  return parts.join("\n\n") + "\n";
+}
+
+function formatHumanRange(start: Date, end: Date | null): string {
+  const dateStr = start.toLocaleDateString(undefined, {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+  const startTime = start.toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  if (!end) return `${dateStr}, ${startTime} (ongoing)`;
+  const endTime = end.toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  return `${dateStr}, ${startTime} – ${endTime}`;
+}
+
+function formatAppsLines(apps: AppUsage[], limit: number): string {
+  return apps
+    .slice(0, limit)
+    .map((a) => `- ${a.name.toLowerCase()} (${a.minutes}m)`)
+    .join("\n");
+}
+
+function renderTranscript(
+  full: MeetingAudioChunk[] | null,
+  activity: ActivitySummary | null,
+): string {
+  if (full && full.length > 0) {
+    return sortAudioChunks(full)
+      .map((c) => {
+        const ts = formatTimeShort(c.timestamp);
+        const sp =
+          c.speakerName && c.speakerName !== "unknown"
+            ? `[${c.speakerName}] `
+            : "";
+        const txt = c.transcription.replace(/\s+/g, " ").trim();
+        return `- ${ts} ${sp}${txt}`;
+      })
+      .join("\n");
+  }
+  // Fallback: curated top fragments (already capped at 8 in the activity)
+  const top = activity?.audio_summary.top_transcriptions ?? [];
+  if (top.length === 0) return "";
+  return top
+    .map((t) => {
+      const ts = formatTimeShort(t.timestamp);
+      const sp =
+        t.speaker && t.speaker !== "unknown" ? `[${t.speaker}] ` : "";
+      const txt = t.transcription.replace(/\s+/g, " ").trim();
+      return `- ${ts} ${sp}${txt}`;
+    })
+    .join("\n");
+}
+
 // ─── Frame lookup for replay-the-moment ──────────────────────────────────
 
 interface SearchOcrItem {
   type?: string;
   content?: {
+    /** OCR rows carry `frame_id`; accessibility rows from `search_accessibility`
+     * return one row per frame with the frame's PK as `id` (no `frame_id`
+     * field). Read both — frameIdFromItem() below normalises. */
     frame_id?: number;
+    id?: number;
     timestamp?: string;
     app_name?: string;
     window_name?: string;
   };
+}
+
+function frameIdFromItem(item: SearchOcrItem): number | null {
+  const c = item.content;
+  if (!c) return null;
+  if (typeof c.frame_id === "number") return c.frame_id;
+  // Accessibility/UI rows: server's search_accessibility SELECTs f.id,
+  // which is the frames PK — same space as OCR's frame_id.
+  if (item.type === "UI" && typeof c.id === "number") return c.id;
+  return null;
 }
 
 /**
@@ -374,6 +648,7 @@ interface SearchAudioItem {
     transcription?: string;
     timestamp?: string;
     file_path?: string;
+    device_type?: string;
     speaker?: { id?: number; name?: string } | null;
   };
 }
@@ -389,9 +664,12 @@ export async function fetchMeetingAudio(
   startIso: string,
   endIso: string,
   cap = 1000,
+  meetingId?: number,
 ): Promise<MeetingAudioChunk[]> {
+  const routedRows = await fetchRoutedMeetingTranscript(meetingId, cap);
+
   const out: MeetingAudioChunk[] = [];
-  const seen = new Set<number>();
+  const seen = new Set<string>();
   const pageSize = 200;
   let offset = 0;
   for (let page = 0; page < 10 && out.length < cap; page++) {
@@ -407,16 +685,23 @@ export async function fetchMeetingAudio(
         const c = item.content;
         if (!c) continue;
         const id = c.chunk_id;
-        if (typeof id !== "number" || seen.has(id)) continue;
+        if (typeof id !== "number") continue;
         if (!c.transcription || !c.timestamp || !c.file_path) continue;
-        seen.add(id);
+        const rowKey = `${id}:${c.timestamp}:${c.transcription}`;
+        if (seen.has(rowKey)) continue;
+        const deviceType = c.device_type ?? "";
+        const isInput = deviceType.toLowerCase() === "input";
+        seen.add(rowKey);
         out.push({
           audioChunkId: id,
           audioFilePath: c.file_path,
-          speakerId: c.speaker?.id ?? null,
-          speakerName: c.speaker?.name ?? "unknown",
+          speakerId: isInput ? null : c.speaker?.id ?? null,
+          speakerName: isInput ? "me" : c.speaker?.name ?? "",
+          deviceType,
+          isInput,
           transcription: c.transcription,
           timestamp: c.timestamp,
+          source: "background",
         });
       }
       if (items.length < pageSize) break;
@@ -425,38 +710,120 @@ export async function fetchMeetingAudio(
       break;
     }
   }
-  out.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+  return mergeMeetingAudioChunks(routedRows, out, cap);
+}
+
+function mergeMeetingAudioChunks(
+  liveRows: MeetingAudioChunk[],
+  backgroundRows: MeetingAudioChunk[],
+  cap: number,
+): MeetingAudioChunk[] {
+  const merged = sortAudioChunks([...liveRows, ...backgroundRows]);
+  const seen = new Set<string>();
+  const out: MeetingAudioChunk[] = [];
+
+  for (const chunk of merged) {
+    const key = [
+      Math.round(timestampMs(chunk.timestamp) / 1000),
+      chunk.deviceType,
+      chunk.speakerName,
+      chunk.transcription.replace(/\s+/g, " ").trim().toLowerCase(),
+    ].join("|");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(chunk);
+    if (out.length >= cap) break;
+  }
+
   return out;
+}
+
+async function fetchRoutedMeetingTranscript(
+  meetingId: number | undefined,
+  cap: number,
+): Promise<MeetingAudioChunk[]> {
+  if (typeof meetingId !== "number" || !Number.isFinite(meetingId)) return [];
+
+  try {
+    const res = await localFetch(`/meetings/${meetingId}/transcript`);
+    if (!res.ok) return [];
+    const body = (await res.json()) as MeetingTranscriptSegment[];
+    return body
+      .slice(0, cap)
+      .filter((segment) => segment.transcript?.trim() && segment.capturedAt)
+      .map((segment) => {
+        const deviceType = segment.deviceType ?? "";
+        const isInput = deviceType.toLowerCase() === "input";
+        const source = segment.source ?? "live";
+        return {
+          audioChunkId:
+            typeof segment.audioChunkId === "number"
+              ? segment.audioChunkId
+              : -segment.id,
+          audioFilePath: segment.audioFilePath ?? "",
+          speakerId: isInput ? null : segment.speakerId ?? null,
+          speakerName: isInput
+            ? "me"
+            : segment.speakerName?.trim() || "speaker",
+          deviceType,
+          isInput,
+          transcription: segment.transcript,
+          timestamp: segment.capturedAt,
+          source,
+        };
+      })
+      .sort((a, b) => timestampMs(a.timestamp) - timestampMs(b.timestamp));
+  } catch {
+    return [];
+  }
 }
 
 /**
  * Pull frames anchored anywhere across [start, end] for the meeting timeline
  * scrubber. Returns a deduped, time-sorted list of {frameId, timestamp}.
  * The caller decides how many to actually render as thumbnails.
+ *
+ * Pulls OCR + accessibility in parallel and merges by frame id. Earlier we
+ * used `content_type=all` with a single 200-row page, but `all` mixes audio
+ * rows (no frame_id) and many OCR rows per frame, so dedup collapsed a
+ * 71-minute meeting to ~66 unique frames — sparse enough that scrubbing
+ * within ~30 s of a frame produced no visible image change. OCR gives one
+ * row per text-bearing frame; accessibility (`search_accessibility`)
+ * returns one row per frame with the frame PK as `content.id`. Both index
+ * into the same `frames` table, so dedup is safe.
  */
 export async function fetchFrameSamples(
   startIso: string,
   endIso: string,
-  limit = 200,
+  limit = 500,
 ): Promise<FrameSample[]> {
-  try {
-    const res = await localFetch(
-      `/search?content_type=all&start_time=${encodeURIComponent(startIso)}&end_time=${encodeURIComponent(endIso)}&limit=${limit}`,
-    );
-    if (!res.ok) return [];
-    const body = (await res.json()) as { data?: SearchOcrItem[] };
-    const seen = new Set<number>();
-    const out: FrameSample[] = [];
-    for (const item of body.data ?? []) {
-      const fid = item.content?.frame_id;
-      const ts = item.content?.timestamp;
-      if (typeof fid !== "number" || !ts || seen.has(fid)) continue;
-      seen.add(fid);
-      out.push({ frameId: fid, timestamp: ts });
+  const fetchOne = async (contentType: "ocr" | "accessibility") => {
+    try {
+      const res = await localFetch(
+        `/search?content_type=${contentType}&start_time=${encodeURIComponent(startIso)}&end_time=${encodeURIComponent(endIso)}&limit=${limit}`,
+      );
+      if (!res.ok) return [] as SearchOcrItem[];
+      const body = (await res.json()) as { data?: SearchOcrItem[] };
+      return body.data ?? [];
+    } catch {
+      return [] as SearchOcrItem[];
     }
-    out.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-    return out;
-  } catch {
-    return [];
+  };
+
+  const [ocrItems, uiItems] = await Promise.all([
+    fetchOne("ocr"),
+    fetchOne("accessibility"),
+  ]);
+
+  const seen = new Set<number>();
+  const out: FrameSample[] = [];
+  for (const item of [...ocrItems, ...uiItems]) {
+    const fid = frameIdFromItem(item);
+    const ts = item.content?.timestamp;
+    if (fid == null || !ts || seen.has(fid)) continue;
+    seen.add(fid);
+    out.push({ frameId: fid, timestamp: ts });
   }
+  out.sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+  return out;
 }

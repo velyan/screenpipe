@@ -9,7 +9,7 @@
 
 use super::{
     AccessibilityTreeNode, NodeBounds, SkipReason, TreeSnapshot, TreeWalkResult, TreeWalkerConfig,
-    TreeWalkerPlatform,
+    TreeWalkerPlatform, WindowBounds,
 };
 use crate::events::AccessibilityNode;
 use crate::platform::windows_uia::UiaContext;
@@ -26,7 +26,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+    GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
 };
 
 /// Excluded apps — password managers and security tools (matches macOS list).
@@ -56,6 +56,8 @@ const SKIP_TYPES: &[&str] = &[
     "ProgressBar",
 ];
 
+const RPC_E_CHANGED_MODE_CODE: i32 = 0x80010106u32 as i32;
+
 /// UIA control types that carry user-visible text in name or value.
 const TEXT_TYPES: &[&str] = &[
     "Text",
@@ -82,7 +84,8 @@ const TEXT_TYPES: &[&str] = &[
 /// to mutate on first call (lazy init). The walker is single-threaded.
 struct WalkerState {
     uia: Option<UiaContext>,
-    com_initialized: bool,
+    com_initialized_by_us: bool,
+    com_ready: bool,
 }
 
 /// Windows tree walker using UI Automation CacheRequest.
@@ -103,7 +106,8 @@ impl WindowsTreeWalker {
             config,
             state: UnsafeCell::new(WalkerState {
                 uia: None,
-                com_initialized: false,
+                com_initialized_by_us: false,
+                com_ready: false,
             }),
         }
     }
@@ -113,11 +117,23 @@ impl WindowsTreeWalker {
     /// Safety: caller must ensure single-threaded access (guaranteed by walker design).
     unsafe fn ensure_init(&self) -> Result<&UiaContext> {
         let state = &mut *self.state.get();
-        if !state.com_initialized {
-            CoInitializeEx(None, COINIT_APARTMENTTHREADED)
-                .ok()
-                .map_err(|e| anyhow::anyhow!("COM init failed: {:?}", e))?;
-            state.com_initialized = true;
+        if !state.com_ready {
+            let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            if hr.is_ok() {
+                state.com_initialized_by_us = true;
+                state.com_ready = true;
+            } else if hr.0 == RPC_E_CHANGED_MODE_CODE {
+                // Tokio's blocking pool can reuse a thread that some other
+                // Windows API already initialized as MTA. UI Automation is
+                // usable from MTA too; the important part is not calling
+                // CoUninitialize for an apartment we did not initialize.
+                tracing::debug!(
+                    "COM already initialized with a different apartment; using existing COM apartment for UIA"
+                );
+                state.com_ready = true;
+            } else {
+                return Err(anyhow::anyhow!("COM init failed: {:?}", hr));
+            }
         }
         if state.uia.is_none() {
             let mut last_err = None;
@@ -156,7 +172,7 @@ impl Drop for WindowsTreeWalker {
         let state = self.state.get_mut();
         // Drop UIA before CoUninitialize
         state.uia.take();
-        if state.com_initialized {
+        if state.com_initialized_by_us {
             unsafe {
                 windows::Win32::System::Com::CoUninitialize();
             }
@@ -185,7 +201,13 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
 
         // Skip excluded apps
         let app_lower = app_name.to_lowercase();
-        if EXCLUDED_APPS.iter().any(|ex| app_lower.contains(ex)) {
+        if EXCLUDED_APPS.iter().any(|ex| app_lower.contains(ex))
+            || self
+                .config
+                .blocked_apps
+                .iter()
+                .any(|pattern| app_lower.contains(&pattern.to_lowercase()))
+        {
             return Ok(TreeWalkResult::Skipped(SkipReason::ExcludedApp));
         }
 
@@ -204,6 +226,15 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
 
         // Apply user-configured ignored windows (check app name and window title)
         let window_lower = window_name.to_lowercase();
+        if self
+            .config
+            .blocked_title_keywords
+            .iter()
+            .any(|pattern| window_lower.contains(&pattern.to_lowercase()))
+        {
+            return Ok(TreeWalkResult::Skipped(SkipReason::ExcludedApp));
+        }
+
         if self.config.ignored_windows.iter().any(|pattern| {
             let p = pattern.to_lowercase();
             app_lower.contains(&p) || window_lower.contains(&p)
@@ -239,6 +270,10 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
 
         // Get monitor dimensions for normalizing element bounds to 0-1 coords
         let monitor_rect = get_monitor_rect(hwnd);
+        // Window rect for the on-screen visibility check (issue #2436).
+        // Stored once per walk — GetWindowRect is cheap and the focused
+        // window doesn't move during the sub-second walk in practice.
+        let window_rect = get_window_rect(hwnd);
 
         // Extract text from the tree (matching macOS text extraction behavior)
         let mut text_buffer = String::with_capacity(4096);
@@ -259,6 +294,7 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
             &mut nodes,
             &mut browser_url,
             &monitor_rect,
+            &window_rect,
             &ignored_lower,
             &mut hit_ignored_extension,
         );
@@ -299,12 +335,27 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
         );
 
         // Windows walker doesn't have timeout-based truncation yet — report as complete
+        // Per-app document_path resolution from on-disk state files
+        // (Obsidian config + VS Code-fork state.vscdb). Returns None
+        // for any unknown app or any failure — never panics.
+        let document_path =
+            super::electron_docs::resolve_electron_doc_path(&app_name.to_lowercase());
         Ok(TreeWalkResult::Found(TreeSnapshot {
             app_name,
             window_name,
+            window_id: None,
+            process_id: Some(pid),
+            window_bounds: window_rect.as_ref().map(|rect| WindowBounds {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+            }),
             text_content: text_buffer,
             nodes,
+            focused_element: None,
             browser_url,
+            document_path,
             timestamp: Utc::now(),
             node_count,
             walk_duration,
@@ -323,6 +374,58 @@ struct MonitorRect {
     y: f64,
     width: f64,
     height: f64,
+}
+
+/// Focused-window rectangle in screen coordinates. Used for the "is the
+/// element actually visible in the captured pixels?" check (issue #2436)
+/// — distinct from `MonitorRect` because we need the *window* clip, not
+/// the monitor's full extent (UIA can report element bounds inside the
+/// monitor but outside the window's visible area for scrolled-off
+/// terminal/editor content).
+struct WindowRect {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+/// Get the focused window's screen rectangle via Win32 GetWindowRect.
+/// Returns None if the call fails or the rect is degenerate; callers
+/// fall back to `on_screen = None` (unknown) in that case rather than
+/// guessing.
+fn get_window_rect(hwnd: HWND) -> Option<WindowRect> {
+    unsafe {
+        let mut r = RECT::default();
+        if GetWindowRect(hwnd, &mut r).is_ok() {
+            let w = (r.right - r.left) as f64;
+            let h = (r.bottom - r.top) as f64;
+            if w > 0.0 && h > 0.0 {
+                return Some(WindowRect {
+                    x: r.left as f64,
+                    y: r.top as f64,
+                    width: w,
+                    height: h,
+                });
+            }
+        }
+        None
+    }
+}
+
+/// True iff the element's screen-absolute frame intersects the focused
+/// window's rect — the on-screen visibility test for issue #2436.
+/// Delegates to the shared pure-geometry helper.
+fn is_on_screen(bounds: &crate::events::ElementBounds, window: &WindowRect) -> bool {
+    super::rects_intersect(
+        bounds.x,
+        bounds.y,
+        bounds.width,
+        bounds.height,
+        window.x,
+        window.y,
+        window.width,
+        window.height,
+    )
 }
 
 /// Get the monitor rectangle containing the given window.
@@ -385,6 +488,7 @@ fn make_tree_node(
     text: &str,
     depth: usize,
     bounds: Option<NodeBounds>,
+    on_screen: Option<bool>,
 ) -> AccessibilityTreeNode {
     let mut n = AccessibilityTreeNode::new(
         role.to_string(),
@@ -392,6 +496,7 @@ fn make_tree_node(
         depth.min(255) as u8,
         bounds,
     );
+    n.on_screen = on_screen;
     n.automation_id = uia_node.automation_id.clone();
     n.class_name = uia_node.class_name.clone();
     n.value = uia_node.value.clone();
@@ -410,6 +515,7 @@ fn make_tree_node(
 
 /// Recursively extract text from the accessibility tree.
 /// Mirrors the macOS walker's text extraction strategy.
+#[allow(clippy::too_many_arguments)]
 fn extract_text_from_tree(
     node: &AccessibilityNode,
     depth: usize,
@@ -418,6 +524,7 @@ fn extract_text_from_tree(
     nodes: &mut Vec<AccessibilityTreeNode>,
     browser_url: &mut Option<String>,
     monitor_rect: &Option<MonitorRect>,
+    window_rect: &Option<WindowRect>,
     ignored_windows_lower: &[String],
     hit_ignored_extension: &mut bool,
 ) {
@@ -436,6 +543,13 @@ fn extract_text_from_tree(
     let norm_bounds = monitor_rect
         .as_ref()
         .and_then(|mr| node.bounds.as_ref().and_then(|b| normalize_bounds(b, mr)));
+    // On-screen check (issue #2436): does the element's screen-absolute
+    // bounds intersect the focused window's rect? `None` when window
+    // bounds aren't available — caller's filter logic must treat that
+    // as "unknown" rather than implicitly true/false.
+    let on_screen = window_rect
+        .as_ref()
+        .and_then(|wr| node.bounds.as_ref().map(|b| is_on_screen(b, wr)));
 
     // Extract text from text-bearing elements
     if TEXT_TYPES.iter().any(|&t| ct.eq_ignore_ascii_case(t)) {
@@ -456,6 +570,7 @@ fn extract_text_from_tree(
                         val.trim(),
                         depth,
                         norm_bounds.clone(),
+                        on_screen,
                     ));
                     // Don't recurse into text controls — their children are sub-elements of the same text
                     return;
@@ -519,6 +634,7 @@ fn extract_text_from_tree(
                             trimmed,
                             depth,
                             norm_bounds.clone(),
+                            on_screen,
                         ));
                     }
                 }
@@ -535,6 +651,7 @@ fn extract_text_from_tree(
                         name.trim(),
                         depth,
                         norm_bounds.clone(),
+                        on_screen,
                     ));
                 }
             }
@@ -554,6 +671,7 @@ fn extract_text_from_tree(
                     val.trim(),
                     depth,
                     norm_bounds.clone(),
+                    on_screen,
                 ));
             }
         } else if ct.eq_ignore_ascii_case("Custom") {
@@ -561,7 +679,14 @@ fn extract_text_from_tree(
             if let Some(ref name) = node.name {
                 if !name.trim().is_empty() {
                     append_text(buffer, name);
-                    nodes.push(make_tree_node(node, ct, name.trim(), depth, norm_bounds));
+                    nodes.push(make_tree_node(
+                        node,
+                        ct,
+                        name.trim(),
+                        depth,
+                        norm_bounds,
+                        on_screen,
+                    ));
                 }
             }
         }
@@ -577,6 +702,7 @@ fn extract_text_from_tree(
             nodes,
             browser_url,
             monitor_rect,
+            window_rect,
             ignored_windows_lower,
             hit_ignored_extension,
         );
@@ -699,7 +825,8 @@ mod tests {
             &mut buf,
             &mut nodes,
             &mut url,
-            &None,
+            &None, // monitor_rect
+            &None, // window_rect
             &[],
             &mut false,
         );
@@ -768,7 +895,8 @@ mod tests {
             &mut buf,
             &mut nodes,
             &mut url,
-            &None,
+            &None, // monitor_rect
+            &None, // window_rect
             &[],
             &mut false,
         );
@@ -858,7 +986,8 @@ mod tests {
             &mut buf,
             &mut nodes,
             &mut url,
-            &None,
+            &None, // monitor_rect
+            &None, // window_rect
             &ignored,
             &mut hit,
         );

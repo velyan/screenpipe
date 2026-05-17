@@ -47,6 +47,17 @@ pub const WRAPPER_SCRIPT: &str = r#"# screenpipe — auto-injected by pi-agent b
 #
 # Regenerated on every pi-agent spawn from screenpipe-core::agents::bash_env.
 
+# Hide the cloud-LLM JWT (SCREENPIPE_API_KEY) from the agent's bash. The
+# pi-coding-agent reads it from auth.json directly and does NOT need it
+# in the env. Leaving it exposed bit a real user (justinspillers,
+# 2026-05-05): the agent saw an env var named "SCREENPIPE_API_KEY", used
+# it on localhost:3030, the server 401'd (it's a JWT, not the local
+# sp-<uuid8> token), and the agent burned 30+ tool calls hunting a
+# phantom auth bug before concluding — wrongly — that "the local API
+# needs a full JWT token". Unset it here so the only auth-shaped name
+# the agent can see is SCREENPIPE_LOCAL_API_KEY, which is correct.
+unset SCREENPIPE_API_KEY
+
 _sp_auth_key() {
   # accept either name so we don't depend on which spawn path set it
   printf '%s' "${SCREENPIPE_LOCAL_API_KEY:-${SCREENPIPE_API_AUTH_KEY:-}}"
@@ -180,6 +191,20 @@ mod tests {
     fn wrapper_script_contains_both_env_var_names() {
         assert!(WRAPPER_SCRIPT.contains("SCREENPIPE_LOCAL_API_KEY"));
         assert!(WRAPPER_SCRIPT.contains("SCREENPIPE_API_AUTH_KEY"));
+    }
+
+    #[test]
+    fn wrapper_script_unsets_cloud_token_env_var() {
+        // The agent must not see SCREENPIPE_API_KEY (cloud JWT) — it's
+        // distinct from SCREENPIPE_LOCAL_API_KEY (local sp-<uuid>) and
+        // exposing both has caused real users' agents to send the JWT
+        // to localhost:3030 and chase phantom auth bugs (justinspillers,
+        // 2026-05-05 — feedback log shows the agent burning 30+ tool
+        // calls before concluding "API needs full JWT" — wrong).
+        assert!(
+            WRAPPER_SCRIPT.contains("unset SCREENPIPE_API_KEY"),
+            "wrapper must unset SCREENPIPE_API_KEY in pi-agent subshells"
+        );
     }
 
     #[test]

@@ -77,7 +77,7 @@ async fn fetch_models_from_gateway(
             let has_vision = best_for
                 .map(|arr| {
                     arr.iter()
-                        .any(|v| v.as_str().map_or(false, |s| s.contains("vision")))
+                        .any(|v| v.as_str().is_some_and(|s| s.contains("vision")))
                 })
                 .unwrap_or(false);
             let input = if has_vision {
@@ -138,13 +138,52 @@ impl PiExecutor {
         self
     }
 
+    /// User policy: when the marker file
+    /// `~/.screenpipe/cloud_media_analysis.disabled` exists, the
+    /// screenpipe-api skill is installed WITHOUT the Gemma 4 E4B
+    /// confidential-enclave block. Default (no marker) = enabled, so
+    /// fresh installs ship the capability documented and Pi knows to
+    /// call `api.screenpi.pe` with `model: "gemma4-e4b"` for audio /
+    /// video / image analysis.
+    ///
+    /// Gating happens at install time (here) rather than by mutating
+    /// the rendered SKILL.md after the fact — those copies get
+    /// overwritten on every Pi run, so post-install edits don't stick.
+    fn cloud_media_analysis_enabled() -> bool {
+        let home = match dirs::home_dir() {
+            Some(h) => h,
+            None => return true,
+        };
+        !home
+            .join(".screenpipe")
+            .join("cloud_media_analysis.disabled")
+            .exists()
+    }
+
+    fn render_screenpipe_api_skill() -> String {
+        let mut s = String::from(include_str!("../../assets/skills/screenpipe-api/SKILL.md"));
+        if Self::cloud_media_analysis_enabled() {
+            // Trim trailing whitespace before appending so we don't
+            // accumulate blank lines on rebuild.
+            while s.ends_with(char::is_whitespace) {
+                s.pop();
+            }
+            s.push('\n');
+            s.push('\n');
+            s.push_str(
+                include_str!("../../assets/skills/screenpipe-api/cloud_media_analysis_block.md")
+                    .trim_end(),
+            );
+            s.push('\n');
+        }
+        s
+    }
+
     /// Ensure screenpipe skills exist in `project_dir/.pi/skills/`.
     pub fn ensure_screenpipe_skill(project_dir: &Path) -> Result<()> {
+        let api_skill = Self::render_screenpipe_api_skill();
         let skills: &[(&str, &str)] = &[
-            (
-                "screenpipe-api",
-                include_str!("../../assets/skills/screenpipe-api/SKILL.md"),
-            ),
+            ("screenpipe-api", api_skill.as_str()),
             (
                 "screenpipe-cli",
                 include_str!("../../assets/skills/screenpipe-cli/SKILL.md"),
@@ -221,11 +260,12 @@ impl PiExecutor {
         use crate::pipes::permissions::PipePermissions;
         let perms = PipePermissions::from_config(config);
 
+        let api_skill = Self::render_screenpipe_api_skill();
         #[allow(clippy::type_complexity)]
         let all_skills: &[(&str, &str, Box<dyn Fn(&PipePermissions) -> bool>)] = &[
             (
                 "screenpipe-api",
-                include_str!("../../assets/skills/screenpipe-api/SKILL.md"),
+                api_skill.as_str(),
                 Box::new(|_| true), // always installed — unified API skill
             ),
             (
@@ -317,14 +357,10 @@ impl PiExecutor {
         let ext_dir = project_dir.join(".pi").join("extensions");
         let ext_path = ext_dir.join("web-search.ts");
 
-        // Offline mode: never install web search (it calls api.screenpi.pe)
-        let offline = crate::offline::is_offline_mode();
-
-        let is_screenpipe_cloud = !offline
-            && matches!(
-                provider,
-                None | Some("screenpipe") | Some("screenpipe-cloud") | Some("pi")
-            );
+        let is_screenpipe_cloud = matches!(
+            provider,
+            None | Some("screenpipe") | Some("screenpipe-cloud") | Some("pi")
+        );
 
         if is_screenpipe_cloud {
             std::fs::create_dir_all(&ext_dir)?;
@@ -391,16 +427,10 @@ impl PiExecutor {
         // Only add screenpipe cloud provider if it's the intended provider
         // (or no provider specified). If the user explicitly chose ollama/openai/custom,
         // do NOT write screenpipe into models.json to avoid silent credit drain via fallback.
-        // Offline mode: never add screenpipe cloud provider.
-        let offline = crate::offline::is_offline_mode();
-        let should_add_screenpipe = if offline {
-            false
-        } else {
-            match provider {
-                None => true,
-                Some("screenpipe") | Some("screenpipe-cloud") | Some("pi") => true,
-                Some(_) => false,
-            }
+        let should_add_screenpipe = match provider {
+            None => true,
+            Some("screenpipe") | Some("screenpipe-cloud") | Some("pi") => true,
+            Some(_) => false,
         };
 
         if should_add_screenpipe {
@@ -473,28 +503,68 @@ impl PiExecutor {
                         "openai-completions"
                     };
 
-                    let user_provider = json!({
-                        "baseUrl": base_url,
-                        "api": wire_api,
-                        "apiKey": api_key,
-                        "models": [{
-                            "id": mdl,
-                            "name": mdl,
-                            "input": ["text", "image"],
-                            "maxTokens": 4096,
-                            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
-                        }]
+                    let new_model = json!({
+                        "id": mdl,
+                        "name": mdl,
+                        "input": ["text", "image"],
+                        "maxTokens": 4096,
+                        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}
                     });
 
+                    // Field-level merge: preserve user-set baseUrl/apiKey when present
+                    // (e.g. jeffutter's `~/.pi/agent/models.json` "ollama" pointing at his
+                    // home server, or "openai-byok" with his real API key) and append our
+                    // model to `models[]` instead of clobbering the array.
+                    //
+                    // Only overwrite a field when (a) the pipe explicitly provided it
+                    // (e.g. `provider_url:` in pipe.md) or (b) no value exists yet.
                     if let Some(providers) = models_config
                         .get_mut("providers")
                         .and_then(|p| p.as_object_mut())
                     {
-                        providers.insert(pi_provider_name.to_string(), user_provider);
+                        let entry = providers
+                            .entry(pi_provider_name.to_string())
+                            .or_insert_with(|| json!({}));
+                        if let Some(obj) = entry.as_object_mut() {
+                            // baseUrl: respect user's existing unless the pipe gave a URL.
+                            let user_pinned_url = obj.contains_key("baseUrl")
+                                && obj.get("baseUrl").and_then(|v| v.as_str()).is_some()
+                                && provider_url.is_none();
+                            if !user_pinned_url {
+                                obj.insert("baseUrl".to_string(), json!(base_url));
+                            }
+                            // api (wire format): always set — it's a function of model
+                            // family, not a user preference.
+                            obj.insert("api".to_string(), json!(wire_api));
+                            // apiKey: respect user's existing if any.
+                            if !obj.contains_key("apiKey")
+                                || obj
+                                    .get("apiKey")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.is_empty())
+                                    .unwrap_or(true)
+                            {
+                                obj.insert("apiKey".to_string(), json!(api_key));
+                            }
+                            // models[]: append if our id isn't already there.
+                            let models_arr =
+                                obj.entry("models".to_string()).or_insert_with(|| json!([]));
+                            if !models_arr.is_array() {
+                                *models_arr = json!([]);
+                            }
+                            if let Some(arr) = models_arr.as_array_mut() {
+                                let already = arr
+                                    .iter()
+                                    .any(|m| m.get("id").and_then(|v| v.as_str()) == Some(mdl));
+                                if !already {
+                                    arr.push(new_model);
+                                }
+                            }
+                        }
                     }
 
                     info!(
-                        "pi config: added provider '{}' with model '{}'",
+                        "pi config: merged provider '{}' (model '{}') into ~/.pi/agent/models.json",
                         pi_provider_name, mdl
                     );
                 }
@@ -605,46 +675,39 @@ impl PiExecutor {
         }
         cmd.arg("-p").arg(prompt);
 
-        // Offline mode: strip all cloud API keys to prevent external requests.
-        // Only localhost providers (ollama) work in offline mode.
-        let offline = crate::offline::is_offline_mode();
-        if !offline {
-            if let Some(ref token) = self.user_token {
-                cmd.env("SCREENPIPE_API_KEY", token);
-            }
+        if let Some(ref token) = self.user_token {
+            cmd.env("SCREENPIPE_API_KEY", token);
+        }
 
-            // Pi resolves apiKey values in models.json as env var names.
-            // Set the actual key so the subprocess can find it.
-            if let Some(key) = provider_api_key {
-                if !key.is_empty() {
-                    match resolved_provider {
-                        "openai" | "openai-byok" => {
-                            cmd.env("OPENAI_API_KEY", key);
-                        }
-                        "openai-chatgpt" => {
-                            cmd.env("OPENAI_CHATGPT_TOKEN", key);
-                        }
-                        "anthropic" | "anthropic-byok" => {
-                            cmd.env("ANTHROPIC_API_KEY", key);
-                        }
-                        "custom" => {
-                            cmd.env("CUSTOM_API_KEY", key);
-                        }
-                        "google" => {
-                            cmd.env("GOOGLE_API_KEY", key);
-                        }
-                        // Ensure screenpipe API key is set as env var fallback
-                        "screenpipe" if self.user_token.is_none() => {
-                            cmd.env("SCREENPIPE_API_KEY", key);
-                        }
-                        _ => {}
+        // Pi resolves apiKey values in models.json as env var names.
+        // Set the actual key so the subprocess can find it.
+        if let Some(key) = provider_api_key {
+            if !key.is_empty() {
+                match resolved_provider {
+                    "openai" | "openai-byok" => {
+                        cmd.env("OPENAI_API_KEY", key);
                     }
+                    "openai-chatgpt" => {
+                        cmd.env("OPENAI_CHATGPT_TOKEN", key);
+                    }
+                    "anthropic" | "anthropic-byok" => {
+                        cmd.env("ANTHROPIC_API_KEY", key);
+                    }
+                    "custom" => {
+                        cmd.env("CUSTOM_API_KEY", key);
+                    }
+                    "google" => {
+                        cmd.env("GOOGLE_API_KEY", key);
+                    }
+                    // Ensure screenpipe API key is set as env var fallback
+                    "screenpipe" if self.user_token.is_none() => {
+                        cmd.env("SCREENPIPE_API_KEY", key);
+                    }
+                    _ => {}
                 }
             }
         }
 
-        // Local server bearer token — kept separate from cloud keys so it
-        // flows even in offline mode (the local server is always localhost).
         if let Some(ref key) = self.api_auth_key {
             cmd.env("SCREENPIPE_API_AUTH_KEY", key);
         }
@@ -732,42 +795,37 @@ impl PiExecutor {
         }
         cmd.arg("-p").arg(prompt);
 
-        // Offline mode: strip all cloud API keys (same logic as spawn_pi)
-        let offline = crate::offline::is_offline_mode();
-        if !offline {
-            if let Some(ref token) = self.user_token {
-                cmd.env("SCREENPIPE_API_KEY", token);
-            }
+        if let Some(ref token) = self.user_token {
+            cmd.env("SCREENPIPE_API_KEY", token);
+        }
 
-            if let Some(key) = provider_api_key {
-                if !key.is_empty() {
-                    match resolved_provider {
-                        "openai" | "openai-byok" => {
-                            cmd.env("OPENAI_API_KEY", key);
-                        }
-                        "openai-chatgpt" => {
-                            cmd.env("OPENAI_CHATGPT_TOKEN", key);
-                        }
-                        "anthropic" | "anthropic-byok" => {
-                            cmd.env("ANTHROPIC_API_KEY", key);
-                        }
-                        "custom" => {
-                            cmd.env("CUSTOM_API_KEY", key);
-                        }
-                        "google" => {
-                            cmd.env("GOOGLE_API_KEY", key);
-                        }
-                        // Ensure screenpipe API key is set as env var fallback
-                        "screenpipe" if self.user_token.is_none() => {
-                            cmd.env("SCREENPIPE_API_KEY", key);
-                        }
-                        _ => {}
+        if let Some(key) = provider_api_key {
+            if !key.is_empty() {
+                match resolved_provider {
+                    "openai" | "openai-byok" => {
+                        cmd.env("OPENAI_API_KEY", key);
                     }
+                    "openai-chatgpt" => {
+                        cmd.env("OPENAI_CHATGPT_TOKEN", key);
+                    }
+                    "anthropic" | "anthropic-byok" => {
+                        cmd.env("ANTHROPIC_API_KEY", key);
+                    }
+                    "custom" => {
+                        cmd.env("CUSTOM_API_KEY", key);
+                    }
+                    "google" => {
+                        cmd.env("GOOGLE_API_KEY", key);
+                    }
+                    // Ensure screenpipe API key is set as env var fallback
+                    "screenpipe" if self.user_token.is_none() => {
+                        cmd.env("SCREENPIPE_API_KEY", key);
+                    }
+                    _ => {}
                 }
             }
         }
 
-        // Local server bearer token — unaffected by offline mode.
         if let Some(ref key) = self.api_auth_key {
             cmd.env("SCREENPIPE_API_AUTH_KEY", key);
         }
@@ -952,16 +1010,15 @@ impl AgentExecutor for PiExecutor {
             )
             .await?;
 
-        // Retry once on "model not found": delete stale models.json and rewrite
+        // Retry once on "model not found": re-merge our managed providers so
+        // any stale entry gets refreshed. Do NOT delete the file — that would
+        // also wipe user-managed providers (e.g. jeffutter's custom groq /
+        // bedrock entries in ~/.pi/agent/models.json).
         if !output.success && output.stderr.to_lowercase().contains("not found") {
             warn!(
-                "pi model not found, retrying with fresh models.json (stderr: {})",
+                "pi model not found, re-merging managed providers (stderr: {})",
                 output.stderr.trim()
             );
-            let config_dir = get_pi_config_dir()?;
-            let models_path = config_dir.join("models.json");
-            // Remove possibly-stale file so ensure_pi_config writes from scratch
-            let _ = std::fs::remove_file(&models_path);
             Self::ensure_pi_config(
                 self.user_token.as_deref(),
                 &self.api_url,
@@ -1044,15 +1101,13 @@ impl AgentExecutor for PiExecutor {
             )
             .await?;
 
-        // Retry once on "model not found"
+        // Retry once on "model not found": re-merge managed providers (don't
+        // delete the file — would wipe user-managed entries).
         if !output.success && output.stderr.to_lowercase().contains("not found") {
             warn!(
-                "pi model not found, retrying with fresh models.json (stderr: {})",
+                "pi model not found, re-merging managed providers (stderr: {})",
                 output.stderr.trim()
             );
-            let config_dir = get_pi_config_dir()?;
-            let models_path = config_dir.join("models.json");
-            let _ = std::fs::remove_file(&models_path);
             Self::ensure_pi_config(
                 self.user_token.as_deref(),
                 &self.api_url,
@@ -1857,11 +1912,13 @@ mod tests {
     #[test]
     fn test_lossy_utf8_handles_invalid_bytes() {
         // Simulate raw bytes from a pipe: "Hi" + 0xFF 0xFE (invalid UTF-8) + newline + "OK" + newline
-        let raw_bytes: &[u8] = b"Hi\xff\xfe\nOK\n";
+        let mut raw_bytes = b"Hi".to_vec();
+        raw_bytes.extend([0xff, 0xfe, b'\n']);
+        raw_bytes.extend_from_slice(b"OK\n");
 
         // Strict UTF-8 should fail
         assert!(
-            std::str::from_utf8(raw_bytes).is_err(),
+            std::str::from_utf8(&raw_bytes).is_err(),
             "raw bytes should not be valid UTF-8"
         );
 

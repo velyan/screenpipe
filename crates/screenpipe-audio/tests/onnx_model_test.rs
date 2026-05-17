@@ -32,16 +32,16 @@ mod tests {
         let start = Instant::now();
 
         // Download/locate the embedding model
-        let embedding_model_path = get_or_download_model(PyannoteModel::Embedding).await?;
+        let embedding_model = get_or_download_model(PyannoteModel::Embedding).await?;
         println!(
             "Model path: {:?} (downloaded in {:?})",
-            embedding_model_path,
+            embedding_model.path,
             start.elapsed()
         );
 
         // Create the ONNX session - this is where segfaults typically occur
         let start = Instant::now();
-        let extractor = EmbeddingExtractor::new(&embedding_model_path)?;
+        let extractor = EmbeddingExtractor::new(&embedding_model.path)?;
         println!("EmbeddingExtractor created in {:?}", start.elapsed());
 
         // Verify we can access the extractor (it's not a null/invalid session)
@@ -61,16 +61,16 @@ mod tests {
         let start = Instant::now();
 
         // Download/locate the segmentation model
-        let segmentation_model_path = get_or_download_model(PyannoteModel::Segmentation).await?;
+        let segmentation_model = get_or_download_model(PyannoteModel::Segmentation).await?;
         println!(
             "Model path: {:?} (downloaded in {:?})",
-            segmentation_model_path,
+            segmentation_model.path,
             start.elapsed()
         );
 
         // Create the ONNX session directly using the speaker module's create_session
         let start = Instant::now();
-        let session = screenpipe_audio::speaker::create_session(&segmentation_model_path)?;
+        let session = screenpipe_audio::speaker::create_session(&segmentation_model.path)?;
         println!("Segmentation session created in {:?}", start.elapsed());
 
         // Basic validation - check session has expected inputs/outputs
@@ -121,10 +121,10 @@ mod tests {
         println!("Testing EmbeddingExtractor inference...");
 
         // Download/locate the embedding model
-        let embedding_model_path = get_or_download_model(PyannoteModel::Embedding).await?;
+        let embedding_model = get_or_download_model(PyannoteModel::Embedding).await?;
 
         // Create the extractor
-        let mut extractor = EmbeddingExtractor::new(&embedding_model_path)?;
+        let mut extractor = EmbeddingExtractor::new(&embedding_model.path)?;
         println!("EmbeddingExtractor created");
 
         // Generate some test audio data (1 second of silence at 16kHz)
@@ -165,15 +165,16 @@ mod tests {
         // Step 2: Download/load embedding model
         println!("Step 2: Loading embedding model...");
         let start = Instant::now();
-        let embedding_path = get_or_download_model(PyannoteModel::Embedding).await?;
-        let _embedding_extractor = EmbeddingExtractor::new(&embedding_path)?;
+        let embedding_model = get_or_download_model(PyannoteModel::Embedding).await?;
+        let _embedding_extractor = EmbeddingExtractor::new(&embedding_model.path)?;
         println!("  EmbeddingExtractor OK ({:?})", start.elapsed());
 
         // Step 3: Download/load segmentation model
         println!("Step 3: Loading segmentation model...");
         let start = Instant::now();
-        let segmentation_path = get_or_download_model(PyannoteModel::Segmentation).await?;
-        let _segmentation_session = screenpipe_audio::speaker::create_session(&segmentation_path)?;
+        let segmentation_model = get_or_download_model(PyannoteModel::Segmentation).await?;
+        let _segmentation_session =
+            screenpipe_audio::speaker::create_session(&segmentation_model.path)?;
         println!("  Segmentation session OK ({:?})", start.elapsed());
 
         println!("---");

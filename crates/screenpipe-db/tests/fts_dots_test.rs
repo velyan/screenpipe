@@ -80,6 +80,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await;
 
@@ -140,6 +141,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await;
 
@@ -191,6 +193,7 @@ mod tests {
                 None,
                 None,
                 Some("main.rs — screenpipe"),
+                None,
                 None,
                 None,
                 None,
@@ -262,6 +265,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await;
 
@@ -312,6 +316,7 @@ mod tests {
                 None,
                 None,
                 Some("zoom.us"),
+                None,
                 None,
                 None,
                 None,
@@ -479,6 +484,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await;
 
@@ -532,6 +538,7 @@ mod tests {
                 ContentType::OCR,
                 100,
                 0,
+                None,
                 None,
                 None,
                 None,
@@ -603,6 +610,7 @@ mod tests {
                     None,
                     None,
                     Some(app_name),
+                    None,
                     None,
                     None,
                     None,

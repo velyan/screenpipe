@@ -5,12 +5,12 @@
 //! Monitor Watcher - Polls for monitor connect/disconnect events
 
 use once_cell::sync::Lazy;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use screenpipe_events::PermissionKind;
 use screenpipe_screen::monitor::{list_monitors_detailed, MonitorListError};
@@ -39,25 +39,34 @@ pub async fn start_monitor_watcher(
     info!("Starting monitor watcher (polling every 5 seconds)");
 
     let handle = tokio::spawn(async move {
-        // Track monitors that were disconnected (for reconnection detection)
-        let mut known_monitors: HashSet<u32> = HashSet::new();
+        // Track monitors that were disconnected (for reconnection detection).
+        // Value is the human-readable display name at the time we last saw it,
+        // so the topology-changed event for a disconnect can carry a name even
+        // though the OS no longer enumerates the gone monitor.
+        let mut known_monitors: HashMap<u32, String> = HashMap::new();
         // Track permission state to avoid log spam
         let mut permission_denied_logged = false;
         // Track whether we stopped monitors due to DRM
         let mut drm_stopped = false;
         // Track whether we stopped recording due to work-hours schedule
         let mut schedule_stopped = false;
+        // Suppresses the topology-changed event for the next reconcile pass.
+        // Set true after DRM/schedule resume so the bulk re-add of monitors
+        // doesn't surface as a user-facing "+N displays detected" notification.
+        let mut suppress_next_topology_event = false;
+        // Warn once per recovery episode, then keep repeated retries quiet.
+        let mut recovery_retry_warned = false;
 
         // Initialize with current monitors
         match list_monitors_detailed().await {
             Ok(monitors) => {
                 for monitor in &monitors {
-                    known_monitors.insert(monitor.id());
+                    known_monitors.insert(monitor.id(), monitor.name().to_string());
                 }
                 permission_denied_logged = false;
             }
             Err(MonitorListError::PermissionDenied) => {
-                error!("Screen recording permission denied. Vision capture is disabled. Grant access in System Settings > Privacy & Security > Screen Recording");
+                warn!("Screen recording permission denied. Vision capture is disabled. Grant access in System Settings > Privacy & Security > Screen Recording");
                 permission_denied_logged = true;
                 permission_monitor::report_state(
                     PermissionKind::ScreenRecording,
@@ -115,9 +124,13 @@ pub async fn start_monitor_watcher(
                     }
                 }
                 drm_stopped = false;
+                suppress_next_topology_event = true;
                 // Re-populate known_monitors after restart
                 if let Ok(monitors) = list_monitors_detailed().await {
-                    known_monitors = monitors.iter().map(|m| m.id()).collect();
+                    known_monitors = monitors
+                        .iter()
+                        .map(|m| (m.id(), m.name().to_string()))
+                        .collect();
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
@@ -158,17 +171,41 @@ pub async fn start_monitor_watcher(
                     }
                 }
                 schedule_stopped = false;
+                suppress_next_topology_event = true;
                 if let Ok(monitors) = list_monitors_detailed().await {
-                    known_monitors = monitors.iter().map(|m| m.id()).collect();
+                    known_monitors = monitors
+                        .iter()
+                        .map(|m| (m.id(), m.name().to_string()))
+                        .collect();
                 }
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             }
 
             // ── Normal monitor polling ──────────────────────────────────────
-            // Only poll when running
+            // If stopped (e.g. no monitors after undock/wake), retry start()
             if vision_manager.status().await != VisionManagerStatus::Running {
                 tokio::time::sleep(Duration::from_secs(5)).await;
+                match vision_manager.start().await {
+                    Ok(()) => {
+                        info!("VisionManager recovered after previous start failure");
+                        recovery_retry_warned = false;
+                        if let Ok(monitors) = list_monitors_detailed().await {
+                            known_monitors = monitors
+                                .iter()
+                                .map(|m| (m.id(), m.name().to_string()))
+                                .collect();
+                        }
+                    }
+                    Err(e) => {
+                        if recovery_retry_warned {
+                            debug!(?e, "VisionManager retry still failing");
+                        } else {
+                            warn!(?e, "VisionManager retry failed; will keep retrying");
+                            recovery_retry_warned = true;
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -188,7 +225,7 @@ pub async fn start_monitor_watcher(
                 }
                 Err(MonitorListError::PermissionDenied) => {
                     if !permission_denied_logged {
-                        error!("Screen recording permission denied. Vision capture is disabled. Grant access in System Settings > Privacy & Security > Screen Recording");
+                        warn!("Screen recording permission denied. Vision capture is disabled. Grant access in System Settings > Privacy & Security > Screen Recording");
                         permission_denied_logged = true;
                         permission_monitor::report_state(
                             PermissionKind::ScreenRecording,
@@ -217,6 +254,13 @@ pub async fn start_monitor_watcher(
             let active_ids: HashSet<u32> =
                 vision_manager.active_monitors().await.into_iter().collect();
 
+            // Empty active set on a populated known set means this is steady-state
+            // boot, not a hot-plug — suppress the notification so the user doesn't
+            // get "started recording 4 monitors" on every restart.
+            let initial_pass = active_ids.is_empty() && known_monitors.is_empty();
+            let mut added: Vec<serde_json::Value> = Vec::new();
+            let mut removed: Vec<serde_json::Value> = Vec::new();
+
             // Detect newly connected monitors (filtered by user selection)
             for monitor in &current_monitors {
                 let monitor_id = monitor.id();
@@ -230,18 +274,31 @@ pub async fn start_monitor_watcher(
                         continue;
                     }
 
-                    if known_monitors.contains(&monitor_id) {
+                    if known_monitors.contains_key(&monitor_id) {
                         info!("Monitor {} reconnected, resuming recording", monitor_id);
                     } else {
                         info!("New monitor {} detected, starting recording", monitor_id);
-                        known_monitors.insert(monitor_id);
                     }
+                    // Keep the name fresh (and insert if first time seen) so a
+                    // later disconnect can still report a human-readable name.
+                    known_monitors.insert(monitor_id, monitor.name().to_string());
 
-                    if let Err(e) = vision_manager.start_monitor(monitor_id).await {
-                        warn!(
-                            "Failed to start recording on monitor {}: {:?}",
-                            monitor_id, e
-                        );
+                    match vision_manager.start_monitor(monitor_id).await {
+                        Ok(()) => {
+                            added.push(serde_json::json!({
+                                "id": monitor_id,
+                                "stable_id": monitor.stable_id(),
+                                "name": monitor.name(),
+                                "width": monitor.width(),
+                                "height": monitor.height(),
+                            }));
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to start recording on monitor {}: {:?}",
+                                monitor_id, e
+                            );
+                        }
                     }
                 }
             }
@@ -250,13 +307,40 @@ pub async fn start_monitor_watcher(
             for monitor_id in &active_ids {
                 if !current_ids.contains(monitor_id) {
                     info!("Monitor {} disconnected, stopping recording", monitor_id);
-                    if let Err(e) = vision_manager.stop_monitor(*monitor_id).await {
-                        warn!(
+                    match vision_manager.stop_monitor(*monitor_id).await {
+                        Ok(()) => {
+                            // Use the last-known name for this id — the OS no
+                            // longer enumerates a disconnected display, so the
+                            // name has to come from our cache or be "unknown".
+                            let name = known_monitors
+                                .get(monitor_id)
+                                .cloned()
+                                .unwrap_or_else(|| format!("display {}", monitor_id));
+                            removed.push(serde_json::json!({
+                                "id": *monitor_id,
+                                "name": name,
+                            }));
+                        }
+                        Err(e) => warn!(
                             "Failed to stop recording on monitor {}: {:?}",
                             monitor_id, e
-                        );
+                        ),
                     }
                 }
+            }
+
+            if suppress_next_topology_event {
+                suppress_next_topology_event = false;
+            } else if !initial_pass && (!added.is_empty() || !removed.is_empty()) {
+                let active_count = vision_manager.active_monitors().await.len();
+                let _ = screenpipe_events::send_event(
+                    "monitor_topology_changed",
+                    serde_json::json!({
+                        "added": added,
+                        "removed": removed,
+                        "active_count": active_count,
+                    }),
+                );
             }
 
             // Wait for the next display reconfiguration event. On macOS the

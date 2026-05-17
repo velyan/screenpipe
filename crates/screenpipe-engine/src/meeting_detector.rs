@@ -23,6 +23,7 @@
 //! and non-meeting contexts (Slack chat, etc.). A mute button counts only when
 //! accompanied by a leave/hangup signal (see `min_signals_required`).
 
+use crate::meeting_telemetry::{capture_detection_decision, MeetingDetectionScanSummary};
 use crate::routes::meetings::{emit_meeting_status_changed, resolve_meeting_status_from};
 use chrono::{DateTime, Utc};
 use futures::{FutureExt, StreamExt};
@@ -288,22 +289,24 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
             ],
             min_signals_required: 1,
         },
-        // Discord native (macOS + Windows)
-        // Native macOS: Electron exposes 0 windows but menu bar has "Mute"/"Deafen"
-        // items ONLY when in a voice channel — these are reliable call signals.
-        // Windows: full Electron AX tree works via UIA.
-        // NOTE: Mute/Deafen menu items exist even when NOT in a voice channel,
-        // so we require "Disconnect" (only present when connected to voice) as
-        // the primary signal. Mute is kept as a secondary confirmation signal.
+        // Discord native — macOS.
+        // Electron exposes 0 windows on macOS but the app menu bar has
+        // Mute/Deafen menu items year-round and a "Disconnect" item ONLY
+        // when in a voice channel. Require Disconnect + Mute (min=2) so
+        // we never trigger from the channel-list panel or the always-on
+        // user-controls bar (those expose Mute/Deafen-like buttons but
+        // not a "Disconnect" menu entry). Concrete FP this guards
+        // against: 2026-04-14 fe669f5b6 — Mute alone fired even when
+        // outside any voice channel.
+        #[cfg(target_os = "macos")]
         MeetingDetectionProfile {
             app_identifiers: AppIdentifiers {
                 macos_app_names: &["discord"],
-                windows_process_names: &["discord.exe"],
+                windows_process_names: &[],
                 browser_url_patterns: &[],
                 browser_title_patterns: &[],
             },
             call_signals: vec![
-                // "Disconnect" only appears when actually connected to a voice channel
                 CallSignal::MenuBarItem {
                     title_contains: "Disconnect",
                 },
@@ -312,12 +315,41 @@ pub fn load_detection_profiles() -> Vec<MeetingDetectionProfile> {
                     name_contains: "Disconnect",
                 },
                 CallSignal::NameContains("Disconnect"),
-                // Mute as secondary confirmation (always present, so not sufficient alone)
                 CallSignal::MenuBarItem {
                     title_contains: "Mute",
                 },
             ],
             min_signals_required: 2,
+        },
+        // Discord native — Windows.
+        // UIA can't express MenuBarItem signals as PropertyConditions
+        // (see windows_scan_process_uia, ~line 1285), so the macOS
+        // profile's Mute/Disconnect menu items never fire here. That
+        // left signals 2+3 (RoleWithName + NameContains, both keyed on
+        // "Disconnect") — and the per-element matching loop short-
+        // circuits on first match, so a single "Disconnect" button
+        // counts as 1 signal, not 2. Net effect of the macOS-tuned
+        // min=2 on Windows: every Discord call went undetected from
+        // 2026-04-15 (commit fe669f5b6) until the user reported it.
+        // Discord's UI never shows "Disconnect" outside an active
+        // voice channel, so min=1 is safe here without the macOS
+        // FP risk.
+        #[cfg(target_os = "windows")]
+        MeetingDetectionProfile {
+            app_identifiers: AppIdentifiers {
+                macos_app_names: &[],
+                windows_process_names: &["discord.exe"],
+                browser_url_patterns: &[],
+                browser_title_patterns: &[],
+            },
+            call_signals: vec![
+                CallSignal::RoleWithName {
+                    role: "AXButton",
+                    name_contains: "Disconnect",
+                },
+                CallSignal::NameContains("Disconnect"),
+            ],
+            min_signals_required: 1,
         },
         // Discord in browser — require BOTH "Voice Connected" bar AND "Disconnect"
         // button. Either alone can appear without being in a call (e.g. seeing other
@@ -1463,6 +1495,10 @@ pub enum MeetingState {
         since: Instant,
         /// Whether this meeting was detected in a browser (longer grace period on end).
         is_browser: bool,
+        /// Consecutive scans (so far) that have seen controls while in Ending.
+        /// Used by re-entry hysteresis: a single visible scan no longer flips
+        /// Ending → Active. See `REENTRY_HYSTERESIS_SCANS`.
+        controls_seen_in_ending: u8,
     },
 }
 
@@ -1487,6 +1523,17 @@ const ENDING_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longer timeout for browser-based meetings — tab switching hides AX controls,
 /// so we wait much longer before declaring the meeting ended.
 const ENDING_TIMEOUT_BROWSER: Duration = Duration::from_secs(300); // 5 minutes
+
+/// Re-entry hysteresis: number of consecutive in-call scans required to leave
+/// Ending back to Active. With prod's 5s scan interval, the value `2` means a
+/// single transient blip (one scan that happens to find controls — AX tree
+/// reflow, brief toolbar peek) can no longer flip the state. Two consecutive
+/// visible scans (≥5s of sustained presence) are needed. This cuts log noise
+/// from the Active⇌Ending oscillation observed in Arc/Meet (Meeting 72,
+/// 2026-05-11) without changing end-detection semantics: the grace clock keeps
+/// ticking during transient visibility, so genuine end-of-call still fires
+/// after `ENDING_TIMEOUT` of true silence.
+const REENTRY_HYSTERESIS_SCANS: u8 = 2;
 
 /// Check if an app name is a known browser.
 fn is_browser_app(app_name: &str) -> bool {
@@ -1625,6 +1672,7 @@ pub fn advance_state(
                         started_at,
                         since: Instant::now(),
                         is_browser,
+                        controls_seen_in_ending: 0,
                     },
                     None,
                 )
@@ -1637,6 +1685,7 @@ pub fn advance_state(
             started_at,
             since,
             is_browser,
+            controls_seen_in_ending,
         } => {
             let timeout = if is_browser {
                 ENDING_TIMEOUT_BROWSER
@@ -1644,21 +1693,44 @@ pub fn advance_state(
                 ENDING_TIMEOUT
             };
             if let Some(result) = best_active {
-                info!(
-                    "meeting v2: Ending -> Active (controls reappeared, app={}, id={})",
-                    result.app_name, meeting_id
+                let next_count = controls_seen_in_ending.saturating_add(1);
+                if next_count >= REENTRY_HYSTERESIS_SCANS {
+                    info!(
+                        "meeting v2: Ending -> Active (controls reappeared, app={}, id={}, hysteresis={}/{})",
+                        result.app_name, meeting_id, next_count, REENTRY_HYSTERESIS_SCANS
+                    );
+                    return (
+                        MeetingState::Active {
+                            meeting_id,
+                            app: result.app_name.clone(),
+                            started_at, // preserve original start time
+                            last_seen: Instant::now(),
+                            is_browser,
+                        },
+                        None,
+                    );
+                }
+                debug!(
+                    "meeting v2: Ending (hysteresis {}/{}, app={}, id={})",
+                    next_count, REENTRY_HYSTERESIS_SCANS, result.app_name, meeting_id
                 );
-                (
-                    MeetingState::Active {
+                // Keep the grace clock ticking — a single transient blip
+                // does not extend the timeout.
+                return (
+                    MeetingState::Ending {
                         meeting_id,
-                        app: result.app_name.clone(),
-                        started_at, // preserve original start time
-                        last_seen: Instant::now(),
+                        app,
+                        started_at,
+                        since,
                         is_browser,
+                        controls_seen_in_ending: next_count,
                     },
                     None,
-                )
-            } else if has_output_audio {
+                );
+            }
+            // best_active was None: the hysteresis counter resets so that
+            // re-entry requires N consecutive visible scans, not N total.
+            if has_output_audio {
                 // Audio output is still active — the user likely just switched
                 // tabs/apps, minimized the window, or switched to another meeting app.
                 // Keep the meeting alive regardless of whether UI controls are visible.
@@ -1705,6 +1777,7 @@ pub fn advance_state(
                         started_at,
                         since,
                         is_browser,
+                        controls_seen_in_ending: 0,
                     },
                     None,
                 )
@@ -2165,6 +2238,7 @@ pub async fn run_meeting_detection_loop(
     mut shutdown_rx: broadcast::Receiver<()>,
     scan_interval: Option<Duration>,
     detector: Option<Arc<screenpipe_audio::meeting_detector::MeetingDetector>>,
+    close_orphaned_meetings_on_start: bool,
 ) {
     let profiles = load_detection_profiles();
     let scanner = Arc::new(MeetingUiScanner::new());
@@ -2179,11 +2253,33 @@ pub async fn run_meeting_detection_loop(
             || !p.app_identifiers.browser_title_patterns.is_empty()
     });
 
-    // Close any orphaned meetings from a prior crash
-    match db.close_orphaned_meetings().await {
-        Ok(0) => debug!("meeting v2: no orphaned meetings"),
-        Ok(n) => info!("meeting v2: closed {} orphaned meeting(s)", n),
-        Err(e) => warn!("meeting v2: failed to close orphaned meetings: {}", e),
+    if close_orphaned_meetings_on_start {
+        // Close any orphaned meetings from a prior crash.
+        match db.close_orphaned_meetings().await {
+            Ok(0) => debug!("meeting v2: no orphaned meetings"),
+            Ok(n) => info!("meeting v2: closed {} orphaned meeting(s)", n),
+            Err(e) => warn!("meeting v2: failed to close orphaned meetings: {}", e),
+        }
+    } else {
+        debug!("meeting v2: preserving active meetings across capture restart");
+    }
+
+    if let Ok(Some(meeting)) = db.get_most_recent_active_meeting().await {
+        let started_at = DateTime::parse_from_rfc3339(&meeting.meeting_start)
+            .map(|dt| dt.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now());
+        info!(
+            "meeting v2: reattached active meeting on watcher start (id={}, app={})",
+            meeting.id, meeting.meeting_app
+        );
+        state = MeetingState::Active {
+            meeting_id: meeting.id,
+            app: meeting.meeting_app,
+            started_at,
+            last_seen: Instant::now(),
+            is_browser: false,
+        };
+        sync_meeting_flag(true, &in_meeting_flag, &detector);
     }
 
     // Calendar enrichment: subscribe to calendar events from the event bus.
@@ -2193,6 +2289,8 @@ pub async fn run_meeting_detection_loop(
 
     // Subscribe to explicit stop signals from the API layer
     let mut stop_sub = subscribe_to_event::<DetectorStopSignal>("detector_stop_tracking");
+    let mut auto_end_sub =
+        subscribe_to_event::<MeetingAutoEndRequest>("meeting_auto_end_requested");
 
     info!(
         "meeting v2: detection loop started (base_interval={:?}, profiles={})",
@@ -2251,6 +2349,61 @@ pub async fn run_meeting_detection_loop(
             }
         }
 
+        if let Some(event) = auto_end_sub.next().now_or_never().flatten() {
+            let request = event.data;
+            let manual_matches = { *manual_meeting.read().await == Some(request.meeting_id) };
+            let detector_matches = matches!(
+                &state,
+                MeetingState::Active { meeting_id, .. }
+                    | MeetingState::Ending { meeting_id, .. }
+                    if *meeting_id == request.meeting_id
+            );
+
+            if manual_matches || detector_matches {
+                let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+                match db
+                    .end_meeting_with_typed_text(request.meeting_id, &now, false)
+                    .await
+                {
+                    Ok(()) => {
+                        info!(
+                            "meeting v2: auto-ended inactive live meeting (id={}, reason={})",
+                            request.meeting_id,
+                            request.reason.as_deref().unwrap_or("unknown")
+                        );
+                        if manual_matches {
+                            let mut manual = manual_meeting.write().await;
+                            if *manual == Some(request.meeting_id) {
+                                *manual = None;
+                            }
+                        }
+                        if detector_matches {
+                            state = MeetingState::Idle;
+                            current_interval = IDLE_APPS_SCAN_INTERVAL;
+                        }
+                        sync_meeting_flag(false, &in_meeting_flag, &detector);
+                        if let Ok(status) =
+                            resolve_meeting_status_from(db.as_ref(), manual_meeting.as_ref()).await
+                        {
+                            emit_meeting_status_changed(&status);
+                        }
+                        if let Err(e) = screenpipe_events::send_event(
+                            "meeting_ended",
+                            serde_json::json!({ "meeting_id": request.meeting_id }),
+                        ) {
+                            warn!("meeting v2: failed to emit meeting_ended event: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "meeting v2: failed to auto-end inactive live meeting {}: {}",
+                            request.meeting_id, e
+                        );
+                    }
+                }
+            }
+        }
+
         // Skip if manual meeting is active
         {
             let manual = manual_meeting.read().await;
@@ -2258,6 +2411,16 @@ pub async fn run_meeting_detection_loop(
                 debug!("meeting v2: manual meeting active, skipping scan");
                 continue;
             }
+        }
+
+        // Skip if the screen is locked. AX queries against meeting apps return
+        // nothing useful when the user is away from the keyboard, and they are
+        // the most expensive operation in this loop on macOS. State stays put
+        // — if we were Active, we resume Active on unlock; the next scan
+        // re-evaluates from reality. Linux never sets this flag (only wake is
+        // tracked there), so this is a no-op on Linux.
+        if crate::sleep_monitor::screen_is_locked() {
+            continue;
         }
 
         // Build active tracking from the current state so find_running_meeting_apps
@@ -2420,7 +2583,10 @@ pub async fn run_meeting_detection_loop(
                     let attendees_str = cal_attendees.as_ref().map(|a| a.join(", "));
 
                     // Try to merge with recently-ended meeting
-                    let meeting_id = match db.find_recent_meeting_for_app(&app, 120).await {
+                    let (meeting_id, decision_trigger) = match db
+                        .find_recent_meeting_for_app(&app, 120)
+                        .await
+                    {
                         Ok(Some(recent)) => match db.reopen_meeting(recent.id).await {
                             Ok(()) => {
                                 info!(
@@ -2449,37 +2615,44 @@ pub async fn run_meeting_detection_loop(
                                         );
                                     }
                                 }
-                                recent.id
+                                (recent.id, "auto_reopen")
                             }
                             Err(e) => {
                                 warn!("meeting v2: failed to reopen meeting {}: {}", recent.id, e);
+                                (
+                                    insert_new_meeting(
+                                        &db,
+                                        &app,
+                                        cal_title.as_deref(),
+                                        attendees_str.as_deref(),
+                                    )
+                                    .await,
+                                    "auto_start",
+                                )
+                            }
+                        },
+                        Ok(None) => (
+                            insert_new_meeting(
+                                &db,
+                                &app,
+                                cal_title.as_deref(),
+                                attendees_str.as_deref(),
+                            )
+                            .await,
+                            "auto_start",
+                        ),
+                        Err(e) => {
+                            warn!("meeting v2: failed to find recent meeting: {}", e);
+                            (
                                 insert_new_meeting(
                                     &db,
                                     &app,
                                     cal_title.as_deref(),
                                     attendees_str.as_deref(),
                                 )
-                                .await
-                            }
-                        },
-                        Ok(None) => {
-                            insert_new_meeting(
-                                &db,
-                                &app,
-                                cal_title.as_deref(),
-                                attendees_str.as_deref(),
+                                .await,
+                                "auto_start",
                             )
-                            .await
-                        }
-                        Err(e) => {
-                            warn!("meeting v2: failed to find recent meeting: {}", e);
-                            insert_new_meeting(
-                                &db,
-                                &app,
-                                cal_title.as_deref(),
-                                attendees_str.as_deref(),
-                            )
-                            .await
                         }
                     };
 
@@ -2504,6 +2677,16 @@ pub async fn run_meeting_detection_loop(
                         resolve_meeting_status_from(db.as_ref(), manual_meeting.as_ref()).await
                     {
                         emit_meeting_status_changed(&status);
+                    }
+                    if let Ok(meeting) = db.get_meeting_by_id(meeting_id).await {
+                        capture_detection_decision(
+                            &meeting,
+                            decision_trigger,
+                            Some(MeetingDetectionScanSummary::from_scan_results(
+                                &scan_results,
+                                has_output_audio,
+                            )),
+                        );
                     }
                 }
                 StateAction::EndMeeting { meeting_id } => {
@@ -2588,6 +2771,7 @@ fn handle_no_apps_running(state: MeetingState) -> (MeetingState, Option<i64>) {
                     started_at,
                     since: Instant::now(),
                     is_browser: false, // process exited → use short timeout
+                    controls_seen_in_ending: 0,
                 },
                 None,
             )
@@ -2605,6 +2789,7 @@ fn handle_no_apps_running(state: MeetingState) -> (MeetingState, Option<i64>) {
             app,
             started_at,
             is_browser,
+            controls_seen_in_ending,
         } => {
             let timeout = if is_browser {
                 ENDING_TIMEOUT_BROWSER
@@ -2630,6 +2815,7 @@ fn handle_no_apps_running(state: MeetingState) -> (MeetingState, Option<i64>) {
                         app,
                         started_at,
                         is_browser,
+                        controls_seen_in_ending,
                     },
                     None,
                 )
@@ -2662,6 +2848,13 @@ struct CalendarEventSignal {
     pub attendees: Vec<String>,
     #[serde(default)]
     pub is_all_day: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MeetingAutoEndRequest {
+    meeting_id: i64,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3078,9 +3271,16 @@ mod tests {
         let results: Vec<ScanResult> = vec![];
         let (ending_state, _) = advance_state(state, &results, false);
 
-        // Transition back to Active (controls reappear)
-        let results = vec![make_scan_result("Zoom", true, 1)];
-        let (active_again, _) = advance_state(ending_state, &results, false);
+        // Hysteresis: re-entry requires REENTRY_HYSTERESIS_SCANS consecutive
+        // in-call scans. First visible scan stays in Ending with counter=1;
+        // the second one flips back to Active.
+        let visible = vec![make_scan_result("Zoom", true, 1)];
+        let (still_ending, _) = advance_state(ending_state, &visible, false);
+        assert!(
+            matches!(still_ending, MeetingState::Ending { .. }),
+            "first visible scan should not yet revert (hysteresis)"
+        );
+        let (active_again, _) = advance_state(still_ending, &visible, false);
 
         if let MeetingState::Active { started_at, .. } = active_again {
             assert_eq!(
@@ -3095,12 +3295,16 @@ mod tests {
     #[test]
     fn test_ending_to_active_controls_reappear() {
         let started = Utc::now();
+        // Counter already at REENTRY_HYSTERESIS_SCANS - 1 so the next visible
+        // scan reverts to Active. Lets us assert the re-entry transition
+        // without coupling this test to the threshold value.
         let state = MeetingState::Ending {
             meeting_id: 42,
             app: "Zoom".to_string(),
             started_at: started,
             since: Instant::now(),
             is_browser: false,
+            controls_seen_in_ending: REENTRY_HYSTERESIS_SCANS - 1,
         };
         let results = vec![make_scan_result("Zoom", true, 1)];
         let (new_state, action) = advance_state(state, &results, false);
@@ -3113,6 +3317,56 @@ mod tests {
     }
 
     #[test]
+    fn test_ending_hysteresis_blocks_single_blip() {
+        // A single in-call scan during Ending must NOT revert. This is the
+        // regression guard for the Arc auto-hide flap pattern: a transient
+        // visible scan should leave us in Ending with the counter
+        // incremented, not flip back to Active immediately.
+        let state = MeetingState::Ending {
+            meeting_id: 42,
+            app: "Arc".to_string(),
+            started_at: Utc::now(),
+            since: Instant::now(),
+            is_browser: true,
+            controls_seen_in_ending: 0,
+        };
+        let results = vec![make_scan_result("Arc", true, 1)];
+        let (new_state, action) = advance_state(state, &results, false);
+        match new_state {
+            MeetingState::Ending {
+                controls_seen_in_ending,
+                ..
+            } => assert_eq!(controls_seen_in_ending, 1),
+            other => panic!("expected Ending, got {:?}", other),
+        }
+        assert!(action.is_none());
+    }
+
+    #[test]
+    fn test_ending_hysteresis_resets_on_missing_scan() {
+        // A controls-absent scan inside Ending resets the consecutive
+        // counter, so re-entry requires N CONSECUTIVE visible scans, not
+        // N total.
+        let state = MeetingState::Ending {
+            meeting_id: 42,
+            app: "Arc".to_string(),
+            started_at: Utc::now(),
+            since: Instant::now(),
+            is_browser: true,
+            controls_seen_in_ending: REENTRY_HYSTERESIS_SCANS - 1,
+        };
+        let results = vec![make_scan_result("Arc", false, 0)];
+        let (new_state, _) = advance_state(state, &results, false);
+        match new_state {
+            MeetingState::Ending {
+                controls_seen_in_ending,
+                ..
+            } => assert_eq!(controls_seen_in_ending, 0, "counter should reset"),
+            other => panic!("expected Ending, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn test_ending_to_idle_timeout() {
         let state = MeetingState::Ending {
             meeting_id: 42,
@@ -3122,6 +3376,7 @@ mod tests {
                 .checked_sub(ENDING_TIMEOUT + Duration::from_secs(1))
                 .unwrap_or(Instant::now()),
             is_browser: false,
+            controls_seen_in_ending: 0,
         };
         let results: Vec<ScanResult> = vec![];
         let (new_state, action) = advance_state(state, &results, false);
@@ -3142,6 +3397,7 @@ mod tests {
             started_at: Utc::now(),
             since,
             is_browser: false,
+            controls_seen_in_ending: 0,
         };
         let results: Vec<ScanResult> = vec![];
         let (new_state, action) = advance_state(state, &results, false);
@@ -3162,6 +3418,7 @@ mod tests {
             started_at: Utc::now(),
             since: Instant::now(),
             is_browser: true,
+            controls_seen_in_ending: 0,
         };
         let results: Vec<ScanResult> = vec![];
         let (new_state, action) = advance_state(state, &results, true);
@@ -3193,6 +3450,7 @@ mod tests {
             started_at: Utc::now(),
             since: Instant::now().checked_sub(Duration::from_secs(5)).unwrap(),
             is_browser: false,
+            controls_seen_in_ending: 0,
         };
         let results: Vec<ScanResult> = vec![];
         let (new_state, action) = advance_state(state, &results, true);
@@ -3213,6 +3471,7 @@ mod tests {
                 .checked_sub(ENDING_TIMEOUT + Duration::from_secs(1))
                 .unwrap_or(Instant::now()),
             is_browser: false,
+            controls_seen_in_ending: 0,
         };
         let results: Vec<ScanResult> = vec![];
         let (new_state, action) = advance_state(state, &results, false);
@@ -3252,6 +3511,7 @@ mod tests {
                 .checked_sub(ENDING_TIMEOUT + Duration::from_secs(1))
                 .unwrap_or(Instant::now()),
             is_browser: false,
+            controls_seen_in_ending: 0,
         };
         let (state, action) = advance_state(state, &[], false);
         assert!(matches!(state, MeetingState::Idle));
@@ -3331,6 +3591,7 @@ mod tests {
                 .checked_sub(ENDING_TIMEOUT + Duration::from_secs(1))
                 .unwrap_or(Instant::now()),
             is_browser: false,
+            controls_seen_in_ending: 0,
         };
         let (new_state, ended_id) = handle_no_apps_running(state);
         assert!(matches!(new_state, MeetingState::Idle));
@@ -3345,6 +3606,7 @@ mod tests {
             started_at: Utc::now(),
             since: Instant::now(),
             is_browser: false,
+            controls_seen_in_ending: 0,
         };
         let (new_state, ended_id) = handle_no_apps_running(state);
         assert!(matches!(new_state, MeetingState::Ending { .. }));
@@ -3362,6 +3624,7 @@ mod tests {
                 .checked_sub(ENDING_TIMEOUT + Duration::from_secs(1))
                 .unwrap_or(Instant::now()),
             is_browser: false,
+            controls_seen_in_ending: 0,
         };
         let (_, ended_id) = handle_no_apps_running(state);
         assert!(ended_id.is_none(), "should not end meeting with id=-1");

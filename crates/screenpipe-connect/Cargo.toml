@@ -7,6 +7,11 @@ repository = { workspace = true }
 license = { workspace = true }
 edition = { workspace = true }
 
+# libsqlite3-sys is pulled in for the `bundled` feature so workspace crates
+# link against the same C SQLite. Not directly imported here — silence machete.
+[package.metadata.cargo-machete]
+ignored = ["libsqlite3-sys"]
+
 [dependencies]
 image = { workspace = true }
 reqwest = { workspace = true }
@@ -18,7 +23,13 @@ anyhow = "1.0"
 screenpipe-core = { path = "../screenpipe-core" }
 screenpipe-secrets = { path = "../screenpipe-secrets" }
 tracing = { workspace = true }
-russh = { version = "0.57", default-features = false, features = ["ring", "flate2", "rsa"] }
+# NOTE: dropped the `rsa` feature — it pulls `rsa = "0.10.0-rc.12"` which
+# has a `match`-arm type error against the pinned `pkcs8 = 0.11`. Ring
+# already covers Ed25519 and ECDSA SSH keys, which is what every modern
+# host accepts; if a user genuinely needs RSA SSH key support, re-enable
+# this feature and pin `rsa` to a version compatible with the resolved
+# `pkcs8`. v2.4.170 left this broken on a pristine cargo check.
+russh = { version = "0.57", default-features = false, features = ["ring", "flate2"] }
 russh-sftp = "2.1"
 dirs = "6"
 chrono = "0.4"
@@ -28,9 +39,8 @@ uuid = { version = "1.5.0", features = ["v4"] }
 thiserror = "1"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "builder"] }
 mdns-sd = "0.13"
-
-[dev-dependencies]
 sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio-rustls"] }
+libsqlite3-sys = { version = "0.26", features = ["bundled"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 eventkit-rs = "0.1"

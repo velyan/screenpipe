@@ -32,6 +32,10 @@ pub enum BlobType {
     /// Pipe configuration manifest (for cross-device pipe sync)
     #[serde(rename = "pipe_config")]
     PipeConfig,
+    /// Memories manifest (for cross-device memories sync). Mirrors the
+    /// PipeConfig pattern: a single JSON manifest blob containing every
+    /// memory the user has, last-write-wins merged across machines.
+    Memories,
 }
 
 impl BlobType {
@@ -44,6 +48,7 @@ impl BlobType {
             BlobType::Accessibility => "accessibility",
             BlobType::Input => "input",
             BlobType::PipeConfig => "pipe_config",
+            BlobType::Memories => "memories",
         }
     }
 }

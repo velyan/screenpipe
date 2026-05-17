@@ -101,6 +101,14 @@ pub(crate) struct SearchQuery {
     speaker_ids: Option<Vec<i64>>,
     #[serde(default)]
     focused: Option<bool>,
+    /// Restrict accessibility hits to elements visually present on the
+    /// captured frame. The AX tree captures off-screen text (terminal
+    /// scroll buffers, scrolled-off IDE editor lines) — passing
+    /// `on_screen=true` filters those out so search hits match what the
+    /// user could actually see. Only meaningful for content_type=accessibility
+    /// (or all). See issue #2436. Default: omitted = match everything.
+    #[serde(default)]
+    on_screen: Option<bool>,
     #[serde(default)]
     browser_url: Option<String>,
     /// Filter audio transcriptions by speaker name (case-insensitive partial match)
@@ -186,6 +194,10 @@ pub(crate) fn compute_search_cache_key(query: &SearchQuery) -> u64 {
     query.max_length.hash(&mut hasher);
     query.speaker_ids.hash(&mut hasher);
     query.focused.hash(&mut hasher);
+    // on_screen changes the result set materially — must be in the
+    // cache key so a cached "no filter" response can't be returned for
+    // an "on_screen=true" query (and vice-versa). Issue #2436.
+    query.on_screen.hash(&mut hasher);
     query.browser_url.hash(&mut hasher);
     query.speaker_name.hash(&mut hasher);
     query.include_cloud.hash(&mut hasher);
@@ -265,6 +277,7 @@ pub(crate) async fn search(
                 query.speaker_name.as_deref(),
                 query.device_name.as_deref(),
                 query.machine_id.as_deref(),
+                query.on_screen,
             ),
             state.db.count_search_results(
                 query_str,
@@ -280,6 +293,7 @@ pub(crate) async fn search(
                 query.browser_url.as_deref(),
                 query.focused,
                 query.speaker_name.as_deref(),
+                query.on_screen,
             ),
         ),
     )
@@ -339,19 +353,31 @@ pub(crate) async fn search(
                     focused: ocr.focused,
                     device_name: ocr.device_name.clone(),
                 }),
-                SearchResult::Audio(audio) => ContentItem::Audio(AudioContent {
-                    chunk_id: audio.audio_chunk_id,
-                    transcription: truncate(audio.transcription.clone()),
-                    timestamp: audio.timestamp,
-                    file_path: audio.file_path.clone(),
-                    offset_index: audio.offset_index,
-                    tags: audio.tags.clone(),
-                    device_name: audio.device_name.clone(),
-                    device_type: audio.device_type.clone().into(),
-                    speaker: audio.speaker.clone(),
-                    start_time: audio.start_time,
-                    end_time: audio.end_time,
-                }),
+                SearchResult::Audio(audio) => {
+                    let transcription = truncate(audio.transcription.clone());
+                    ContentItem::Audio(AudioContent {
+                        chunk_id: audio.audio_chunk_id,
+                        transcription: transcription.clone(),
+                        text: transcription,
+                        timestamp: audio.timestamp,
+                        file_path: audio.file_path.clone(),
+                        offset_index: audio.offset_index,
+                        tags: audio.tags.clone(),
+                        device_name: audio.device_name.clone(),
+                        device_type: audio.device_type.clone().into(),
+                        speaker: audio.speaker.clone(),
+                        speaker_label: audio.speaker_label.clone(),
+                        speaker_source: audio.speaker_source.clone(),
+                        speaker_confidence: audio.speaker_confidence,
+                        speaker_provisional: audio.speaker_provisional,
+                        start_time: audio.start_time,
+                        end_time: audio.end_time,
+                        source: audio.source.clone(),
+                        meeting_id: audio.meeting_id,
+                        provider: audio.provider.clone(),
+                        model: audio.model.clone(),
+                    })
+                }
                 SearchResult::UI(ui) => ContentItem::UI(UiContent {
                     id: ui.id,
                     text: truncate(ui.text.clone()),
@@ -760,6 +786,7 @@ mod tests {
             max_length: None,
             speaker_ids: None,
             focused: None,
+            on_screen: None,
             browser_url: None,
             speaker_name: None,
             include_cloud: false,
@@ -786,6 +813,7 @@ mod tests {
             max_length: None,
             speaker_ids: None,
             focused: None,
+            on_screen: None,
             browser_url: None,
             speaker_name: None,
             include_cloud: false,
@@ -820,6 +848,7 @@ mod tests {
             max_length: None,
             speaker_ids: None,
             focused: None,
+            on_screen: None,
             browser_url: None,
             speaker_name: None,
             include_cloud: false,
@@ -846,6 +875,7 @@ mod tests {
             max_length: None,
             speaker_ids: None,
             focused: None,
+            on_screen: None,
             browser_url: None,
             speaker_name: None,
             include_cloud: false,
@@ -862,6 +892,46 @@ mod tests {
             key1, key2,
             "Different queries should produce different cache keys"
         );
+    }
+
+    /// Issue #2436: changing `on_screen` must invalidate the cache —
+    /// otherwise a query that was cached with the filter unset would be
+    /// served back to a caller asking for `on_screen=true`, returning
+    /// off-screen-text matches the caller explicitly excluded.
+    #[test]
+    fn test_search_cache_key_distinguishes_on_screen() {
+        let mk = |on_screen: Option<bool>| SearchQuery {
+            q: Some("test".to_string()),
+            pagination: PaginationQuery {
+                limit: 10,
+                offset: 0,
+            },
+            content_type: ContentType::All,
+            start_time: None,
+            end_time: None,
+            app_name: None,
+            window_name: None,
+            frame_name: None,
+            include_frames: false,
+            min_length: None,
+            max_length: None,
+            speaker_ids: None,
+            focused: None,
+            on_screen,
+            browser_url: None,
+            speaker_name: None,
+            include_cloud: false,
+            max_content_length: None,
+            device_name: None,
+            machine_id: None,
+            filter_pii: false,
+        };
+        let none = compute_search_cache_key(&mk(None));
+        let yes = compute_search_cache_key(&mk(Some(true)));
+        let no = compute_search_cache_key(&mk(Some(false)));
+        assert_ne!(none, yes, "None vs Some(true) must hash differently");
+        assert_ne!(none, no, "None vs Some(false) must hash differently");
+        assert_ne!(yes, no, "Some(true) vs Some(false) must hash differently");
     }
 
     #[test]

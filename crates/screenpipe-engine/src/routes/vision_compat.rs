@@ -1058,6 +1058,7 @@ pub(crate) async fn capture_active_window(
         app_name: app_name.as_deref(),
         window_name: window_name.as_deref(),
         browser_url: browser_url.as_deref(),
+        document_path: None,
         focused,
         capture_trigger: CAPTURE_TRIGGER_API,
         capture_provenance,

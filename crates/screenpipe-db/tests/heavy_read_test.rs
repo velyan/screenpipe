@@ -70,6 +70,7 @@ async fn test_concurrent_ocr_searches_dont_starve_pool() {
                     None,
                     None,
                     None,
+                    None,
                 )
                 .await;
             let elapsed = start.elapsed();
@@ -154,6 +155,7 @@ async fn test_search_completes_within_timeout() {
             0,
             Some(one_hour_ago),
             Some(now),
+            None,
             None,
             None,
             None,

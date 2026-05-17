@@ -5,7 +5,7 @@
 /**
  * Parallel-chat e2e — Louis's exact repro driven against the running
  * Tauri app via WebDriver. Bypasses Pi entirely (no model, no auth, no
- * network) by emitting `pi_event` envelopes directly from the webview;
+ * network) by emitting `agent_event` envelopes directly from the webview;
  * the panel's listener picks them up the same way it does in
  * production. This isolates the React layer that the vitest data-layer
  * tests can't reach.
@@ -59,6 +59,14 @@ async function emitFromWebview(eventName: string, payload: unknown): Promise<voi
   );
 }
 
+async function emitAgentEvent(sessionId: string, event: unknown): Promise<void> {
+  await emitFromWebview('agent_event', {
+    source: 'pi',
+    sessionId,
+    event,
+  });
+}
+
 /** Switch the chat panel to a given session id. Mirrors what the
  *  sidebar's row click does. */
 async function switchToSession(id: string): Promise<void> {
@@ -69,12 +77,56 @@ async function switchToSession(id: string): Promise<void> {
   await browser.pause(t(400));
 }
 
-/** Fake one Pi assistant turn for a session. Forges the same envelope
- *  Rust emits: { sessionId, event }. */
-async function fakePiTurn(sessionId: string, fullText: string): Promise<void> {
-  await emitFromWebview('pi_event', {
+/** Seed a user message into a session via the e2e hook the chat panel
+ *  exposes on `window.__e2eSeedUserMessage`. Required because
+ *  `ensureAssistantPlaceholder` only creates an assistant bubble when the
+ *  last message in the session is `role: "user"` (added 2026-04-29) — so
+ *  faking agent_event with no preceding user message is a no-op. */
+async function seedUserMessage(sessionId: string, text: string): Promise<void> {
+  await browser.waitUntil(
+    async () =>
+      (await browser.execute(
+        () => typeof (window as any).__e2eSeedUserMessage === "function",
+      )) as boolean,
+    {
+      timeout: t(5_000),
+      interval: 100,
+      timeoutMsg: "E2E chat seed hook did not mount",
+    },
+  );
+  const seeded = (await browser.executeAsync(
+    (sid: string, txt: string, done: (v?: unknown) => void) => {
+      const g = globalThis as unknown as {
+        __e2eSeedUserMessage?: (sid: string, txt: string) => void;
+      };
+      if (typeof g.__e2eSeedUserMessage === "function") {
+        g.__e2eSeedUserMessage(sid, txt);
+        done(true);
+        return;
+      }
+      done(false);
+    },
     sessionId,
-    event: { type: 'message_start', message: { role: 'assistant' } },
+    text,
+  )) as boolean;
+  if (!seeded) {
+    throw new Error("E2E chat seed hook disappeared before seeding");
+  }
+  await browser.pause(t(100));
+}
+
+/** Fake one Pi assistant turn for a session. Forges the same envelope
+ *  Rust emits: { sessionId, event }. Seeds a synthetic user message
+ *  first because the panel's placeholder logic requires a user-message
+ *  tail before it'll materialize an assistant bubble for streaming
+ *  deltas. In production, `sendPiMessage` does this; in tests we do it
+ *  via the `__e2eSeedUserMessage` hook. */
+async function fakePiTurn(sessionId: string, fullText: string): Promise<void> {
+  await seedUserMessage(sessionId, `(e2e) prompt for: ${fullText}`);
+
+  await emitAgentEvent(sessionId, {
+    type: 'message_start',
+    message: { role: 'assistant' },
   });
   await browser.pause(t(50));
 
@@ -83,19 +135,15 @@ async function fakePiTurn(sessionId: string, fullText: string): Promise<void> {
   // the 0.70+ shape standalone-chat handles).
   const half = Math.floor(fullText.length / 2);
   for (const delta of [fullText.slice(0, half), fullText.slice(half)]) {
-    await emitFromWebview('pi_event', {
-      sessionId,
-      event: {
-        type: 'message_update',
-        assistantMessageEvent: { type: 'text_delta', delta },
-      },
+    await emitAgentEvent(sessionId, {
+      type: 'message_update',
+      assistantMessageEvent: { type: 'text_delta', delta },
     });
     await browser.pause(t(50));
   }
 
-  await emitFromWebview('pi_event', {
-    sessionId,
-    event: { type: 'agent_end' },
+  await emitAgentEvent(sessionId, {
+    type: 'agent_end',
   });
   await browser.pause(t(100));
 }

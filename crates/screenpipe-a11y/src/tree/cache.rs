@@ -106,6 +106,7 @@ mod tests {
             nodes: vec![],
             focused_element: None,
             browser_url: None,
+            document_path: None,
             timestamp: Utc::now(),
             node_count: 1,
             walk_duration: Duration::from_millis(10),

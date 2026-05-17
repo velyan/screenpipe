@@ -87,6 +87,46 @@ async fn a11y_walk(app_filter: Option<&str>, settle_ms: u64) -> anyhow::Result<(
             let label = format!("walk {} (t+{}ms)", i + 1, elapsed);
             match result {
                 TreeWalkResult::Found(snap) => {
+                    // Line-capture stats: for each AXStaticText node, count how
+                    // many had `lines` populated and how many were on-screen
+                    // multi-line candidates that did NOT get lines (eligibility
+                    // gap = AX call failure or budget exhaustion).
+                    let mut static_text_total = 0usize;
+                    let mut static_text_onscreen = 0usize;
+                    let mut static_text_multiline_candidates = 0usize;
+                    let mut nodes_with_lines = 0usize;
+                    let mut total_lines: usize = 0;
+                    let mut sample_lines_text: Option<String> = None;
+                    for node in &snap.nodes {
+                        if node.role != "AXStaticText" {
+                            continue;
+                        }
+                        static_text_total += 1;
+                        if node.on_screen == Some(true) {
+                            static_text_onscreen += 1;
+                        }
+                        if let Some(b) = &node.bounds {
+                            // Same heuristic as the walker uses to gate capture.
+                            if node.on_screen == Some(true)
+                                && screenpipe_a11y::tree::node_looks_multiline(&node.text, b, 1.5)
+                            {
+                                static_text_multiline_candidates += 1;
+                            }
+                        }
+                        if let Some(lines) = &node.lines {
+                            nodes_with_lines += 1;
+                            total_lines += lines.len();
+                            if sample_lines_text.is_none() {
+                                let preview: String =
+                                    node.text.chars().take(60).collect::<String>().replace('\n', " ↵ ");
+                                sample_lines_text = Some(format!(
+                                    "  └─ sample: {} lines on '{}…'",
+                                    lines.len(),
+                                    preview
+                                ));
+                            }
+                        }
+                    }
                     println!(
                         "{label:<25}  Found: app={:?} window={:?} nodes={} text_len={} truncated={}",
                         snap.app_name,
@@ -95,6 +135,17 @@ async fn a11y_walk(app_filter: Option<&str>, settle_ms: u64) -> anyhow::Result<(
                         snap.text_content.len(),
                         snap.truncated,
                     );
+                    println!(
+                        "                              AXStaticText: {} total, {} on-screen, {} multi-line candidates",
+                        static_text_total, static_text_onscreen, static_text_multiline_candidates,
+                    );
+                    println!(
+                        "                              line capture: {} nodes with lines, {} total lines",
+                        nodes_with_lines, total_lines,
+                    );
+                    if let Some(s) = sample_lines_text {
+                        println!("                            {s}");
+                    }
                     if !snap.text_content.is_empty() {
                         let preview = snap
                             .text_content

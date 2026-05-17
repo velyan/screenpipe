@@ -91,18 +91,6 @@ export const Providers = forwardRef<
         person_profiles: "identified_only",
         capture_pageview: false,
       });
-      // Offline mode: opt out of PostHog immediately on init.
-      // The setting is read async from the store by SettingsProvider,
-      // but we also check here to prevent any early events from leaking.
-      import("@/lib/hooks/use-settings").then(({ getStore }) => {
-        getStore().then((store) => {
-          store.get<{ offlineMode?: boolean }>("settings").then((s) => {
-            if (s?.offlineMode) {
-              posthog.opt_out_capturing();
-            }
-          });
-        });
-      }).catch(() => {});
     }
   }, []);
 

@@ -14,7 +14,9 @@ import {
   UserPlus,
   Monitor,
   Mic,
+  MicOff,
   Volume2,
+  VolumeX,
   PanelLeftClose,
   PanelLeftOpen,
   Search,
@@ -22,10 +24,9 @@ import {
   Phone,
   Plug,
   NotebookPen,
-  X,
 } from "lucide-react";
 import { emit } from "@tauri-apps/api/event";
-import { useChatStore } from "@/lib/stores/chat-store";
+import { useChatStore, type SessionStatus } from "@/lib/stores/chat-store";
 import { useOverlayData } from "@/app/shortcut-reminder/use-overlay-data";
 import { cn } from "@/lib/utils";
 import { AppSidebar, SidebarProvider, useSidebarContext } from "@/components/app-sidebar";
@@ -37,7 +38,10 @@ import { MemoriesSection } from "@/components/settings/memories-section";
 import { ConnectionsSection } from "@/components/settings/connections-section";
 import { MeetingNotesSection } from "@/components/meeting-notes";
 import { StandaloneChat } from "@/components/standalone-chat";
-import { ChatSidebar } from "@/components/chat-sidebar";
+import {
+  ChatSidebar,
+  CollapsedChatSidebarButton,
+} from "@/components/chat-sidebar";
 import { mountPiEventRouter } from "@/lib/stores/pi-event-router";
 import { mountPipeRunRecorder } from "@/lib/events/pipe-run-recorder";
 import { mountPipeWatchWriter } from "@/lib/events/pipe-watch-writer";
@@ -46,13 +50,16 @@ import Timeline from "@/components/rewind/timeline";
 import { useQueryState } from "nuqs";
 import { listen } from "@tauri-apps/api/event";
 import { useSettings } from "@/lib/hooks/use-settings";
+import { useRunningPipes } from "@/lib/hooks/use-running-pipes";
 import { commands } from "@/lib/utils/tauri";
 import { formatShortcutDisplay } from "@/lib/chat-utils";
 import { useTeam } from "@/lib/hooks/use-team";
 import { useEnterprisePolicy } from "@/lib/hooks/use-enterprise-policy";
 import { EnterpriseLicensePrompt } from "@/components/enterprise-license-prompt";
+import { PipeActivityIndicator } from "@/components/pipe-activity-indicator";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { computeMeetingActive, type MeetingStatusResponse } from "@/lib/utils/meeting-state";
+import type { MeetingRecord } from "@/lib/utils/meeting-format";
 import { useRouter } from "next/navigation";
 import { appendAuthToken, ensureApiReady, getApiBaseUrl, localFetch } from "@/lib/api";
 import {
@@ -99,6 +106,13 @@ function HomeContent() {
   const { isTranslucent } = useSidebarContext();
   const teamState = useTeam();
   const { isSectionHidden, isSettingLocked, needsLicenseKey, submitLicenseKey } = useEnterprisePolicy();
+  const runningPipes = useRunningPipes();
+  const runningPipeCount = runningPipes.length;
+  const selectChatConversation = useCallback((id: string) => {
+    setActiveSection("home");
+    useChatStore.getState().actions.setCurrent(id);
+    void emit("chat-load-conversation", { conversationId: id });
+  }, [setActiveSection]);
 
   // Redirect settings sections to the standalone settings page
   useEffect(() => {
@@ -120,7 +134,7 @@ function HomeContent() {
   // Mount the Pi event router once, app-wide. Listens for `pi_event` /
   // `pi_session_evicted` outside any chat-component lifecycle and mirrors
   // per-session liveness into the chat store. This is what lets the chat
-  // sidebar show a live ● dot for sessions running in the background while
+  // sidebar show live activity for sessions running in the background while
   // the user is on Timeline / Pipes / Settings — without it, status would
   // freeze the moment the chat unmounts. Idempotent.
   useEffect(() => {
@@ -135,6 +149,124 @@ function HomeContent() {
     // store; this writer is what makes "switch away and back" preserve
     // the full live transcript. Idempotent.
     void mountPipeWatchWriter();
+  }, []);
+
+  // Overlay-side foreground sessions don't pass through this window's
+  // background router path. Mirror lightweight activity (status + preview)
+  // so the home sidebar stays live without mirroring full message bodies.
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenFn: (() => void) | undefined;
+    (async () => {
+      const unlisten = await listen<{
+        id: string;
+        status?: SessionStatus;
+        preview?: string;
+        title?: string;
+        updatedAt: number;
+        lastError?: string;
+        unreadHint?: boolean;
+      }>("chat-session-activity", (event) => {
+        if (cancelled) return;
+        const { id, status, preview, title, updatedAt, lastError, unreadHint } = event.payload ?? {};
+        if (!id || !updatedAt) return;
+        const store = useChatStore.getState();
+        const existing = store.sessions[id];
+        if (!existing) {
+          store.actions.upsert({
+            id,
+            title: title?.trim() || "new chat",
+            preview: preview ?? "",
+            status: status ?? "idle",
+            lastError,
+            messageCount: 0,
+            createdAt: updatedAt,
+            updatedAt,
+            pinned: false,
+            hidden: false,
+            unread: false,
+          });
+        } else {
+          if (existing.updatedAt > updatedAt) return;
+          const nextTitle = title?.trim() || existing.title;
+          const nextPreview = preview ?? existing.preview;
+          const nextStatus = status ?? existing.status;
+          const nextLastError =
+            lastError !== undefined
+              ? lastError || undefined
+              : nextStatus === "error"
+                ? existing.lastError
+                : undefined;
+          if (
+            existing.title === nextTitle &&
+            existing.preview === nextPreview &&
+            existing.status === nextStatus &&
+            existing.lastError === nextLastError &&
+            existing.updatedAt === updatedAt
+          ) return;
+          store.actions.patch(id, {
+            title: nextTitle,
+            preview: nextPreview,
+            status: nextStatus,
+            lastError: nextLastError,
+            updatedAt,
+          });
+        }
+        if (unreadHint && store.currentId !== id && store.panelSessionId !== id) {
+          store.actions.markUnread(id);
+        }
+      });
+      unlistenFn = unlisten;
+    })();
+    return () => {
+      cancelled = true;
+      unlistenFn?.();
+    };
+  }, []);
+
+  // Saved-title correction path. Activity updates are best-effort during
+  // streaming; this event is emitted after canonical on-disk save, so use it
+  // to guarantee Main row title converges from "new chat" to real title.
+  useEffect(() => {
+    let cancelled = false;
+    let unlistenFn: (() => void) | undefined;
+    (async () => {
+      const unlisten = await listen<{ id: string; title?: string }>(
+        "chat-conversation-saved",
+        (event) => {
+          if (cancelled) return;
+          const { id, title } = event.payload ?? {};
+          const nextTitle = title?.trim();
+          if (!id || !nextTitle) return;
+
+          const store = useChatStore.getState();
+          const existing = store.sessions[id];
+          if (!existing) {
+            store.actions.upsert({
+              id,
+              title: nextTitle,
+              preview: "",
+              status: "idle",
+              messageCount: 0,
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+              pinned: false,
+              hidden: false,
+              unread: false,
+            });
+            return;
+          }
+          if (existing.title !== nextTitle) {
+            store.actions.patch(id, { title: nextTitle });
+          }
+        },
+      );
+      unlistenFn = unlisten;
+    })();
+    return () => {
+      cancelled = true;
+      unlistenFn?.();
+    };
   }, []);
 
   // Selecting a chat from the sidebar (or any other source that emits
@@ -240,22 +372,48 @@ function HomeContent() {
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, [toggleSidebar]);
-  const overlayData = useOverlayData();
+  const overlayData = useOverlayData({
+    includeDeviceLevels: false,
+    includeOcrPulse: false,
+    minIntervalMs: 1000,
+    quantize: true,
+  });
 
-  // Fetch actual recording devices from health endpoint (same source as tray menu)
-  interface RecordingDevice { name: string; kind: "monitor" | "input" | "output"; active: boolean }
+  // Fetch actual recording devices. Audio comes from /audio/device/status so
+  // user-paused devices stay visible and can be resumed from the same control.
+  interface RecordingDevice {
+    name: string;
+    fullName: string;
+    kind: "monitor" | "input" | "output";
+    active: boolean;
+  }
+  interface AudioDeviceStatus {
+    name: string;
+    is_running: boolean;
+    is_user_disabled?: boolean;
+  }
   const [recordingDevices, setRecordingDevices] = useState<RecordingDevice[]>([]);
+  const recordingDevicesSnapshotRef = useRef("");
 
   useEffect(() => {
     let cancelled = false;
     const fetchDevices = () => {
-      localFetch("/health")
-        .then((r) => r.ok ? r.json() : null)
-        .then((health: { monitors?: string[]; device_status_details?: string } | null) => {
-          if (cancelled || !health) return;
+      Promise.all([
+        localFetch("/health")
+          .then((r) => r.ok ? r.json() : null)
+          .catch(() => null),
+        localFetch("/audio/device/status")
+          .then((r) => r.ok ? r.json() : null)
+          .catch(() => null),
+      ])
+        .then(([health, audioStatus]: [
+          { monitors?: string[]; device_status_details?: string } | null,
+          AudioDeviceStatus[] | null,
+        ]) => {
+          if (cancelled) return;
           const devices: RecordingDevice[] = [];
           // Parse monitors — filter to only those actually being recorded
-          if (health.monitors) {
+          if (health?.monitors) {
             const monitorIds: string[] = settings.monitorIds ?? ["default"];
             const useAll = settings.useAllMonitors ?? true;
             for (const name of health.monitors) {
@@ -270,12 +428,28 @@ function HomeContent() {
                 });
                 if (!matched) continue;
               }
-              devices.push({ name, kind: "monitor", active: true });
+              devices.push({ name, fullName: name, kind: "monitor", active: true });
             }
           }
-          // Parse audio devices from device_status_details
-          // Format: "DeviceName (input): active (last activity: 2s ago), DeviceName (output): inactive"
-          if (health.device_status_details) {
+
+          const visibleAudioDevices = Array.isArray(audioStatus)
+            ? audioStatus.filter((d) => d.is_running || d.is_user_disabled)
+            : [];
+
+          if (visibleAudioDevices.length > 0) {
+            for (const device of visibleAudioDevices) {
+              const kind = device.name.includes("(output)") ? "output" as const : "input" as const;
+              const name = device.name.replace(/\s*\((input|output)\)\s*/gi, "").trim();
+              devices.push({
+                name,
+                fullName: device.name,
+                kind,
+                active: device.is_running,
+              });
+            }
+          } else if (health?.device_status_details) {
+            // Fallback for older sidecars that do not expose /audio/device/status.
+            // Format: "DeviceName (input): active (last activity: 2s ago)"
             for (const part of health.device_status_details.split(", ")) {
               const match = part.split(": ");
               if (match.length < 2) continue;
@@ -285,10 +459,15 @@ function HomeContent() {
                 : nameAndType.includes("(output)") ? "output" as const
                 : "input" as const;
               const name = nameAndType.replace(/\s*\((input|output)\)\s*/gi, "").trim();
-              devices.push({ name, kind, active });
+              const suffix = kind === "input" ? "input" : "output";
+              devices.push({ name, fullName: `${name} (${suffix})`, kind, active });
             }
           }
-          setRecordingDevices(devices);
+          const snapshot = JSON.stringify(devices);
+          if (snapshot !== recordingDevicesSnapshotRef.current) {
+            recordingDevicesSnapshotRef.current = snapshot;
+            setRecordingDevices(devices);
+          }
         })
         .catch(() => {});
     };
@@ -367,7 +546,7 @@ function HomeContent() {
     };
   }, []);
 
-  const toggleMeeting = useCallback(async (seed?: { title?: string; attendees?: string }) => {
+  const toggleMeeting = useCallback(async (seed?: { title?: string; attendees?: string; resumeMeetingId?: number }) => {
     setMeetingLoading(true);
     try {
       if (meetingState.active) {
@@ -379,6 +558,7 @@ function HomeContent() {
           body: JSON.stringify({ id: targetId }),
         });
         if (res.ok) {
+          const meeting: MeetingRecord = await res.json();
           manualMeetingStartedAt.current = 0;
           setMeetingState({
             active: false,
@@ -388,11 +568,17 @@ function HomeContent() {
             meetingApp: null,
             detectionSource: null,
           });
+          return meeting;
         }
+        const bodyText = await res.text().catch(() => "");
+        throw new Error(
+          `stop meeting failed: HTTP ${res.status}${bodyText ? ` — ${bodyText}` : ""}`,
+        );
       } else {
         // No meeting active — start a manual one (optionally seeded from a
-        // calendar event when the caller has it).
-        const body: Record<string, string> = { app: "manual" };
+        // calendar event when the caller has it), or resume an existing note.
+        const body: Record<string, string | number> = { app: "manual" };
+        if (seed?.resumeMeetingId) body.id = seed.resumeMeetingId;
         if (seed?.title) body.title = seed.title;
         if (seed?.attendees) body.attendees = seed.attendees;
         const res = await localFetch("/meetings/start", {
@@ -401,19 +587,26 @@ function HomeContent() {
           body: JSON.stringify(body),
         });
         if (res.ok) {
+          const meeting: MeetingRecord = await res.json();
           manualMeetingStartedAt.current = Date.now();
           setMeetingState({
             active: true,
             manualActive: true,
-            activeMeetingId: null,
-            stoppableMeetingId: null,
-            meetingApp: "manual",
-            detectionSource: "manual",
+            activeMeetingId: meeting.id,
+            stoppableMeetingId: meeting.id,
+            meetingApp: meeting.meeting_app,
+            detectionSource: meeting.detection_source,
           });
+          return meeting;
         }
+        const bodyText = await res.text().catch(() => "");
+        throw new Error(
+          `start meeting failed: HTTP ${res.status}${bodyText ? ` — ${bodyText}` : ""}`,
+        );
       }
     } catch (e) {
       console.error("meeting toggle failed:", e);
+      throw e;
     } finally {
       setMeetingLoading(false);
     }
@@ -649,57 +842,109 @@ function HomeContent() {
                 const screenOpacity = overlayData.screenActive ? 0.5 + Math.min(overlayData.captureFps / 2, 0.5) : 0.2;
                 const audioOpacity = overlayData.audioActive ? 0.5 + Math.min(overlayData.speechRatio, 0.5) : 0.2;
 
-                const groups: { key: string; icon: typeof Monitor; count: number; title: string; opacity: number; devices: RecordingDevice[] }[] = [];
+                const groups: {
+                  key: "monitor" | "mic" | "output";
+                  icon: typeof Monitor;
+                  pausedIcon?: typeof Monitor;
+                  count: number;
+                  title: string;
+                  opacity: number;
+                  devices: RecordingDevice[];
+                }[] = [];
                 if (monitors.length > 0) groups.push({ key: "monitor", icon: Monitor, count: monitors.length, title: monitors.map((d) => d.name).join(", "), opacity: screenOpacity, devices: monitors });
-                if (inputs.length > 0) groups.push({ key: "mic", icon: Mic, count: inputs.length, title: inputs.map((d) => d.name).join(", "), opacity: audioOpacity, devices: inputs });
-                if (outputs.length > 0) groups.push({ key: "output", icon: Volume2, count: outputs.length, title: outputs.map((d) => d.name).join(", "), opacity: audioOpacity, devices: outputs });
+                if (inputs.length > 0) groups.push({ key: "mic", icon: Mic, pausedIcon: MicOff, count: inputs.length, title: inputs.map((d) => d.name).join(", "), opacity: audioOpacity, devices: inputs });
+                if (outputs.length > 0) groups.push({ key: "output", icon: Volume2, pausedIcon: VolumeX, count: outputs.length, title: outputs.map((d) => d.name).join(", "), opacity: audioOpacity, devices: outputs });
 
                 return (
                   <div className="flex items-center gap-2 mt-1.5">
-                    {groups.map(({ key, icon: Icon, count, title, opacity, devices: groupDevices }) => (
-                      <Tooltip key={key}>
-                        <TooltipTrigger asChild>
-                          <button
-                            className={cn(
-                              "flex items-center gap-0.5 rounded px-0.5 transition-all",
-                              key === "monitor"
-                                ? "cursor-default"
-                                : cn(
-                                    "cursor-pointer",
-                                    isTranslucent ? "hover:bg-white/10" : "hover:bg-muted"
+                    {groups.map(({ key, icon: ActiveIcon, pausedIcon: PausedIcon, count, title, opacity, devices: groupDevices }) => {
+                      const activeCount = groupDevices.filter((d: RecordingDevice) => d.active).length;
+                      const allActive = groupDevices.every((d: RecordingDevice) => d.active);
+                      const isAudioGroup = key !== "monitor";
+                      const Icon = isAudioGroup && !allActive && PausedIcon ? PausedIcon : ActiveIcon;
+                      const iconOpacity = isAudioGroup && !allActive ? 0.45 : opacity;
+                      const actionLabel = key === "monitor"
+                        ? title
+                        : allActive
+                          ? `${title} — click to pause capture`
+                          : activeCount === 0
+                            ? `${title} paused — click to resume capture`
+                            : `${title} partially paused — click to resume paused devices`;
+                      return (
+                        <Tooltip key={key}>
+                          <TooltipTrigger asChild>
+                            <button
+                              type="button"
+                              aria-label={actionLabel}
+                              className={cn(
+                                "flex items-center gap-0.5 rounded px-0.5 transition-all",
+                                key === "monitor"
+                                  ? "cursor-default"
+                                  : cn(
+                                      "cursor-pointer",
+                                      isTranslucent ? "hover:bg-white/10" : "hover:bg-muted"
+                                    )
+                              )}
+                              onClick={key === "monitor" ? undefined : async () => {
+                                const endpoint = allActive
+                                  ? "/audio/device/stop"
+                                  : "/audio/device/start";
+                                const targetFullNames = new Set(
+                                  groupDevices
+                                    .filter((d) => allActive || !d.active)
+                                    .map((d) => d.fullName)
+                                );
+                                if (targetFullNames.size === 0) return;
+
+                                const previousDevices = recordingDevices;
+                                setRecordingDevices((prev) =>
+                                  prev.map((device) =>
+                                    targetFullNames.has(device.fullName)
+                                      ? {
+                                          ...device,
+                                          active: !allActive,
+                                        }
+                                      : device
                                   )
-                            )}
-                            onClick={key === "monitor" ? undefined : async () => {
-                              const allActive = groupDevices.every((d: RecordingDevice) => d.active);
-                              const endpoint = allActive
-                                ? "/audio/device/stop"
-                                : "/audio/device/start";
-                              for (const d of groupDevices) {
-                                if (allActive || !d.active) {
-                                  const suffix = d.kind === "input" ? "input" : "output";
-                                  await localFetch(endpoint, {
-                                    method: "POST",
-                                    headers: { "Content-Type": "application/json" },
-                                    body: JSON.stringify({ device_name: `${d.name} (${suffix})` }),
-                                  }).catch(() => {});
+                                );
+
+                                const results = await Promise.allSettled(
+                                  Array.from(targetFullNames).map((deviceName) =>
+                                    localFetch(endpoint, {
+                                      method: "POST",
+                                      headers: { "Content-Type": "application/json" },
+                                      body: JSON.stringify({ device_name: deviceName }),
+                                    }).then((response) => {
+                                      if (!response.ok) {
+                                        throw new Error(`audio device toggle failed: ${response.status}`);
+                                      }
+                                      return response;
+                                    })
+                                  )
+                                );
+
+                                if (results.some((result) => result.status === "rejected")) {
+                                  setRecordingDevices(previousDevices);
                                 }
-                              }
-                            }}
-                          >
-                            <Icon
-                              className={cn("h-3 w-3 transition-opacity duration-500", isTranslucent ? "vibrant-sidebar-fg" : "text-foreground")}
-                              style={{ opacity }}
-                            />
-                            {count > 1 && (
-                              <span className={cn("text-[9px] font-medium leading-none", isTranslucent ? "vibrant-sidebar-fg-muted" : "text-foreground/50")}>{count}</span>
-                            )}
-                          </button>
-                        </TooltipTrigger>
-                        <TooltipContent side="bottom" className="text-xs">
-                          {key === "monitor" ? title : `${title} — click to ${groupDevices.every((d: RecordingDevice) => d.active) ? "mute" : "unmute"}`}
-                        </TooltipContent>
-                      </Tooltip>
-                    ))}
+                              }}
+                            >
+                              <Icon
+                                aria-hidden="true"
+                                focusable="false"
+                                className={cn("h-3 w-3 transition-colors", isTranslucent ? "vibrant-sidebar-fg" : "text-foreground")}
+                                style={{ opacity: iconOpacity }}
+                              />
+                              {count > 1 && (
+                                <span className={cn("text-[9px] font-medium leading-none", isTranslucent ? "vibrant-sidebar-fg-muted" : "text-foreground/50")}>{count}</span>
+                              )}
+                            </button>
+                          </TooltipTrigger>
+                          <TooltipContent side="bottom" className="text-xs">
+                            {actionLabel}
+                          </TooltipContent>
+                        </Tooltip>
+                      );
+                    })}
                     <div className="w-px h-3 bg-border mx-0.5" />
                     <NotificationBell />
                     <Tooltip>
@@ -707,15 +952,16 @@ function HomeContent() {
                         <button
                           onClick={() => toggleMeeting()}
                           disabled={meetingLoading}
+                          aria-label={meetingState.active ? "stop meeting" : "start meeting"}
                           className={cn(
                             "relative flex items-center justify-center h-5 w-5 rounded transition-colors",
                             isTranslucent ? "vibrant-nav-item hover:bg-white/10" : "text-muted-foreground hover:text-foreground hover:bg-muted"
                           )}
                         >
                           {meetingState.active && (
-                            <span className="absolute -top-0.5 -right-0.5 h-1.5 w-1.5 rounded-full bg-foreground animate-pulse" />
+                            <span aria-hidden="true" className="absolute -top-0.5 -right-0.5 h-1.5 w-1.5 rounded-full bg-foreground animate-pulse" />
                           )}
-                          <Phone className={cn("h-3 w-3", isTranslucent ? "vibrant-sidebar-fg" : "text-muted-foreground")} />
+                          <Phone aria-hidden="true" focusable="false" className={cn("h-3 w-3", isTranslucent ? "vibrant-sidebar-fg" : "text-muted-foreground")} />
                         </button>
                       </TooltipTrigger>
                       <TooltipContent side="top" className="text-xs">
@@ -839,8 +1085,8 @@ function HomeContent() {
                         }
                       }}
                       className={cn(
-                        "w-full flex items-center px-2.5 py-1.5 rounded-lg transition-all duration-150 text-left group",
-                        sidebarCollapsed ? "justify-center" : "space-x-2.5",
+                        "relative w-full flex items-center px-2.5 py-1.5 rounded-lg transition-all duration-150 text-left group",
+                        sidebarCollapsed ? "justify-center" : "gap-2.5",
                         isActive
                           ? isTranslucent
                             ? "vibrant-nav-active"
@@ -858,7 +1104,25 @@ function HomeContent() {
                       )}>
                         {section.icon}
                       </div>
-                      {!sidebarCollapsed && <span className={cn("text-xs truncate", isActive && isTranslucent ? "font-semibold vibrant-sidebar-fg" : "font-medium")}>{section.label}</span>}
+                      {!sidebarCollapsed && <span className={cn("text-xs truncate", section.id === "pipes" && runningPipeCount > 0 && "flex-1", isActive && isTranslucent ? "font-semibold vibrant-sidebar-fg" : "font-medium")}>{section.label}</span>}
+                      {section.id === "pipes" && runningPipeCount > 0 && (
+                        sidebarCollapsed ? (
+                          <PipeActivityIndicator
+                            kind="running"
+                            iconOnly
+                            className="pointer-events-none absolute right-1 top-1 scale-[0.72]"
+                            ariaLabel={`${runningPipeCount} running pipe${runningPipeCount === 1 ? "" : "s"}`}
+                          />
+                        ) : (
+                          <PipeActivityIndicator
+                            kind="running"
+                            label={runningPipeCount}
+                            className="ml-auto shrink-0"
+                            labelClassName="text-muted-foreground/60"
+                            ariaLabel={`${runningPipeCount} running pipe${runningPipeCount === 1 ? "" : "s"}`}
+                          />
+                        )
+                      )}
                     </button>
                   );
                   if (sidebarCollapsed) {
@@ -871,6 +1135,12 @@ function HomeContent() {
                   }
                   return btn;
                 })}
+                {sidebarCollapsed && (
+                  <CollapsedChatSidebarButton
+                    onSelect={selectChatConversation}
+                    isTranslucent={isTranslucent}
+                  />
+                )}
               </div>
 
 
@@ -1045,7 +1315,7 @@ function HomeContent() {
                 Pi response and lost the partial token stream.
                 The ChatSidebar (recents + live status) is part of the same
                 layer so it's mounted with the chat. The pi-event-router (see
-                the useEffect above) updates the sidebar dots independently
+                the useEffect above) updates sidebar activity independently
                 of the chat panel, so background sessions keep pulsing in the
                 sidebar even on non-chat views — though the sidebar itself is
                 only visible when the user navigates back to the chat. */}
@@ -1075,6 +1345,7 @@ function HomeContent() {
 
           </div>
       </div>
+
     </div>
   );
 }

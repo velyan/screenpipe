@@ -18,17 +18,17 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "@/components/ui/tooltip";
 import { useSettings, ChatMessage, ChatConversation } from "@/lib/hooks/use-settings";
 import { cn } from "@/lib/utils";
-import { Loader2, Send, Square, User, Settings, ExternalLink, X, ImageIcon, History, Search, Trash2, ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Plus, Copy, Check, Clock, Paperclip, Filter, RefreshCw, GitBranch, MoreHorizontal, Pencil, Pin, Shield, ShieldCheck, Sparkles } from "lucide-react";
+import { Loader2, Send, Square, Settings, ExternalLink, X, ImageIcon, History, Search, Trash2, ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Plus, Copy, Check, Clock, Paperclip, Filter, RefreshCw, GitBranch, MoreHorizontal, Pencil, Pin, Shield, ShieldCheck, Sparkles, Plug, CornerDownRight } from "lucide-react";
 import { SchedulePromptDialog } from "@/components/chat/schedule-prompt-dialog";
 import { PipeContextBanner } from "@/components/chat/pipe-context-banner";
+import { SourceCitationFooter } from "@/components/chat/source-citation-footer";
 import { BrowserSidebar } from "@/components/browser-sidebar";
 import { toast } from "@/components/ui/use-toast";
 import { motion, AnimatePresence } from "framer-motion";
-import { PipeAIIcon, PipeAIIconLarge } from "@/components/pipe-ai-icon";
+import { PipeAIIconLarge } from "@/components/pipe-ai-icon";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { MemoizedReactMarkdown } from "@/components/markdown";
 import { VideoComponent } from "@/components/rewind/video";
-import { MermaidDiagram } from "@/components/rewind/mermaid-diagram";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { AIPresetsSelector } from "@/components/rewind/ai-presets-selector";
 import { AIPreset, PiQueuedPrompt } from "@/lib/utils/tauri";
@@ -63,6 +63,41 @@ import { SummaryCards } from "@/components/chat/summary-cards";
 import { type CustomTemplate } from "@/lib/summary-templates";
 import { usePipes } from "@/lib/hooks/use-pipes";
 import { localFetch, getApiBaseUrl } from "@/lib/api";
+import {
+  formatSourceCitationsMarkdown,
+  sourceCitationsFromMessage,
+  type SourceCitation,
+} from "@/lib/source-citations";
+import { getFaviconUrl } from "@/components/rewind/timeline/favicon-utils";
+import {
+  formatSteerShortcut,
+  getComposerPrimaryAction,
+  isComposerSteerShortcut,
+  isQueuedItemCancelShortcut,
+  isQueuedItemSteerShortcut,
+  normalizeQueueEventPayload,
+  queuedPreviewMatchesText,
+} from "@/lib/chat-queue-controls";
+
+const MermaidDiagram = React.lazy(() =>
+  import("@/components/rewind/mermaid-diagram").then((mod) => ({
+    default: mod.MermaidDiagram,
+  }))
+);
+
+function MermaidDiagramBlock({ chart }: { chart: string }) {
+  return (
+    <React.Suspense
+      fallback={
+        <div className="my-4 text-xs text-muted-foreground">
+          rendering diagram...
+        </div>
+      }
+    >
+      <MermaidDiagram chart={chart} />
+    </React.Suspense>
+  );
+}
 // Session ID is per-conversation — set on mount (new conv) and updated on load/new.
 // Stored as a ref so event listeners always see the current value without stale closures.
 
@@ -74,6 +109,7 @@ interface MentionSuggestion {
 }
 
 const APP_SUGGESTION_LIMIT = 10;
+const STREAM_RENDER_THROTTLE_MS = 80;
 
 interface Speaker {
   id: number;
@@ -170,7 +206,7 @@ function buildSystemPrompt(): string {
   const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
   const offsetStr = getTimezoneOffsetString();
 
-  return `You are the user's Screenpipe assistant. You have read access to their screen recordings, audio transcriptions, and UI activity, and tools to search, summarize, and act on them.
+  return `You are the user's Screenpipe assistant. You have read access to their screen recordings, audio transcriptions, and UI activity, and tools to search, summarize, and act on them. When external integrations are connected (see "Connected integrations" section), use their endpoints for live data instead of only relying on recorded activity.
 
 # Voice and length — the most important rule
 
@@ -204,9 +240,14 @@ When summarizing what the user did, write like a friend recapping their day. Con
 - If a search returns empty, silently widen and retry. Don't enumerate possibilities or ask the user to choose.
 - Never say "no data found" after one filtered search — verify first with an unfiltered time-only search.
 
+# Connection write policy
+
+Never POST, PUT, or PATCH to a connection proxy unless the user explicitly asks you to create, write, or modify something in that service. For ambiguous requests, read first. Ask before writing.
+
 # Tool selection
 
-- "meeting / call / conversation / what did I/they say" → search with content_type: "audio", no q param
+- "upcoming meetings / calendar events / what's on my calendar / schedule" → if a calendar integration is connected (google-calendar, apple-calendar), call its events endpoint first; only fall back to audio search if no calendar is connected
+- "meeting / call / conversation / what did I/they say" → search with content_type: "audio", no q param (for past meetings/calls captured by screenpipe)
 - "how long / time spent / which apps / most used" → activity-summary (not raw frame counts or SQL)
 - "what was on screen / what was I reading" → search with content_type: "all" or "accessibility"
 - "what was I doing" → activity-summary first; the windows field usually has enough without further searches
@@ -262,6 +303,17 @@ User's timezone: ${timezone} (UTC${offsetStr})
 User's local time: ${now.toLocaleString()}`;
 }
 
+function buildConnectionsContext(
+  connections: Array<{ id: string; name: string; category?: string; description?: string }>
+): string {
+  const withDesc = connections.filter((c) => c.description);
+  if (withDesc.length === 0) return "";
+  const entries = withDesc
+    .map((c) => `## ${c.name} (${c.id})\n${c.description}`)
+    .join("\n\n");
+  return `\n\n# Connected integrations\n\nThe user has connected the following external services. Use the endpoints listed under each to fetch live data when relevant. All endpoints are on http://localhost:3030 and require \`-H "Authorization: Bearer $SCREENPIPE_API_AUTH_KEY"\`.\n\n${entries}`;
+}
+
 interface SearchResult {
   type: "OCR" | "Audio" | "UI";
   content: {
@@ -298,6 +350,7 @@ interface Message {
   images?: string[]; // base64 data URLs of attached images
   timestamp: number;
   contentBlocks?: ContentBlock[];
+  sourceCitations?: SourceCitation[];
   model?: string;
   provider?: string;
   retryPrompt?: string; // when set, renders a retry CTA on error messages
@@ -415,12 +468,343 @@ function GridDissolveLoader({
   );
 }
 
+// Pulls /search query params out of a curl-style bash command so the chat row
+// can show "Searched ChatGPT 'foo'" instead of the raw curl URL. Pi's pipes
+// emit these as plain bash tool calls (no MCP), with the app name encoded as
+// app_name=X in the query string — see crates/screenpipe-core/assets/pipes/.
+interface SearchInfo {
+  appName?: string;
+  windowName?: string;
+  query?: string;
+  contentType?: string;
+}
+function parseSearchCommand(cmd: string): SearchInfo | null {
+  if (!cmd) return null;
+  const m = cmd.match(/https?:\/\/[^\s'"`]+\/search\?[^\s'"`]+/);
+  if (!m) return null;
+  try {
+    const url = new URL(m[0]);
+    if (!url.pathname.endsWith("/search")) return null;
+    const sp = url.searchParams;
+    const out: SearchInfo = {
+      appName: sp.get("app_name") || undefined,
+      windowName: sp.get("window_name") || undefined,
+      query: sp.get("q") || undefined,
+      contentType: sp.get("content_type") || undefined,
+    };
+    if (!out.appName && !out.windowName && !out.query && !out.contentType) return null;
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+// Reads the JSON payload from a `-d '<json>'` (or --data / --data-raw)
+// argument of a curl command. Single-quoted is the common shape in pi's
+// pipes; double-quoted with backslash-escaped inner quotes is the fallback.
+function curlBodyJson(cmd: string): any | null {
+  let m = cmd.match(/(?:-d|--data(?:-raw|-binary)?)\s+'((?:[^'\\]|\\.)*)'/s);
+  let raw = m ? m[1] : null;
+  if (!raw) {
+    m = cmd.match(/(?:-d|--data(?:-raw|-binary)?)\s+"((?:[^"\\]|\\.)*)"/s);
+    raw = m ? m[1].replace(/\\"/g, '"') : null;
+  }
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch {}
+  try { return JSON.parse(raw.replace(/\\'/g, "'")); } catch {}
+  return null;
+}
+
+function curlMethod(cmd: string): string {
+  if (/(^|\s)(?:-I|--head)(?=\s|$)/i.test(cmd)) return "HEAD";
+  const m = cmd.match(/(?:-X|--request)\s+([A-Z]+)/i);
+  return m ? m[1].toUpperCase() : "GET";
+}
+
+function trunc(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n) + "…" : s;
+}
+
+function sqlTables(sql: string): string[] {
+  const out = new Set<string>();
+  const re = /(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*)/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(sql)) !== null) out.add(m[1].toLowerCase());
+  return Array.from(out);
+}
+
+function sqlVerb(sql: string): string {
+  const s = sql.trim().toUpperCase();
+  if (s.startsWith("SELECT")) {
+    if (/^\s*SELECT\s+COUNT\s*\(/i.test(sql.trim())) return "Counted";
+    return "Queried";
+  }
+  if (s.startsWith("WITH")) return "Queried";
+  if (s.startsWith("INSERT")) return "Inserted into";
+  if (s.startsWith("UPDATE")) return "Updated";
+  if (s.startsWith("DELETE")) return "Deleted from";
+  return "Ran SQL on";
+}
+
+type WebTargetKind = "fetch" | "navigate" | "eval";
+
+interface WebTargetPresentation {
+  url: string;
+  domain: string;
+  label: string;
+  kind: WebTargetKind;
+}
+
+interface CurlPresentation {
+  label: string;
+  appName?: string;
+  connectionIconName?: string;
+  webTarget?: WebTargetPresentation;
+}
+
+function parseUrlCandidate(raw: string): URL | null {
+  let candidate = raw;
+  for (let i = 0; i < 4; i++) {
+    try {
+      return new URL(candidate);
+    } catch {
+      candidate = candidate.replace(/[),.;\]}]+$/, "");
+    }
+  }
+  return null;
+}
+
+function urlsInCommand(cmd: string): URL[] {
+  return Array.from(cmd.matchAll(/https?:\/\/[^\s'"`<>]+/g))
+    .map((m) => parseUrlCandidate(m[0]))
+    .filter((url): url is URL => Boolean(url));
+}
+
+function isLocalScreenpipeUrl(url: URL): boolean {
+  return (url.hostname === "localhost" || url.hostname === "127.0.0.1") && url.port === "3030";
+}
+
+function domainForUrl(url: URL): string {
+  return url.hostname.replace(/^www\./i, "");
+}
+
+function displayWebUrl(url: URL): string {
+  const domain = domainForUrl(url);
+  const path = `${url.pathname}${url.search}`;
+  return path && path !== "/" ? trunc(`${domain}${path}`, 48) : domain;
+}
+
+function webTargetFromUrl(url: URL, kind: WebTargetKind): WebTargetPresentation | null {
+  if (isLocalScreenpipeUrl(url)) return null;
+  return {
+    url: url.toString(),
+    domain: domainForUrl(url),
+    label: displayWebUrl(url),
+    kind,
+  };
+}
+
+function webTargetFromUrlString(raw: string, kind: WebTargetKind): WebTargetPresentation | null {
+  const url = parseUrlCandidate(raw);
+  return url ? webTargetFromUrl(url, kind) : null;
+}
+
+function firstExternalWebTarget(cmd: string, kind: WebTargetKind): WebTargetPresentation | null {
+  for (const url of urlsInCommand(cmd)) {
+    const target = webTargetFromUrl(url, kind);
+    if (target) return target;
+  }
+  return null;
+}
+
+function externalCurlLabel(method: string, target: WebTargetPresentation): string {
+  if (method === "GET") return `Fetched ${target.domain}`;
+  if (method === "HEAD") return `Checked ${target.domain}`;
+  if (method === "POST") return `Posted to ${target.domain}`;
+  return `${method} ${target.domain}`;
+}
+
+// Maps pi's bash curl calls to the local screenpipe API into a human label.
+// Pi only emits raw curl (no MCP), so the action lives in the URL + body —
+// every endpoint family pi actually uses (sampled from ~/.pi/agent/sessions)
+// gets its own rewrite here. Unknown endpoints fall back to "<METHOD> <path>".
+function classifyCurl(cmd: string): CurlPresentation | null {
+  if (!cmd) return null;
+
+  const search = parseSearchCommand(cmd);
+  if (search) {
+    const target = search.appName || search.windowName || search.contentType || "recordings";
+    const q = search.query ? ` "${trunc(search.query, 40)}"` : "";
+    return { label: `Searched ${target}${q}`, appName: search.appName || search.windowName };
+  }
+
+  const method = curlMethod(cmd);
+  const urls = urlsInCommand(cmd);
+  const url = urls.find(isLocalScreenpipeUrl);
+  if (!url) {
+    const target = firstExternalWebTarget(cmd, "fetch");
+    if (!target || !/\bcurl\b/i.test(cmd)) return null;
+    return { label: externalCurlLabel(method, target), webTarget: target };
+  }
+
+  const path = url.pathname.replace(/\/$/, "") || "/";
+
+  if (path === "/raw_sql") {
+    const body = curlBodyJson(cmd);
+    const sql = body && typeof body.query === "string" ? body.query : null;
+    if (!sql) return { label: "Ran SQL" };
+    const tables = sqlTables(sql);
+    const verb = sqlVerb(sql);
+    if (tables.length === 0) return { label: verb };
+    if (tables.length === 1) return { label: `${verb} ${tables[0]}` };
+    return { label: `${verb} ${tables.slice(0, 2).join(" + ")}${tables.length > 2 ? " +…" : ""}` };
+  }
+
+  if (path === "/activity-summary") return { label: "Activity summary" };
+
+  if (path === "/memories") {
+    if (method === "POST") return { label: "Saved memory" };
+    return { label: "Listed memories" };
+  }
+  const memMatch = path.match(/^\/memories\/(\w+)$/);
+  if (memMatch) {
+    const id = memMatch[1];
+    if (method === "PATCH" || method === "PUT") return { label: `Updated memory #${id}` };
+    if (method === "DELETE") return { label: `Deleted memory #${id}` };
+    return { label: `Got memory #${id}` };
+  }
+
+  if (path === "/meetings") return { label: "Listed meetings" };
+  const meetingMatch = path.match(/^\/meetings\/(\w+)$/);
+  if (meetingMatch) {
+    const id = meetingMatch[1];
+    if (method === "PATCH" || method === "PUT") {
+      const body = curlBodyJson(cmd);
+      const hasTitle = body && typeof body.title === "string" && body.title.length > 0;
+      const hasNote = body && typeof body.note === "string" && body.note.length > 0;
+      if (hasTitle && hasNote) return { label: `Renamed + summarized meeting #${id}` };
+      if (hasNote) return { label: `Summarized meeting #${id}` };
+      if (hasTitle) return { label: `Renamed meeting #${id}` };
+      return { label: `Updated meeting #${id}` };
+    }
+    if (method === "DELETE") return { label: `Deleted meeting #${id}` };
+    return { label: `Got meeting #${id}` };
+  }
+
+  if (path === "/speakers/similar") {
+    const name = url.searchParams.get("name") || url.searchParams.get("speaker_name");
+    return { label: name ? `Found similar speakers for "${trunc(name, 30)}"` : "Found similar speakers" };
+  }
+  if (path === "/speakers/merge") return { label: "Merged speakers" };
+  if (path === "/speakers/search") {
+    const q = url.searchParams.get("name") || url.searchParams.get("q");
+    return { label: q ? `Searched speakers "${trunc(q, 30)}"` : "Searched speakers" };
+  }
+  if (path === "/speakers/unnamed") return { label: "Listed unnamed speakers" };
+  if (path.startsWith("/speakers/")) {
+    const id = path.split("/")[2];
+    if (method === "PATCH" || method === "PUT") return { label: `Renamed speaker #${id}` };
+    return { label: `Got speaker #${id}` };
+  }
+
+  if (path === "/connections/browsers/owned-default/navigate") {
+    const body = curlBodyJson(cmd);
+    if (body && typeof body.url === "string") {
+      const target = webTargetFromUrlString(body.url, "navigate");
+      if (target) return { label: `Opened ${target.domain} in agent browser`, webTarget: target };
+    }
+    return { label: "Navigated agent browser" };
+  }
+  if (path === "/connections/browsers/owned-default/eval") {
+    const body = curlBodyJson(cmd);
+    if (body && typeof body.url === "string") {
+      const target = webTargetFromUrlString(body.url, "eval");
+      if (target) return { label: `Ran JS on ${target.domain}`, webTarget: target };
+    }
+    return { label: "Ran JS in agent browser" };
+  }
+  if (path.startsWith("/connections/browsers/")) return { label: "Agent browser action" };
+
+  if (path === "/connections") {
+    return { label: "Listed connections", connectionIconName: "connections" };
+  }
+  if (path.startsWith("/connections/")) {
+    const name = path.split("/")[2];
+    if (method === "DELETE") {
+      return { label: `Removed ${name} connection`, connectionIconName: name };
+    }
+    if (method === "POST" || method === "PATCH" || method === "PUT") {
+      return { label: `Configured ${name} connection`, connectionIconName: name };
+    }
+    return { label: `${name} connection`, connectionIconName: name };
+  }
+
+  if (path === "/pipes") {
+    if (method === "POST") return { label: "Installed pipe" };
+    return { label: "Listed pipes" };
+  }
+  const pipeMatch = path.match(/^\/pipes\/([^/]+)(?:\/(.+))?$/);
+  if (pipeMatch) {
+    const name = pipeMatch[1];
+    const sub = pipeMatch[2];
+    if (sub === "executions") return { label: `${name}: recent runs` };
+    if (sub === "run" || method === "POST") return { label: `Ran pipe ${name}` };
+    if (method === "PATCH" || method === "PUT") return { label: `Configured pipe ${name}` };
+    if (method === "DELETE") return { label: `Removed pipe ${name}` };
+    return { label: `Pipe ${name}` };
+  }
+
+  if (path === "/frames/export") return { label: "Exported video" };
+  if (path === "/health") return { label: "Health check" };
+  if (path === "/list-monitors") return { label: "Listed monitors" };
+  if (path === "/list-audio-devices") return { label: "Listed audio devices" };
+  if (path === "/tags") return { label: "Listed tags" };
+
+  return { label: `${method} ${path}` };
+}
+
+function extractAppFromToolCall(toolCall: ToolCall): string | undefined {
+  if (toolCall.toolName === "bash") {
+    return classifyCurl(String(toolCall.args?.command ?? ""))?.appName;
+  }
+  return undefined;
+}
+
+function extractConnectionIconFromToolCall(toolCall: ToolCall): string | undefined {
+  if (toolCall.toolName === "bash") {
+    return classifyCurl(String(toolCall.args?.command ?? ""))?.connectionIconName;
+  }
+  return undefined;
+}
+
+function extractWebTargetFromToolCall(toolCall: ToolCall): WebTargetPresentation | undefined {
+  if (toolCall.toolName === "bash") {
+    return classifyCurl(String(toolCall.args?.command ?? ""))?.webTarget;
+  }
+  return undefined;
+}
+
 // Human-friendly label for a tool call (no JSON, no raw paths)
 function friendlyToolLabel(toolCall: ToolCall): string {
   const fileName = (p: string) => p.split("/").pop() || p;
   switch (toolCall.toolName) {
-    case "bash":
-      return `Ran ${toolCall.args.command ? `\`${String(toolCall.args.command).slice(0, 60)}${String(toolCall.args.command).length > 60 ? "…" : ""}\`` : "command"}`;
+    case "bash": {
+      const cmd = String(toolCall.args.command ?? "");
+      const result = classifyCurl(cmd);
+      if (result) return result.label;
+      // Fallback for non-API curls / arbitrary shell — strip the auth-header
+      // boilerplate so the truncation surfaces the meaningful tail, not the
+      // 80-char "-H Authorization: Bearer $SCREENPIPE_API_AUTH_KEY" header.
+      const stripped = cmd
+        .replace(/^\s*curl\s+/, "curl ")
+        .replace(/\s-s\s+/g, " ")
+        .replace(/\s-H\s+['"]Authorization:\s*Bearer\s+\$?SCREENPIPE_API_AUTH_KEY['"]\s*/g, " ")
+        .replace(/\s-H\s+['"]Content-Type:\s*application\/json['"]\s*/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+      const display = stripped || cmd;
+      return `Ran ${display ? `\`${display.slice(0, 60)}${display.length > 60 ? "…" : ""}\`` : "command"}`;
+    }
     case "read":
       return `Read ${fileName(toolCall.args.path || "")}`;
     case "edit":
@@ -478,6 +862,9 @@ function FriendlyToolDetails({ toolCall }: { toolCall: ToolCall }) {
 function ToolCallRailItem({ toolCall, isLast }: { toolCall: ToolCall; isLast: boolean }) {
   const [expanded, setExpanded] = useState(false);
   const label = friendlyToolLabel(toolCall);
+  const appName = extractAppFromToolCall(toolCall);
+  const connectionIconName = extractConnectionIconFromToolCall(toolCall);
+  const webTarget = extractWebTargetFromToolCall(toolCall);
 
   return (
     <div className="relative flex min-w-0">
@@ -485,7 +872,9 @@ function ToolCallRailItem({ toolCall, isLast }: { toolCall: ToolCall; isLast: bo
       <div className="flex flex-col items-center flex-shrink-0 w-5">
         {/* Dot */}
         <div className="relative flex items-center justify-center w-5 h-5">
-          {toolCall.isRunning ? (
+          {connectionIconName && !toolCall.isRunning && !toolCall.isError ? (
+            <ConnectionToolIcon name={connectionIconName} />
+          ) : toolCall.isRunning ? (
             // Pulsing hollow dot for running
             <motion.div
               className="w-2 h-2 border border-foreground"
@@ -517,6 +906,11 @@ function ToolCallRailItem({ toolCall, isLast }: { toolCall: ToolCall; isLast: bo
           onClick={() => setExpanded(!expanded)}
           className="w-full flex items-center gap-1.5 text-left min-w-0 group py-0.5"
         >
+          {webTarget ? (
+            <WebTargetIcon target={webTarget} sizeClass="w-3.5 h-3.5" letterClass="text-[8px]" />
+          ) : appName && !connectionIconName && (
+            <AppIcon name={appName} sizeClass="w-3.5 h-3.5" letterClass="text-[8px]" />
+          )}
           <span className="truncate flex-1 text-xs font-mono text-foreground/70 group-hover:text-foreground transition-colors duration-150">
             {label}
           </span>
@@ -613,15 +1007,80 @@ function formatMinutes(minutes: number): string {
   return m > 0 ? `${h}h ${m}m` : `${h}h`;
 }
 
-function AppIcon({ name }: { name: string }) {
+// Static fallback for web/SaaS apps the OS won't give us via /app-icon. Keys
+// are normalized (trim + lowercase, .app/.exe stripped). Paths point at the
+// existing assets in apps/screenpipe-app-tauri/public/images/.
+const STATIC_APP_ICONS: Record<string, string> = {
+  chatgpt: "/images/openai.png",
+  openai: "/images/openai.png",
+  claude: "/images/claude-ai.svg",
+  "claude.ai": "/images/claude-ai.svg",
+  anthropic: "/images/anthropic.png",
+  perplexity: "/images/perplexity.svg",
+  ollama: "/images/ollama.png",
+  "lm studio": "/images/lmstudio.png",
+  lmstudio: "/images/lmstudio.png",
+  msty: "/images/msty.webp",
+  anythingllm: "/images/anythingllm.png",
+  safari: "/images/safari.svg",
+  notion: "/images/notion.svg",
+  github: "/images/github.png",
+  copilot: "/images/github.png",
+  "github copilot": "/images/github.png",
+  linear: "/images/linear.svg",
+  asana: "/images/asana.svg",
+  jira: "/images/jira.png",
+  hubspot: "/images/hubspot.png",
+  monday: "/images/monday.png",
+  bitrix24: "/images/bitrix24.png",
+  financialsense: "/images/financialsense.png",
+  glean: "/images/glean.svg",
+  "google-calendar": "/images/google-calendar.svg",
+  "google calendar": "/images/google-calendar.svg",
+  "google-docs": "/images/google-docs.svg",
+  "google docs": "/images/google-docs.svg",
+  "google-sheets": "/images/google-sheets.svg",
+  "google sheets": "/images/google-sheets.svg",
+  logseq: "/images/logseq.png",
+  loops: "/images/loops.svg",
+  make: "/images/make.png",
+  n8n: "/images/n8n.png",
+  ntfy: "/images/ntfy.png",
+  pocket: "/images/pocket.png",
+  posthog: "/images/posthog.svg",
+  pushover: "/images/pushover.png",
+  quickbooks: "/images/quickbooks.svg",
+  whatsapp: "/images/whatsapp.svg",
+  resend: "/images/resend.svg",
+  limitless: "/images/limitless.svg",
+  granola: "/images/granola.png",
+  fireflies: "/images/fireflies.png",
+  otter: "/images/otter.png",
+  bee: "/images/bee.png",
+  airtable: "/images/airtable.png",
+  apple: "/images/apple.svg",
+  "apple intelligence": "/images/apple-intelligence.png",
+  screenpipe: "/images/screenpipe.png",
+};
+
+function normalizeAppKey(name: string): string {
+  return name.trim().toLowerCase().replace(/\.app$|\.exe$/i, "");
+}
+
+function AppIcon({
+  name,
+  sizeClass = "w-5 h-5",
+  letterClass = "text-[10px]",
+}: { name: string; sizeClass?: string; letterClass?: string }) {
   const color = nameToColor(name);
   const [iconFailed, setIconFailed] = React.useState(false);
-  const iconUrl = `http://localhost:11435/app-icon?name=${encodeURIComponent(name)}`;
+  const staticPath = STATIC_APP_ICONS[normalizeAppKey(name)];
+  const iconUrl = staticPath ?? `http://localhost:11435/app-icon?name=${encodeURIComponent(name)}`;
   return (
-    <div className="w-5 h-5 rounded-sm flex-shrink-0 flex items-center justify-center overflow-hidden">
+    <div className={cn("rounded-sm flex-shrink-0 flex items-center justify-center overflow-hidden", sizeClass)}>
       {iconFailed ? (
         <span
-          className="w-full h-full flex items-center justify-center text-[10px] font-semibold text-white rounded-sm"
+          className={cn("w-full h-full flex items-center justify-center font-semibold text-white rounded-sm", letterClass)}
           style={{ backgroundColor: color }}
         >
           {name.charAt(0).toUpperCase()}
@@ -637,6 +1096,75 @@ function AppIcon({ name }: { name: string }) {
       )}
     </div>
   );
+}
+
+function WebTargetIcon({
+  target,
+  sizeClass = "w-5 h-5",
+  letterClass = "text-[10px]",
+}: { target: WebTargetPresentation; sizeClass?: string; letterClass?: string }) {
+  const color = nameToColor(target.domain);
+  const [iconFailed, setIconFailed] = React.useState(false);
+  return (
+    <div
+      className={cn("rounded-sm flex-shrink-0 flex items-center justify-center overflow-hidden bg-background", sizeClass)}
+      title={target.label}
+    >
+      {iconFailed ? (
+        <span
+          className={cn("w-full h-full flex items-center justify-center font-semibold text-white rounded-sm", letterClass)}
+          style={{ backgroundColor: color }}
+        >
+          {target.domain.charAt(0).toUpperCase()}
+        </span>
+      ) : (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img
+          src={getFaviconUrl(target.domain)}
+          alt={target.domain}
+          className="w-full h-full object-contain"
+          onError={() => setIconFailed(true)}
+        />
+      )}
+    </div>
+  );
+}
+
+function ConnectionToolIcon({ name }: { name: string }) {
+  const key = normalizeAppKey(name);
+  if (key === "connections") {
+    return <Plug className="w-3.5 h-3.5 text-foreground/70" aria-label="connections" />;
+  }
+  if (key === "gmail") {
+    return (
+      <svg viewBox="0 0 999.517 749.831" className="w-3.5 h-3.5" aria-label="Gmail">
+        <path fill="#4285F4" d="M68.149 749.831h159.014V363.654L0 193.282v488.4C0 719.391 30.553 749.831 68.149 749.831"/>
+        <path fill="#34A853" d="M772.354 749.831h159.014c37.709 0 68.149-30.553 68.149-68.149v-488.4L772.354 363.654"/>
+        <path fill="#FBBC04" d="M772.354 68.342v295.312l227.163-170.372V102.417c0-84.277-96.203-132.322-163.557-81.779"/>
+        <path fill="#EA4335" d="M227.163 363.654V68.342l272.595 204.447 272.595-204.447v295.312L499.758 568.1"/>
+        <path fill="#C5221F" d="M0 102.417v90.865l227.163 170.372V68.342L163.557 20.638C96.09-29.906 0 18.139 0 102.417"/>
+      </svg>
+    );
+  }
+  if (key === "microsoft365" || key === "microsoft-365" || key === "office365" || key === "outlook") {
+    return (
+      <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" aria-label="Microsoft 365">
+        <path fill="#F25022" d="M1 1h10v10H1z"/>
+        <path fill="#7FBA00" d="M13 1h10v10H13z"/>
+        <path fill="#00A4EF" d="M1 13h10v10H1z"/>
+        <path fill="#FFB900" d="M13 13h10v10H13z"/>
+      </svg>
+    );
+  }
+  if (key === "calcom" || key === "cal.com") {
+    return (
+      <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 text-foreground" fill="currentColor" aria-label="Cal.com">
+        <path d="M2.408 14.488C1.035 14.488 0 13.4 0 12.058c0-1.346.982-2.443 2.408-2.443.758 0 1.282.233 1.691.765l-.66.55a1.343 1.343 0 0 0-1.03-.442c-.93 0-1.44.711-1.44 1.57 0 .86.559 1.557 1.44 1.557.413 0 .765-.147 1.043-.443l.651.573c-.391.51-.929.743-1.695.743zM6.948 10.913h.89v3.49h-.89v-.51c-.185.362-.493.604-1.083.604-.943 0-1.695-.82-1.695-1.826 0-1.007.752-1.825 1.695-1.825.585 0 .898.241 1.083.604zm.026 1.758c0-.546-.374-.998-.964-.998-.568 0-.938.457-.938.998 0 .528.37.998.938.998.586 0 .964-.456.964-.998zM8.467 9.503h.89v4.895h-.89zM9.752 13.937a.53.53 0 0 1 .542-.528c.313 0 .533.242.533.528a.527.527 0 0 1-.533.537.534.534 0 0 1-.542-.537zM14.23 13.839c-.33.403-.832.658-1.426.658a1.806 1.806 0 0 1-1.84-1.826c0-1.007.778-1.825 1.84-1.825.572 0 1.07.241 1.4.622l-.687.577c-.172-.215-.396-.376-.713-.376-.568 0-.938.456-.938.998 0 .541.37.997.938.997.343 0 .58-.179.757-.42zM14.305 12.671c0-1.007.78-1.825 1.84-1.825 1.061 0 1.84.818 1.84 1.825 0 1.007-.779 1.826-1.84 1.826-1.06-.005-1.84-.82-1.84-1.826zm2.778 0c0-.546-.37-.998-.938-.998-.568-.004-.937.452-.937.998 0 .542.37.998.937.998.568 0 .938-.456.938-.998zM24 12.269v2.13h-.89v-1.911c0-.604-.281-.864-.704-.864-.396 0-.678.197-.678.864v1.91h-.89v-1.91c0-.604-.285-.864-.704-.864-.396 0-.744.197-.744.864v1.91h-.89v-3.49h.89v.484c.185-.376.52-.564 1.035-.564.489 0 .898.241 1.123.649.224-.417.554-.65 1.153-.65.731.005 1.299.56 1.299 1.442z"/>
+      </svg>
+    );
+  }
+
+  return <AppIcon name={name} sizeClass="w-3.5 h-3.5" letterClass="text-[8px]" />;
 }
 
 function AppStatsBlock({ content }: { content: string }) {
@@ -689,7 +1217,7 @@ function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
       className={cn(
         "prose prose-sm max-w-full break-words overflow-hidden [word-break:break-word]",
         isUser
-          ? "prose-invert dark:prose dark:text-background"
+          ? "text-foreground dark:prose-invert"
           : "dark:prose-invert"
       )}
       remarkPlugins={[remarkGfm]}
@@ -825,7 +1353,7 @@ function MarkdownBlock({ text, isUser }: { text: string; isUser: boolean }) {
           const isCodeBlock = className?.includes("language-");
 
           if (language === "mermaid") {
-            return <MermaidDiagram chart={content} />;
+            return <MermaidDiagramBlock chart={content} />;
           }
 
           if (language === "app-stats") {
@@ -997,6 +1525,12 @@ function ToolCallGroup({ toolCalls, defaultExpanded = false }: { toolCalls: Tool
 // Renders message content with interleaved text and tool call blocks
 function MessageContent({ message, onImageClick, onRetry }: { message: Message; onImageClick?: (images: string[], index: number) => void; onRetry?: (prompt: string) => void }) {
   const isUser = message.role === "user";
+  const { settings } = useSettings();
+  const hideThinkingBlocks = settings?.hideThinkingBlocks ?? true;
+  const sourceCitations = isUser ? [] : sourceCitationsFromMessage(message);
+  const sourceFooter = sourceCitations.length > 0 ? (
+    <SourceCitationFooter citations={sourceCitations} />
+  ) : null;
 
   // Retry CTA — shown at the bottom of error messages that have a retryPrompt
   const retryCta = !isUser && message.retryPrompt ? (
@@ -1031,11 +1565,12 @@ function MessageContent({ message, onImageClick, onRetry }: { message: Message; 
             return <MarkdownBlock key={`text-${group.key}`} text={group.text} isUser={isUser} />;
           }
           if (group.type === "thinking") {
-            // Always start collapsed. The "thought for Xs" pill is enough
-            // signal that the assistant did chain-of-thought work — auto-
-            // expanding it (the c092166e0 behavior) drew the eye to the
-            // raw reasoning text instead of the actual response and felt
-            // noisy on every message. Click to expand if you want detail.
+            // Settings → Display → Hide Thinking Blocks (default true). Even
+            // when shown the block starts collapsed: the "thought for Xs"
+            // pill is enough signal that the assistant did chain-of-thought
+            // work — auto-expanding (the c092166e0 behavior) drew the eye
+            // to raw reasoning instead of the response.
+            if (hideThinkingBlocks) return null;
             return <ThinkingBlock key={`thinking-${group.key}`} text={group.text} isThinking={group.isThinking} durationMs={group.durationMs} />;
           }
           if (group.type === "tool-group") {
@@ -1043,6 +1578,7 @@ function MessageContent({ message, onImageClick, onRetry }: { message: Message; 
           }
           return null;
         })}
+        {sourceFooter}
         {retryCta}
       </div>
     );
@@ -1079,6 +1615,7 @@ function MessageContent({ message, onImageClick, onRetry }: { message: Message; 
     <div className="space-y-2">
       {imageThumbs}
       <MarkdownBlock text={message.content} isUser={isUser} />
+      {sourceFooter}
       {retryCta}
     </div>
   );
@@ -1091,15 +1628,19 @@ function CollapsibleUserMessage({ label, fullContent }: { label: string; fullCon
       <div className="flex items-center gap-1.5">
         <span className="flex-1 text-sm font-medium">{label}</span>
         <button
-          onClick={() => setExpanded(!expanded)}
-          className="shrink-0 p-0.5 rounded hover:bg-background/20 text-background/60 hover:text-background/90 transition-colors"
+          onClick={(e) => {
+            e.stopPropagation();
+            setExpanded(!expanded);
+          }}
+          onMouseUp={(e) => e.stopPropagation()}
+          className="shrink-0 p-0.5 rounded hover:bg-muted-foreground/10 text-muted-foreground hover:text-foreground transition-colors"
           title={expanded ? "Collapse prompt" : "Show full prompt"}
         >
           {expanded ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
         </button>
       </div>
       {expanded && (
-        <div className="mt-2 pt-2 border-t border-background/20 text-xs opacity-80 whitespace-pre-wrap break-words">
+        <div className="mt-2 pt-2 border-t border-border/50 text-xs text-muted-foreground whitespace-pre-wrap break-words">
           {fullContent}
         </div>
       )}
@@ -1128,6 +1669,7 @@ function ChatTitleMenu({
 }) {
   const [open, setOpen] = useState(false);
   const [renaming, setRenaming] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [draft, setDraft] = useState("");
   const inputRef = useRef<HTMLInputElement | null>(null);
 
@@ -1191,7 +1733,10 @@ function ChatTitleMenu({
   };
   const handleDelete = async () => {
     setOpen(false);
-    if (!confirm("Delete this chat? This cannot be undone.")) return;
+    setConfirmingDelete(true);
+  };
+  const confirmDelete = async () => {
+    setConfirmingDelete(false);
     try {
       await deleteConversation(conversationId);
       useChatStore.getState().actions.drop(conversationId);
@@ -1271,6 +1816,24 @@ function ChatTitleMenu({
           Delete
         </button>
       </PopoverContent>
+      <Dialog open={confirmingDelete} onOpenChange={setConfirmingDelete}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>delete chat</DialogTitle>
+            <p className="text-sm text-muted-foreground">
+              Delete this chat? This cannot be undone.
+            </p>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirmingDelete(false)}>
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={() => void confirmDelete()}>
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Popover>
   );
 }
@@ -1300,7 +1863,7 @@ export function StandaloneChat({
   // filter popover so users can mention them directly with @id — helps the
   // agent pick the right connection for a query instead of having to guess.
   const [connections, setConnections] = useState<
-    Array<{ id: string; name: string; category?: string }>
+    Array<{ id: string; name: string; category?: string; description?: string }>
   >([]);
   // Watch the input section's width so suggestion chips can collapse into
   // a popover on narrow chat columns.
@@ -1321,11 +1884,11 @@ export function StandaloneChat({
         const res = await localFetch("/connections");
         if (!res.ok) return;
         const json = (await res.json()) as {
-          data?: Array<{ id: string; name: string; connected: boolean; category?: string }>;
+          data?: Array<{ id: string; name: string; connected: boolean; category?: string; description?: string }>;
         };
         const list = (json.data ?? [])
           .filter((c) => c.connected)
-          .map((c) => ({ id: c.id, name: c.name, category: c.category }));
+          .map((c) => ({ id: c.id, name: c.name, category: c.category, description: c.description }));
         if (!cancelled) setConnections(list);
       } catch {
         // silent — filter just won't surface connections, no UI regression
@@ -1334,6 +1897,29 @@ export function StandaloneChat({
     return () => {
       cancelled = true;
     };
+  }, []);
+
+  // Re-fetch connections whenever the window becomes visible — picks up any
+  // integrations connected in Settings while the chat was open.
+  useEffect(() => {
+    const fetchConnections = async () => {
+      try {
+        const res = await localFetch("/connections");
+        if (!res.ok) return;
+        const json = (await res.json()) as {
+          data?: Array<{ id: string; name: string; connected: boolean; category?: string; description?: string }>;
+        };
+        const list = (json.data ?? [])
+          .filter((c) => c.connected)
+          .map((c) => ({ id: c.id, name: c.name, category: c.category, description: c.description }));
+        setConnections(list);
+      } catch { /* silent */ }
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") fetchConnections();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
   }, []);
 
   // Custom summary templates (persisted in settings)
@@ -1367,12 +1953,12 @@ export function StandaloneChat({
   const [messages, setMessages] = useState<Message[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
-  const [streamedCharCount, setStreamedCharCount] = useState(0);
   // Prompts the user has queued while a previous one is still streaming.
   // Sourced from rust via the `pi-queue-changed` event — single source of
   // truth lives in `pi_command_queue.rs`. Cleared as soon as the drain loop
   // pulls a queued item and writes it to stdin (it's then in-flight).
   const [queuedPrompts, setQueuedPrompts] = useState<PiQueuedPrompt[]>([]);
+  const [queuedActionPromptId, setQueuedActionPromptId] = useState<string | null>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [openMessageMenuId, setOpenMessageMenuId] = useState<string | null>(null);
   // Cursor-style inline edit: click a sent user message to tweak and resend
@@ -1473,13 +2059,18 @@ export function StandaloneChat({
   const piStreamingTextRef = useRef<string>("");
   const piMessageIdRef = useRef<string | null>(null);
   const piContentBlocksRef = useRef<ContentBlock[]>([]);
+  const streamRenderTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Last error text observed anywhere in the current Pi stream — used to surface
   // quota / credits_exhausted errors when agent_end arrives with no content and
   // no explicit stopReason=error on any message (some providers drop that flag).
   const piLastErrorRef = useRef<string | null>(null);
   const piStartInFlightRef = useRef(false);
   const piFirstCallRetried = useRef(false);
+  const sessionActivityLastEmitAtRef = useRef<Record<string, number>>({});
+  const sessionActivityLastSigRef = useRef<Record<string, string>>({});
   const piStoppedIntentionallyRef = useRef(false);
+  const piIntentionallyStoppedPidsRef = useRef<Set<number>>(new Set());
+  const piPresetSwitchPromiseRef = useRef<Promise<void> | null>(null);
   const piCrashCountRef = useRef(0);
   const piLastCrashRef = useRef(0);
   const piThinkingStartRef = useRef<number | null>(null);
@@ -1519,7 +2110,7 @@ export function StandaloneChat({
   const lastUserMessageRef = useRef<string>("");
 
   // Ref to sendMessage so useEffect callbacks can call it without stale closures
-  const sendMessageRef = useRef<(msg: string) => Promise<void>>();
+  const sendMessageRef = useRef<(msg: string, displayLabel?: string) => Promise<void>>();
   // Bypass guard for auto-send from chat-prefill (Pi confirmed running but React state stale)
   const autoSendBypassRef = useRef(false);
 
@@ -1541,6 +2132,36 @@ export function StandaloneChat({
   const [conversationId, setConversationId] = useState<string | null>(
     initialSessionIdRef.current,
   );
+
+  const cancelStreamingMessageRender = useCallback(() => {
+    if (streamRenderTimerRef.current) {
+      clearTimeout(streamRenderTimerRef.current);
+      streamRenderTimerRef.current = null;
+    }
+  }, []);
+
+  const renderStreamingMessageSnapshot = useCallback(() => {
+    const msgId = piMessageIdRef.current;
+    if (!msgId) return;
+    const content = piStreamingTextRef.current;
+    const contentBlocks = [...piContentBlocksRef.current];
+    setMessages((prev) =>
+      prev.map((m) => (m.id === msgId ? { ...m, content, contentBlocks } : m))
+    );
+  }, [setMessages]);
+
+  const flushStreamingMessageRender = useCallback(() => {
+    cancelStreamingMessageRender();
+    renderStreamingMessageSnapshot();
+  }, [cancelStreamingMessageRender, renderStreamingMessageSnapshot]);
+
+  const scheduleStreamingMessageRender = useCallback(() => {
+    if (streamRenderTimerRef.current) return;
+    streamRenderTimerRef.current = setTimeout(() => {
+      streamRenderTimerRef.current = null;
+      renderStreamingMessageSnapshot();
+    }, STREAM_RENDER_THROTTLE_MS);
+  }, [renderStreamingMessageSnapshot]);
 
   // Process an image file to base64
   // Resize image to max 1024px and compress as JPEG to keep base64 payload small
@@ -1996,6 +2617,78 @@ export function StandaloneChat({
     useChatStore.getState().actions.setPanelSession(conversationId);
   }, [conversationId]);
 
+  // E2E hook: expose a function to seed a user message into a session.
+  // Required by parallel-chat.spec.ts because `ensureAssistantPlaceholder`
+  // (added 2026-04-29 in e1f55023d) only creates an assistant bubble when
+  // the last message in LOCAL React state is `role: "user"`. Without a
+  // way to inject a user message, the test's pure pi_event-faking path
+  // can't materialize any assistant DOM and CI has been red on every PR
+  // since.
+  //
+  // Three places get updated:
+  //   1. Local React state (`setMessages`) — what `ensureAssistantPlaceholder`
+  //      reads via `setMessages(prev => …)`. This is the critical one.
+  //   2. The chat-store via `upsert` — needed because `appendMessage` no-ops
+  //      when the session record doesn't exist yet (a brand-new session
+  //      created by `chat-load-conversation` → `startNewConversation` does
+  //      NOT seed a sessions[id] entry; that only happens on first save
+  //      after agent_end). Without upsert, the seed silently disappears.
+  //   3. `piSessionIdRef.current` — set if the panel hasn't yet caught up
+  //      to the requested session, so `text_delta` handlers (keyed by
+  //      sessionId) route correctly.
+  //
+  // Production impact: zero — only a non-functional reference on `window`,
+  // never read from production code paths.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    (window as any).__e2eSeedUserMessage = (sid: string, text: string) => {
+      const id = `e2e-user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const userMsg = {
+        id,
+        role: "user" as const,
+        content: text,
+        timestamp: Date.now(),
+      };
+
+      // (2) Ensure the session record exists in the store so subsequent
+      // appendMessage / setStreaming / snapshotSession calls actually
+      // mutate something. upsert overwrites if existing, so we read first
+      // and merge messages by hand.
+      const store = useChatStore.getState();
+      const existing = store.sessions[sid];
+      if (!existing) {
+        store.actions.upsert({
+          id: sid,
+          title: "e2e",
+          preview: text.slice(0, 60),
+          status: "idle",
+          messageCount: 1,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          pinned: false,
+          unread: false,
+          messages: [userMsg as any],
+        });
+      } else {
+        store.actions.appendMessage(sid, userMsg as any);
+      }
+
+      // (1) Mirror to local React state so `ensureAssistantPlaceholder`
+      // sees the user-tail on the next text_delta. Always do this — the
+      // test only ever seeds for the about-to-stream session, which is
+      // by definition what the panel is rendering.
+      setMessages((prev) => [...prev, userMsg as any]);
+
+      // (3) Force the session ref in case the panel hasn't finished
+      // switching yet. Otherwise text_deltas with this sid would route
+      // to the wrong handler.
+      piSessionIdRef.current = sid;
+    };
+    return () => {
+      delete (window as any).__e2eSeedUserMessage;
+    };
+  }, []);
+
   // Cross-window rename sync. The chat-store is window-local (zustand
   // lives in each WebView's JS context), so a rename done in the /chat
   // overlay would otherwise never reach the chat-sidebar in /home. The
@@ -2243,19 +2936,23 @@ export function StandaloneChat({
   // Remove a specific @mention from input
   const removeFilter = (filterType: "time" | "content" | "app" | "speaker", label?: string) => {
     let newInput = input;
-    if (filterType === "time" && label) {
+    if (filterType === "time") {
       // Remove time mentions like @today, @yesterday, @last-hour, etc.
-      const timePatterns: Record<string, RegExp> = {
-        "today": /@today\b/gi,
-        "yesterday": /@yesterday\b/gi,
-        "last week": /@last[- ]?week\b/gi,
-        "last hour": /@last[- ]?hour\b/gi,
-        "this morning": /@this[- ]?morning\b/gi,
-      };
-      const pattern = timePatterns[label];
-      if (pattern) newInput = newInput.replace(pattern, "").trim();
+      if(label){
+        const timePatterns: Record<string, RegExp> = {
+          "today": /@today\b/gi,
+          "yesterday": /@yesterday\b/gi,
+          "last week": /@last[- ]?week\b/gi,
+          "last hour": /@last[- ]?hour\b/gi,
+          "this morning": /@this[- ]?morning\b/gi,
+        };
+        const pattern = timePatterns[label];
+        if (pattern) newInput = newInput.replace(pattern, "").trim();
+      }else{
+        newInput = newInput.replace(/@(today|yesterday|last[- ]?week|last[- ]?hour|this[- ]?morning)\b/gi, "").trim();
+      }
     } else if (filterType === "content") {
-      newInput = newInput.replace(/@(audio|screen)\b/gi, "").trim();
+      newInput = newInput.replace(/@(audio|screen|input)\b/gi, "").trim();
     } else if (filterType === "app" && activeFilters.appName) {
       // Remove app mention - need to find the pattern
       const appPattern = new RegExp(`@${activeFilters.appName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, "gi");
@@ -2382,10 +3079,16 @@ export function StandaloneChat({
       return;
     }
 
-    // Enter without shift submits the form. We intentionally don't gate on
-    // isLoading anymore — if a previous prompt is still streaming, the new
-    // one is enqueued at the rust level (see `pi_command_queue.rs`) and
-    // shown in the queued-cards rail under the transcript.
+    if (isComposerSteerShortcut(e, isMac) && !showMentionDropdown) {
+      e.preventDefault();
+      if (input.trim() || pastedImages.length > 0) {
+        steerMessage(input.trim());
+      }
+      return;
+    }
+
+    // Enter without shift submits the form. While Pi is replying, submit maps
+    // to native steering so the correction applies to the current answer.
     if (e.key === "Enter" && !e.shiftKey && !showMentionDropdown) {
       e.preventDefault();
       if (input.trim() || pastedImages.length > 0) {
@@ -2414,6 +3117,24 @@ export function StandaloneChat({
   };
 
   useEffect(() => {
+    const handleComposerSteerShortcut = (event: KeyboardEvent) => {
+      if (showMentionDropdown) return;
+      if (isComposing || event.isComposing || event.keyCode === 229) return;
+      if (document.activeElement !== inputRef.current && event.target !== inputRef.current) return;
+      if (!isComposerSteerShortcut(event, isMac)) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+      if (input.trim() || pastedImages.length > 0) {
+        void steerMessage(input.trim());
+      }
+    };
+
+    window.addEventListener("keydown", handleComposerSteerShortcut, true);
+    return () => window.removeEventListener("keydown", handleComposerSteerShortcut, true);
+  }, [input, isComposing, isMac, pastedImages, showMentionDropdown]);
+
+  useEffect(() => {
     // Don't resolve preset until settings are loaded from the store —
     // before that, settings.aiPresets contains only the hardcoded default,
     // which would cause Pi to start with the wrong model then immediately restart.
@@ -2436,14 +3157,16 @@ export function StandaloneChat({
   const isPi = true;
   const hasValidModel = activePreset?.model && activePreset.model.trim() !== "";
   const needsLogin = activePreset?.provider === "screenpipe-cloud" && !settings.user?.token;
+  // needsLogin is advisory only — chat is allowed without auth (the cloud
+  // backend accepts unauthenticated requests for now). The login warning is
+  // surfaced in the UI banner but does not gate sends.
   // Pi auto-starts on first message, so don't block chat when Pi is not running
-  const canChat = hasPresets && hasValidModel && !needsLogin && !piStarting;
+  const canChat = hasPresets && hasValidModel && !piStarting;
 
   const getDisabledReason = (): string | null => {
     if (!hasPresets) return "No AI presets configured";
     if (!activePreset) return "No preset selected";
     if (!hasValidModel) return `No model selected in "${activePreset.id}" preset`;
-    if (needsLogin) return "Login required";
     if (piStarting) return "Starting Pi agent...";
     return null;
   };
@@ -2532,7 +3255,8 @@ export function StandaloneChat({
     // This is passed via --append-system-prompt to Pi, enabling Anthropic prompt
     // caching (90% input cost reduction on subsequent messages).
     const presetPrompt = p.prompt || "";
-    const systemPrompt = `${buildSystemPrompt()}\n\n${presetPrompt}`.trim() || null;
+    const connectionsCtx = buildConnectionsContext(connections);
+    const systemPrompt = `${buildSystemPrompt()}\n\n${presetPrompt}${connectionsCtx}`.trim() || null;
     return {
       provider: p.provider,
       url: p.url || "",
@@ -2542,7 +3266,73 @@ export function StandaloneChat({
       systemPrompt,
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activePreset?.provider, activePreset?.url, activePreset?.model, activePreset?.apiKey, (activePreset as any)?.maxTokens, activePreset?.prompt]);
+  }, [activePreset?.provider, activePreset?.url, activePreset?.model, activePreset?.apiKey, (activePreset as any)?.maxTokens, activePreset?.prompt, connections]);
+
+  const setRunningConfigFromProviderConfig = useCallback((providerConfig: NonNullable<ReturnType<typeof buildProviderConfig>>) => {
+    piRunningConfigRef.current = {
+      provider: providerConfig.provider,
+      model: providerConfig.model,
+      url: providerConfig.url,
+      apiKey: providerConfig.apiKey,
+      maxTokens: providerConfig.maxTokens,
+      systemPrompt: providerConfig.systemPrompt,
+      token: settings.user?.token ?? null,
+    };
+  }, [settings.user?.token]);
+
+  const restartCurrentPiSession = useCallback(async (providerConfig: NonNullable<ReturnType<typeof buildProviderConfig>>) => {
+    let currentPid = piInfo?.pid;
+    if (typeof currentPid !== "number") {
+      try {
+        const info = await commands.piInfo(piSessionIdRef.current);
+        if (info.status === "ok") {
+          currentPid = info.data.pid;
+        }
+      } catch {}
+    }
+    if (typeof currentPid === "number") {
+      piIntentionallyStoppedPidsRef.current.add(currentPid);
+      setTimeout(() => {
+        piIntentionallyStoppedPidsRef.current.delete(currentPid);
+      }, 30_000);
+    } else if (piInfo?.running) {
+      piStoppedIntentionallyRef.current = true;
+    }
+
+    const home = await homeDir();
+    const dir = await join(home, ".screenpipe", "pi-chat");
+    const result = await commands.piStart(
+      piSessionIdRef.current,
+      dir,
+      settings.user?.token ?? null,
+      providerConfig,
+    );
+    if (result.status !== "ok" || !result.data.running) {
+      throw new Error(result.status === "error" ? result.error : "Pi did not start");
+    }
+    setPiInfo(result.data);
+    piSessionSyncedRef.current = false;
+    setRunningConfigFromProviderConfig(providerConfig);
+  }, [piInfo?.pid, piInfo?.running, setRunningConfigFromProviderConfig, settings.user?.token]);
+
+  // When connections change (e.g., user connected Google Calendar in Settings),
+  // silently restart Pi if the system prompt changed and no message is in-flight.
+  useEffect(() => {
+    if (connections.length === 0) return;
+    const config = buildProviderConfig();
+    if (!config) return;
+    const running = piRunningConfigRef.current;
+    if (!running || running.systemPrompt === config.systemPrompt) return;
+    if (piMessageIdRef.current) return; // don't interrupt an active turn
+    restartCurrentPiSession(config)
+      .then(() => {
+        if (piRunningConfigRef.current) {
+          piRunningConfigRef.current = { ...piRunningConfigRef.current, systemPrompt: config.systemPrompt };
+        }
+      })
+      .catch(() => {});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connections]);
 
   // Check Pi status on mount — Pi is auto-started at app boot by Rust
   useEffect(() => {
@@ -2575,7 +3365,7 @@ export function StandaloneChat({
   //   alive and preserves the full conversation, so the user can switch
   //   haiku ↔ sonnet ↔ opus mid-session without losing context.
   // - If any other spawn-time field changed (url, apiKey, maxTokens, systemPrompt):
-  //   full restart via `pi_update_config` — those are baked into Pi's CLI args
+  //   restart the current Pi session — those are baked into Pi's CLI args
   //   and models.json, so the subprocess has to be respawned to see them.
   //
   // Called directly from the AIPresetsSelector onPresetSaved callback.
@@ -2604,40 +3394,51 @@ export function StandaloneChat({
       return;
     }
 
+    const enqueuePresetSwitch = (task: () => Promise<void>) => {
+      const previousSwitch = piPresetSwitchPromiseRef.current;
+      let switchPromise: Promise<void>;
+      switchPromise = (previousSwitch ?? Promise.resolve())
+        .catch(() => {})
+        .then(task)
+        .finally(() => {
+          if (piPresetSwitchPromiseRef.current === switchPromise) {
+            piPresetSwitchPromiseRef.current = null;
+          }
+        });
+      piPresetSwitchPromiseRef.current = switchPromise;
+      return switchPromise;
+    };
+
     if (!spawnTimeFieldsChanged && (providerChanged || modelChanged)) {
       // Hot-swap path — preserves conversation state.
       console.log("[Pi] Hot-swap model:", providerConfig.provider, providerConfig.model);
-      commands
-        .piSetModel(piSessionIdRef.current, providerConfig)
-        .then(() => {
-          piRunningConfigRef.current = {
-            provider: providerConfig.provider,
-            model: providerConfig.model,
-            url: providerConfig.url,
-            apiKey: providerConfig.apiKey,
-            maxTokens: providerConfig.maxTokens,
-            systemPrompt: providerConfig.systemPrompt,
-            token: settings.user?.token ?? null,
-          };
-        })
-        .catch((e) => {
+      enqueuePresetSwitch(async () => {
+        try {
+          await commands.piSetModel(piSessionIdRef.current, providerConfig);
+          setRunningConfigFromProviderConfig(providerConfig);
+        } catch (e) {
           console.error("[Pi] Hot-swap failed, falling back to full restart:", e);
-          piSessionSyncedRef.current = false;
-          commands.piUpdateConfig(settings.user?.token ?? null, providerConfig).catch((err) => {
+          try {
+            await restartCurrentPiSession(providerConfig);
+          } catch (err) {
             console.error("[Pi] Fallback restart also failed:", err);
-          });
-        });
+          }
+        }
+      });
       return;
     }
 
     // Full restart — spawn-time field changed.
     console.log("[Pi] Full restart (spawn-time field changed):", providerConfig.provider, providerConfig.model);
-    piSessionSyncedRef.current = false;
-    commands.piUpdateConfig(settings.user?.token ?? null, providerConfig).catch((e) => {
-      console.error("[Pi] Preset switch failed:", e);
+    enqueuePresetSwitch(async () => {
+      try {
+        await restartCurrentPiSession(providerConfig);
+      } catch (e) {
+        console.error("[Pi] Preset switch failed:", e);
+      }
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [settings.user?.token]);
+  }, [settings.user?.token, setRunningConfigFromProviderConfig, restartCurrentPiSession]);
 
   // Listen for Pi / pipe events.
   //
@@ -2699,7 +3500,6 @@ export function StandaloneChat({
       piMessageIdRef.current = newAssistantId;
       piStreamingTextRef.current = "";
       piContentBlocksRef.current = [];
-      setStreamedCharCount(0);
       setIsLoading(true);
       setIsStreaming(true);
       const sidNow = piSessionIdRef.current;
@@ -2725,6 +3525,47 @@ export function StandaloneChat({
     };
 
     const handlePiEventData = (data: any) => {
+        const emitSessionActivity = (
+          partial: {
+            status?: ReturnType<typeof statusForEvent>;
+            preview?: string;
+            title?: string;
+            lastError?: string;
+            unreadHint?: boolean;
+          },
+          opts?: { throttleMs?: number },
+        ) => {
+          try {
+            const sid = piSessionIdRef.current;
+            if (!sid) return;
+            const status = partial.status ?? null;
+            const preview = partial.preview?.replace(/\s+/g, " ").trim();
+            const title = partial.title?.trim();
+            const lastError = partial.lastError;
+            const unreadHint = partial.unreadHint === true;
+            const updatedAt = Date.now();
+            const sig = `${status ?? ""}|${preview ?? ""}|${title ?? ""}|${lastError ?? ""}|${unreadHint ? "1" : "0"}`;
+            const lastSig = sessionActivityLastSigRef.current[sid];
+            const throttleMs = opts?.throttleMs ?? 0;
+            const lastAt = sessionActivityLastEmitAtRef.current[sid] ?? 0;
+            if (sig === lastSig && throttleMs > 0 && updatedAt - lastAt < throttleMs) return;
+            if (sig === lastSig && throttleMs === 0) return;
+            if (throttleMs > 0 && updatedAt - lastAt < throttleMs && !status && !lastError) return;
+            sessionActivityLastSigRef.current[sid] = sig;
+            sessionActivityLastEmitAtRef.current[sid] = updatedAt;
+            void emit("chat-session-activity", {
+              id: sid,
+              status: status ?? undefined,
+              preview: preview || undefined,
+              title: title || undefined,
+              updatedAt,
+              lastError,
+              unreadHint,
+            });
+          } catch {
+            // best effort only
+          }
+        };
 
         // Mirror status into the chat-store so the sidebar dot reflects what
         // Pi is actually doing. The bus routes foreground events exclusively
@@ -2743,19 +3584,45 @@ export function StandaloneChat({
             if (cur !== next) {
               store.actions.patch(sid, { status: next });
             }
+            emitSessionActivity({
+              status: next,
+              title: useChatStore.getState().sessions[sid]?.title,
+              lastError: next === "error" ? (piLastErrorRef.current ?? undefined) : undefined,
+            });
           }
         } catch {
           /* defensive — never let a status-mirror failure break the
              foreground event handler */
         }
 
-        if (data.type === "message_update" && data.assistantMessageEvent) {
+        if (
+          data.type === "agent_end" ||
+          data.type === "pipe_done" ||
+          (data.type === "response" && data.success === false) ||
+          (data.type === "auto_retry_end" && data.success === false) ||
+          (data.type === "message_update" && data.assistantMessageEvent?.type === "error") ||
+          ((data.type === "message_start" || data.type === "message_end") &&
+            data.message?.role === "assistant" &&
+            data.message?.stopReason === "error")
+        ) {
+          cancelStreamingMessageRender();
+        }
+
+        if (
+          data.type === "message_update" &&
+          data.assistantMessageEvent &&
+          data.assistantMessageEvent.type !== "error"
+        ) {
           const evt = data.assistantMessageEvent;
           if (evt.type === "text_delta" && evt.delta) {
             // First delta of a queued turn → create the placeholder lazily.
             if (!ensureAssistantPlaceholder()) return;
             piStreamingTextRef.current += evt.delta;
-            setStreamedCharCount(piStreamingTextRef.current.length);
+            emitSessionActivity({
+              status: "streaming",
+              preview: evt.delta,
+              unreadHint: true,
+            }, { throttleMs: 250 });
 
             // Append to last text block or create new one
             const blocks = piContentBlocksRef.current;
@@ -2766,14 +3633,7 @@ export function StandaloneChat({
               blocks.push({ type: "text", text: evt.delta });
             }
 
-            if (piMessageIdRef.current) {
-              const msgId = piMessageIdRef.current;
-              const content = piStreamingTextRef.current;
-              const contentBlocks = [...blocks];
-              setMessages((prev) =>
-                prev.map((m) => m.id === msgId ? { ...m, content, contentBlocks } : m)
-              );
-            }
+            scheduleStreamingMessageRender();
 
             // Trigger follow-up generation after enough content
             if (
@@ -2804,13 +3664,7 @@ export function StandaloneChat({
             if (thinkingBlock && thinkingBlock.type === "thinking") {
               thinkingBlock.text += evt.delta;
             }
-            if (piMessageIdRef.current) {
-              const msgId = piMessageIdRef.current;
-              const contentBlocks = [...blocks];
-              setMessages((prev) =>
-                prev.map((m) => m.id === msgId ? { ...m, content: m.content === "Processing..." ? "" : m.content, contentBlocks } : m)
-              );
-            }
+            scheduleStreamingMessageRender();
           } else if (evt.type === "thinking_end") {
             const blocks = piContentBlocksRef.current;
             const thinkingBlock = blocks[blocks.length - 1];
@@ -2873,6 +3727,7 @@ export function StandaloneChat({
           const errorStr = data.finalError || "Request failed after retries";
           console.error("[Pi] Auto-retry failed:", errorStr);
           piLastErrorRef.current = errorStr;
+          emitSessionActivity({ status: "error", lastError: errorStr });
 
           // Detect rate limit or daily limit from the error
           const quotaErrorType = classifyQuotaError(errorStr);
@@ -2904,6 +3759,7 @@ export function StandaloneChat({
           const reason = data.assistantMessageEvent.reason || "";
           const errorDetail = data.assistantMessageEvent.error || "";
           console.error("[Pi] Message error:", reason, errorDetail);
+          emitSessionActivity({ status: "error", lastError: `${reason} ${errorDetail}`.trim() || undefined });
 
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
@@ -2959,6 +3815,7 @@ export function StandaloneChat({
             piStreamingTextRef.current.length > 0 ||
             piContentBlocksRef.current.length > 0;
           if (hasStreamedContent) {
+            flushStreamingMessageRender();
             piStreamingTextRef.current = "";
             piMessageIdRef.current = null;
             piContentBlocksRef.current = [];
@@ -3001,6 +3858,7 @@ export function StandaloneChat({
           const errMsg = data.message.errorMessage || data.message.error || "Unknown error";
           console.error("[Pi] LLM error via", data.type, ":", errMsg);
           piLastErrorRef.current = errMsg;
+          emitSessionActivity({ status: "error", lastError: errMsg });
 
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
@@ -3158,9 +4016,11 @@ export function StandaloneChat({
             followUpFiredRef.current = false;
             setIsLoading(false);
             setIsStreaming(false);
+            emitSessionActivity({ status: "idle" });
           }
         } else if (data.type === "response" && data.success === false) {
           const errorStr = data.error || "Unknown error";
+          emitSessionActivity({ status: "error", lastError: errorStr });
           // Pi agent first-call bug (pi-mono#2461) — first RPC prompt crashes.
           // Auto-retry the same prompt once. The second call works.
           if (errorStr.includes("startsWith") || errorStr.includes("text.startsWith")) {
@@ -3278,6 +4138,9 @@ export function StandaloneChat({
         if (!mounted) return;
         if (payload.sessionId !== piSessionIdRef.current) return;
         const terminatedPid = payload.pid;
+        if (typeof terminatedPid === "number" && piIntentionallyStoppedPidsRef.current.delete(terminatedPid)) {
+          return;
+        }
         if (piStoppedIntentionallyRef.current) {
           piStoppedIntentionallyRef.current = false;
           return;
@@ -3377,6 +4240,7 @@ export function StandaloneChat({
         if (!piMessageIdRef.current) return;
         const line = event.payload;
         if (line.includes("model_not_allowed") || line.includes("403")) {
+          cancelStreamingMessageRender();
           const msgId = piMessageIdRef.current;
           if (msgId) {
             setMessages((prev) =>
@@ -3384,6 +4248,7 @@ export function StandaloneChat({
             );
           }
         } else if (line.includes("429") || line.includes("rate") || line.includes("daily_limit")) {
+          cancelStreamingMessageRender();
           const msgId = piMessageIdRef.current;
           if (msgId) {
             setMessages((prev) =>
@@ -3391,6 +4256,7 @@ export function StandaloneChat({
             );
           }
         } else if (line.includes("content must be a string") || line.includes("does not support images") || line.includes("image_url is not supported")) {
+          cancelStreamingMessageRender();
           const msgId = piMessageIdRef.current;
           if (msgId) {
             setMessages((prev) =>
@@ -3416,10 +4282,11 @@ export function StandaloneChat({
     // session this panel is bound to. Single source of truth lives in
     // `pi_command_queue.rs`; this listener just mirrors it into local state.
     let unlistenQueue: UnlistenFn | undefined;
-    listen<{ sessionId: string; queued: PiQueuedPrompt[] }>("pi-queue-changed", (event) => {
+    listen<{ sessionId?: string; session_id?: string; queued?: PiQueuedPrompt[] }>("pi-queue-changed", (event) => {
       if (!mounted) return;
-      if (event.payload.sessionId !== piSessionIdRef.current) return;
-      setQueuedPrompts(event.payload.queued ?? []);
+      const { sessionId, queued } = normalizeQueueEventPayload(event.payload);
+      if (sessionId !== piSessionIdRef.current) return;
+      setQueuedPrompts(queued);
     }).then(fn => { unlistenQueue = fn; });
 
     // Initial fetch — closes the gap between component mount and first event.
@@ -3448,6 +4315,7 @@ export function StandaloneChat({
 
     return () => {
       mounted = false;
+      cancelStreamingMessageRender();
       for (const off of busUnregistrations) {
         try { off(); } catch { /* ignore — tearing down */ }
       }
@@ -3718,6 +4586,17 @@ export function StandaloneChat({
    * the chat-store — same path used for any other message, just kicked off
    * after the queue drains.
    */
+  function imageDataUrlsToPiImages(images: string[]) {
+    const piImages: Array<{ type: string; mimeType: string; data: string }> = [];
+    for (const img of images) {
+      const match = img.match(/^data:(image\/[^;]+);base64,(.+)$/);
+      if (match) {
+        piImages.push({ type: "image", mimeType: match[1], data: match[2] });
+      }
+    }
+    return piImages;
+  }
+
   async function enqueuePiMessage(userMessage: string, displayLabel?: string) {
     if (!piInfo?.running) {
       // No Pi running → fall back to the normal start-and-send path.
@@ -3738,7 +4617,14 @@ export function StandaloneChat({
       timestamp: Date.now(),
       queued: true,
     };
-    setMessages((prev) => [...prev, newUserMessage]);
+    setMessages((prev) => {
+      const next = [...prev, newUserMessage];
+      void saveConversation(next, {
+        refreshHistory: false,
+        syncActiveConversation: false,
+      });
+      return next;
+    });
     setInput("");
     if (inputRef.current) inputRef.current.style.height = "auto";
 
@@ -3762,10 +4648,6 @@ export function StandaloneChat({
       storeState.actions.patch(sidNow, { lastUserMessageAt: Date.now() });
     }
 
-    // Persist immediately — covers the edge case where Pi crashes between
-    // enqueue and dequeue, leaving the user's message stranded otherwise.
-    void saveConversation([...messages, newUserMessage]);
-
     posthog.capture("chat_message_enqueued", {
       provider: activePreset?.provider,
       model: activePreset?.model,
@@ -3774,13 +4656,7 @@ export function StandaloneChat({
 
     // Convert any data-URL pastes to the Pi image-content shape (same format
     // used by the normal send path further down in this file).
-    const piImages: Array<{ type: string; mimeType: string; data: string }> = [];
-    for (const img of pastedImages) {
-      const match = img.match(/^data:(image\/[^;]+);base64,(.+)$/);
-      if (match) {
-        piImages.push({ type: "image", mimeType: match[1], data: match[2] });
-      }
-    }
+    const piImages = imageDataUrlsToPiImages(pastedImages);
     if (pastedImages.length > 0) setPastedImages([]);
 
     try {
@@ -3797,7 +4673,48 @@ export function StandaloneChat({
     }
   }
 
-  async function sendPiMessage(userMessage: string, displayLabel?: string) {
+  function clearActivePiTurnState() {
+    cancelStreamingMessageRender();
+    piStreamingTextRef.current = "";
+    piMessageIdRef.current = null;
+    piContentBlocksRef.current = [];
+    setIsLoading(false);
+    setIsStreaming(false);
+  }
+
+  async function interruptActivePiTurn() {
+    const hasActiveTurn = isLoading || isStreaming || !!piMessageIdRef.current;
+    if (!hasActiveTurn) return;
+
+    let aborted = false;
+    try {
+      const abortResult = await Promise.race([
+        commands.piAbort(piSessionIdRef.current),
+        new Promise<{ status: "error"; error: string }>((resolve) => {
+          window.setTimeout(() => resolve({ status: "error", error: "Abort timed out" }), 1_500);
+        }),
+      ]);
+      if (abortResult.status === "ok") {
+        aborted = true;
+      } else {
+        console.warn("[Pi] Abort before steering failed:", abortResult.error);
+      }
+    } catch (e) {
+      console.warn("[Pi] Abort before steering threw:", e);
+    }
+
+    if (!aborted) {
+      const providerConfig = buildProviderConfig();
+      if (!providerConfig) {
+        throw new Error("No AI preset selected");
+      }
+      await restartCurrentPiSession(providerConfig);
+    }
+
+    clearActivePiTurnState();
+  }
+
+  async function sendPiMessage(userMessage: string, displayLabel?: string, imageDataUrls?: string[]) {
     // Auto-start Pi if it's not running yet (new session or crash recovery)
     if (!piInfo?.running) {
       if (piStartInFlightRef.current) {
@@ -3826,15 +4743,7 @@ export function StandaloneChat({
             piCrashCountRef.current = 0; // reset crash loop counter on manual start
             // Keep running-config ref in sync so preset watcher doesn't re-trigger
             if (providerConfig) {
-              piRunningConfigRef.current = {
-                provider: providerConfig.provider,
-                model: providerConfig.model,
-                url: providerConfig.url,
-                apiKey: providerConfig.apiKey,
-                maxTokens: providerConfig.maxTokens,
-                systemPrompt: providerConfig.systemPrompt,
-                token: settings.user?.token ?? null,
-              };
+              setRunningConfigFromProviderConfig(providerConfig);
             }
           } else {
             const providerLabel = providerConfig?.provider || "AI";
@@ -3852,28 +4761,21 @@ export function StandaloneChat({
       }
     }
 
-    // If a previous message is still processing, abort it first.
-    // piAbort now waits for the Pi SDK to confirm the abort completed — no sleep needed.
-    if (piMessageIdRef.current) {
-      console.warn("[Pi] Aborting previous message before sending new one");
-      try {
-        await commands.piAbort(piSessionIdRef.current);
-      } catch (e) {
-        console.warn("[Pi] Failed to abort previous:", e);
-      }
-      piStreamingTextRef.current = "";
-      piMessageIdRef.current = null;
-      piContentBlocksRef.current = [];
-      setIsLoading(false);
-      setIsStreaming(false);
+    if (piPresetSwitchPromiseRef.current) {
+      await piPresetSwitchPromiseRef.current;
     }
+
+    await interruptActivePiTurn();
+
+    const outgoingImages = imageDataUrls ?? pastedImages;
+    const shouldClearPastedImages = imageDataUrls == null && pastedImages.length > 0;
 
     const newUserMessage: Message = {
       id: Date.now().toString(),
       role: "user",
       content: userMessage,
       ...(displayLabel ? { displayContent: displayLabel } : {}),
-      ...(pastedImages.length > 0 ? { images: [...pastedImages] } : {}),
+      ...(outgoingImages.length > 0 ? { images: [...outgoingImages] } : {}),
       timestamp: Date.now(),
     };
 
@@ -3882,7 +4784,6 @@ export function StandaloneChat({
     piStreamingTextRef.current = "";
     piMessageIdRef.current = assistantMessageId;
     piContentBlocksRef.current = [];
-    setStreamedCharCount(0);
 
     // Clear follow-ups for new message
     setFollowUpSuggestions([]);
@@ -3893,7 +4794,11 @@ export function StandaloneChat({
     }
     lastUserMessageRef.current = userMessage;
 
-    setMessages((prev) => [...prev, newUserMessage]);
+    setMessages((prev) => {
+      const next = [...prev, newUserMessage];
+      void saveConversation(next, { refreshHistory: false });
+      return next;
+    });
     setInput("");
     if (inputRef.current) inputRef.current.style.height = "auto";
     setIsLoading(true);
@@ -3949,20 +4854,10 @@ export function StandaloneChat({
       storeState.actions.patch(sidNow, { lastUserMessageAt: Date.now() });
     }
 
-    // Persist user message to disk immediately so it survives a
-    // navigate-away-mid-stream or a Pi crash before agent_end. The
-    // existing save-on-isLoading-transition only fires when the stream
-    // completes cleanly — if anything kills the turn before then, the
-    // user's message would otherwise live only in the in-memory store
-    // and vanish on the next cold reload. Fire-and-forget: the next
-    // save (on agent_end) will overwrite the same file with the full
-    // conversation including the assistant reply.
-    void saveConversation([...messages, newUserMessage]);
-
     posthog.capture("chat_message_sent", {
       provider: activePreset?.provider,
       model: activePreset?.model,
-      has_images: pastedImages.length > 0 || !!prefillFrameId,
+      has_images: outgoingImages.length > 0 || !!prefillFrameId,
       has_context: !!prefillContext,
       message_index: messages.filter((m) => m.role === "user").length,
     });
@@ -4006,7 +4901,7 @@ export function StandaloneChat({
         setPrefillContext(null);
       }
 
-      for (const img of pastedImages) {
+      for (const img of outgoingImages) {
         const match = img.match(/^data:(image\/[^;]+);base64,(.+)$/);
         if (match) {
           piImages.push({
@@ -4016,7 +4911,7 @@ export function StandaloneChat({
           });
         }
       }
-      if (pastedImages.length > 0) setPastedImages([]);
+      if (shouldClearPastedImages) setPastedImages([]);
 
       setMessages((prev) => [
         ...prev,
@@ -4078,6 +4973,9 @@ export function StandaloneChat({
           if (startRes.status === "ok" && startRes.data.running) {
             setPiInfo(startRes.data);
             piSessionSyncedRef.current = false;
+            if (providerConfig) {
+              setRunningConfigFromProviderConfig(providerConfig);
+            }
             result = await commands.piPrompt(
               piSessionIdRef.current,
               promptMessage,
@@ -4224,18 +5122,229 @@ export function StandaloneChat({
   async function sendMessage(userMessage: string, displayLabel?: string) {
     if ((!canChat && !autoSendBypassRef.current) || (!activePreset && !autoSendBypassRef.current)) return;
 
-    // If a previous prompt is still streaming, enqueue this one at the rust
-    // level instead of going through sendPiMessage (which aborts the previous
-    // turn — exactly what we DON'T want when the user is queueing follow-ups).
-    // The rust queue's drain loop will pull this prompt and write it to stdin
-    // as soon as the in-flight prompt's `agent_end` arrives. The pi-event-router
-    // will append the new turn's user + assistant messages to the chat-store.
+    // If Pi is mid-reply, the default composer action is native steering:
+    // the new message should interrupt and redirect the current reply. Queued
+    // follow-up is still available through the clock button.
     if (isLoading || isStreaming) {
-      return enqueuePiMessage(userMessage, displayLabel);
+      return steerMessage(userMessage, displayLabel);
     }
 
     // All providers route through Pi agent
     return sendPiMessage(userMessage, displayLabel);
+  }
+
+  async function queueFollowUpMessage(userMessage: string, displayLabel?: string) {
+    if ((!canChat && !autoSendBypassRef.current) || (!activePreset && !autoSendBypassRef.current)) return;
+    return enqueuePiMessage(userMessage, displayLabel);
+  }
+
+  function findLocalQueuedMessage(prompt: PiQueuedPrompt): Message | undefined {
+    return messages.find(
+      (message) =>
+        message.role === "user" &&
+        message.queued &&
+        queuedPreviewMatchesText(prompt.preview, message.content),
+    );
+  }
+
+  function removeLocalQueuedMessage(prompt: PiQueuedPrompt) {
+    const matchesPrompt = (message: unknown) => {
+      if (!message || typeof message !== "object") return false;
+      const candidate = message as { role?: unknown; queued?: unknown; content?: unknown };
+      return (
+        candidate.role === "user" &&
+        candidate.queued === true &&
+        typeof candidate.content === "string" &&
+        queuedPreviewMatchesText(prompt.preview, candidate.content)
+      );
+    };
+
+    setMessages((prev) => {
+      let removed = false;
+      const next = prev.filter((message) => {
+        if (!removed && matchesPrompt(message)) {
+          removed = true;
+          return false;
+        }
+        return true;
+      });
+      if (!removed) return prev;
+      void saveConversation(next, {
+        refreshHistory: false,
+        syncActiveConversation: false,
+      });
+      return next;
+    });
+
+    const sid = piSessionIdRef.current;
+    if (!sid) return;
+    const storeState = useChatStore.getState();
+    const sessionMessages = storeState.sessions[sid]?.messages;
+    if (!sessionMessages?.length) return;
+
+    let removed = false;
+    const nextMessages = sessionMessages.filter((message) => {
+      if (!removed && matchesPrompt(message)) {
+        removed = true;
+        return false;
+      }
+      return true;
+    });
+    if (removed) {
+      storeState.actions.setMessages(sid, nextMessages);
+    }
+  }
+
+  async function cancelQueuedPrompt(prompt: PiQueuedPrompt, options: { silent?: boolean } = {}) {
+    setQueuedActionPromptId(prompt.id);
+    try {
+      const result = await commands.piCancelQueued(piSessionIdRef.current, prompt.id);
+      if (result.status !== "ok") {
+        if (!options.silent) {
+          toast({ title: "failed to cancel queued message", description: result.error, variant: "destructive" });
+        }
+        return false;
+      }
+      if (!result.data) {
+        if (!options.silent) {
+          toast({
+            title: "message already started",
+            description: "Use stop if you want to interrupt the active reply.",
+          });
+        }
+        return false;
+      }
+      setQueuedPrompts((prev) => prev.filter((queued) => queued.id !== prompt.id));
+      removeLocalQueuedMessage(prompt);
+      return true;
+    } catch (e) {
+      if (!options.silent) {
+        toast({
+          title: "failed to cancel queued message",
+          description: e instanceof Error ? e.message : String(e),
+          variant: "destructive",
+        });
+      }
+      return false;
+    } finally {
+      setQueuedActionPromptId((current) => current === prompt.id ? null : current);
+    }
+  }
+
+  async function steerMessage(userMessage: string, displayLabel?: string, imageDataUrls?: string[]) {
+    const hasImages = imageDataUrls ? imageDataUrls.length > 0 : pastedImages.length > 0;
+    const trimmed = userMessage.trim();
+    if (!trimmed && !hasImages) return;
+
+    const hadActiveReply = isLoading || isStreaming || !!piMessageIdRef.current;
+    if (!hadActiveReply || !piInfo?.running) {
+      return sendPiMessage(trimmed, displayLabel, imageDataUrls);
+    }
+
+    posthog.capture("chat_message_steered", {
+      provider: activePreset?.provider,
+      model: activePreset?.model,
+      had_active_reply: hadActiveReply,
+      from_queue: !!imageDataUrls,
+    });
+
+    const outgoingImages = imageDataUrls ?? pastedImages;
+    const shouldClearPastedImages = imageDataUrls == null && pastedImages.length > 0;
+
+    const newUserMessage: Message = {
+      id: Date.now().toString(),
+      role: "user",
+      content: trimmed,
+      ...(displayLabel ? { displayContent: displayLabel } : {}),
+      ...(outgoingImages.length > 0 ? { images: [...outgoingImages] } : {}),
+      timestamp: Date.now(),
+    };
+
+    setFollowUpSuggestions([]);
+    followUpFiredRef.current = false;
+    if (followUpAbortRef.current) {
+      followUpAbortRef.current.abort();
+      followUpAbortRef.current = null;
+    }
+    lastUserMessageRef.current = trimmed;
+
+    setMessages((prev) => {
+      const next = [...prev, newUserMessage];
+      void saveConversation(next, {
+        refreshHistory: false,
+        syncActiveConversation: false,
+      });
+      return next;
+    });
+    setInput("");
+    if (inputRef.current) inputRef.current.style.height = "auto";
+
+    const sidNow = piSessionIdRef.current;
+    if (sidNow) {
+      const storeState = useChatStore.getState();
+      if (!storeState.sessions[sidNow]) {
+        storeState.actions.upsert({
+          id: sidNow,
+          title: "new chat",
+          preview: "",
+          status: "streaming",
+          messageCount: 0,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          pinned: false,
+          unread: false,
+        });
+      }
+      storeState.actions.appendMessage(sidNow, newUserMessage as any);
+      storeState.actions.patch(sidNow, { lastUserMessageAt: Date.now() });
+    }
+
+    const piImages = imageDataUrlsToPiImages(outgoingImages);
+    if (shouldClearPastedImages) setPastedImages([]);
+
+    try {
+      const result = await commands.piSteer(
+        piSessionIdRef.current,
+        trimmed,
+        piImages.length > 0 ? piImages : null,
+      );
+      if (result.status !== "ok") {
+        toast({ title: "failed to steer message", description: result.error, variant: "destructive" });
+      }
+    } catch (e) {
+      console.warn("[Pi] failed to steer message:", e);
+      toast({
+        title: "failed to steer message",
+        description: e instanceof Error ? e.message : String(e),
+        variant: "destructive",
+      });
+    }
+  }
+
+  async function steerQueuedPrompt(prompt: PiQueuedPrompt) {
+    const queuedMessage = findLocalQueuedMessage(prompt);
+    if (!queuedMessage && (!prompt.preview || prompt.preview.length >= 200)) {
+      toast({
+        title: "full queued prompt unavailable",
+        description: "Cancel it or let it run next; ScreenPipe only has a preview for this item.",
+      });
+      return;
+    }
+
+    const cancelled = await cancelQueuedPrompt(prompt, { silent: true });
+    if (!cancelled) {
+      toast({
+        title: "message already started",
+        description: "That follow-up has moved out of the queue.",
+      });
+      return;
+    }
+
+    await steerMessage(
+      queuedMessage?.content ?? prompt.preview,
+      queuedMessage?.displayContent,
+      queuedMessage?.images ?? [],
+    );
   }
 
   // Keep ref in sync so useEffect callbacks can call sendMessage
@@ -4265,6 +5374,13 @@ export function StandaloneChat({
       }
       if (sections.length > 0) {
         body = sections.join("\n\n");
+      }
+    }
+
+    if (m.role === "assistant") {
+      const citationsMarkdown = formatSourceCitationsMarkdown(sourceCitationsFromMessage(m));
+      if (citationsMarkdown) {
+        body = body ? `${body}\n\n${citationsMarkdown}` : citationsMarkdown;
       }
     }
 
@@ -4377,25 +5493,34 @@ export function StandaloneChat({
           startNewConversation={startNewConversation}
         />
         <div className="flex-1" />
-        <Button
-          variant="default"
-          size="sm"
-          onMouseDown={(e) => e.stopPropagation()}
-          onClick={async (e) => {
-            e.stopPropagation();
-            piStoppedIntentionallyRef.current = true;
-            await startNewConversation();
-            // Pi will auto-restart on the next message via the sendPiMessage flow
-          }}
-          className="relative z-10 h-7 px-3 gap-1.5 text-xs bg-foreground text-background hover:bg-background hover:text-foreground transition-colors duration-150"
-          title="New chat"
-        >
-          <Plus size={14} />
-          <span>New</span>
-        </Button>
-        <kbd suppressHydrationWarning className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-mono text-muted-foreground bg-muted/50 border border-border/50 rounded">
-          {formatShortcutDisplay(settings.showChatShortcut || (isMac ? "Control+Super+L" : "Alt+L"), isMac)}
-        </kbd>
+        {/* New-chat affordance + shortcut chip. Shown in the floating
+            overlay chat (`/chat`) where there's no AppSidebar. Hidden
+            on the home page — the AppSidebar's first nav row already
+            spawns a fresh session, so a duplicate top-right button
+            just crowds the BrowserSidebar's column. */}
+        {!hideInlineHistory && (
+          <>
+            <Button
+              variant="default"
+              size="sm"
+              onMouseDown={(e) => e.stopPropagation()}
+              onClick={async (e) => {
+                e.stopPropagation();
+                piStoppedIntentionallyRef.current = true;
+                await startNewConversation();
+                // Pi will auto-restart on the next message via the sendPiMessage flow
+              }}
+              className="relative z-10 h-7 px-3 gap-1.5 text-xs bg-foreground text-background hover:bg-background hover:text-foreground transition-colors duration-150"
+              title="New chat"
+            >
+              <Plus size={14} />
+              <span>New</span>
+            </Button>
+            <kbd suppressHydrationWarning className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-mono text-muted-foreground bg-muted/50 border border-border/50 rounded">
+              {formatShortcutDisplay(settings.showChatShortcut || (isMac ? "Control+Super+L" : "Alt+L"), isMac)}
+            </kbd>
+          </>
+        )}
       </div>
 
       {/* Main content area with optional history sidebar — only used in
@@ -4477,7 +5602,7 @@ export function StandaloneChat({
                               {conv.title}
                             </p>
                             <p className="text-[10px] text-muted-foreground">
-                              {conv.messages.length} messages
+                              {conv.messageCount} messages
                             </p>
                           </div>
                           <Popover
@@ -4628,7 +5753,7 @@ export function StandaloneChat({
             )}
           </div>
         )}
-        {messages.length === 0 && !isPreparingPrefill && hasPresets && hasValidModel && !needsLogin && (
+        {messages.length === 0 && !isPreparingPrefill && hasPresets && hasValidModel && (
           <SummaryCards
             onSendMessage={sendMessage}
             autoSuggestions={autoSuggestions}
@@ -4660,27 +5785,20 @@ export function StandaloneChat({
               exit={{ opacity: 0, y: -10 }}
               transition={{ duration: 0.2 }}
               className={cn(
-                "relative flex gap-3 min-w-0",
-                message.role === "user" ? "flex-row-reverse" : "flex-row"
+                "relative flex min-w-0",
+                message.role === "user" ? "justify-end" : "justify-start"
               )}
               data-testid={`chat-message-${message.role}`}
               data-message-id={message.id}
             >
               <div
                 className={cn(
-                  "flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border transition-colors",
+                  "group/message flex flex-col min-w-0",
                   message.role === "user"
-                    ? "bg-foreground text-background border-foreground"
-                    : "bg-muted/50 text-foreground border-border/50"
+                    ? "items-end max-w-[82%]"
+                    : "items-start w-full"
                 )}
               >
-                {message.role === "user" ? (
-                  <User className="h-4 w-4" />
-                ) : (
-                  <PipeAIIcon size={16} animated={false} />
-                )}
-              </div>
-              <div className="group/message flex-1 flex flex-col min-w-0">
               <div
                 onMouseDown={(e) => {
                   if (message.role !== "user" || isLoading || editingMessageId === message.id) return;
@@ -4710,15 +5828,15 @@ export function StandaloneChat({
                   setEditingMessageId(message.id);
                 }}
                 className={cn(
-                  "relative rounded-xl px-4 py-3 text-sm border overflow-hidden max-w-full transition-opacity",
+                  "relative rounded-xl px-4 py-3 text-sm overflow-hidden max-w-full transition-all",
                   message.role === "user"
-                    ? "bg-foreground text-background border-foreground"
-                    : "bg-muted/30 border-border/50",
+                    ? "bg-muted/60 text-foreground"
+                    : "bg-background text-foreground",
                   message.role === "user" && !isLoading && editingMessageId !== message.id && "cursor-text",
                   // Queued user messages — visually de-emphasised so the eye stays on
                   // the active turn. Cleared when pi-mono fires message_start for
                   // this turn (see handler above).
-                  message.queued && "opacity-50 border-dashed"
+                  message.queued && "bg-muted/35 text-muted-foreground opacity-80"
                 )}
               >
                 {editingMessageId === message.id ? (
@@ -4745,7 +5863,7 @@ export function StandaloneChat({
                       const idx = messages.findIndex((m) => m.id === message.id);
                       if (idx === -1) return;
                       setMessages((prev) => prev.slice(0, idx));
-                      sendMessage(trimmed);
+                      sendMessage(trimmed, message.displayContent);
                     }}
                     onKeyDown={(e) => {
                       if (e.key === "Escape") { e.preventDefault(); setEditingMessageId(null); }
@@ -4755,7 +5873,7 @@ export function StandaloneChat({
                       }
                     }}
                     rows={Math.min(8, Math.max(1, editDraft.split("\n").length))}
-                    className="w-full resize-none bg-transparent text-background placeholder:text-background/40 focus:outline-none"
+                    className="w-full resize-none bg-transparent text-foreground placeholder:text-muted-foreground focus:outline-none"
                   />
                 ) : (
                   <MessageContent message={message} onImageClick={(images, index) => setImageViewer({ images, index })} onRetry={(prompt) => sendMessage(prompt)} />
@@ -4900,61 +6018,6 @@ export function StandaloneChat({
               </motion.div>
             );
           })()}
-        </AnimatePresence>
-
-        {/* Queued follow-ups — rendered between the streaming message and the
-            scroll anchor so they sit visually in the "what's next" gap. The
-            list comes from rust via `pi-queue-changed`; entries disappear as
-            the drain loop pulls each prompt and starts streaming it. */}
-        <AnimatePresence>
-          {queuedPrompts.length > 0 && (
-            <motion.div
-              key="queued-rail"
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: -4 }}
-              transition={{ duration: 0.2 }}
-              className="px-4 py-2 space-y-1.5"
-            >
-              <div className="text-[10px] uppercase tracking-wider text-muted-foreground/60 px-1">
-                queued · waiting for current reply
-              </div>
-              {queuedPrompts.map((p, i) => (
-                <motion.div
-                  key={p.id}
-                  layout
-                  initial={{ opacity: 0, x: -6 }}
-                  animate={{ opacity: 0.55, x: 0 }}
-                  exit={{ opacity: 0, x: 6, scale: 0.96 }}
-                  transition={{ duration: 0.18 }}
-                  whileHover={{ opacity: 0.85 }}
-                  className="group/qcard flex items-center gap-2 px-3 py-2 rounded-md border border-dashed border-border/40 bg-transparent text-sm text-muted-foreground/80 hover:border-border hover:bg-muted/30 transition-colors"
-                  title={p.preview.length > 80 ? p.preview : undefined}
-                >
-                  <span className="font-mono text-[10px] text-muted-foreground/50 shrink-0 w-4 text-right">
-                    {i + 1}
-                  </span>
-                  <Clock className="h-3 w-3 flex-shrink-0 opacity-50" />
-                  <span className="truncate flex-1">{p.preview}</span>
-                  <button
-                    type="button"
-                    onClick={async () => {
-                      try {
-                        await commands.piCancelQueued(piSessionIdRef.current, p.id);
-                      } catch (e) {
-                        console.warn("[Pi] cancel queued failed:", e);
-                      }
-                    }}
-                    className="opacity-0 group-hover/qcard:opacity-100 transition-opacity p-0.5 hover:bg-muted rounded shrink-0"
-                    aria-label="cancel queued message"
-                    title="cancel"
-                  >
-                    <X className="h-3 w-3 text-muted-foreground" />
-                  </button>
-                </motion.div>
-              ))}
-            </motion.div>
-          )}
         </AnimatePresence>
 
         <div ref={messagesEndRef} />
@@ -5238,16 +6301,26 @@ export function StandaloneChat({
                 time
               </div>
               {STATIC_MENTION_SUGGESTIONS.filter((s) => s.category === "time").map((s) => {
-                const isActive = activeFilters.timeRanges.some((r) => r.label === s.description);
+                const timeLabels: Record<string, string> = {
+                  "today's activity": "today",
+                  "yesterday": "yesterday",
+                  "past 7 days": "last week",
+                  "past hour": "last hour",
+                  "this morning": "this morning",
+                };
+                const isActive = activeFilters.timeRanges.some((r) => r.label === timeLabels[s.description]);
                 return (
                   <button
                     key={s.tag}
                     type="button"
                     onClick={() => {
                       if (isActive) {
-                        removeFilter("time", s.description);
+                        removeFilter("time", timeLabels[s.description]);
                       } else {
-                        setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                        removeFilter("time");
+                        setTimeout(() => {
+                          setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                        }, 0);
                       }
                       setAppFilterOpen(false);
                     }}
@@ -5278,8 +6351,10 @@ export function StandaloneChat({
                       if (isActive) {
                         removeFilter("content");
                       } else {
-                        if (activeFilters.contentType) removeFilter("content");
-                        setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                        removeFilter("content");
+                        setTimeout(() => {
+                          setInput((prev) => `${s.tag} ${prev.trim()}`.trim() + " ");
+                        }, 0);
                       }
                       setAppFilterOpen(false);
                     }}
@@ -5401,7 +6476,6 @@ export function StandaloneChat({
                 const match = settings.aiPresets?.find((p) => p.id === id);
                 if (match) setActivePreset(match);
               } : undefined}
-              showLoginCta={false}
             />
           </div>
         </div>
@@ -5430,6 +6504,103 @@ export function StandaloneChat({
               )}
             </AnimatePresence>
           )}
+
+          <AnimatePresence>
+            {queuedPrompts.length > 0 && (
+              <motion.div
+                key="composer-queued-rail"
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: 6 }}
+                transition={{ duration: 0.18 }}
+                className="mb-2 rounded-lg border border-border/60 bg-background/95 shadow-sm overflow-hidden"
+              >
+                <div className="flex items-center justify-between gap-2 px-3 py-1.5 border-b border-border/50">
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <Clock className="h-3 w-3 text-muted-foreground/70 shrink-0" />
+                    <span className="text-[10px] uppercase tracking-wider text-muted-foreground/70">
+                      queued
+                    </span>
+                  </div>
+                  <span className="text-[10px] font-mono text-muted-foreground/60">
+                    {queuedPrompts.length}
+                  </span>
+                </div>
+                <TooltipProvider delayDuration={150}>
+                  <div className="max-h-[156px] overflow-y-auto scrollbar-minimal">
+                    {queuedPrompts.map((p, i) => {
+                      const isBusy = queuedActionPromptId === p.id;
+                      const label = p.preview || "image follow-up";
+                      return (
+                        <motion.div
+                          key={p.id}
+                          layout
+                          initial={{ opacity: 0, y: 4 }}
+                          animate={{ opacity: 1, y: 0 }}
+                          exit={{ opacity: 0, x: 8, scale: 0.98 }}
+                          transition={{ duration: 0.16 }}
+                          tabIndex={0}
+                          role="listitem"
+                          onKeyDown={(e) => {
+                            if (isBusy) return;
+                            if (isQueuedItemSteerShortcut(e, isMac)) {
+                              e.preventDefault();
+                              steerQueuedPrompt(p);
+                            } else if (isQueuedItemCancelShortcut(e)) {
+                              e.preventDefault();
+                              cancelQueuedPrompt(p);
+                            }
+                          }}
+                          className="group/qcard flex items-center gap-2 px-3 py-2 border-b border-border/40 last:border-b-0 text-sm text-muted-foreground/90 focus-visible:outline-none focus-visible:bg-muted/40 hover:bg-muted/30 transition-colors"
+                          title={label.length > 90 ? label : undefined}
+                        >
+                          <span className="font-mono text-[10px] text-muted-foreground/50 shrink-0 w-4 text-right">
+                            {i + 1}
+                          </span>
+                          <span className="truncate flex-1 min-w-0">{label}</span>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <button
+                                type="button"
+                                disabled={isBusy}
+                                onClick={() => steerQueuedPrompt(p)}
+                                className="h-7 w-7 rounded-md inline-flex items-center justify-center text-foreground bg-muted/70 hover:bg-muted disabled:opacity-50 disabled:pointer-events-none transition-colors"
+                                aria-label={`steer queued message ${i + 1}`}
+                              >
+                                {isBusy ? (
+                                  <Loader2 className="h-3 w-3 animate-spin" />
+                                ) : (
+                                  <CornerDownRight className="h-3 w-3" />
+                                )}
+                              </button>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">
+                              Steer current reply with this message ({formatSteerShortcut(isMac)})
+                            </TooltipContent>
+                          </Tooltip>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <button
+                                type="button"
+                                disabled={isBusy}
+                                onClick={() => cancelQueuedPrompt(p)}
+                                className="h-7 w-7 rounded-md inline-flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-muted disabled:opacity-50 disabled:pointer-events-none transition-colors"
+                                aria-label={`remove queued message ${i + 1}`}
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            </TooltipTrigger>
+                            <TooltipContent side="top">Remove queued message</TooltipContent>
+                          </Tooltip>
+                        </motion.div>
+                      );
+                    })}
+                  </div>
+                </TooltipProvider>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
           <div
             className={cn(
               "flex flex-col rounded-lg border bg-input ring-offset-background transition-colors focus-within:border-foreground focus-within:ring-foreground/10 focus-within:ring-1",
@@ -5450,7 +6621,7 @@ export function StandaloneChat({
                   disabledReason
                     ? disabledReason
                     : isLoading || isStreaming
-                      ? "type to queue next message..."
+                      ? "Steer current reply..."
                       : "Ask about your screen... (type @ for filters, paste images)"
                 }
                 disabled={!canChat}
@@ -5601,44 +6772,73 @@ export function StandaloneChat({
                 <Paperclip className="h-4 w-4" />
               </Button>
               {(() => {
-                // Three button modes:
-                //   1. streaming + input empty → stop (square)
-                //   2. streaming + input has text → queue (chevron-up, submits, enqueues)
-                //   3. not streaming → send (paper plane)
                 const hasInput = input.trim().length > 0 || pastedImages.length > 0;
-                const isQueueMode = (isLoading || isStreaming) && hasInput;
-                const isStopMode = (isLoading || isStreaming) && !hasInput;
+                const primaryAction = getComposerPrimaryAction(isLoading || isStreaming, hasInput);
+                const isSteerMode = primaryAction === "steer";
+                const isStopMode = primaryAction === "stop";
                 return (
-                  <Button
-                    type={isStopMode ? "button" : "submit"}
-                    size="icon"
-                    disabled={(!hasInput && !isStopMode) || !canChat}
-                    onClick={isStopMode ? handleStop : undefined}
-                    className={cn(
-                      "h-8 w-8 transition-all duration-200 relative",
-                      "bg-foreground text-background hover:bg-foreground/80"
+                  <>
+                    {isSteerMode && (
+                      <TooltipProvider delayDuration={150}>
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <Button
+                              type="button"
+                              size="icon"
+                              variant="ghost"
+                              disabled={!canChat}
+                              onClick={() => queueFollowUpMessage(input.trim())}
+                              className="h-8 w-8 text-muted-foreground hover:text-foreground hover:bg-muted/60 relative"
+                              aria-label="queue follow-up after current reply"
+                              title="queue follow-up after current reply"
+                            >
+                              <Clock className="h-3.5 w-3.5" />
+                              {queuedPrompts.length > 0 && (
+                                <span className="absolute -top-1.5 -right-1.5 min-w-[16px] h-[16px] px-1 rounded-full bg-muted text-foreground text-[9px] font-mono font-semibold flex items-center justify-center border border-background">
+                                  {queuedPrompts.length}
+                                </span>
+                              )}
+                            </Button>
+                          </TooltipTrigger>
+                          <TooltipContent side="top">
+                            Queue follow-up after current reply
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
                     )}
-                    title={
-                      isStopMode
-                        ? "stop"
-                        : isQueueMode
-                          ? `queue (${queuedPrompts.length + 1} pending)`
-                          : "send"
-                    }
-                  >
-                    {isStopMode ? (
-                      <Square className="h-4 w-4" />
-                    ) : isQueueMode ? (
-                      <ChevronUp className="h-4 w-4" />
-                    ) : (
-                      <Send className="h-4 w-4" />
-                    )}
-                    {isQueueMode && queuedPrompts.length > 0 && (
-                      <span className="absolute -top-1.5 -right-1.5 min-w-[16px] h-[16px] px-1 rounded-full bg-foreground text-background text-[9px] font-mono font-semibold flex items-center justify-center border border-background">
-                        {queuedPrompts.length + 1}
-                      </span>
-                    )}
-                  </Button>
+                    <Button
+                      type={isStopMode ? "button" : "submit"}
+                      size="icon"
+                      disabled={(!hasInput && !isStopMode) || !canChat}
+                      onClick={isStopMode ? handleStop : undefined}
+                      className={cn(
+                        "h-8 w-8 transition-all duration-200 relative",
+                        "bg-foreground text-background hover:bg-foreground/80"
+                      )}
+                      title={
+                        isStopMode
+                          ? "stop"
+                          : isSteerMode
+                            ? "steer current reply"
+                            : "send"
+                      }
+                      aria-label={
+                        isStopMode
+                          ? "stop reply"
+                          : isSteerMode
+                            ? "steer current reply"
+                            : "send message"
+                      }
+                    >
+                      {isStopMode ? (
+                        <Square className="h-4 w-4" />
+                      ) : isSteerMode ? (
+                        <CornerDownRight className="h-4 w-4" />
+                      ) : (
+                        <Send className="h-4 w-4" />
+                      )}
+                    </Button>
+                  </>
                 );
               })()}
             </div>

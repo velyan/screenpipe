@@ -5,9 +5,10 @@
 //! macOS accessibility tree walker using cidre AX APIs.
 
 use super::{
-    AccessibilityTreeNode, FocusedElementContext, SkipReason, TreeSnapshot, TreeWalkResult,
-    TreeWalkerConfig, TreeWalkerPlatform, WindowBounds,
+    AccessibilityTreeNode, FocusedElementContext, LineBudget, SkipReason, TreeSnapshot,
+    TreeWalkResult, TreeWalkerConfig, TreeWalkerPlatform, WindowBounds,
 };
+use crate::tree::macos_lines::{self, NormalizeRefs};
 use anyhow::Result;
 use chrono::Utc;
 use cidre::{ax, cf, ns};
@@ -238,6 +239,96 @@ fn retry_focused_app_pid() -> Option<(i32, FocusedAppRetrySource)> {
     retry_frontmost_pid_via_cg_window_list()
         .map(|pid| (pid, FocusedAppRetrySource::CgWindowList))
         .or_else(|| active_workspace_app_pid().map(|pid| (pid, FocusedAppRetrySource::NsWorkspace)))
+}
+
+/// Extract an absolute file path for the focused window.
+///
+/// Two-stage resolution:
+///   1. **AX (`AXDocument`).** True Cocoa `NSDocument` apps (TextEdit,
+///      Pages, Numbers, Keynote, Xcode, Notes, BBEdit, Sublime, …)
+///      populate `AXDocument` on the focused window with a `file://`
+///      URL. Browsers populate it with `http(s)` — we skip those so
+///      they stay in `browser_url` and don't double-record.
+///   2. **Per-app state files.** Electron editors (Obsidian, and
+///      future additions like VS Code / Cursor / Notion) aren't
+///      `NSDocument` subclasses, so `AXDocument` returns nothing.
+///      For known apps we fall back to a deterministic per-app file
+///      probe (e.g. Obsidian's `obsidian.json` + `workspace.json`).
+///      See [`super::electron_docs`].
+///
+/// Edge cases handled:
+///   - Untitled / unsaved buffers → `AXDocument` returns `None`,
+///     fallback returns `None`. Field stays NULL.
+///   - `AXDocument` is a `file://` URL with percent-encoding
+///     (spaces → `%20`) → decoded into the raw absolute path.
+///   - AX call could in theory block when the inspected app's main
+///     thread is hung; mitigated by the per-call
+///     `set_messaging_timeout_secs` applied at the walk root upstream.
+///
+/// Cost: one extra `AXUIElementCopyAttributeValue` per focused-window
+/// walk (~tens of microseconds typical), plus — only for known
+/// Electron apps — a small JSON file read that's cached behind a
+/// short TTL. Runs after the tree walk so it never inflates the
+/// walk-timeout budget.
+fn extract_document_path(window: &ax::UiElement, app_lower: &str) -> Option<String> {
+    if let Some(raw) = get_string_attr(window, ax::attr::document()) {
+        if let Some(p) = parse_axdocument_value(&raw) {
+            return Some(p);
+        }
+    }
+    super::electron_docs::resolve_electron_doc_path(app_lower)
+}
+
+/// Pure helper: turn a raw `AXDocument` string value into an absolute file path.
+/// Split out from `extract_document_path` so it can be unit-tested without an
+/// `ax::UiElement`. Returns `None` for non-`file://` schemes (browsers, custom
+/// URI handlers) so they don't pollute the document_path column.
+fn parse_axdocument_value(raw: &str) -> Option<String> {
+    if !raw.starts_with("file://") {
+        return None;
+    }
+
+    // Strip scheme. macOS file URLs may contain `%20` for spaces, `%2F`
+    // for legitimate slash-in-filename, non-ASCII via UTF-8 percent-encoded
+    // bytes, etc. We do a tolerant decode: bytes that don't form a valid
+    // UTF-8 sequence after decoding fall back to the raw URL — better than
+    // panicking and better than dropping the whole field.
+    let without_scheme = raw.trim_start_matches("file://");
+
+    // Drop a leading host segment if present (`file:///Users/...` →
+    // `/Users/...`; `file://localhost/Users/...` → `/Users/...`). On macOS
+    // the canonical form is `file:///` (empty host), but we tolerate both.
+    let path_part = if let Some(rest) = without_scheme.strip_prefix("localhost/") {
+        format!("/{}", rest)
+    } else {
+        without_scheme.to_string()
+    };
+
+    Some(percent_decode_path(&path_part).unwrap_or(path_part))
+}
+
+/// Tolerant percent-decoder for file paths. Returns `None` if the decoded
+/// bytes aren't valid UTF-8 (caller falls back to the raw URL string).
+/// Malformed `%xx` (non-hex digit, or truncated near end of input) passes
+/// through verbatim rather than dropping the whole path.
+fn percent_decode_path(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Extract the browser URL from the focused window using AX APIs.
@@ -552,6 +643,7 @@ impl MacosTreeWalker {
             return Ok(TreeWalkResult::Skipped(SkipReason::Incognito));
         }
 
+        // Apply user-configured ignored windows (also check window title)
         let window_lower = window_name.to_lowercase();
         if self
             .config
@@ -562,7 +654,6 @@ impl MacosTreeWalker {
             return Ok(TreeWalkResult::Skipped(SkipReason::ExcludedApp));
         }
 
-        // Apply user-configured ignored windows (also check window title)
         if self.config.ignored_windows.iter().any(|pattern| {
             let p = pattern.to_lowercase();
             window_lower.contains(&p)
@@ -625,8 +716,8 @@ impl MacosTreeWalker {
 
         let text_content = state.text_buffer;
         // Don't bail on empty text — we still need the app_name and window_name
-        // for frame metadata. If the one-shot warm-up retry still yields no text,
-        // downstream capture logic will fall back to OCR explicitly.
+        // for frame metadata. Some apps may return empty text on the first walk
+        // after AXEnhancedUserInterface is set (Chromium builds the tree async).
 
         // Truncate if needed
         let text_content = if text_content.len() > self.config.max_text_length {
@@ -650,13 +741,26 @@ impl MacosTreeWalker {
             None
         };
 
+        // Extract document path. Skipped for browsers — their AXDocument
+        // value is the http(s) URL we already pulled into browser_url
+        // above, never a file:// URL. For everything else (editors,
+        // word processors, IDEs, note apps) AXDocument may carry a
+        // file:// URL we can decode into an absolute path; for known
+        // Electron editors we fall through to per-app state-file probes.
+        let document_path = if is_browser(&app_lower) {
+            None
+        } else {
+            extract_document_path(window, &app_lower)
+        };
+
         debug!(
-            "tree walk: app={}, window={}, nodes={}, text_len={}, url={:?}, duration={:?}",
+            "tree walk: app={}, window={}, nodes={}, text_len={}, url={:?}, doc={:?}, duration={:?}",
             app_name,
             window_name,
             state.node_count,
             text_content.len(),
             browser_url,
+            document_path,
             walk_duration
         );
 
@@ -670,6 +774,7 @@ impl MacosTreeWalker {
             nodes: state.nodes,
             focused_element,
             browser_url,
+            document_path,
             timestamp: Utc::now(),
             node_count: state.node_count,
             walk_duration,
@@ -712,6 +817,13 @@ struct WalkState {
     /// Set to true when a browser extension popup matching an ignored pattern is
     /// detected. Signals the caller to skip the entire capture (including screenshot).
     hit_ignored_extension: bool,
+    /// Per-frame budget for parameterized AX calls used by line-bounds capture.
+    /// `None` when line capture is disabled — see `TreeWalkerConfig::enable_line_bounds`.
+    line_budget: Option<LineBudget>,
+    /// Cap on parameterized AX calls per multi-line node (see config field).
+    line_max_calls_per_node: usize,
+    /// Multi-line safety factor — same field as `TreeWalkerConfig::line_bounds_min_height_ratio`.
+    line_min_height_ratio: f32,
 }
 
 impl WalkState {
@@ -742,6 +854,30 @@ impl WalkState {
                 .map(|s| s.to_lowercase())
                 .collect(),
             hit_ignored_extension: false,
+            line_budget: if config.enable_line_bounds {
+                Some(LineBudget::new(
+                    config.line_bounds_max_calls_per_frame,
+                    config.line_bounds_time_budget,
+                ))
+            } else {
+                None
+            },
+            line_max_calls_per_node: config.line_bounds_max_calls_per_node,
+            line_min_height_ratio: config.line_bounds_min_height_ratio,
+        }
+    }
+
+    /// Snapshot the geometry refs needed to normalize per-line CGRects.
+    fn normalize_refs(&self) -> NormalizeRefs {
+        NormalizeRefs {
+            monitor_x: self.monitor_x,
+            monitor_y: self.monitor_y,
+            monitor_w: self.monitor_w,
+            monitor_h: self.monitor_h,
+            window_x: self.window_x,
+            window_y: self.window_y,
+            window_w: self.window_w,
+            window_h: self.window_h,
         }
     }
 
@@ -894,23 +1030,34 @@ fn walk_element(elem: &ax::UiElement, depth: usize, state: &mut WalkState) {
 
 /// Extract text attributes from an element, append to the buffer, and collect a structured node.
 fn extract_text(elem: &ax::UiElement, role_str: &str, depth: usize, state: &mut WalkState) {
-    // Read element bounds once (used for all text extraction paths)
-    let bounds =
-        get_element_frame(elem).and_then(|(x, y, w, h)| normalize_bounds(x, y, w, h, state));
+    // Read element bounds once (used for all text extraction paths). The
+    // raw screen-absolute frame is also passed to is_on_screen() so we
+    // know whether the captured screenshot actually shows this element —
+    // see issue #2436 for the search-hits-off-screen-text bug this fixes.
+    let frame = get_element_frame(elem);
+    let bounds = frame.and_then(|(x, y, w, h)| normalize_bounds(x, y, w, h, state));
+    let on_screen = frame.and_then(|(x, y, w, h)| is_on_screen(x, y, w, h, state));
 
     // For text fields / text areas, prefer value (the actual content)
     if role_str == "AXTextField" || role_str == "AXTextArea" || role_str == "AXComboBox" {
         if let Some(val) = get_string_attr(elem, ax::attr::value()) {
             if !val.is_empty() {
                 append_text(&mut state.text_buffer, &val);
+                let trimmed = val.trim().to_string();
                 let mut node = AccessibilityTreeNode::new(
                     role_str.to_string(),
-                    val.trim().to_string(),
+                    trimmed.clone(),
                     depth.min(255) as u8,
-                    bounds,
+                    bounds.clone(),
                 );
-                node.value = Some(val.trim().to_string());
+                node.on_screen = on_screen;
+                node.value = Some(trimmed.clone());
                 fill_ax_props(&mut node, elem, role_str);
+                // AXTextArea is the multi-line case (textarea, rich text views);
+                // the gate naturally skips single-line AXTextField/AXComboBox.
+                if role_str == "AXTextArea" {
+                    node.lines = capture_lines_for_node(elem, &trimmed, &bounds, on_screen, state);
+                }
                 state.nodes.push(node);
                 return;
             }
@@ -922,13 +1069,16 @@ fn extract_text(elem: &ax::UiElement, role_str: &str, depth: usize, state: &mut 
         if let Some(val) = get_string_attr(elem, ax::attr::value()) {
             if !val.is_empty() {
                 append_text(&mut state.text_buffer, &val);
+                let trimmed = val.trim().to_string();
                 let mut node = AccessibilityTreeNode::new(
                     role_str.to_string(),
-                    val.trim().to_string(),
+                    trimmed.clone(),
                     depth.min(255) as u8,
-                    bounds,
+                    bounds.clone(),
                 );
+                node.on_screen = on_screen;
                 fill_ax_props(&mut node, elem, role_str);
+                node.lines = capture_lines_for_node(elem, &trimmed, &bounds, on_screen, state);
                 state.nodes.push(node);
                 return;
             }
@@ -945,6 +1095,7 @@ fn extract_text(elem: &ax::UiElement, role_str: &str, depth: usize, state: &mut 
                 depth.min(255) as u8,
                 bounds,
             );
+            node.on_screen = on_screen;
             fill_ax_props(&mut node, elem, role_str);
             state.nodes.push(node);
             return;
@@ -961,6 +1112,7 @@ fn extract_text(elem: &ax::UiElement, role_str: &str, depth: usize, state: &mut 
                 depth.min(255) as u8,
                 bounds,
             );
+            node.on_screen = on_screen;
             fill_ax_props(&mut node, elem, role_str);
             state.nodes.push(node);
         }
@@ -1007,6 +1159,45 @@ fn get_u32_attr_by_name(elem: &ax::UiElement, name: &str) -> Option<u32> {
         .ok()
         .and_then(|value| value.try_as_number().and_then(|number| number.to_i64()))
         .and_then(|raw| u32::try_from(raw).ok())
+}
+
+/// True iff the element's screen-absolute frame intersects the focused
+/// window's screen rect. This is the "is the element actually visible
+/// in the captured pixels?" test that issue #2436 needs to filter
+/// search hits to on-screen text only.
+///
+/// Returns `None` when window bounds aren't populated (early in the
+/// walk, or for tools that don't set them) — the AX walker would still
+/// emit the node, callers see the unknown state and treat it as
+/// "no information" rather than assuming on-screen.
+///
+/// Note: this is a window-level check, not a scroll-container-level
+/// check. Text inside a fully-on-screen scroll viewport but past its
+/// visible region (e.g. terminal scroll buffer in iTerm) will still
+/// report `Some(true)` if iTerm returns frame coords inside the
+/// window. The proper second-pass clip walks up to the nearest
+/// `AXScrollArea` ancestor and intersects with its visible rect —
+/// follow-up.
+fn is_on_screen(
+    elem_x: f64,
+    elem_y: f64,
+    elem_w: f64,
+    elem_h: f64,
+    state: &WalkState,
+) -> Option<bool> {
+    if state.window_w <= 0.0 || state.window_h <= 0.0 {
+        return None;
+    }
+    Some(super::rects_intersect(
+        elem_x,
+        elem_y,
+        elem_w,
+        elem_h,
+        state.window_x,
+        state.window_y,
+        state.window_w,
+        state.window_h,
+    ))
 }
 
 /// Normalize an element's screen-absolute frame to 0-1 coordinates.
@@ -1161,6 +1352,40 @@ fn is_interactive_role(role_str: &str) -> bool {
     )
 }
 
+/// Capture per-visual-line bounds for an AX text node when the node looks
+/// multi-line and the per-frame budget still has headroom. Returns `None`
+/// when:
+///   - line capture is disabled in config (`state.line_budget == None`)
+///   - the node is off-screen (no point spending IPC on invisible content)
+///   - the node fits on a single line at its current bounds
+///   - the per-frame call/time budget is exhausted
+///   - the element doesn't expose `AXBoundsForRange` (some custom text views)
+fn capture_lines_for_node(
+    elem: &ax::UiElement,
+    text: &str,
+    bounds: &Option<super::NodeBounds>,
+    on_screen: Option<bool>,
+    state: &mut WalkState,
+) -> Option<Vec<super::LineSpan>> {
+    // Only spend IPC on visually-present text — off-screen scroll-buffer
+    // content can't be highlighted by the user anyway (issue #2436's premise).
+    if on_screen != Some(true) {
+        return None;
+    }
+    let bounds_ref = bounds.as_ref()?;
+    if !super::node_looks_multiline(text, bounds_ref, state.line_min_height_ratio) {
+        return None;
+    }
+
+    // Snapshot non-budget state up-front so we can take an exclusive mutable
+    // borrow on `line_budget` afterwards without re-borrowing `state`.
+    let refs = state.normalize_refs();
+    let max_per_node = state.line_max_calls_per_node;
+
+    let budget = state.line_budget.as_mut()?;
+    macos_lines::capture_line_spans(elem, text, &refs, budget, max_per_node)
+}
+
 /// Fill automation properties on an AccessibilityTreeNode from an AX element.
 /// Only fetches bool states for interactive elements to limit IPC overhead.
 fn fill_ax_props(node: &mut AccessibilityTreeNode, elem: &ax::UiElement, role_str: &str) {
@@ -1244,23 +1469,87 @@ mod tests {
     }
 
     #[test]
-    fn test_should_retry_focused_app_lookup_only_for_no_value() {
-        assert!(should_retry_focused_app_lookup(ax::err::NO_VALUE.into()));
-        assert!(!should_retry_focused_app_lookup(
-            ax::err::API_DISABLED.into()
-        ));
+    fn test_percent_decode_path_basic() {
+        assert_eq!(
+            percent_decode_path("/Users/me/Note.md").as_deref(),
+            Some("/Users/me/Note.md")
+        );
+        assert_eq!(
+            percent_decode_path("/Users/me/My%20Note.md").as_deref(),
+            Some("/Users/me/My Note.md")
+        );
+        // %2F mid-path stays as a literal slash byte (legitimate filenames
+        // can contain slashes on HFS+/APFS via path separator escaping).
+        assert_eq!(
+            percent_decode_path("/Users/me/a%2Fb.md").as_deref(),
+            Some("/Users/me/a/b.md")
+        );
     }
 
     #[test]
-    fn test_should_retry_empty_text_walk_only_for_non_empty_node_tree() {
-        let mut state = WalkState::new(&TreeWalkerConfig::default(), Instant::now());
-        assert!(!should_retry_empty_text_walk(&state));
+    fn test_percent_decode_path_passes_through_malformed() {
+        // Non-hex after % → leave verbatim instead of dropping the whole path.
+        assert_eq!(
+            percent_decode_path("/Users/me/%g0.md").as_deref(),
+            Some("/Users/me/%g0.md")
+        );
+        // Truncated trailing % — last 1-2 bytes pass through (no panic).
+        assert_eq!(
+            percent_decode_path("/Users/me/foo%").as_deref(),
+            Some("/Users/me/foo%")
+        );
+        assert_eq!(
+            percent_decode_path("/Users/me/foo%2").as_deref(),
+            Some("/Users/me/foo%2")
+        );
+    }
 
-        state.node_count = 3;
-        assert!(should_retry_empty_text_walk(&state));
+    #[test]
+    fn test_percent_decode_path_empty_and_unicode() {
+        assert_eq!(percent_decode_path("").as_deref(), Some(""));
+        // %C3%A9 = é in UTF-8 — confirm decode is bytewise so multi-byte
+        // sequences round-trip correctly.
+        assert_eq!(
+            percent_decode_path("/n%C3%A9.md").as_deref(),
+            Some("/né.md")
+        );
+    }
 
-        state.text_buffer = "ready".into();
-        assert!(!should_retry_empty_text_walk(&state));
+    #[test]
+    fn test_parse_axdocument_value_skips_non_file() {
+        // Browsers and other URL schemes must not show up as document_path.
+        assert_eq!(parse_axdocument_value("https://example.com"), None);
+        assert_eq!(parse_axdocument_value("http://localhost:3000/"), None);
+        assert_eq!(
+            parse_axdocument_value("chrome-extension://abc/popup.html"),
+            None
+        );
+        assert_eq!(parse_axdocument_value(""), None);
+        assert_eq!(parse_axdocument_value("/Users/me/raw-path-no-scheme"), None);
+    }
+
+    #[test]
+    fn test_parse_axdocument_value_file_urls() {
+        // Canonical macOS form: file:///<absolute-path>
+        assert_eq!(
+            parse_axdocument_value("file:///Users/me/Notes/Daily.md").as_deref(),
+            Some("/Users/me/Notes/Daily.md")
+        );
+        // Tolerated: file://localhost/<path> (some older AppKit code paths)
+        assert_eq!(
+            parse_axdocument_value("file://localhost/Users/me/file.txt").as_deref(),
+            Some("/Users/me/file.txt")
+        );
+        // Percent-encoded space common in document names
+        assert_eq!(
+            parse_axdocument_value("file:///Users/me/My%20Doc.md").as_deref(),
+            Some("/Users/me/My Doc.md")
+        );
+        // UTF-8 multibyte percent-encoded
+        assert_eq!(
+            parse_axdocument_value("file:///n%C3%A9.md").as_deref(),
+            Some("/né.md")
+        );
     }
 
     #[test]

@@ -497,6 +497,13 @@ fn remove_pid_file(pipes_dir: &Path, pipe_name: &str) {
 
 /// Check if a process with the given PID is still alive.
 fn is_process_alive(pid: u32) -> bool {
+    // 0 is reserved as the "claimed-but-no-child-yet" placeholder. Treating it as
+    // alive on unix would be catastrophic — kill(0, 0) targets the whole process
+    // group, which means the existence check would return true and any kill that
+    // followed would signal every sibling.
+    if pid == 0 {
+        return false;
+    }
     #[cfg(unix)]
     {
         // kill(pid, 0) checks existence without sending a signal
@@ -529,6 +536,7 @@ fn is_process_alive(pid: u32) -> bool {
 
 /// On startup, remove any PID files whose processes are no longer alive.
 fn cleanup_orphaned_pid_files(pipes_dir: &Path) {
+    let self_pid = std::process::id();
     let entries = match std::fs::read_dir(pipes_dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -539,6 +547,14 @@ fn cleanup_orphaned_pid_files(pipes_dir: &Path) {
         }
         let pipe_name = entry.file_name().to_string_lossy().to_string();
         if let Some(pid) = read_pid_file(pipes_dir, &pipe_name) {
+            // Never kill ourselves. In-process (pi-agent) pipes never have a
+            // child PID, so the pre-spawn placeholder claim used to be the
+            // running app's own PID — meaning the next backend bounce would
+            // SIGKILL the app. Treat self-PID files as stale claims.
+            if pid == self_pid {
+                remove_pid_file(pipes_dir, &pipe_name);
+                continue;
+            }
             if is_process_alive(pid) {
                 info!(
                     "startup: killing orphaned pipe '{}' process {}",
@@ -1081,16 +1097,11 @@ const DEFAULT_TIMEOUT_SECS: u64 = 600;
 /// Set up permissions for a Pi pipe: install extension, filtered skills,
 /// write the permissions JSON file, and register the token with the server.
 /// Returns the generated token (if any) so the caller can clean it up later.
-///
-/// In offline mode, the permissions extension is always installed (even for
-/// unrestricted pipes) so it can block external network requests.
 async fn setup_pipe_permissions(
     pipe_dir: &Path,
     config: &PipeConfig,
     token_registry: Option<&Arc<dyn permissions::PipeTokenRegistry>>,
 ) -> Option<String> {
-    let offline = crate::offline::is_offline_mode();
-
     if let Err(e) = PiExecutor::ensure_permissions_extension(pipe_dir, config) {
         warn!("failed to install permissions extension: {}", e);
     }
@@ -1107,31 +1118,11 @@ async fn setup_pipe_permissions(
         warn!("failed to install filtered skills: {}", e);
     }
 
-    // In offline mode, always install the permissions extension so it can
-    // block external curl commands, even if the pipe has no other restrictions.
-    if offline {
-        let ext_dir = pipe_dir.join(".pi").join("extensions");
-        let ext_path = ext_dir.join("screenpipe-permissions.ts");
-        if !ext_path.exists() {
-            if let Err(e) = std::fs::create_dir_all(&ext_dir) {
-                warn!("failed to create extensions dir for offline mode: {}", e);
-            } else {
-                let ext_content = include_str!("../../assets/extensions/screenpipe-permissions.ts");
-                if let Err(e) = std::fs::write(&ext_path, ext_content) {
-                    warn!(
-                        "failed to install permissions extension for offline mode: {}",
-                        e
-                    );
-                }
-            }
-        }
-    }
-
     let mut perms = permissions::PipePermissions::from_config(config);
     perms.pipe_dir = Some(pipe_dir.to_string_lossy().to_string());
 
-    // In offline mode or with filesystem sandbox, force restrictions so the permissions JSON is always written
-    let force_write = offline || perms.pipe_dir.is_some();
+    // Always write permissions JSON when filesystem sandbox is active.
+    let force_write = perms.pipe_dir.is_some();
 
     if perms.has_any_restrictions() || force_write {
         // Generate a unique pipe token for server-side enforcement
@@ -1219,6 +1210,9 @@ pub struct PipeManager {
     token_registry: Option<Arc<dyn permissions::PipeTokenRegistry>>,
     /// Extra context appended to every pipe prompt (e.g. connected integrations).
     extra_context: Option<String>,
+    /// Connected integrations context injected into every pipe *system* prompt.
+    /// Set by the engine layer (which owns the SecretStore) via `set_connections_context`.
+    connections_context: Option<String>,
     /// Local API auth key — injected into pipe subprocesses as SCREENPIPE_LOCAL_API_KEY
     /// so pipes can authenticate to localhost:3030 when API auth is enabled.
     local_api_key: Option<String>,
@@ -1260,6 +1254,7 @@ impl PipeManager {
             )),
             token_registry: None,
             extra_context: None,
+            connections_context: None,
             local_api_key: None,
             fallback_registry: registry,
         }
@@ -1288,6 +1283,18 @@ impl PipeManager {
     /// Clear extra context.
     pub fn clear_extra_context(&mut self) {
         self.extra_context = None;
+    }
+
+    /// Set connected integrations context for the system prompt.
+    /// Called by the engine layer after computing it via `render_context`.
+    pub fn set_connections_context(&mut self, ctx: String) {
+        self.connections_context = if ctx.is_empty() { None } else { Some(ctx) };
+    }
+
+    /// Expose the API port so callers (e.g. engine layer) can pass it to
+    /// `render_context` without needing a separate field.
+    pub fn api_port(&self) -> u16 {
+        self.api_port
     }
 
     /// Set the local API auth key. Injected into pipe subprocesses as
@@ -1778,8 +1785,11 @@ impl PipeManager {
             }
         }
 
-        // Write a pre-emptive PID file to claim the lock before spawn
-        write_pid_file(&self.pipes_dir, name, std::process::id());
+        // Pre-emptive lock claim. Sentinel 0 means "claimed, no child PID yet";
+        // the spawn watcher overwrites it with the real subprocess PID. Never
+        // write our own PID — for in-process pi-agent runs there is no child,
+        // and a self-PID file would make the next startup SIGKILL the app.
+        write_pid_file(&self.pipes_dir, name, 0);
 
         // Resolve preset
         let (run_model, run_provider, run_provider_url, run_api_key, preset_prompt) =
@@ -1849,8 +1859,12 @@ impl PipeManager {
 
         let pipe_dir = self.pipes_dir.clone().join(name);
 
-        let pipe_system_prompt =
-            render_pipe_system_prompt(&body, self.api_port, preset_prompt.as_deref());
+        let pipe_system_prompt = render_pipe_system_prompt(
+            &body,
+            self.api_port,
+            preset_prompt.as_deref(),
+            self.connections_context.as_deref(),
+        );
         let prompt = self.render_prompt(&config, &body, preset_prompt.as_deref());
         let pipe_name = name.to_string();
 
@@ -2208,8 +2222,9 @@ impl PipeManager {
                 }
             }
 
-            // Write a pre-emptive PID file to claim the lock before spawn
-            write_pid_file(&self.pipes_dir, name, std::process::id());
+            // Pre-emptive lock claim with sentinel 0. See start_pipe_background
+            // for the rationale — never write our own PID here.
+            write_pid_file(&self.pipes_dir, name, 0);
 
             let started_at = Utc::now();
             let pipe_dir = self.pipes_dir.join(name);
@@ -2325,8 +2340,12 @@ impl PipeManager {
                 .unwrap_or(false);
 
             // Build prompt with context header
-            let pipe_system_prompt =
-                render_pipe_system_prompt(&body, self.api_port, preset_prompt.as_deref());
+            let pipe_system_prompt = render_pipe_system_prompt(
+                &body,
+                self.api_port,
+                preset_prompt.as_deref(),
+                self.connections_context.as_deref(),
+            );
             let prompt = self.render_prompt(&config, &body, preset_prompt.as_deref());
 
             // Shared PID — set synchronously by the executor right after spawn
@@ -3074,6 +3093,7 @@ impl PipeManager {
         let api_port = self.api_port;
         let token_registry = self.token_registry.clone();
         let extra_context = self.extra_context.clone();
+        let connections_context = self.connections_context.clone();
         let _local_api_key = self.local_api_key.clone();
 
         let handle = tokio::spawn(async move {
@@ -3436,8 +3456,12 @@ impl PipeManager {
 
                     let pipe_dir = pipes_dir.join(name);
 
-                    let pipe_system_prompt =
-                        render_pipe_system_prompt(body, api_port, preset_prompt.as_deref());
+                    let pipe_system_prompt = render_pipe_system_prompt(
+                        body,
+                        api_port,
+                        preset_prompt.as_deref(),
+                        connections_context.as_deref(),
+                    );
                     let prompt = render_prompt_with_port(
                         config,
                         body,
@@ -3480,7 +3504,8 @@ impl PipeManager {
                             let mut r = running_ref.lock().await;
                             r.insert(pipe_name.clone(), ExecutionHandle { pid: 0 });
                         }
-                        write_pid_file(&pipes_dir_for_mark, &pipe_name, std::process::id());
+                        // Sentinel 0 — see start_pipe_background.
+                        write_pid_file(&pipes_dir_for_mark, &pipe_name, 0);
 
                         info!("scheduler: running pipe '{}'", pipe_name);
 
@@ -4043,7 +4068,12 @@ pub fn serialize_pipe(config: &PipeConfig, body: &str) -> Result<String> {
 /// Contains the pipe body (instructions from pipe.md) and the preset system prompt.
 /// These are identical across runs and across turns within a run, making them
 /// ideal for Anthropic prompt caching (90% input cost reduction on cache hits).
-fn render_pipe_system_prompt(body: &str, api_port: u16, system_prompt: Option<&str>) -> String {
+fn render_pipe_system_prompt(
+    body: &str,
+    api_port: u16,
+    system_prompt: Option<&str>,
+    connections_context: Option<&str>,
+) -> String {
     let os = std::env::consts::OS;
     let mut sys = String::new();
 
@@ -4063,6 +4093,13 @@ fn render_pipe_system_prompt(body: &str, api_port: u16, system_prompt: Option<&s
         "CRITICAL: You ARE this pipe. You are already running inside it. NEVER run `screenpipe pipe run` — that would create a recursive duplicate. Execute the task directly using the tools available to you (bash, file I/O, HTTP requests, etc.).\n\nOS: {os}\nOutput directory: ./output/\nScreenpipe API: http://localhost:{api_port}{api_auth_note}\nPrefer bun/TypeScript for scripts. Python may not be installed.\nSend notifications via POST http://localhost:11435/notify with {{\"title\": \"...\", \"body\": \"...\"}}. Body supports markdown. File links MUST use absolute paths (e.g. [View log](/Users/me/file.md)), never relative paths like ./output/file.md — relative paths break the notification link handler.\n\n"
     ));
     sys.push_str(body);
+
+    if let Some(ctx) = connections_context {
+        sys.push_str("\n\n");
+        sys.push_str(ctx);
+        sys.push_str("\n\nConnection write policy: never POST, PUT, or PATCH to a connection proxy unless the pipe body or user explicitly asks you to create, write, or modify something in that service. Read first, write only when clearly instructed.");
+    }
+
     sys
 }
 
@@ -4675,6 +4712,7 @@ mod tests {
 
         pm.start_scheduler().await.unwrap();
         let gen_after_start = gen_ref.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(gen_after_start > 0);
 
         // Simulate stale scheduler: increment generation externally
         gen_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -4857,7 +4895,7 @@ mod tests {
             reparsed.config.is_empty(),
             "extras HashMap should be empty after roundtrip"
         );
-        assert_eq!(reparsed.enabled, true);
+        assert!(reparsed.enabled);
         assert_eq!(reparsed.schedule, "every 30m");
         assert_eq!(reparsed_body, "Hello prompt");
     }
@@ -5161,7 +5199,7 @@ mod tests {
         assert!(prompt.contains("Time range:"));
         assert!(prompt.contains("Do the work described above now."));
         // Port / body go into system prompt, not user prompt
-        let sys = render_pipe_system_prompt("body text", 3031, None);
+        let sys = render_pipe_system_prompt("body text", 3031, None, None);
         assert!(sys.contains("http://localhost:3031"));
         assert!(!sys.contains("http://localhost:3030"));
         assert!(sys.contains("body text"));
@@ -5169,7 +5207,7 @@ mod tests {
 
     #[test]
     fn test_render_prompt_default_port() {
-        let config = PipeConfig {
+        let _config = PipeConfig {
             name: "test".to_string(),
             schedule: "manual".to_string(),
             enabled: true,
@@ -5188,13 +5226,13 @@ mod tests {
             privacy_filter: false,
             trigger: None,
         };
-        let sys = render_pipe_system_prompt("hello", 3030, None);
+        let sys = render_pipe_system_prompt("hello", 3030, None, None);
         assert!(sys.contains("http://localhost:3030"));
     }
 
     #[test]
     fn test_render_prompt_with_system_prompt() {
-        let config = PipeConfig {
+        let _config = PipeConfig {
             name: "test".to_string(),
             schedule: "every 1h".to_string(),
             enabled: true,
@@ -5213,7 +5251,8 @@ mod tests {
             privacy_filter: false,
             trigger: None,
         };
-        let sys = render_pipe_system_prompt("body text", 3030, Some("You are a helpful assistant"));
+        let sys =
+            render_pipe_system_prompt("body text", 3030, Some("You are a helpful assistant"), None);
         assert!(sys.starts_with("You are a helpful assistant\n\n"));
         assert!(sys.contains("body text"));
         assert!(sys.contains("http://localhost:3030"));
@@ -5221,7 +5260,7 @@ mod tests {
 
     #[test]
     fn test_render_prompt_without_system_prompt() {
-        let config = PipeConfig {
+        let _config = PipeConfig {
             name: "test".to_string(),
             schedule: "every 1h".to_string(),
             enabled: true,
@@ -5240,14 +5279,14 @@ mod tests {
             privacy_filter: false,
             trigger: None,
         };
-        let sys = render_pipe_system_prompt("body text", 3030, None);
+        let sys = render_pipe_system_prompt("body text", 3030, None, None);
         assert!(!sys.contains("System prompt:"));
         assert!(sys.contains("body text"));
     }
 
     #[test]
     fn test_system_prompt_contains_anti_recursion_warning() {
-        let sys = render_pipe_system_prompt("task body", 3030, None);
+        let sys = render_pipe_system_prompt("task body", 3030, None, None);
         assert!(sys.contains("NEVER run `screenpipe pipe run`"));
         assert!(sys.contains("You ARE this pipe"));
     }

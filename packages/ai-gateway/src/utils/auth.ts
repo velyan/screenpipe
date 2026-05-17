@@ -174,29 +174,45 @@ async function validateSubscriptionWithId(env: Env, token: string): Promise<{ is
 
   // Check by UUID (Supabase user ID)
   if (UUID_REGEX.test(token)) {
+    const headers = {
+      apikey: env.SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${env.SUPABASE_ANON_KEY}`,
+    };
+    let resolvedUserId = token;
+    let hasSub = false;
     try {
-      // Check cloud_subscriptions directly for both active and trialing
-      const response = await fetch(
-        `${env.SUPABASE_URL}/rest/v1/cloud_subscriptions?select=id&user_id=eq.${token}&status=in.(active,trialing)&limit=1`,
-        {
-          headers: {
-            apikey: env.SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${env.SUPABASE_ANON_KEY}`,
-          },
-        }
-      );
-
-      if (!response.ok) {
-        console.error('Supabase error:', await response.text());
-        return { isValid: false };
+      // Resolve UUID → Clerk userId in parallel with subscription check.
+      // Returning the Clerk userId as `userId` (which becomes `deviceId`
+      // upstream) ensures usage is keyed on the same identifier regardless
+      // of whether the client sends a UUID, a Clerk userId, or a Clerk JWT.
+      // Without this, /billing (sends UUID) and the desktop app (sends
+      // Clerk JWT → resolves to user_xxx) read different usage buckets.
+      const [userRes, subsRes] = await Promise.all([
+        fetch(
+          `${env.SUPABASE_URL}/rest/v1/users?select=clerk_id&id=eq.${token}&limit=1`,
+          { headers }
+        ),
+        fetch(
+          `${env.SUPABASE_URL}/rest/v1/cloud_subscriptions?select=id&user_id=eq.${token}&status=in.(active,trialing)&limit=1`,
+          { headers }
+        ),
+      ]);
+      if (userRes.ok) {
+        const users = await userRes.json() as Array<{ clerk_id: string | null }>;
+        if (users[0]?.clerk_id) resolvedUserId = users[0].clerk_id;
       }
-
-      const subs = await response.json() as Array<{ id: string }>;
-      return { isValid: subs.length > 0, userId: token };
+      if (subsRes.ok) {
+        const subs = await subsRes.json() as Array<{ id: string }>;
+        hasSub = subs.length > 0;
+      } else {
+        console.error('Supabase subscription check error:', await subsRes.text());
+      }
     } catch (error) {
-      console.error('Error checking subscription:', error);
-      return { isValid: false };
+      console.error('Error in UUID auth path:', error);
     }
+    // Always return resolvedUserId (clerk_id when available, UUID otherwise)
+    // so the non-subscribed UUID branch upstream also keys on the same id.
+    return { isValid: hasSub, userId: resolvedUserId };
   }
 
   // Clerk user IDs - resolve to UUID first, then check subscription

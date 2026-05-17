@@ -86,8 +86,12 @@ async function tryDeductCredit(env: Env, userId: string, reason: string): Promis
 
 /**
  * Get user's current credit balance without deducting.
+ *
+ * Exported because the cost-cap check in `index.ts` also needs this — credits
+ * extend the daily cost ceiling 1:1 (1 credit = $1 of headroom). Without that,
+ * users who pay $50 still 429 on Opus and file Intercom tickets.
  */
-async function getCreditBalance(env: Env, userId: string): Promise<number> {
+export async function getCreditBalance(env: Env, userId: string): Promise<number> {
   const clerkId = await resolveClerkId(env, userId);
   if (!clerkId) return 0;
 
@@ -114,6 +118,16 @@ async function getCreditBalance(env: Env, userId: string): Promise<number> {
 const MODEL_WEIGHTS: Record<string, number> = {
   // Auto — smart routing, free
   'auto': 0,
+  // OpenAI API
+  'gpt-5.5-pro': 36,
+  'gpt-5.5': 6,
+  'gpt-5.4-pro': 36,
+  'gpt-5.3-codex': 3,
+  'gpt-5.4-mini': 1,
+  'gpt-5.4-nano': 1,
+  'gpt-5.4': 3,
+  'gpt-5-mini': 1,
+  'gpt-5-nano': 1,
   // Vertex MaaS — free for users (GCP credits), weight=0 so they don't eat daily quota
   'glm-4.7': 0,
   'glm-5': 0,
@@ -131,6 +145,10 @@ const MODEL_WEIGHTS: Record<string, number> = {
   'gemini-3-flash': 0,
   'gemini-3.1-flash-lite': 0,
   'gemini-2.5-flash': 0,
+  // OpenAI
+  'gpt-5.5': 6,
+  'gpt-5.4-mini': 1,
+  'gpt-5.4': 3,
   // OpenRouter models
   'qwen3.5-flash': 0,
   'qwen3.5-397b': 3,
@@ -167,6 +185,7 @@ const DEFAULT_TIER_CONFIG: Record<UserTier, TierLimits> = {
     allowedModels: [
       'auto',
       'claude-haiku-4-5',
+      'gemini-2.5-flash',
       'gemini-3-flash',
       'gemini-3.1-flash-lite',
       'glm-4.7',
@@ -184,6 +203,7 @@ const DEFAULT_TIER_CONFIG: Record<UserTier, TierLimits> = {
       'auto',
       'claude-haiku-4-5',
       'claude-sonnet-4-5',
+      'gemini-2.5-flash',
       'gemini-3-flash',
       'gemini-3.1-flash-lite',
       'gemini-3-pro',
@@ -485,4 +505,3 @@ export function isModelAllowed(model: string, tier: UserTier, env?: Env): boolea
     allowed.toLowerCase().includes(model.toLowerCase())
   );
 }
-

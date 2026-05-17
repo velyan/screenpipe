@@ -47,6 +47,7 @@ pub mod otter;
 pub mod perplexity;
 pub mod pipedrive;
 pub mod pocket;
+pub mod posthog;
 pub mod pushover;
 pub mod quickbooks;
 pub mod resend;
@@ -72,7 +73,7 @@ use async_trait::async_trait;
 use screenpipe_secrets::SecretStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -166,6 +167,40 @@ pub trait Integration: Send + Sync {
     fn proxy_config(&self) -> Option<&'static ProxyConfig> {
         None
     }
+
+    /// Extra PEM-encoded root certificate to trust when calling this
+    /// integration's API. Required for providers that run on a private
+    /// CA (e.g. Bee uses `CN=BeeCertificateAuthority`, not WebPKI).
+    /// Default `None` — system roots only.
+    ///
+    /// The proxy handler in screenpipe-engine and the integration's own
+    /// `test()` both consult this and rebuild their reqwest client with
+    /// the cert appended via `add_root_certificate` when present.
+    fn extra_root_pem(&self) -> Option<&'static str> {
+        None
+    }
+}
+
+/// Build a reqwest client that trusts the given integration's extra root
+/// CA (if any) on top of the system roots. Falls through to a default
+/// client when the integration uses public CAs. Centralised here so the
+/// proxy handler and `test()` callers stay in sync.
+pub fn build_client_for(integ: &dyn Integration) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder();
+    if let Some(pem) = integ.extra_root_pem() {
+        match reqwest::Certificate::from_pem(pem.as_bytes()) {
+            Ok(cert) => builder = builder.add_root_certificate(cert),
+            Err(e) => tracing::warn!(
+                "extra_root_pem for {} failed to parse — falling back to system roots: {}",
+                integ.def().id,
+                e
+            ),
+        }
+    }
+    builder.build().unwrap_or_else(|e| {
+        tracing::warn!("custom client build failed, using default: {}", e);
+        reqwest::Client::new()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -201,6 +236,7 @@ pub fn all_integrations() -> Vec<Box<dyn Integration>> {
         Box::new(ntfy::Ntfy),
         Box::new(toggl::Toggl),
         Box::new(brex::Brex),
+        Box::new(posthog::PostHog),
         Box::new(clickup::ClickUp),
         Box::new(confluence::Confluence),
         Box::new(salesforce::Salesforce),
@@ -306,8 +342,9 @@ async fn save_connection(
     save_store(screenpipe_dir, &file_store)
 }
 
-/// Remove a connection from SecretStore. Falls back to the legacy file
-/// only when no SecretStore is available.
+/// Remove a connection from SecretStore and the legacy file.
+/// Always clears both stores so that credentials migrated from the legacy
+/// connections.json (saved before SecretStore was available) are fully removed.
 async fn remove_connection(
     secret_store: Option<&SecretStore>,
     screenpipe_dir: &Path,
@@ -316,13 +353,15 @@ async fn remove_connection(
     if let Some(ss) = secret_store {
         let store_key = format!("cred:{}", key);
         ss.delete(&store_key).await?;
-        return Ok(());
     }
 
-    // No SecretStore — fall back to file
+    // Always also clear from the legacy file — handles the migration case where
+    // credentials were written to connections.json before SecretStore existed.
     let mut file_store = load_store(screenpipe_dir);
-    file_store.remove(key);
-    save_store(screenpipe_dir, &file_store)
+    if file_store.remove(key).is_some() {
+        save_store(screenpipe_dir, &file_store)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -363,9 +402,13 @@ impl ConnectionManager {
                 }
                 any_connected
             } else {
-                load_connection(ss, &self.screenpipe_dir, def.id)
+                self.get_all_instances(def.id)
                     .await
-                    .map(|c| c.enabled && !c.credentials.is_empty())
+                    .map(|instances| {
+                        instances
+                            .into_iter()
+                            .any(|(_, c)| c.enabled && !c.credentials.is_empty())
+                    })
                     .unwrap_or(false)
             };
             result.push(ConnectionInfo {
@@ -393,9 +436,18 @@ impl ConnectionManager {
     }
 
     pub async fn get_credentials(&self, id: &str) -> Result<Option<Map<String, Value>>> {
+        self.get_credentials_instance(id, None).await
+    }
+
+    pub async fn get_credentials_instance(
+        &self,
+        id: &str,
+        instance: Option<&str>,
+    ) -> Result<Option<Map<String, Value>>> {
         self.find(id)?;
+        let key = make_key(id, instance);
         Ok(
-            load_connection(self.secret_store.as_deref(), &self.screenpipe_dir, id)
+            load_connection(self.secret_store.as_deref(), &self.screenpipe_dir, &key)
                 .await
                 .map(|c| c.credentials),
         )
@@ -415,6 +467,16 @@ impl ConnectionManager {
             .iter()
             .find(|i| i.def().id == id)
             .map(|i| i.def())
+    }
+
+    /// Look up the extra root CA PEM (if any) this integration needs.
+    /// Used by the proxy handler to build a reqwest client that trusts
+    /// providers behind a private CA (e.g. Bee).
+    pub fn find_extra_root_pem(&self, id: &str) -> Option<&'static str> {
+        self.integrations
+            .iter()
+            .find(|i| i.def().id == id)
+            .and_then(|i| i.extra_root_pem())
     }
 
     pub async fn disconnect(&self, id: &str) -> Result<()> {
@@ -460,47 +522,7 @@ impl ConnectionManager {
         id: &str,
     ) -> Result<Vec<(Option<String>, SavedConnection)>> {
         self.find(id)?;
-        let mut results = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-
-        // Check SecretStore first
-        if let Some(ss) = self.secret_store.as_deref() {
-            let prefix = format!("cred:{}", id);
-            if let Ok(keys) = ss.list(&prefix).await {
-                for key in keys {
-                    if key == prefix {
-                        if let Ok(Some(conn)) = ss.get_json::<SavedConnection>(&key).await {
-                            seen.insert(None::<String>);
-                            results.push((None, conn));
-                        }
-                    } else if let Some(inst) = key.strip_prefix(&format!("{}:", prefix)) {
-                        let inst = inst.to_string();
-                        if let Ok(Some(conn)) = ss.get_json::<SavedConnection>(&key).await {
-                            seen.insert(Some(inst.clone()));
-                            results.push((Some(inst), conn));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Fall back to file for any not found in store
-        let file_store = load_store(&self.screenpipe_dir);
-        let prefix = format!("{}:", id);
-        for (key, conn) in &file_store {
-            if key == id {
-                if seen.insert(None::<String>) {
-                    results.push((None, conn.clone()));
-                }
-            } else if let Some(inst) = key.strip_prefix(&prefix) {
-                let inst = inst.to_string();
-                if seen.insert(Some(inst.clone())) {
-                    results.push((Some(inst), conn.clone()));
-                }
-            }
-        }
-
-        Ok(results)
+        Ok(load_all_instances(self.secret_store.as_deref(), &self.screenpipe_dir, id).await)
     }
 
     /// Remove a specific instance (or the default) for the given integration.
@@ -527,6 +549,13 @@ pub struct ConnectionInfo {
     pub is_oauth: bool,
 }
 
+type CredentialConnection<'a> = (
+    &'a dyn Integration,
+    &'static IntegrationDef,
+    Option<String>,
+    Map<String, Value>,
+);
+
 // ---------------------------------------------------------------------------
 // Pi context rendering — uses proxy URLs instead of raw credentials
 // ---------------------------------------------------------------------------
@@ -539,29 +568,27 @@ pub async fn render_context(
     let integrations = all_integrations();
 
     // Credential-based integrations
-    let mut cred_connected: Vec<(
-        &dyn Integration,
-        &'static IntegrationDef,
-        Map<String, Value>,
-    )> = Vec::new();
-    for i in integrations.iter().filter(|i| i.oauth_config().is_none()) {
-        let def = i.def();
-        if let Some(conn) = load_connection(secret_store, screenpipe_dir, def.id).await {
+    let mut cred_connected: Vec<CredentialConnection<'_>> = Vec::new();
+    for integration in integrations.iter().filter(|i| i.oauth_config().is_none()) {
+        let def = integration.def();
+        for (instance, conn) in load_all_instances(secret_store, screenpipe_dir, def.id).await {
             if conn.enabled && !conn.credentials.is_empty() {
-                cred_connected.push((i.as_ref(), def, conn.credentials));
+                cred_connected.push((integration.as_ref(), def, instance, conn.credentials));
             }
         }
     }
 
     // OAuth integrations with a stored token
-    let mut oauth_connected: Vec<(&dyn Integration, &'static IntegrationDef)> = Vec::new();
-    for i in integrations.iter().filter(|i| i.oauth_config().is_some()) {
-        let def = i.def();
-        if oauth::read_oauth_token_instance(secret_store, def.id, None)
-            .await
-            .is_some()
-        {
-            oauth_connected.push((i.as_ref(), def));
+    let mut oauth_connected: Vec<(&dyn Integration, &'static IntegrationDef, Option<String>)> =
+        Vec::new();
+    for integration in integrations.iter().filter(|i| i.oauth_config().is_some()) {
+        let def = integration.def();
+        let mut instances = oauth::list_oauth_instances(secret_store, def.id).await;
+        instances.sort();
+        for instance in instances {
+            if oauth::is_oauth_instance_connected(secret_store, def.id, instance.as_deref()).await {
+                oauth_connected.push((integration.as_ref(), def, instance));
+            }
         }
     }
 
@@ -576,18 +603,19 @@ pub async fn render_context(
          The proxy injects authentication automatically. NEVER fetch or use raw API keys.\n",
     );
 
-    for (integration, def, creds) in &cred_connected {
-        out.push_str(&format!("\n## {} ({})\n", def.name, def.id));
+    for (integration, def, instance, creds) in &cred_connected {
+        out.push_str(&connection_context_header(def, instance.as_deref()));
         out.push_str(&format!("{}\n", def.description));
 
         if integration.proxy_config().is_some() {
+            let suffix = instance_query(instance.as_deref());
             out.push_str(&format!(
-                "  proxy: {}/{}/proxy/  (append the API path, e.g. /v1/pages)\n",
-                base, def.id
+                "  proxy: {}/{}/proxy/<api-path>{}  (append the API path, e.g. /v1/pages)\n",
+                base, def.id, suffix
             ));
             out.push_str(&format!(
-                "  config: {}/{}/config  (non-secret settings)\n",
-                base, def.id
+                "  config: {}/{}/config{}  (non-secret settings)\n",
+                base, def.id, suffix
             ));
         } else {
             // No proxy config — fall back to raw credentials (webhook-style integrations)
@@ -599,22 +627,23 @@ pub async fn render_context(
         }
     }
 
-    for (integration, def) in &oauth_connected {
-        out.push_str(&format!("\n## {} ({})\n", def.name, def.id));
+    for (integration, def, instance) in &oauth_connected {
+        out.push_str(&connection_context_header(def, instance.as_deref()));
         out.push_str(&format!("{}\n", def.description));
 
         if integration.proxy_config().is_some() {
+            let suffix = instance_query(instance.as_deref());
             out.push_str(&format!(
-                "  proxy: {}/{}/proxy/  (append the API path, e.g. /v1/pages)\n",
-                base, def.id
+                "  proxy: {}/{}/proxy/<api-path>{}  (append the API path, e.g. /v1/pages)\n",
+                base, def.id, suffix
             ));
             out.push_str(&format!(
-                "  config: {}/{}/config  (non-secret settings)\n",
-                base, def.id
+                "  config: {}/{}/config{}  (non-secret settings)\n",
+                base, def.id, suffix
             ));
         } else {
             // OAuth without proxy — still don't expose the token
-            out.push_str("  (connected via OAuth — no proxy available, use API directly)\n");
+            out.push_str("  (connected via OAuth — use the endpoints listed above; no raw token is exposed)\n");
         }
     }
 
@@ -644,6 +673,82 @@ fn make_key(id: &str, instance: Option<&str>) -> String {
     }
 }
 
+async fn load_all_instances(
+    secret_store: Option<&SecretStore>,
+    screenpipe_dir: &Path,
+    id: &str,
+) -> Vec<(Option<String>, SavedConnection)> {
+    let mut instances = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(store) = secret_store {
+        let prefix = format!("cred:{}", id);
+        if let Ok(keys) = store.list(&prefix).await {
+            for key in keys {
+                if key == prefix {
+                    if let Ok(Some(conn)) = store.get_json::<SavedConnection>(&key).await {
+                        if seen.insert(None::<String>) {
+                            instances.push((None, conn));
+                        }
+                    }
+                } else if let Some(inst) = key.strip_prefix(&format!("{}:", prefix)) {
+                    let inst = inst.to_string();
+                    if let Ok(Some(conn)) = store.get_json::<SavedConnection>(&key).await {
+                        if seen.insert(Some(inst.clone())) {
+                            instances.push((Some(inst), conn));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let store = load_store(screenpipe_dir);
+    let prefix = format!("{}:", id);
+    for (key, conn) in store {
+        if key == id {
+            if seen.insert(None::<String>) {
+                instances.push((None, conn));
+            }
+        } else if let Some(inst) = key.strip_prefix(&prefix) {
+            let inst = inst.to_string();
+            if seen.insert(Some(inst.clone())) {
+                instances.push((Some(inst), conn));
+            }
+        }
+    }
+
+    instances.sort_by(|(a, _), (b, _)| a.cmp(b));
+    instances
+}
+
+fn connection_context_header(def: &'static IntegrationDef, instance: Option<&str>) -> String {
+    match instance {
+        Some(instance) => format!("\n## {} ({}, instance: {})\n", def.name, def.id, instance),
+        None => format!("\n## {} ({})\n", def.name, def.id),
+    }
+}
+
+fn instance_query(instance: Option<&str>) -> String {
+    match instance {
+        Some(instance) => format!("?instance={}", percent_encode_query_value(instance)),
+        None => String::new(),
+    }
+}
+
+fn percent_encode_query_value(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    encoded
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -652,4 +757,67 @@ pub fn require_str<'a>(map: &'a Map<String, Value>, key: &str) -> Result<&'a str
     map.get(key)
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing required field: {}", key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_screenpipe_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "screenpipe-connect-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn manual_webhook_creds() -> Map<String, Value> {
+        let mut creds = Map::new();
+        creds.insert(
+            "webhook_url".to_string(),
+            Value::String("https://example.com/webhook".to_string()),
+        );
+        creds
+    }
+
+    #[tokio::test]
+    async fn named_manual_instances_count_as_connected() {
+        let dir = temp_screenpipe_dir();
+        let mgr = ConnectionManager::new(dir.clone(), None);
+
+        mgr.connect_instance("discord", Some("work"), manual_webhook_creds())
+            .await
+            .unwrap();
+
+        let discord = mgr
+            .list()
+            .await
+            .into_iter()
+            .find(|connection| connection.def.id == "discord")
+            .unwrap();
+        assert!(discord.connected);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn render_context_includes_named_manual_instances() {
+        let dir = temp_screenpipe_dir();
+        let mgr = ConnectionManager::new(dir.clone(), None);
+
+        mgr.connect_instance("discord", Some("work"), manual_webhook_creds())
+            .await
+            .unwrap();
+
+        let context = render_context(&dir, 3030, None).await;
+        assert!(context.contains("## Discord (discord, instance: work)"));
+        assert!(context.contains("webhook_url: https://example.com/webhook"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
