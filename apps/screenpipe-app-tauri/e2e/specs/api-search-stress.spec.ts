@@ -377,18 +377,18 @@ describe("Local API search and stability", function () {
   });
 
   const invalidAuthCases = [
-    ["empty bearer", { Authorization: "Bearer " }, "/search?limit=1"],
-    ["missing bearer value", { Authorization: "Bearer" }, "/search?limit=1"],
-    ["basic auth", { Authorization: "Basic abc" }, "/search?limit=1"],
-    ["random auth scheme", { Authorization: "screenpipe bad" }, "/search?limit=1"],
-    ["x-api-key only", { "x-api-key": "definitely-not-the-key" }, "/search?limit=1"],
-    ["very long bearer", { Authorization: `Bearer ${"x".repeat(4096)}` }, "/search?limit=1"],
-    ["invalid token query", {}, "/search?limit=1&token=definitely-not-the-key"],
-    ["empty token query", {}, "/search?limit=1&token="],
+    ["empty bearer", { Authorization: "Bearer " }, "/connections"],
+    ["missing bearer value", { Authorization: "Bearer" }, "/connections"],
+    ["basic auth", { Authorization: "Basic abc" }, "/connections"],
+    ["random auth scheme", { Authorization: "screenpipe bad" }, "/connections"],
+    ["x-api-key only", { "x-api-key": "definitely-not-the-key" }, "/connections"],
+    ["very long bearer", { Authorization: `Bearer ${"x".repeat(4096)}` }, "/connections"],
+    ["invalid token query", {}, "/connections?token=definitely-not-the-key"],
+    ["empty token query", {}, "/connections?token="],
   ] as const;
 
   for (const [label, headers, path] of invalidAuthCases) {
-    it(`rejects invalid auth shape: ${label}`, async function () {
+    it(`rejects invalid auth shape on protected endpoint: ${label}`, async function () {
       if (!key) this.skip();
       const res = await fetchJson(apiUrl(path), headers);
       expect(res.ok).toBe(false);
@@ -397,22 +397,30 @@ describe("Local API search and stability", function () {
     });
   }
 
-  it("rejects unauthenticated search when API auth is enabled", async function () {
+  it("rejects unauthenticated protected endpoints when API auth is enabled", async function () {
     if (!key) this.skip();
-    const res = await fetchJson(apiUrl("/search?limit=1"));
+    const res = await fetchJson(apiUrl("/connections"));
     expect(res.ok).toBe(false);
     expect(res.status).toBeGreaterThanOrEqual(400);
     expect(res.status).toBeLessThan(500);
   });
 
-  it("rejects an invalid bearer token", async function () {
+  it("rejects an invalid bearer token on protected endpoints", async function () {
     if (!key) this.skip();
-    const res = await fetchJson(apiUrl("/search?limit=1"), {
+    const res = await fetchJson(apiUrl("/connections"), {
       Authorization: "Bearer definitely-not-the-key",
     });
     expect(res.ok).toBe(false);
     expect(res.status).toBeGreaterThanOrEqual(400);
     expect(res.status).toBeLessThan(500);
+  });
+
+  it("allows unauthenticated loopback search for Moya compatibility", async function () {
+    if (!key) this.skip();
+    const res = await fetchJson(apiUrl("/search?limit=1"));
+    expectNoServerError(res, "loopback-compatible search");
+    expect(res.ok).toBe(true);
+    expect(res.body).toHaveProperty("data");
   });
 
   it("accepts the bearer token on authenticated search", async function () {
@@ -422,11 +430,9 @@ describe("Local API search and stability", function () {
     expect(res.body).toHaveProperty("data");
   });
 
-  it("accepts token query fallback for authenticated search", async function () {
+  it("accepts token query fallback on protected endpoints", async function () {
     if (!key) this.skip();
-    const res = await fetchJson(
-      apiUrl(`/search?limit=1&token=${encodeURIComponent(key)}`),
-    );
+    const res = await fetchJson(apiUrl(`/connections?token=${encodeURIComponent(key)}`));
     expect(res.ok).toBe(true);
     expect(res.body).toHaveProperty("data");
   });
