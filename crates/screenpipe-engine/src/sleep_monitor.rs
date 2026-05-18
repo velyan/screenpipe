@@ -667,8 +667,12 @@ pub fn start_sleep_monitor() {
 mod tests {
     use super::*;
 
+    static GLOBAL_FLAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_recently_woke_flag() {
+        let _guard = GLOBAL_FLAG_TEST_LOCK.lock().unwrap();
+        RECENTLY_WOKE.store(false, Ordering::SeqCst);
         assert!(!recently_woke_from_sleep());
         RECENTLY_WOKE.store(true, Ordering::SeqCst);
         assert!(recently_woke_from_sleep());
@@ -678,6 +682,7 @@ mod tests {
 
     #[test]
     fn test_screen_is_locked_flag() {
+        let _guard = GLOBAL_FLAG_TEST_LOCK.lock().unwrap();
         assert!(!screen_is_locked());
         SCREEN_IS_LOCKED.store(true, Ordering::SeqCst);
         assert!(screen_is_locked());
@@ -743,6 +748,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn test_on_did_wake_sets_audio_invalidation() {
+        let _guard = GLOBAL_FLAG_TEST_LOCK.lock().unwrap();
         // Clear stale flags
         let _ = screenpipe_audio::stream_invalidation::take();
         let _ = screenpipe_screen::stream_invalidation::take();
