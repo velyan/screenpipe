@@ -5,7 +5,7 @@
 
 import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { ChevronDown, ChevronUp, Plus, RefreshCw } from "lucide-react";
+import { ChevronDown, ChevronUp, Plug, Plus, RefreshCw } from "lucide-react";
 import { PipeAIIconLarge } from "@/components/pipe-ai-icon";
 import { type TemplatePipe } from "@/lib/hooks/use-pipes";
 import { FALLBACK_TEMPLATES, type CustomTemplate } from "@/lib/summary-templates";
@@ -25,10 +25,8 @@ interface SummaryCardsProps {
   pipesLoading?: boolean;
 }
 
-// ─── Grid scan refresh animation ──────────────────────────────────────────────
-// Brand-aligned: 3x2 card skeleton with micro-grid scan inside each card.
-// A diagonal scan line sweeps across all 6 cards simultaneously — cells flip
-// on/off as it passes, like screenpipe scanning your screen for new context.
+// ─── Suggestion refresh animation ─────────────────────────────────────────────
+// Two quiet rows matching the persistent suggestion layout.
 
 function SuggestionSkeleton() {
   const GRID_COLS = 8;
@@ -46,34 +44,28 @@ function SuggestionSkeleton() {
   }, []);
 
   return (
-    <div className="grid grid-cols-3 gap-1.5">
-      {[0, 1, 2, 3, 4, 5].map((cardIdx) => {
-        const cardRow = Math.floor(cardIdx / 3);
-        const cardCol = cardIdx % 3;
-        // Offset each card's scan phase so the line travels across all 6
-        const cardOffset = cardRow * 4 + cardCol * 3;
+    <div className="overflow-hidden rounded-md border border-border/35 bg-muted/[0.08] shadow-sm divide-y divide-border/25">
+      {[0, 1].map((rowIdx) => {
+        const rowOffset = rowIdx * 4;
 
         return (
           <div
-            key={cardIdx}
-            className="border border-border/20 p-2"
-            style={{ minHeight: 52 }}
+            key={rowIdx}
+            className="flex min-h-[34px] items-center gap-1.5 px-1.5 py-1.5"
           >
-            {/* Micro grid — scan line sweeps diagonally */}
             <div
-              className="grid gap-px mb-2"
+              className="grid shrink-0 gap-px"
               style={{
-                gridTemplateColumns: `repeat(${GRID_COLS}, 4px)`,
-                gridTemplateRows: `repeat(${GRID_ROWS}, 4px)`,
+                gridTemplateColumns: `repeat(${GRID_COLS}, 3px)`,
+                gridTemplateRows: `repeat(${GRID_ROWS}, 3px)`,
               }}
             >
               {Array.from({ length: CARD_CELLS }, (_, i) => {
                 const r = Math.floor(i / GRID_COLS);
                 const c = i % GRID_COLS;
-                const diag = r + c + cardOffset;
+                const diag = r + c + rowOffset;
                 const scanPos = tick % (GRID_ROWS + GRID_COLS + 10);
                 const dist = Math.abs(diag - scanPos);
-                // On the scan line = bright, trailing = dimmer, rest = faint flicker
                 const on = dist === 0 || (dist < 3 && ((tick + i) % 3 === 0));
                 return (
                   <div
@@ -81,24 +73,99 @@ function SuggestionSkeleton() {
                     className={`transition-colors duration-75 ${
                       on ? "bg-foreground" : dist < 5 ? "bg-foreground/10" : "bg-foreground/[0.03]"
                     }`}
-                    style={{ width: 4, height: 4 }}
+                    style={{ width: 3, height: 3 }}
                   />
                 );
               })}
             </div>
-            {/* Text placeholder bars that pulse with the scan */}
-            <div
-              className="h-[7px] bg-foreground/[0.08] transition-all duration-100"
-              style={{ width: `${55 + Math.sin(tick * 0.15 + cardIdx) * 25}%` }}
-            />
-            <div
-              className="h-[5px] bg-foreground/[0.04] mt-1 transition-all duration-100"
-              style={{ width: `${35 + Math.sin(tick * 0.15 + cardIdx + 2) * 20}%` }}
-            />
+            <div className="min-w-0 flex-1 space-y-1">
+              <div
+                className="h-[7px] bg-foreground/[0.08] transition-all duration-100"
+                style={{ width: `${55 + Math.sin(tick * 0.15 + rowIdx) * 25}%` }}
+              />
+              <div
+                className="h-[5px] bg-foreground/[0.04] transition-all duration-100"
+                style={{ width: `${35 + Math.sin(tick * 0.15 + rowIdx + 2) * 20}%` }}
+              />
+            </div>
           </div>
         );
       })}
     </div>
+  );
+}
+
+const CONNECTION_ICON_PATHS: Record<string, string> = {
+  "apple-calendar": "/images/apple.svg",
+  asana: "/images/asana.svg",
+  github: "/images/github.png",
+  "github-issues": "/images/github.png",
+  github_issues: "/images/github.png",
+  "google-calendar": "/images/google-calendar.svg",
+  "google calendar": "/images/google-calendar.svg",
+  "google-docs": "/images/google-docs.svg",
+  "google docs": "/images/google-docs.svg",
+  "google-sheets": "/images/google-sheets.svg",
+  "google sheets": "/images/google-sheets.svg",
+  hubspot: "/images/hubspot.png",
+  jira: "/images/jira.png",
+  linear: "/images/linear.svg",
+  notion: "/images/notion.svg",
+  obsidian: "",
+  perplexity: "/images/perplexity.svg",
+  posthog: "/images/posthog.svg",
+  zapier: "/images/zapier.png",
+};
+
+function normalizeConnectionIconKey(name: string) {
+  return name.trim().toLowerCase().replace(/\.app$|\.exe$/i, "");
+}
+
+function ConnectionSuggestionIcon({ name }: { name: string }) {
+  const key = normalizeConnectionIconKey(name);
+  const path = CONNECTION_ICON_PATHS[key];
+
+  if (key === "gmail") {
+    return (
+      <svg viewBox="0 0 999.517 749.831" className="w-3.5 h-3.5 flex-shrink-0" aria-hidden>
+        <path fill="#4285F4" d="M68.149 749.831h159.014V363.654L0 193.282v488.4C0 719.391 30.553 749.831 68.149 749.831"/>
+        <path fill="#34A853" d="M772.354 749.831h159.014c37.709 0 68.149-30.553 68.149-68.149v-488.4L772.354 363.654"/>
+        <path fill="#FBBC04" d="M772.354 68.342v295.312l227.163-170.372V102.417c0-84.277-96.203-132.322-163.557-81.779"/>
+        <path fill="#EA4335" d="M227.163 363.654V68.342l272.595 204.447 272.595-204.447v295.312L499.758 568.1"/>
+        <path fill="#C5221F" d="M0 102.417v90.865l227.163 170.372V68.342L163.557 20.638C96.09-29.906 0 18.139 0 102.417"/>
+      </svg>
+    );
+  }
+
+  if (key === "microsoft365" || key === "microsoft-365" || key === "outlook") {
+    return (
+      <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 flex-shrink-0" aria-hidden>
+        <path fill="#F25022" d="M1 1h10v10H1z"/>
+        <path fill="#7FBA00" d="M13 1h10v10H13z"/>
+        <path fill="#00A4EF" d="M1 13h10v10H1z"/>
+        <path fill="#FFB900" d="M13 13h10v10H13z"/>
+      </svg>
+    );
+  }
+
+  if (key === "obsidian") {
+    return (
+      <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 flex-shrink-0 text-[#7C3AED]" fill="currentColor" aria-hidden>
+        <path d="M19.355 18.538a68.967 68.959 0 0 0 1.858-2.954.81.81 0 0 0-.062-.9c-.516-.685-1.504-2.075-2.042-3.362-.553-1.321-.636-3.375-.64-4.377a1.707 1.707 0 0 0-.358-1.05l-3.198-4.064a3.744 3.744 0 0 1-.076.543c-.106.503-.307 1.004-.536 1.5-.134.29-.29.6-.446.914l-.31.626c-.516 1.068-.997 2.227-1.132 3.59-.124 1.26.046 2.73.815 4.481.128.011.257.025.386.044a6.363 6.363 0 0 1 3.326 1.505c.916.79 1.744 1.922 2.415 3.5zM8.199 22.569c.073.012.146.02.22.02.78.024 2.095.092 3.16.29.87.16 2.593.64 4.01 1.055 1.083.316 2.198-.548 2.355-1.664.114-.814.33-1.735.725-2.58l-.01.005c-.67-1.87-1.522-3.078-2.416-3.849a5.295 5.295 0 0 0-2.778-1.257c-1.54-.216-2.952.19-3.84.45.532 2.218.368 4.829-1.425 7.531zM5.533 9.938c-.023.1-.056.197-.098.29L2.82 16.059a1.602 1.602 0 0 0 .313 1.772l4.116 4.24c2.103-3.101 1.796-6.02.836-8.3-.728-1.73-1.832-3.081-2.55-3.831zM9.32 14.01c.615-.183 1.606-.465 2.745-.534-.683-1.725-.848-3.233-.716-4.577.154-1.552.7-2.847 1.235-3.95.113-.235.223-.454.328-.664.149-.297.288-.577.419-.86.217-.47.379-.885.46-1.27.08-.38.08-.72-.014-1.043-.095-.325-.297-.675-.68-1.06a1.6 1.6 0 0 0-1.475.36l-4.95 4.452a1.602 1.602 0 0 0-.513.952l-.427 2.83c.672.59 2.328 2.316 3.335 4.711.09.21.175.43.253.653z" />
+      </svg>
+    );
+  }
+
+  if (path) {
+    return <img src={path} alt="" className="w-3.5 h-3.5 flex-shrink-0 object-contain" />;
+  }
+
+  return (
+    <Plug
+      className="w-3.5 h-3.5 flex-shrink-0 text-muted-foreground/70 group-hover:text-foreground/70"
+      strokeWidth={1.5}
+      aria-hidden
+    />
   );
 }
 
@@ -264,24 +331,8 @@ export function SummaryCards({
       )}
 
       {/* ─── Dynamic AI suggestions ─────────────────────────────────────────── */}
-      <div className="w-full max-w-lg">
-        <div className="flex items-center gap-1.5 mb-1.5 px-1">
-          <div className="text-[10px] text-muted-foreground/60 uppercase tracking-wider font-medium font-mono">
-            based on your activity
-          </div>
-          {onRefreshSuggestions && (
-            <button
-              onClick={onRefreshSuggestions}
-              disabled={suggestionsRefreshing}
-              className="p-0.5 text-muted-foreground/30 hover:text-foreground transition-colors duration-150 disabled:opacity-30 cursor-pointer"
-              title="refresh suggestions"
-            >
-              <RefreshCw className={`w-3 h-3 ${suggestionsRefreshing ? 'animate-spin' : ''}`} strokeWidth={1.5} />
-            </button>
-          )}
-        </div>
-
-        {/* Grid scan skeleton while refreshing / suggestion cards */}
+      <div className="w-full max-w-md">
+        {/* Persistent suggestions */}
         <AnimatePresence mode="wait">
         {suggestionsRefreshing ? (
           <motion.div
@@ -295,15 +346,14 @@ export function SummaryCards({
           </motion.div>
         ) : (
           <motion.div
-            key="cards"
+            key="suggestions"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             transition={{ duration: 0.15 }}
-            className="grid grid-cols-3 gap-1.5"
+            className="overflow-hidden rounded-md border border-border/35 bg-muted/[0.08] shadow-sm divide-y divide-border/25"
           >
-              {autoSuggestions.slice(0, 6).map((s, i) => {
-                const isHero = (s.priority ?? 2) === 1 && i === 0;
+              {autoSuggestions.slice(0, 2).map((s, i) => {
                 return (
                   <motion.button
                     key={s.text}
@@ -312,27 +362,33 @@ export function SummaryCards({
                     transition={{ duration: 0.15, delay: i * 0.05 }}
                     type="button"
                     onClick={() => onSendMessage(s.text)}
-                    className={`group text-left p-2 font-mono bg-muted/20 hover:bg-foreground hover:text-background border hover:border-foreground text-muted-foreground transition-all duration-150 cursor-pointer ${
-                      isHero
-                        ? "border-border/40 bg-muted/30"
-                        : "border-border/20"
-                    }`}
+                    className="group flex min-h-[34px] w-full items-center gap-1.5 px-1.5 py-1.5 text-left font-mono text-muted-foreground transition-colors duration-150 hover:bg-muted/25 hover:text-foreground"
                     title={s.text}
                   >
-                    <div className={`text-[11px] leading-tight ${isHero ? "font-medium" : ""} line-clamp-2`}>
+                    <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+                      {s.connectionIcon && <ConnectionSuggestionIcon name={s.connectionIcon} />}
+                    </span>
+                    <span className="min-w-0 flex-1 text-xs leading-tight line-clamp-2">
                       {s.text}
-                    </div>
-                    {s.preview && (
-                      <div className="text-[10px] text-muted-foreground/50 group-hover:text-background/50 leading-tight mt-0.5 truncate">
-                        {s.preview}
-                      </div>
-                    )}
+                    </span>
                   </motion.button>
                 );
               })}
           </motion.div>
         )}
         </AnimatePresence>
+        {onRefreshSuggestions && (
+          <div className="mt-1.5 flex justify-center">
+            <button
+              onClick={onRefreshSuggestions}
+              disabled={suggestionsRefreshing}
+              className="rounded-full p-1 text-muted-foreground/35 transition-colors duration-150 hover:bg-muted/30 hover:text-foreground disabled:opacity-30 cursor-pointer"
+              title="refresh suggestions"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${suggestionsRefreshing ? 'animate-spin' : ''}`} strokeWidth={1.5} />
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Custom Summary Builder modal */}
