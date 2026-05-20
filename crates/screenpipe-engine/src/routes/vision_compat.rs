@@ -48,6 +48,8 @@ const FOCUSED_WINDOW_CAPTURE_TIMEOUT_REASON: &str = "capture_focused_window_time
 const FOCUSED_WINDOW_CAPTURE_TIMEOUT_MS: u64 = 1_250;
 const DEFAULT_ACTIVE_WINDOW_AX_TIMEOUT_MS: u64 = 1_500;
 const DEFAULT_ACTIVE_WINDOW_AX_MAX_NODES: u64 = 20_000;
+const RETRY_ACTIVE_WINDOW_AX_TIMEOUT_MS: u64 = 5_000;
+const RETRY_ACTIVE_WINDOW_AX_MAX_NODES: u64 = 50_000;
 const MIN_ACTIVE_WINDOW_AX_TIMEOUT_MS: u64 = 100;
 const MAX_ACTIVE_WINDOW_AX_TIMEOUT_MS: u64 = 5_000;
 const MIN_ACTIVE_WINDOW_AX_MAX_NODES: u64 = 500;
@@ -570,6 +572,13 @@ fn apply_active_window_walk_budget(
     config: &mut TreeWalkerConfig,
     req: &CaptureActiveWindowRequest,
 ) {
+    let (timeout_ms, max_nodes) = active_window_walk_budget_values(req);
+
+    config.walk_timeout_override = Some(std::time::Duration::from_millis(timeout_ms));
+    config.max_nodes_override = usize::try_from(max_nodes).ok();
+}
+
+fn active_window_walk_budget_values(req: &CaptureActiveWindowRequest) -> (u64, u64) {
     let timeout_ms = req
         .accessibility_timeout_ms
         .unwrap_or(DEFAULT_ACTIVE_WINDOW_AX_TIMEOUT_MS)
@@ -585,8 +594,36 @@ fn apply_active_window_walk_budget(
             MAX_ACTIVE_WINDOW_AX_MAX_NODES,
         );
 
-    config.walk_timeout_override = Some(std::time::Duration::from_millis(timeout_ms));
-    config.max_nodes_override = usize::try_from(max_nodes).ok();
+    (timeout_ms, max_nodes)
+}
+
+fn expand_active_window_walk_budget_for_retry(
+    config: &mut TreeWalkerConfig,
+    req: &CaptureActiveWindowRequest,
+) -> bool {
+    if req.accessibility_timeout_ms.is_some() || req.accessibility_max_nodes.is_some() {
+        return false;
+    }
+
+    let (timeout_ms, max_nodes) = active_window_walk_budget_values(req);
+    let retry_timeout_ms = RETRY_ACTIVE_WINDOW_AX_TIMEOUT_MS.clamp(
+        MIN_ACTIVE_WINDOW_AX_TIMEOUT_MS,
+        MAX_ACTIVE_WINDOW_AX_TIMEOUT_MS,
+    );
+    let retry_max_nodes = RETRY_ACTIVE_WINDOW_AX_MAX_NODES.clamp(
+        MIN_ACTIVE_WINDOW_AX_MAX_NODES,
+        MAX_ACTIVE_WINDOW_AX_MAX_NODES,
+    );
+
+    if timeout_ms >= retry_timeout_ms && max_nodes >= retry_max_nodes {
+        return false;
+    }
+
+    config.walk_timeout_override = Some(std::time::Duration::from_millis(
+        timeout_ms.max(retry_timeout_ms),
+    ));
+    config.max_nodes_override = usize::try_from(max_nodes.max(retry_max_nodes)).ok();
+    true
 }
 
 fn parse_focused_accessibility(raw: Option<String>) -> Option<FocusedAccessibilityResponse> {
@@ -865,18 +902,9 @@ async fn capture_active_window_accessibility_only(
     req: &CaptureActiveWindowRequest,
     tree_walker_config: TreeWalkerConfig,
 ) -> Result<JsonResponse<ActiveWindowCaptureResponse>, (StatusCode, JsonResponse<Value>)> {
-    let config = tree_walker_config.clone();
-    let tree_walk_result = tokio::task::spawn_blocking(move || walk_accessibility_tree(&config))
+    let tree_walk_result = walk_active_window_accessibility_tree(tree_walker_config.clone())
         .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                JsonResponse(json!({
-                    "error": "active_window_capture_failed",
-                    "message": error.to_string(),
-                })),
-            )
-        })?;
+        .map_err(active_window_tree_walk_error)?;
 
     let tree_snapshot = match tree_walk_result {
         TreeWalkResult::Found(snapshot) => snapshot,
@@ -890,6 +918,10 @@ async fn capture_active_window_accessibility_only(
             ));
         }
     };
+    let tree_snapshot =
+        retry_truncated_tree_snapshot_if_better(req, &tree_walker_config, tree_snapshot)
+            .await
+            .map_err(active_window_tree_walk_error)?;
 
     Ok(active_window_response_from_tree_snapshot(
         req,
@@ -898,6 +930,101 @@ async fn capture_active_window_accessibility_only(
         tree_snapshot,
     )
     .await)
+}
+
+async fn walk_active_window_accessibility_tree(
+    config: TreeWalkerConfig,
+) -> Result<TreeWalkResult, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || walk_accessibility_tree(&config)).await
+}
+
+async fn retry_truncated_tree_snapshot_if_better(
+    req: &CaptureActiveWindowRequest,
+    tree_walker_config: &TreeWalkerConfig,
+    snapshot: TreeSnapshot,
+) -> Result<TreeSnapshot, tokio::task::JoinError> {
+    if !snapshot.truncated {
+        return Ok(snapshot);
+    }
+
+    let mut retry_config = tree_walker_config.clone();
+    if !expand_active_window_walk_budget_for_retry(&mut retry_config, req) {
+        return Ok(snapshot);
+    }
+
+    debug!(
+        "active-window accessibility walk truncated ({:?}, nodes={}, text_len={}); retrying with larger budget",
+        snapshot.truncation_reason,
+        snapshot.node_count,
+        snapshot.text_content.len()
+    );
+
+    let retry_result = walk_active_window_accessibility_tree(retry_config).await?;
+    let TreeWalkResult::Found(retry_snapshot) = retry_result else {
+        return Ok(snapshot);
+    };
+
+    if retry_snapshot_is_better(&snapshot, &retry_snapshot) {
+        Ok(retry_snapshot)
+    } else {
+        Ok(snapshot)
+    }
+}
+
+fn retry_snapshot_is_better(current: &TreeSnapshot, retry: &TreeSnapshot) -> bool {
+    retry_snapshot_identity_matches(current, retry)
+        && (retry.node_count > current.node_count
+            || retry.text_content.len() > current.text_content.len()
+            || (!retry.truncated && current.truncated))
+}
+
+fn retry_snapshot_identity_matches(current: &TreeSnapshot, retry: &TreeSnapshot) -> bool {
+    if current.process_id != retry.process_id {
+        return false;
+    }
+    if current.window_id.is_some()
+        && retry.window_id.is_some()
+        && current.window_id != retry.window_id
+    {
+        return false;
+    }
+    if !stable_identity_text_matches(&current.app_name, &retry.app_name) {
+        return false;
+    }
+    if !stable_identity_text_matches(&current.window_name, &retry.window_name) {
+        return false;
+    }
+    if current.browser_url.is_some()
+        && retry.browser_url.is_some()
+        && current.browser_url != retry.browser_url
+    {
+        return false;
+    }
+    if current.document_path.is_some()
+        && retry.document_path.is_some()
+        && current.document_path != retry.document_path
+    {
+        return false;
+    }
+    true
+}
+
+fn stable_identity_text_matches(left: &str, right: &str) -> bool {
+    let left = left.trim();
+    let right = right.trim();
+    left.is_empty() || right.is_empty() || left.eq_ignore_ascii_case(right)
+}
+
+fn active_window_tree_walk_error(
+    error: tokio::task::JoinError,
+) -> (StatusCode, JsonResponse<Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        JsonResponse(json!({
+            "error": "active_window_capture_failed",
+            "message": error.to_string(),
+        })),
+    )
 }
 
 #[oasgen]
@@ -955,12 +1082,20 @@ pub(crate) async fn capture_active_window(
                 ..
             } = resolved.captured_window;
 
-            let browser_url = browser_url.or_else(|| resolved.tree_snapshot.browser_url.clone());
+            let tree_snapshot = retry_truncated_tree_snapshot_if_better(
+                &req,
+                &tree_walker_config,
+                resolved.tree_snapshot,
+            )
+            .await
+            .map_err(active_window_tree_walk_error)?;
+
+            let browser_url = browser_url.or_else(|| tree_snapshot.browser_url.clone());
 
             (
                 image,
                 resolved.monitor_id,
-                Some(resolved.tree_snapshot),
+                Some(tree_snapshot),
                 Some(app_name),
                 Some(window_name),
                 browser_url,
@@ -985,6 +1120,13 @@ pub(crate) async fn capture_active_window(
 
             if reason == FOCUSED_WINDOW_CAPTURE_TIMEOUT_REASON {
                 if let Some(tree_snapshot) = tree_snapshot.clone() {
+                    let tree_snapshot = retry_truncated_tree_snapshot_if_better(
+                        &req,
+                        &tree_walker_config,
+                        tree_snapshot,
+                    )
+                    .await
+                    .map_err(active_window_tree_walk_error)?;
                     return Ok(active_window_response_from_tree_snapshot(
                         &req,
                         state.enable_main_body_distillation,
@@ -1035,6 +1177,13 @@ pub(crate) async fn capture_active_window(
                         debug!(
                             "active-window strict=false returning accessibility-only fallback (reason={reason})"
                         );
+                        let tree_snapshot = retry_truncated_tree_snapshot_if_better(
+                            &req,
+                            &tree_walker_config,
+                            tree_snapshot,
+                        )
+                        .await
+                        .map_err(active_window_tree_walk_error)?;
                         return Ok(active_window_response_from_tree_snapshot(
                             &req,
                             state.enable_main_body_distillation,
@@ -1417,7 +1566,7 @@ mod tests {
     fn focused_accessibility_response_includes_bounds() {
         let response = focused_accessibility_response(Some(FocusedElementContext {
             role: "AXTextArea".to_string(),
-            name: Some("Message Example User".to_string()),
+            name: Some("Message Input".to_string()),
             input_text: Some("Draft text".to_string()),
             selected_text: None,
             bounds: Some(NodeBounds {
@@ -1477,6 +1626,117 @@ mod tests {
             config.max_nodes_override,
             Some(MAX_ACTIVE_WINDOW_AX_MAX_NODES as usize)
         );
+    }
+
+    #[test]
+    fn active_window_retry_budget_expands_truncated_default_walks() {
+        let mut config = TreeWalkerConfig::default();
+        let req = CaptureActiveWindowRequest {
+            strict: false,
+            include_ocr: false,
+            include_structured_messages: true,
+            structured_timeout_ms: 250,
+            identity_overrides: vec![],
+            accessibility_timeout_ms: None,
+            accessibility_max_nodes: None,
+        };
+
+        assert!(expand_active_window_walk_budget_for_retry(
+            &mut config,
+            &req
+        ));
+        assert_eq!(
+            config.walk_timeout_override.unwrap().as_millis(),
+            u128::from(RETRY_ACTIVE_WINDOW_AX_TIMEOUT_MS)
+        );
+        assert_eq!(
+            config.max_nodes_override,
+            Some(RETRY_ACTIVE_WINDOW_AX_MAX_NODES as usize)
+        );
+
+        let mut config = TreeWalkerConfig::default();
+        let req = CaptureActiveWindowRequest {
+            accessibility_timeout_ms: Some(RETRY_ACTIVE_WINDOW_AX_TIMEOUT_MS),
+            accessibility_max_nodes: Some(RETRY_ACTIVE_WINDOW_AX_MAX_NODES),
+            ..req
+        };
+
+        assert!(!expand_active_window_walk_budget_for_retry(
+            &mut config,
+            &req
+        ));
+        assert_eq!(config.walk_timeout_override, None);
+        assert_eq!(config.max_nodes_override, None);
+    }
+
+    #[test]
+    fn active_window_retry_budget_preserves_explicit_low_budgets() {
+        let mut config = TreeWalkerConfig::default();
+        let req = CaptureActiveWindowRequest {
+            strict: false,
+            include_ocr: false,
+            include_structured_messages: true,
+            structured_timeout_ms: 250,
+            identity_overrides: vec![],
+            accessibility_timeout_ms: Some(MIN_ACTIVE_WINDOW_AX_TIMEOUT_MS),
+            accessibility_max_nodes: Some(MIN_ACTIVE_WINDOW_AX_MAX_NODES),
+        };
+
+        assert!(!expand_active_window_walk_budget_for_retry(
+            &mut config,
+            &req
+        ));
+        assert_eq!(config.walk_timeout_override, None);
+        assert_eq!(config.max_nodes_override, None);
+    }
+
+    #[test]
+    fn retry_snapshot_selection_prefers_deeper_non_truncated_walks() {
+        let raw_text = "Sidebar only";
+        let current = TreeSnapshot {
+            app_name: "Arc".to_string(),
+            window_name: "Gmail".to_string(),
+            window_id: Some(7),
+            process_id: Some(42),
+            window_bounds: None,
+            text_content: raw_text.to_string(),
+            nodes: Vec::new(),
+            focused_element: None,
+            browser_url: Some("https://mail.google.com/mail/u/0/#inbox/example".to_string()),
+            document_path: None,
+            timestamp: Utc::now(),
+            node_count: 400,
+            walk_duration: std::time::Duration::from_millis(1_500),
+            content_hash: TreeSnapshot::compute_hash(raw_text),
+            simhash: TreeSnapshot::compute_simhash(raw_text),
+            truncated: true,
+            truncation_reason: screenpipe_a11y::tree::TruncationReason::Timeout,
+            max_depth_reached: 8,
+        };
+        let retry_text = "Sidebar only\nMessage body reached after retry";
+        let retry = TreeSnapshot {
+            text_content: retry_text.to_string(),
+            node_count: 2_000,
+            walk_duration: std::time::Duration::from_millis(2_200),
+            content_hash: TreeSnapshot::compute_hash(retry_text),
+            simhash: TreeSnapshot::compute_simhash(retry_text),
+            truncated: false,
+            truncation_reason: screenpipe_a11y::tree::TruncationReason::None,
+            max_depth_reached: 18,
+            ..current.clone()
+        };
+
+        assert!(retry_snapshot_is_better(&current, &retry));
+        assert!(!retry_snapshot_is_better(&retry, &current));
+
+        let mut different_window = retry.clone();
+        different_window.window_id = Some(99);
+        assert!(!retry_snapshot_is_better(&current, &different_window));
+
+        let mut different_app = retry.clone();
+        different_app.process_id = Some(99);
+        different_app.app_name = "Mail".to_string();
+        assert!(!retry_snapshot_is_better(&current, &different_app));
     }
 
     #[tokio::test]
@@ -1547,6 +1807,203 @@ mod tests {
         assert!(!main_body.contains("Hide sidebar"));
         assert!(!main_body.contains("Share"));
         assert!(response.main_body_meta.is_some());
+    }
+
+    #[tokio::test]
+    async fn accessibility_only_response_filters_browser_sidebar_when_distillation_disabled() {
+        let raw_text = "Hide sidebar\nGo back\nResearch Folder\nExample Article: Build, Lead, or Learn\nThis paragraph describes the main article content after the page header.";
+        let nodes = vec![
+            AccessibilityTreeNode::new(
+                "AXButton".to_string(),
+                "Hide sidebar".to_string(),
+                2,
+                Some(NodeBounds {
+                    left: 0.01,
+                    top: 0.02,
+                    width: 0.10,
+                    height: 0.03,
+                }),
+            ),
+            AccessibilityTreeNode::new(
+                "AXButton".to_string(),
+                "Go back".to_string(),
+                2,
+                Some(NodeBounds {
+                    left: 0.12,
+                    top: 0.02,
+                    width: 0.08,
+                    height: 0.03,
+                }),
+            ),
+            AccessibilityTreeNode::new(
+                "AXStaticText".to_string(),
+                "Research Folder".to_string(),
+                2,
+                Some(NodeBounds {
+                    left: 0.03,
+                    top: 0.30,
+                    width: 0.15,
+                    height: 0.03,
+                }),
+            ),
+            AccessibilityTreeNode::new(
+                "AXHeading".to_string(),
+                "Example Article: Build, Lead, or Learn".to_string(),
+                3,
+                Some(NodeBounds {
+                    left: 0.31,
+                    top: 0.20,
+                    width: 0.48,
+                    height: 0.05,
+                }),
+            ),
+            AccessibilityTreeNode::new(
+                "AXStaticText".to_string(),
+                "This paragraph describes the main article content after the page header."
+                    .to_string(),
+                3,
+                Some(NodeBounds {
+                    left: 0.31,
+                    top: 0.31,
+                    width: 0.54,
+                    height: 0.08,
+                }),
+            ),
+        ];
+        let snapshot = TreeSnapshot {
+            app_name: "Arc".to_string(),
+            window_name: "Example Article: Build, Lead, or Learn".to_string(),
+            window_id: Some(7),
+            process_id: Some(42),
+            window_bounds: None,
+            text_content: raw_text.to_string(),
+            nodes,
+            focused_element: None,
+            browser_url: Some("https://example.test/articles/build-lead-learn".to_string()),
+            document_path: None,
+            timestamp: Utc::now(),
+            node_count: 5,
+            walk_duration: std::time::Duration::from_millis(50),
+            content_hash: TreeSnapshot::compute_hash(raw_text),
+            simhash: TreeSnapshot::compute_simhash(raw_text),
+            truncated: false,
+            truncation_reason: screenpipe_a11y::tree::TruncationReason::None,
+            max_depth_reached: 3,
+        };
+        let req = CaptureActiveWindowRequest {
+            strict: false,
+            include_ocr: false,
+            include_structured_messages: true,
+            structured_timeout_ms: 250,
+            identity_overrides: vec![],
+            accessibility_timeout_ms: None,
+            accessibility_max_nodes: None,
+        };
+
+        let JsonResponse(response) =
+            active_window_response_from_tree_snapshot(&req, false, 0.60, snapshot).await;
+        let main_body = response.main_body_text.unwrap_or_default();
+
+        assert!(main_body.contains("Example Article"));
+        assert!(main_body.contains("main article content"));
+        assert!(!main_body.contains("Hide sidebar"));
+        assert!(!main_body.contains("Go back"));
+        assert!(!main_body.contains("Research Folder"));
+        assert!(response.main_body_meta.is_some());
+    }
+
+    #[tokio::test]
+    async fn accessibility_only_response_prefers_notes_focused_editor_value() {
+        let raw_text = "Quick Notes, 4 notes\nAll iCloud, 1,219 notes\nArticles\nTasks:";
+        let nodes = vec![
+            AccessibilityTreeNode::new(
+                "AXStaticText".to_string(),
+                "Quick Notes, 4 notes".to_string(),
+                2,
+                Some(NodeBounds {
+                    left: 0.02,
+                    top: 0.10,
+                    width: 0.16,
+                    height: 0.03,
+                }),
+            ),
+            AccessibilityTreeNode::new(
+                "AXStaticText".to_string(),
+                "Articles".to_string(),
+                2,
+                Some(NodeBounds {
+                    left: 0.03,
+                    top: 0.26,
+                    width: 0.12,
+                    height: 0.03,
+                }),
+            ),
+            AccessibilityTreeNode::new(
+                "AXStaticText".to_string(),
+                "Tasks:".to_string(),
+                4,
+                Some(NodeBounds {
+                    left: 0.22,
+                    top: 0.48,
+                    width: 0.10,
+                    height: 0.03,
+                }),
+            ),
+        ];
+        let focused = FocusedElementContext {
+            role: "AXTextArea".to_string(),
+            name: None,
+            input_text: Some(
+                "Tasks:\n     - Review onboarding copy\n     - Draft launch follow-up".to_string(),
+            ),
+            selected_text: None,
+            bounds: Some(NodeBounds {
+                left: 0.36,
+                top: 0.08,
+                width: 0.62,
+                height: 0.90,
+            }),
+        };
+        let snapshot = TreeSnapshot {
+            app_name: "Notes".to_string(),
+            window_name: "All iCloud - 1,219 notes".to_string(),
+            window_id: Some(8),
+            process_id: Some(43),
+            window_bounds: None,
+            text_content: raw_text.to_string(),
+            nodes,
+            focused_element: Some(focused),
+            browser_url: None,
+            document_path: None,
+            timestamp: Utc::now(),
+            node_count: 3,
+            walk_duration: std::time::Duration::from_millis(50),
+            content_hash: TreeSnapshot::compute_hash(raw_text),
+            simhash: TreeSnapshot::compute_simhash(raw_text),
+            truncated: false,
+            truncation_reason: screenpipe_a11y::tree::TruncationReason::None,
+            max_depth_reached: 4,
+        };
+        let req = CaptureActiveWindowRequest {
+            strict: false,
+            include_ocr: false,
+            include_structured_messages: true,
+            structured_timeout_ms: 250,
+            identity_overrides: vec![],
+            accessibility_timeout_ms: None,
+            accessibility_max_nodes: None,
+        };
+
+        let JsonResponse(response) =
+            active_window_response_from_tree_snapshot(&req, false, 0.60, snapshot).await;
+        let main_body = response.main_body_text.unwrap_or_default();
+
+        assert_eq!(
+            main_body,
+            "Tasks:\n- Review onboarding copy\n- Draft launch follow-up"
+        );
+        assert!(!main_body.contains("Quick Notes"));
+        assert!(!main_body.contains("Articles"));
     }
 
     #[test]

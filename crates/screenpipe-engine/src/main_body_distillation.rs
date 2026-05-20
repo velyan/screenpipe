@@ -23,8 +23,13 @@ const MIN_HORIZONTAL_OVERLAP: f32 = 0.18;
 const MIN_TEXT_ONLY_MATCH_SCORE: f32 = 0.72;
 const MIN_OCR_CONFIDENCE_FOR_FALLBACK: f32 = 0.80;
 const BROWSER_TOP_CHROME_CUTOFF: f32 = 0.09;
+const BROWSER_LEFT_RAIL_RIGHT_CUTOFF: f32 = 0.34;
+const BROWSER_LEFT_RAIL_MAX_WIDTH: f32 = 0.28;
+const BROWSER_MIN_LEFT_RAIL_LINES: usize = 4;
 const BROWSER_PRIMARY_BAND_HALF_WIDTH: f32 = 0.24;
 const BROWSER_MIN_PRIMARY_SCORE: f32 = 18.0;
+const MAIL_CONTENT_MIN_SCORE: f32 = 28.0;
+const MAIL_CONTENT_MIN_LINES: usize = 1;
 
 #[derive(Debug, Clone)]
 pub struct DistillationConfig {
@@ -114,9 +119,6 @@ pub async fn distill_main_body_text(
     if raw_text.is_empty() {
         return fallback_result("", "no_text", Vec::new(), 0.0, None);
     }
-    if !config.enabled {
-        return fallback_result(raw_text, "disabled", Vec::new(), 1.0, None);
-    }
 
     // Deterministic prefilter: keep likely visible primary content before model call.
     let heuristic = heuristic_main_body(&input);
@@ -125,6 +127,16 @@ pub async fn distill_main_body_text(
     } else {
         heuristic.main_body_text.as_str()
     };
+
+    if !config.enabled {
+        return heuristic_fallback_result(
+            prefiltered_text,
+            "disabled",
+            heuristic.excluded_ui_text,
+            1.0,
+            None,
+        );
+    }
 
     let cache_key = build_cache_key(prefiltered_text, input.content_hash);
 
@@ -290,6 +302,20 @@ fn normalize_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn normalize_multiline_text(text: &str) -> Option<String> {
+    let lines = text
+        .lines()
+        .map(normalize_line)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
+}
+
 fn normalize_for_match(text: &str) -> String {
     text.chars()
         .map(|c| {
@@ -326,6 +352,13 @@ struct OutputLine {
     top: f32,
     left: f32,
     order: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentPaneSurface {
+    BrowserGmail,
+    AppleMail,
+    AppleNotes,
 }
 
 fn parse_json_f32(value: &serde_json::Value) -> Option<f32> {
@@ -444,6 +477,122 @@ fn is_browser_shell_context(input: &DistillationInput<'_>) -> bool {
     })
 }
 
+fn normalized_ascii_tokens(value: &str) -> String {
+    value
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect::<String>()
+}
+
+fn normalized_nonempty_tokens(value: &str) -> String {
+    normalized_ascii_tokens(value)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn content_pane_surface(input: &DistillationInput<'_>) -> Option<ContentPaneSurface> {
+    let browser_url = input.browser_url.unwrap_or("").to_lowercase();
+    if browser_url.contains("mail.google.com")
+        || browser_url.contains("gmail.com")
+        || looks_like_browser_gmail_context(input)
+    {
+        return Some(ContentPaneSurface::BrowserGmail);
+    }
+
+    let app_name = normalized_ascii_tokens(input.app_name.unwrap_or(""));
+    let app_tokens: Vec<&str> = app_name.split_whitespace().collect();
+    if app_tokens.iter().any(|token| *token == "notes") {
+        return Some(ContentPaneSurface::AppleNotes);
+    }
+    if app_tokens.iter().any(|token| *token == "mail") {
+        return Some(ContentPaneSurface::AppleMail);
+    }
+
+    None
+}
+
+fn looks_like_browser_gmail_context(input: &DistillationInput<'_>) -> bool {
+    if !is_browser_shell_context(input) {
+        return false;
+    }
+
+    let window = input.window_name.unwrap_or("").to_lowercase();
+    if window.contains("gmail") || window.contains("google mail") {
+        return true;
+    }
+
+    let raw = input.raw_text.to_lowercase();
+    raw.contains("search mail")
+        && raw.contains("compose")
+        && (raw.contains("inbox") || raw.contains("starred") || raw.contains("all mail"))
+}
+
+fn looks_like_apple_mail_navigation_line(line: &str) -> bool {
+    matches!(
+        normalize_for_match(line).as_str(),
+        "favourites"
+            | "favorites"
+            | "vips"
+            | "flagged"
+            | "drafts"
+            | "sent"
+            | "junk"
+            | "bin"
+            | "trash"
+            | "archive"
+            | "smart mailboxes"
+            | "exchange"
+            | "all mail"
+    )
+}
+
+fn focused_text_entry_text(focused_element: Option<&FocusedElementContext>) -> Option<String> {
+    let focused = focused_element?;
+    if focused.role.as_str() != "AXTextArea" {
+        return None;
+    }
+
+    focused
+        .selected_text
+        .as_deref()
+        .and_then(normalize_multiline_text)
+        .or_else(|| {
+            focused
+                .input_text
+                .as_deref()
+                .and_then(normalize_multiline_text)
+        })
+}
+
+fn content_surface_focus_band(
+    surface: ContentPaneSurface,
+    focused_element: Option<&FocusedElementContext>,
+) -> Option<(f32, f32)> {
+    if surface != ContentPaneSurface::AppleMail {
+        return None;
+    }
+
+    let focused = focused_element?;
+    if focused.role.as_str() != "AXWebArea" {
+        return None;
+    }
+
+    let bounds = focused.bounds.as_ref()?;
+    if !bounds_look_like_content_pane(surface, bounds) || bounds.width < 0.25 {
+        return None;
+    }
+
+    Some((
+        bounds
+            .left
+            .max(content_pane_left_threshold(surface))
+            .clamp(0.0, 1.0),
+        bounds_right(bounds).clamp(0.0, 1.0),
+    ))
+}
+
 fn ocr_line_center_x(line: &OcrLine) -> f32 {
     line.bounds.left + line.bounds.width * 0.5
 }
@@ -550,17 +699,344 @@ fn infer_browser_primary_band_from_ax_candidates(candidates: &[AxCandidate]) -> 
     ))
 }
 
-fn line_overlaps_band(bounds: &screenpipe_a11y::tree::NodeBounds, band: (f32, f32)) -> bool {
-    let left = bounds.left;
-    let right = bounds.left + bounds.width;
-    right >= band.0 && left <= band.1
+fn line_strongly_overlaps_band(
+    bounds: &screenpipe_a11y::tree::NodeBounds,
+    band: (f32, f32),
+) -> bool {
+    axis_overlap_ratio(bounds.left, bounds.left + bounds.width, band.0, band.1) >= 0.70
+}
+
+fn bounds_right(bounds: &screenpipe_a11y::tree::NodeBounds) -> f32 {
+    bounds.left + bounds.width
+}
+
+fn bounds_look_like_browser_left_rail(bounds: &screenpipe_a11y::tree::NodeBounds) -> bool {
+    bounds.left < 0.24
+        && bounds_right(bounds) <= BROWSER_LEFT_RAIL_RIGHT_CUTOFF
+        && bounds.width <= BROWSER_LEFT_RAIL_MAX_WIDTH
+}
+
+fn bounds_look_like_browser_primary_content(bounds: &screenpipe_a11y::tree::NodeBounds) -> bool {
+    bounds.left >= 0.18 && bounds.width >= 0.20 && bounds_right(bounds) >= 0.45
+}
+
+fn content_pane_left_threshold(surface: ContentPaneSurface) -> f32 {
+    match surface {
+        ContentPaneSurface::BrowserGmail => 0.36,
+        ContentPaneSurface::AppleMail => 0.36,
+        ContentPaneSurface::AppleNotes => 0.36,
+    }
+}
+
+fn bounds_look_like_content_pane(
+    surface: ContentPaneSurface,
+    bounds: &screenpipe_a11y::tree::NodeBounds,
+) -> bool {
+    let right = bounds_right(bounds);
+    if right <= content_pane_left_threshold(surface) {
+        return false;
+    }
+
+    let center = bounds.left + bounds.width * 0.5;
+    match surface {
+        ContentPaneSurface::BrowserGmail => {
+            bounds.left >= 0.34 || (center >= 0.48 && right >= 0.56)
+        }
+        ContentPaneSurface::AppleMail => bounds.left >= 0.34 || (center >= 0.48 && right >= 0.56),
+        ContentPaneSurface::AppleNotes => right >= 0.42 && (bounds.width >= 0.22 || center >= 0.38),
+    }
+}
+
+fn candidate_looks_like_content_pane(surface: ContentPaneSurface, candidate: &AxCandidate) -> bool {
+    if surface == ContentPaneSurface::AppleNotes
+        && matches!(candidate.role.as_str(), "AXTextArea" | "AXTextField")
+        && normalize_for_match(&candidate.line).len() >= 3
+    {
+        return true;
+    }
+
+    candidate
+        .bounds
+        .as_ref()
+        .map(|bounds| bounds_look_like_content_pane(surface, bounds))
+        .unwrap_or(false)
+}
+
+fn content_pane_candidate_score(surface: ContentPaneSurface, candidate: &AxCandidate) -> f32 {
+    if candidate.bounds.is_some() {
+        return ax_primary_candidate_score(candidate);
+    }
+
+    if surface == ContentPaneSurface::AppleNotes
+        && matches!(candidate.role.as_str(), "AXTextArea" | "AXTextField")
+    {
+        return normalize_for_match(&candidate.line).len().min(220) as f32;
+    }
+
+    0.0
+}
+
+fn content_pane_ocr_is_present(surface: ContentPaneSurface, lines: &[OcrLine]) -> bool {
+    let content_count = lines
+        .iter()
+        .filter(|line| bounds_look_like_content_pane(surface, &line.bounds))
+        .count();
+
+    if content_count < MAIL_CONTENT_MIN_LINES {
+        return false;
+    }
+
+    let content_score = lines
+        .iter()
+        .filter(|line| bounds_look_like_content_pane(surface, &line.bounds))
+        .map(ocr_primary_line_score)
+        .sum::<f32>();
+
+    content_score >= MAIL_CONTENT_MIN_SCORE
+}
+
+fn filter_content_pane_ocr_lines(
+    surface: ContentPaneSurface,
+    lines: Vec<OcrLine>,
+    excluded: &mut Vec<String>,
+) -> Vec<OcrLine> {
+    if !content_pane_ocr_is_present(surface, &lines) {
+        return lines;
+    }
+
+    lines
+        .into_iter()
+        .filter(|line| {
+            if bounds_look_like_content_pane(surface, &line.bounds) {
+                return true;
+            }
+            push_excluded(excluded, &line.text);
+            false
+        })
+        .collect()
+}
+
+fn content_pane_ax_is_present(surface: ContentPaneSurface, candidates: &[AxCandidate]) -> bool {
+    let content_count = candidates
+        .iter()
+        .filter(|candidate| candidate_looks_like_content_pane(surface, candidate))
+        .count();
+
+    if content_count < MAIL_CONTENT_MIN_LINES {
+        return false;
+    }
+
+    let content_score = candidates
+        .iter()
+        .filter(|candidate| candidate_looks_like_content_pane(surface, candidate))
+        .map(|candidate| content_pane_candidate_score(surface, candidate))
+        .sum::<f32>();
+
+    content_score >= MAIL_CONTENT_MIN_SCORE
+}
+
+fn filter_content_pane_ax_candidates(
+    surface: ContentPaneSurface,
+    candidates: Vec<AxCandidate>,
+    excluded: &mut Vec<String>,
+) -> Vec<AxCandidate> {
+    if !content_pane_ax_is_present(surface, &candidates) {
+        return candidates;
+    }
+
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            if candidate_looks_like_content_pane(surface, candidate) {
+                return true;
+            }
+            push_excluded(excluded, &candidate.line);
+            false
+        })
+        .collect()
+}
+
+fn ocr_left_rail_is_present(lines: &[OcrLine]) -> bool {
+    let left_rail_count = lines
+        .iter()
+        .filter(|line| bounds_look_like_browser_left_rail(&line.bounds))
+        .count();
+
+    if left_rail_count < BROWSER_MIN_LEFT_RAIL_LINES {
+        return false;
+    }
+
+    let right_content_score = lines
+        .iter()
+        .filter(|line| bounds_look_like_browser_primary_content(&line.bounds))
+        .map(ocr_primary_line_score)
+        .sum::<f32>();
+
+    right_content_score >= BROWSER_MIN_PRIMARY_SCORE
+}
+
+fn filter_browser_left_rail_ocr_lines(
+    lines: Vec<OcrLine>,
+    excluded: &mut Vec<String>,
+) -> Vec<OcrLine> {
+    if !ocr_left_rail_is_present(&lines) {
+        return lines;
+    }
+
+    lines
+        .into_iter()
+        .filter(|line| {
+            if bounds_look_like_browser_left_rail(&line.bounds) {
+                push_excluded(excluded, &line.text);
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
+fn ax_left_rail_is_present(candidates: &[AxCandidate]) -> bool {
+    let left_rail_count = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .bounds
+                .as_ref()
+                .map(bounds_look_like_browser_left_rail)
+                .unwrap_or(false)
+        })
+        .count();
+
+    if left_rail_count < BROWSER_MIN_LEFT_RAIL_LINES {
+        return false;
+    }
+
+    let right_content_score = candidates
+        .iter()
+        .filter(|candidate| {
+            candidate
+                .bounds
+                .as_ref()
+                .map(bounds_look_like_browser_primary_content)
+                .unwrap_or(false)
+        })
+        .map(ax_primary_candidate_score)
+        .sum::<f32>();
+
+    right_content_score >= BROWSER_MIN_PRIMARY_SCORE
+}
+
+fn filter_browser_left_rail_ax_candidates(
+    candidates: Vec<AxCandidate>,
+    excluded: &mut Vec<String>,
+) -> Vec<AxCandidate> {
+    if !ax_left_rail_is_present(&candidates) {
+        return candidates;
+    }
+
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            if candidate
+                .bounds
+                .as_ref()
+                .map(bounds_look_like_browser_left_rail)
+                .unwrap_or(false)
+            {
+                push_excluded(excluded, &candidate.line);
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
+fn title_fragments(window_name: Option<&str>) -> Vec<String> {
+    let Some(window_name) = window_name else {
+        return Vec::new();
+    };
+
+    let mut fragments = Vec::new();
+    for part in window_name.split(['|', '—', '–']) {
+        let normalized = normalized_nonempty_tokens(part);
+        if normalized.len() >= 8 && !fragments.contains(&normalized) {
+            fragments.push(normalized);
+        }
+    }
+
+    let normalized = normalized_nonempty_tokens(window_name);
+    if normalized.len() >= 8 && !fragments.contains(&normalized) {
+        fragments.push(normalized);
+    }
+
+    fragments.sort_by_key(|fragment| std::cmp::Reverse(fragment.len()));
+    fragments
+}
+
+fn candidate_matches_title(candidate: &AxCandidate, title_fragments: &[String]) -> bool {
+    let normalized = normalized_nonempty_tokens(&candidate.line);
+    if normalized.len() < 8 {
+        return false;
+    }
+
+    title_fragments.iter().any(|title| {
+        normalized == *title
+            || normalized.contains(title)
+            || (title.contains(&normalized) && normalized.len() >= 12)
+    })
+}
+
+fn candidate_is_primary_title_marker(candidate: &AxCandidate) -> bool {
+    if candidate.role == "AXHeading" {
+        return true;
+    }
+
+    candidate
+        .bounds
+        .as_ref()
+        .map(bounds_look_like_browser_primary_content)
+        .unwrap_or(false)
+}
+
+fn filter_browser_before_title_ax_candidates(
+    input: &DistillationInput<'_>,
+    candidates: Vec<AxCandidate>,
+    excluded: &mut Vec<String>,
+) -> Vec<AxCandidate> {
+    let fragments = title_fragments(input.window_name);
+    if fragments.is_empty() {
+        return candidates;
+    }
+
+    let Some(marker_idx) = candidates.iter().position(|candidate| {
+        candidate_matches_title(candidate, &fragments)
+            && candidate_is_primary_title_marker(candidate)
+    }) else {
+        return candidates;
+    };
+
+    if marker_idx == 0 {
+        return candidates;
+    }
+
+    candidates
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, candidate)| {
+            if idx >= marker_idx {
+                return Some(candidate);
+            }
+            push_excluded(excluded, &candidate.line);
+            None
+        })
+        .collect()
 }
 
 fn ax_candidate_overlaps_band(candidate: &AxCandidate, band: (f32, f32)) -> bool {
     candidate
         .bounds
         .as_ref()
-        .map(|bounds| line_overlaps_band(bounds, band))
+        .map(|bounds| line_strongly_overlaps_band(bounds, band))
         .unwrap_or(true)
 }
 
@@ -581,13 +1057,15 @@ fn filter_browser_shell_ocr_lines(
         prefiltered.push(line);
     }
 
+    let prefiltered = filter_browser_left_rail_ocr_lines(prefiltered, excluded);
+
     let Some(primary_band) = infer_browser_primary_band(&prefiltered) else {
         return prefiltered;
     };
 
     prefiltered
         .into_iter()
-        .filter(|line| line_overlaps_band(&line.bounds, primary_band))
+        .filter(|line| line_strongly_overlaps_band(&line.bounds, primary_band))
         .collect()
 }
 
@@ -859,7 +1337,20 @@ fn heuristic_main_body(input: &DistillationInput<'_>) -> HeuristicMainBody {
     let mut excluded = Vec::new();
     let mut seen = HashSet::new();
     let browser_shell = is_browser_shell_context(input);
-    let focus_band = if browser_shell {
+    let content_surface = content_pane_surface(input);
+
+    if content_surface == Some(ContentPaneSurface::AppleNotes) {
+        if let Some(editor_text) = focused_text_entry_text(input.focused_element) {
+            return HeuristicMainBody {
+                main_body_text: editor_text,
+                excluded_ui_text: excluded,
+            };
+        }
+    }
+
+    let focus_band = if let Some(surface) = content_surface {
+        content_surface_focus_band(surface, input.focused_element)
+    } else if browser_shell {
         None
     } else {
         focus_band_from_element(input.focused_element)
@@ -879,6 +1370,9 @@ fn heuristic_main_body(input: &DistillationInput<'_>) -> HeuristicMainBody {
             }
             true
         });
+    }
+    if let Some(surface) = content_surface {
+        ocr_lines = filter_content_pane_ocr_lines(surface, ocr_lines, &mut excluded);
     }
     ocr_lines
         .sort_by(|a, b| visual_order(a.bounds.left, a.bounds.top, b.bounds.left, b.bounds.top));
@@ -922,6 +1416,21 @@ fn heuristic_main_body(input: &DistillationInput<'_>) -> HeuristicMainBody {
                 continue;
             }
 
+            if content_surface == Some(ContentPaneSurface::AppleMail)
+                && looks_like_apple_mail_navigation_line(&line)
+            {
+                push_excluded(&mut excluded, &line);
+                continue;
+            }
+
+            if focus_band.is_some()
+                && content_surface == Some(ContentPaneSurface::AppleMail)
+                && node.bounds.is_none()
+            {
+                push_excluded(&mut excluded, &line);
+                continue;
+            }
+
             if should_exclude_role(&node.role)
                 || should_exclude_bounds(node)
                 || looks_like_ui_chrome_line(&line)
@@ -953,6 +1462,23 @@ fn heuristic_main_body(input: &DistillationInput<'_>) -> HeuristicMainBody {
         // Guard rail: if focus-band gating was too aggressive, restore base-filtered lines.
         if in_focus_candidates.is_empty() && !out_of_focus_candidates.is_empty() {
             in_focus_candidates = out_of_focus_candidates;
+        }
+
+        if let Some(surface) = content_surface {
+            in_focus_candidates =
+                filter_content_pane_ax_candidates(surface, in_focus_candidates, &mut excluded);
+        }
+
+        if browser_shell {
+            in_focus_candidates =
+                filter_browser_left_rail_ax_candidates(in_focus_candidates, &mut excluded);
+            if content_surface.is_none() {
+                in_focus_candidates = filter_browser_before_title_ax_candidates(
+                    input,
+                    in_focus_candidates,
+                    &mut excluded,
+                );
+            }
         }
 
         if browser_shell && ocr_lines.is_empty() {
@@ -1445,6 +1971,945 @@ mod tests {
         assert!(out.main_body_text.contains("Another article paragraph"));
         assert!(!out.main_body_text.contains("Example navigation row"));
         assert!(!out.main_body_text.contains("Recommended article card"));
+    }
+
+    #[tokio::test]
+    async fn disabled_distillation_still_filters_browser_sidebar_chrome() {
+        let nodes = vec![
+            AccessibilityTreeNode {
+                role: "AXButton".to_string(),
+                text: "Hide sidebar".to_string(),
+                depth: 1,
+                bounds: Some(NodeBounds {
+                    left: 0.01,
+                    top: 0.02,
+                    width: 0.10,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXButton".to_string(),
+                text: "Go back".to_string(),
+                depth: 1,
+                bounds: Some(NodeBounds {
+                    left: 0.12,
+                    top: 0.02,
+                    width: 0.08,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Research Folder".to_string(),
+                depth: 2,
+                bounds: Some(NodeBounds {
+                    left: 0.03,
+                    top: 0.30,
+                    width: 0.15,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXHeading".to_string(),
+                text: "Example Article: Build, Lead, or Learn".to_string(),
+                depth: 3,
+                bounds: Some(NodeBounds {
+                    left: 0.31,
+                    top: 0.20,
+                    width: 0.48,
+                    height: 0.05,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "This paragraph describes the main article content after the page header."
+                    .to_string(),
+                depth: 3,
+                bounds: Some(NodeBounds {
+                    left: 0.31,
+                    top: 0.31,
+                    width: 0.54,
+                    height: 0.08,
+                }),
+                ..Default::default()
+            },
+        ];
+
+        let input = DistillationInput {
+            raw_text: "Hide sidebar\nGo back\nResearch Folder\nExample Article: Build, Lead, or Learn\nThis paragraph describes the main article content after the page header.",
+            ocr_text_json: None,
+            app_name: Some("Arc"),
+            window_name: Some("Example Article: Build, Lead, or Learn"),
+            browser_url: Some("https://example.test/articles/build-lead-learn"),
+            content_hash: Some(132),
+            nodes: Some(&nodes),
+            focused_element: None,
+        };
+
+        let out = distill_main_body_text(
+            input,
+            &DistillationConfig {
+                enabled: false,
+                min_confidence: 0.60,
+            },
+        )
+        .await;
+
+        assert_eq!(out.metadata.status, "disabled");
+        assert_eq!(out.metadata.provider, PROVIDER_HEURISTIC_FALLBACK);
+        assert!(out.main_body_text.contains("Example Article"));
+        assert!(out.main_body_text.contains("main article content"));
+        assert!(!out.main_body_text.contains("Hide sidebar"));
+        assert!(!out.main_body_text.contains("Go back"));
+        assert!(!out.main_body_text.contains("Research Folder"));
+    }
+
+    #[tokio::test]
+    async fn disabled_distillation_filters_arc_left_rail_when_article_is_sparse() {
+        let nodes = vec![
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Portfolio".to_string(),
+                depth: 2,
+                bounds: Some(NodeBounds {
+                    left: 0.32,
+                    top: 0.06,
+                    width: 0.07,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "News & Content".to_string(),
+                depth: 2,
+                bounds: Some(NodeBounds {
+                    left: 0.50,
+                    top: 0.06,
+                    width: 0.12,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "example.test".to_string(),
+                depth: 2,
+                bounds: Some(NodeBounds {
+                    left: 0.02,
+                    top: 0.06,
+                    width: 0.14,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Sidebar Project A".to_string(),
+                depth: 2,
+                bounds: Some(NodeBounds {
+                    left: 0.03,
+                    top: 0.22,
+                    width: 0.14,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Sidebar Project B".to_string(),
+                depth: 2,
+                bounds: Some(NodeBounds {
+                    left: 0.03,
+                    top: 0.35,
+                    width: 0.08,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Sidebar Project C".to_string(),
+                depth: 2,
+                bounds: Some(NodeBounds {
+                    left: 0.03,
+                    top: 0.48,
+                    width: 0.10,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Sidebar Design Board".to_string(),
+                depth: 2,
+                bounds: Some(NodeBounds {
+                    left: 0.03,
+                    top: 0.70,
+                    width: 0.15,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXHeading".to_string(),
+                text: "EXAMPLE FEATURE STORY".to_string(),
+                depth: 4,
+                bounds: Some(NodeBounds {
+                    left: 0.42,
+                    top: 0.42,
+                    width: 0.28,
+                    height: 0.06,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Capability-led operating model overview".to_string(),
+                depth: 4,
+                bounds: Some(NodeBounds {
+                    left: 0.20,
+                    top: 0.68,
+                    width: 0.24,
+                    height: 0.06,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Customers care about outcomes, not products. The SaaS gold rush made that easy to forget.".to_string(),
+                depth: 4,
+                bounds: Some(NodeBounds {
+                    left: 0.30,
+                    top: 0.69,
+                    width: 0.50,
+                    height: 0.08,
+                }),
+                ..Default::default()
+            },
+        ];
+
+        let input = DistillationInput {
+            raw_text: "Portfolio\nNews & Content\nexample.test\nSidebar Project A\nSidebar Project B\nSidebar Project C\nSidebar Design Board\nEXAMPLE FEATURE STORY\nCapability-led operating model overview\nCustomers care about outcomes, not products. The product rush made that easy to forget.",
+            ocr_text_json: None,
+            app_name: Some("Arc"),
+            window_name: Some("Example Feature Story"),
+            browser_url: Some("https://example.test/articles/feature-story"),
+            content_hash: Some(133),
+            nodes: Some(&nodes),
+            focused_element: None,
+        };
+
+        let out = distill_main_body_text(
+            input,
+            &DistillationConfig {
+                enabled: false,
+                min_confidence: 0.60,
+            },
+        )
+        .await;
+
+        assert!(out.main_body_text.contains("EXAMPLE FEATURE STORY"));
+        assert!(out.main_body_text.contains("Customers care about outcomes"));
+        assert!(!out.main_body_text.contains("Portfolio"));
+        assert!(!out.main_body_text.contains("News & Content"));
+        assert!(!out.main_body_text.contains("example.test"));
+        assert!(!out.main_body_text.contains("Sidebar Project A"));
+        assert!(!out.main_body_text.contains("Sidebar Project B"));
+        assert!(!out.main_body_text.contains("Sidebar Design Board"));
+    }
+
+    #[tokio::test]
+    async fn disabled_distillation_prefers_gmail_message_pane_over_navigation() {
+        let nodes = vec![
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Search mail".to_string(),
+                depth: 2,
+                bounds: Some(NodeBounds {
+                    left: 0.24,
+                    top: 0.05,
+                    width: 0.20,
+                    height: 0.04,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Inbox 10129 unread".to_string(),
+                depth: 3,
+                bounds: Some(NodeBounds {
+                    left: 0.18,
+                    top: 0.25,
+                    width: 0.18,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Spam 152 unread".to_string(),
+                depth: 3,
+                bounds: Some(NodeBounds {
+                    left: 0.18,
+                    top: 0.55,
+                    width: 0.16,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXHeading".to_string(),
+                text: "Quarterly product update and roadmap notes".to_string(),
+                depth: 4,
+                bounds: Some(NodeBounds {
+                    left: 0.45,
+                    top: 0.16,
+                    width: 0.45,
+                    height: 0.06,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Partner announcement about a product integration".to_string(),
+                depth: 5,
+                bounds: Some(NodeBounds {
+                    left: 0.48,
+                    top: 0.42,
+                    width: 0.42,
+                    height: 0.04,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Surveyed users say the workflow helps them better understand next steps."
+                    .to_string(),
+                depth: 5,
+                bounds: Some(NodeBounds {
+                    left: 0.48,
+                    top: 0.52,
+                    width: 0.42,
+                    height: 0.06,
+                }),
+                ..Default::default()
+            },
+        ];
+
+        let input = DistillationInput {
+            raw_text: "Search mail\nInbox 10129 unread\nSpam 152 unread\nQuarterly product update and roadmap notes\nPartner announcement about a product integration\nSurveyed users say the workflow helps them better understand next steps.",
+            ocr_text_json: None,
+            app_name: Some("Arc"),
+            window_name: Some("Quarterly product update"),
+            browser_url: Some("https://mail.google.com/mail/u/0/#inbox/abc"),
+            content_hash: Some(134),
+            nodes: Some(&nodes),
+            focused_element: None,
+        };
+
+        let out = distill_main_body_text(
+            input,
+            &DistillationConfig {
+                enabled: false,
+                min_confidence: 0.60,
+            },
+        )
+        .await;
+
+        assert!(out.main_body_text.contains("Quarterly product update"));
+        assert!(out.main_body_text.contains("product integration"));
+        assert!(!out.main_body_text.contains("Search mail"));
+        assert!(!out.main_body_text.contains("Inbox 10129"));
+        assert!(!out.main_body_text.contains("Spam 152"));
+    }
+
+    #[tokio::test]
+    async fn disabled_distillation_detects_gmail_when_browser_url_is_missing() {
+        let nodes = vec![
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Search mail".to_string(),
+                depth: 2,
+                bounds: Some(NodeBounds {
+                    left: 0.24,
+                    top: 0.05,
+                    width: 0.20,
+                    height: 0.04,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Inbox 10129 unread".to_string(),
+                depth: 3,
+                bounds: Some(NodeBounds {
+                    left: 0.18,
+                    top: 0.25,
+                    width: 0.18,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXHeading".to_string(),
+                text: "Project Update".to_string(),
+                depth: 4,
+                bounds: Some(NodeBounds {
+                    left: 0.45,
+                    top: 0.16,
+                    width: 0.30,
+                    height: 0.05,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Thanks for the update, please find the project summary attached."
+                    .to_string(),
+                depth: 5,
+                bounds: Some(NodeBounds {
+                    left: 0.48,
+                    top: 0.34,
+                    width: 0.42,
+                    height: 0.06,
+                }),
+                ..Default::default()
+            },
+        ];
+
+        let input = DistillationInput {
+            raw_text: "Search mail\nCompose\nInbox 10129 unread\nProject Update\nThanks for the update, please find the project summary attached.",
+            ocr_text_json: None,
+            app_name: Some("Arc"),
+            window_name: Some("Project Update - Gmail"),
+            browser_url: None,
+            content_hash: Some(139),
+            nodes: Some(&nodes),
+            focused_element: None,
+        };
+
+        let out = distill_main_body_text(
+            input,
+            &DistillationConfig {
+                enabled: false,
+                min_confidence: 0.60,
+            },
+        )
+        .await;
+
+        assert!(out.main_body_text.contains("Project Update"));
+        assert!(out.main_body_text.contains("summary attached"));
+        assert!(!out.main_body_text.contains("Search mail"));
+        assert!(!out.main_body_text.contains("Inbox 10129"));
+    }
+
+    #[tokio::test]
+    async fn disabled_distillation_prefers_apple_mail_reading_pane_over_message_list() {
+        let nodes = vec![
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Example Sender".to_string(),
+                depth: 3,
+                bounds: Some(NodeBounds {
+                    left: 0.17,
+                    top: 0.32,
+                    width: 0.19,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Example Contact".to_string(),
+                depth: 3,
+                bounds: Some(NodeBounds {
+                    left: 0.17,
+                    top: 0.62,
+                    width: 0.16,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXHeading".to_string(),
+                text: "Re: Example download is ready".to_string(),
+                depth: 4,
+                bounds: Some(NodeBounds {
+                    left: 0.42,
+                    top: 0.16,
+                    width: 0.38,
+                    height: 0.04,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Hello, could you please check how much free disk space you have?"
+                    .to_string(),
+                depth: 5,
+                bounds: Some(NodeBounds {
+                    left: 0.42,
+                    top: 0.34,
+                    width: 0.50,
+                    height: 0.08,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Disk space is: 401.45GB / 460.43GB".to_string(),
+                depth: 5,
+                bounds: Some(NodeBounds {
+                    left: 0.42,
+                    top: 0.64,
+                    width: 0.32,
+                    height: 0.04,
+                }),
+                ..Default::default()
+            },
+        ];
+        let focused = FocusedElementContext {
+            role: "AXRow".to_string(),
+            name: Some("Example Sender".to_string()),
+            input_text: None,
+            selected_text: None,
+            bounds: Some(NodeBounds {
+                left: 0.17,
+                top: 0.32,
+                width: 0.19,
+                height: 0.04,
+            }),
+        };
+
+        let input = DistillationInput {
+            raw_text: "Example Sender\nExample Contact\nRe: Example download is ready\nHello, could you please check how much free disk space you have?\nDisk space is: 401.45GB / 460.43GB",
+            ocr_text_json: None,
+            app_name: Some("Mail"),
+            window_name: Some("Inbox - All Mail - 284 messages"),
+            browser_url: None,
+            content_hash: Some(135),
+            nodes: Some(&nodes),
+            focused_element: Some(&focused),
+        };
+
+        let out = distill_main_body_text(
+            input,
+            &DistillationConfig {
+                enabled: false,
+                min_confidence: 0.60,
+            },
+        )
+        .await;
+
+        assert!(out.main_body_text.contains("Hello"));
+        assert!(out.main_body_text.contains("free disk space"));
+        assert!(!out.main_body_text.contains("Example Sender"));
+        assert!(!out.main_body_text.contains("Example Contact"));
+    }
+
+    #[tokio::test]
+    async fn disabled_distillation_uses_apple_mail_focused_web_area_bounds() {
+        let nodes = vec![
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Favourites".to_string(),
+                depth: 2,
+                bounds: Some(NodeBounds {
+                    left: 0.03,
+                    top: 0.18,
+                    width: 0.12,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Inbox - All Mail - 284 messages".to_string(),
+                depth: 2,
+                bounds: None,
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "VIPs".to_string(),
+                depth: 2,
+                bounds: Some(NodeBounds {
+                    left: 0.0,
+                    top: 0.24,
+                    width: 1.0,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXHeading".to_string(),
+                text: "Example thread subject".to_string(),
+                depth: 4,
+                bounds: Some(NodeBounds {
+                    left: 0.42,
+                    top: 0.18,
+                    width: 0.40,
+                    height: 0.04,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "This is the selected message body in the reading pane.".to_string(),
+                depth: 5,
+                bounds: Some(NodeBounds {
+                    left: 0.42,
+                    top: 0.34,
+                    width: 0.52,
+                    height: 0.07,
+                }),
+                ..Default::default()
+            },
+        ];
+        let focused = FocusedElementContext {
+            role: "AXWebArea".to_string(),
+            name: None,
+            input_text: None,
+            selected_text: None,
+            bounds: Some(NodeBounds {
+                left: 0.38,
+                top: 0.30,
+                width: 0.60,
+                height: 0.28,
+            }),
+        };
+
+        let input = DistillationInput {
+            raw_text: "Favourites\nInbox - All Mail - 284 messages\nVIPs\nExample thread subject\nThis is the selected message body in the reading pane.",
+            ocr_text_json: None,
+            app_name: Some("Mail"),
+            window_name: Some("Inbox - All Mail - 284 messages"),
+            browser_url: None,
+            content_hash: Some(141),
+            nodes: Some(&nodes),
+            focused_element: Some(&focused),
+        };
+
+        let out = distill_main_body_text(
+            input,
+            &DistillationConfig {
+                enabled: false,
+                min_confidence: 0.60,
+            },
+        )
+        .await;
+
+        assert!(out.main_body_text.contains("Example thread subject"));
+        assert!(out.main_body_text.contains("selected message body"));
+        assert!(!out.main_body_text.contains("Favourites"));
+        assert!(!out.main_body_text.contains("VIPs"));
+        assert!(!out.main_body_text.contains("All Mail"));
+    }
+
+    #[tokio::test]
+    async fn disabled_distillation_prefers_notes_editor_over_sidebar_and_note_list() {
+        let nodes = vec![
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "All iCloud 1,219 notes".to_string(),
+                depth: 2,
+                bounds: Some(NodeBounds {
+                    left: 0.04,
+                    top: 0.20,
+                    width: 0.15,
+                    height: 0.04,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "No additional text".to_string(),
+                depth: 3,
+                bounds: Some(NodeBounds {
+                    left: 0.23,
+                    top: 0.32,
+                    width: 0.14,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Could you send the notes by Friday?".to_string(),
+                depth: 3,
+                bounds: Some(NodeBounds {
+                    left: 0.23,
+                    top: 0.45,
+                    width: 0.16,
+                    height: 0.05,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXTextArea".to_string(),
+                text: "Tasks:\n- Review onboarding copy\n- Draft launch follow-up".to_string(),
+                depth: 4,
+                bounds: Some(NodeBounds {
+                    left: 0.28,
+                    top: 0.16,
+                    width: 0.46,
+                    height: 0.08,
+                }),
+                ..Default::default()
+            },
+        ];
+        let focused = FocusedElementContext {
+            role: "AXRow".to_string(),
+            name: Some("No additional text".to_string()),
+            input_text: None,
+            selected_text: None,
+            bounds: Some(NodeBounds {
+                left: 0.23,
+                top: 0.32,
+                width: 0.14,
+                height: 0.04,
+            }),
+        };
+
+        let input = DistillationInput {
+            raw_text: "All iCloud 1,219 notes\nNo additional text\nCould you send the notes by Friday?\nTasks:\n- Review onboarding copy\n- Draft launch follow-up",
+            ocr_text_json: None,
+            app_name: Some("Notes"),
+            window_name: Some("All iCloud - 1,219 notes"),
+            browser_url: None,
+            content_hash: Some(136),
+            nodes: Some(&nodes),
+            focused_element: Some(&focused),
+        };
+
+        let out = distill_main_body_text(
+            input,
+            &DistillationConfig {
+                enabled: false,
+                min_confidence: 0.60,
+            },
+        )
+        .await;
+
+        assert!(out.main_body_text.contains("Review onboarding copy"));
+        assert!(out.main_body_text.contains("Draft launch follow-up"));
+        assert!(!out.main_body_text.contains("All iCloud"));
+        assert!(!out.main_body_text.contains("No additional text"));
+        assert!(!out.main_body_text.contains("Could you send the notes"));
+    }
+
+    #[tokio::test]
+    async fn disabled_distillation_prefers_unbounded_notes_editor_text() {
+        let nodes = vec![
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Quick Notes, 4 notes".to_string(),
+                depth: 2,
+                bounds: Some(NodeBounds {
+                    left: 0.03,
+                    top: 0.20,
+                    width: 0.15,
+                    height: 0.04,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Could you send the notes by Friday?".to_string(),
+                depth: 3,
+                bounds: Some(NodeBounds {
+                    left: 0.22,
+                    top: 0.45,
+                    width: 0.16,
+                    height: 0.05,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXTextArea".to_string(),
+                text: "Tasks:\n- Review onboarding copy\n- Draft launch follow-up".to_string(),
+                depth: 4,
+                bounds: None,
+                ..Default::default()
+            },
+        ];
+
+        let input = DistillationInput {
+            raw_text: "Quick Notes, 4 notes\nCould you send the notes by Friday?\nTasks:\n- Review onboarding copy\n- Draft launch follow-up",
+            ocr_text_json: None,
+            app_name: Some("Notes"),
+            window_name: Some("All iCloud - 1,219 notes"),
+            browser_url: None,
+            content_hash: Some(137),
+            nodes: Some(&nodes),
+            focused_element: None,
+        };
+
+        let out = distill_main_body_text(
+            input,
+            &DistillationConfig {
+                enabled: false,
+                min_confidence: 0.60,
+            },
+        )
+        .await;
+
+        assert!(out.main_body_text.contains("Review onboarding copy"));
+        assert!(!out.main_body_text.contains("Quick Notes"));
+        assert!(!out.main_body_text.contains("Could you send"));
+    }
+
+    #[tokio::test]
+    async fn disabled_distillation_prefers_focused_notes_editor_value() {
+        let nodes = vec![
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Articles".to_string(),
+                depth: 2,
+                bounds: Some(NodeBounds {
+                    left: 0.04,
+                    top: 0.22,
+                    width: 0.13,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Tasks:".to_string(),
+                depth: 3,
+                bounds: Some(NodeBounds {
+                    left: 0.20,
+                    top: 0.48,
+                    width: 0.14,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+        ];
+        let focused = FocusedElementContext {
+            role: "AXTextArea".to_string(),
+            name: None,
+            input_text: Some(
+                "Tasks:\n     - Review onboarding copy\n     - Draft launch follow-up".to_string(),
+            ),
+            selected_text: None,
+            bounds: Some(NodeBounds {
+                left: 0.36,
+                top: 0.08,
+                width: 0.62,
+                height: 0.90,
+            }),
+        };
+
+        let input = DistillationInput {
+            raw_text: "Articles\nTasks:",
+            ocr_text_json: None,
+            app_name: Some("Notes"),
+            window_name: Some("All iCloud - 1,219 notes"),
+            browser_url: None,
+            content_hash: Some(138),
+            nodes: Some(&nodes),
+            focused_element: Some(&focused),
+        };
+
+        let out = distill_main_body_text(
+            input,
+            &DistillationConfig {
+                enabled: false,
+                min_confidence: 0.60,
+            },
+        )
+        .await;
+
+        assert_eq!(
+            out.main_body_text,
+            "Tasks:\n- Review onboarding copy\n- Draft launch follow-up"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_distillation_ignores_notes_search_field_focus() {
+        let nodes = vec![
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "All iCloud 1,219 notes".to_string(),
+                depth: 2,
+                bounds: Some(NodeBounds {
+                    left: 0.04,
+                    top: 0.20,
+                    width: 0.15,
+                    height: 0.04,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXTextArea".to_string(),
+                text: "Tasks:\n- Review onboarding copy".to_string(),
+                depth: 4,
+                bounds: Some(NodeBounds {
+                    left: 0.38,
+                    top: 0.14,
+                    width: 0.52,
+                    height: 0.08,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Draft launch follow-up".to_string(),
+                depth: 4,
+                bounds: Some(NodeBounds {
+                    left: 0.38,
+                    top: 0.26,
+                    width: 0.32,
+                    height: 0.04,
+                }),
+                ..Default::default()
+            },
+        ];
+        let focused = FocusedElementContext {
+            role: "AXTextField".to_string(),
+            name: Some("Search".to_string()),
+            input_text: Some("moya".to_string()),
+            selected_text: None,
+            bounds: Some(NodeBounds {
+                left: 0.68,
+                top: 0.03,
+                width: 0.26,
+                height: 0.05,
+            }),
+        };
+
+        let input = DistillationInput {
+            raw_text: "All iCloud 1,219 notes\nmoya\nTasks:\n- Review onboarding copy\nDraft launch follow-up",
+            ocr_text_json: None,
+            app_name: Some("Notes"),
+            window_name: Some("All iCloud - 1,219 notes"),
+            browser_url: None,
+            content_hash: Some(140),
+            nodes: Some(&nodes),
+            focused_element: Some(&focused),
+        };
+
+        let out = distill_main_body_text(
+            input,
+            &DistillationConfig {
+                enabled: false,
+                min_confidence: 0.60,
+            },
+        )
+        .await;
+
+        assert!(out.main_body_text.contains("Review onboarding copy"));
+        assert!(out.main_body_text.contains("Draft launch follow-up"));
+        assert!(!out.main_body_text.contains("All iCloud"));
+        assert!(!out.main_body_text.contains("moya"));
     }
 
     #[test]
