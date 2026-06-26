@@ -14,9 +14,12 @@ screenpipe-screen = { path = "../screenpipe-screen" }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 image = { workspace = true }
+lru = "0.16.3"
 once_cell = { workspace = true }
 regex = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 

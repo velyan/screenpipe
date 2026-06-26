@@ -289,6 +289,7 @@ async fn flush_level0_bulk(
 }
 
 mod accessibility;
+mod active_window_compat;
 mod audio;
 mod elements;
 mod frames;
@@ -303,6 +304,7 @@ mod tags;
 mod text_positions;
 mod write_ops;
 
+pub use self::active_window_compat::{ActiveWindowCompatRow, FrameCaptureMetadata};
 pub(crate) use self::text_positions::calculate_confidence;
 pub use self::text_positions::{
     find_matching_a11y_positions, find_matching_positions, parse_all_text_positions,

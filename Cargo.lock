@@ -8104,6 +8104,8 @@ dependencies = [
  "arc-swap",
  "chrono",
  "cidre 0.13.1",
+ "core-foundation 0.10.1",
+ "core-graphics",
  "crossbeam-channel",
  "dirs 6.0.0",
  "evdev",
@@ -8128,7 +8130,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-audio"
-version = "0.4.24"
+version = "0.3.335-moya.1"
 dependencies = [
  "anyhow",
  "audiopipe",
@@ -8190,7 +8192,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-audio-eval"
-version = "0.4.24"
+version = "0.3.335-moya.1"
 dependencies = [
  "anyhow",
  "audiopipe",
@@ -8214,13 +8216,16 @@ dependencies = [
  "anyhow",
  "chrono",
  "image",
+ "lru",
  "once_cell",
  "regex",
  "screenpipe-a11y",
  "screenpipe-core",
  "screenpipe-db",
  "screenpipe-screen",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tracing",
@@ -8228,7 +8233,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-config"
-version = "0.4.24"
+version = "0.3.335-moya.1"
 dependencies = [
  "dirs 6.0.0",
  "serde",
@@ -8241,7 +8246,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-connect"
-version = "0.4.24"
+version = "0.3.335-moya.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8284,7 +8289,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-core"
-version = "0.4.24"
+version = "0.3.335-moya.1"
 dependencies = [
  "accessibility",
  "accessibility-sys",
@@ -8336,7 +8341,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-db"
-version = "0.4.24"
+version = "0.3.335-moya.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8364,7 +8369,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-engine"
-version = "0.4.24"
+version = "0.3.335-moya.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -8438,7 +8443,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-events"
-version = "0.4.24"
+version = "0.3.335-moya.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -8456,7 +8461,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-meeting-eval"
-version = "0.4.24"
+version = "0.3.335-moya.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -8468,7 +8473,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-redact"
-version = "0.4.24"
+version = "0.3.335-moya.1"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -8505,7 +8510,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-rfdetr-mlx"
-version = "0.4.24"
+version = "0.3.335-moya.1"
 dependencies = [
  "image",
  "mlx-rs",
@@ -8516,7 +8521,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-screen"
-version = "0.4.24"
+version = "0.3.335-moya.1"
 dependencies = [
  "accessibility-sys",
  "anyhow",
@@ -8576,7 +8581,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-sync"
-version = "0.4.24"
+version = "0.3.335-moya.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -8598,7 +8603,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-team-memory"
-version = "0.4.24"
+version = "0.3.335-moya.1"
 dependencies = [
  "serde",
  "serde_yaml",
@@ -8607,7 +8612,7 @@ dependencies = [
 
 [[package]]
 name = "screenpipe-vault"
-version = "0.4.24"
+version = "0.3.335-moya.1"
 dependencies = [
  "argon2",
  "chacha20poly1305",

@@ -1828,6 +1828,9 @@ fn get_bool_attr(elem: &ax::UiElement, attr: &ax::Attr) -> Option<bool> {
     })
 }
 
+// Retained as an upstream fallback path; the fork's inline retry logic in
+// `walk_focused_window_inner` is the active resolver.
+#[allow(dead_code)]
 fn resolve_focused_ax_app() -> Option<(Retained<ax::UiElement>, i32, String)> {
     let sys = ax::UiElement::sys_wide();
     if let Ok(focused_app) = sys.focused_app() {

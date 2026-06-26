@@ -35,10 +35,10 @@ use tracing::debug;
 use crate::conversation_extraction::{
     extract_structured_messages_cancelable, StructuredExtractionInput,
 };
-use crate::main_body_distillation::{
+use screenpipe_capture::main_body_distillation::{
     distill_main_body_text, DistillationConfig, DistillationInput,
 };
-use crate::paired_capture::{paired_capture, walk_accessibility_tree, CaptureContext};
+use screenpipe_capture::paired_capture::{paired_capture, walk_accessibility_tree, CaptureContext};
 use crate::server::AppState;
 
 const PROVENANCE_FOCUSED_WINDOW: &str = "focused_window";
@@ -1315,6 +1315,7 @@ pub(crate) async fn capture_active_window(
         capture_provenance,
         force_ocr: req.include_ocr,
         use_pii_removal: state.use_pii_removal,
+        screenshot_disabled: false,
         enable_main_body_distillation: state.enable_main_body_distillation,
         main_body_distillation_threshold: state.main_body_distillation_threshold,
         languages: Vec::new(),

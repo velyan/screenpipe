@@ -4,7 +4,7 @@
 
 use clap::Parser;
 use screenpipe_a11y::tree::{AccessibilityTreeNode, FocusedElementContext};
-use screenpipe_engine::main_body_distillation::{
+use screenpipe_capture::main_body_distillation::{
     distill_main_body_text, DistillationConfig, DistillationInput,
 };
 use serde::{Deserialize, Serialize};
