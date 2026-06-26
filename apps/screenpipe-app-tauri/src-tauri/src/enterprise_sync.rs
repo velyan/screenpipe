@@ -26,8 +26,8 @@ mod imp {
     use crate::recording::local_api_context_from_app;
     use base64::Engine;
     use ee_sync::{
-        AudioRow, EnterpriseSyncConfig, EnterpriseSyncError, FrameRow, LocalApiClient, SnapshotRow,
-        UiEventRow,
+        AudioRow, EnterpriseSyncConfig, EnterpriseSyncError, FrameRow, LocalApiClient, MemoryRow,
+        SnapshotRow, UiEventRow,
     };
     use serde::Deserialize;
     use std::sync::Arc;
@@ -37,15 +37,23 @@ mod imp {
 
     pub(super) struct ScreenpipeLocalClient {
         api_url_base: String,
-        api_key: Option<String>,
+        // App handle, so we can re-read the current api_auth_key from
+        // `RecordingState` on every request. The previous implementation
+        // captured the key once at startup — but `enterprise_sync::spawn`
+        // runs *before* the recording server finishes booting, so the
+        // snapshot was always `None`. Every subsequent /search call hit
+        // a 403 because no Bearer header was attached, the sync task
+        // backed off for an hour, and no telemetry ever made it to the
+        // customer's storage backend.
+        app: tauri::AppHandle,
         http: reqwest::Client,
     }
 
     impl ScreenpipeLocalClient {
-        pub fn new(api_url_base: String, api_key: Option<String>) -> Self {
+        pub fn new(api_url_base: String, app: tauri::AppHandle) -> Self {
             Self {
                 api_url_base,
-                api_key,
+                app,
                 http: reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(30))
                     .build()
@@ -53,8 +61,12 @@ mod imp {
             }
         }
 
+        fn current_api_key(&self) -> Option<String> {
+            crate::recording::local_api_context_from_app(&self.app).api_key
+        }
+
         fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-            match &self.api_key {
+            match self.current_api_key() {
                 Some(key) => req.header("Authorization", format!("Bearer {key}")),
                 None => req,
             }
@@ -115,6 +127,26 @@ mod imp {
     #[derive(Debug, Deserialize)]
     struct LocalSpeaker {
         name: Option<String>,
+    }
+
+    // /memories has a different envelope from /search — it's a paginated list,
+    // not a typed-search response. Tags arrive already-parsed as a JSON array.
+    #[derive(Debug, Deserialize)]
+    struct LocalMemoriesResponse {
+        data: Vec<LocalMemoryItem>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LocalMemoryItem {
+        id: i64,
+        content: String,
+        source: String,
+        #[serde(default)]
+        tags: Vec<String>,
+        importance: f64,
+        frame_id: Option<i64>,
+        created_at: String,
+        updated_at: String,
     }
 
     #[async_trait::async_trait]
@@ -258,11 +290,14 @@ mod imp {
                         continue;
                     }
                     // Truncate text_content aggressively — full keylog
-                    // streams blow the token budget. 200 chars is enough
-                    // for "what was typed" without leaking essays.
+                    // streams blow the token budget. ~200 bytes is enough
+                    // for "what was typed" without leaking essays. Round the
+                    // cut to a UTF-8 char boundary — a raw `&t[..200]` panics
+                    // when byte 200 lands inside a multi-byte char (e.g. Polish
+                    // `ł`), which crashed the sync worker for non-ASCII users.
                     let text_content = i.text_content.map(|t| {
                         if t.len() > 200 {
-                            format!("{}…", &t[..200])
+                            format!("{}…", ee_sync::truncate_on_char_boundary(&t, 200))
                         } else {
                             t
                         }
@@ -363,6 +398,88 @@ mod imp {
                 height: h,
             }))
         }
+
+        async fn fetch_frame_jpeg(
+            &self,
+            frame_id: i64,
+        ) -> Result<Option<Vec<u8>>, EnterpriseSyncError> {
+            // Same image `/frames/{id}` serves in the UI — decoded from local
+            // video, with capture-time PII redaction already applied when the
+            // org policy enables it. Full resolution here; the core fulfiller
+            // downscales + bounds size before upload.
+            let img_url = format!("{}/frames/{}", self.api_url_base, frame_id);
+            let resp = self
+                .auth(self.http.get(&img_url))
+                .send()
+                .await
+                .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))?;
+            if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                // Expired from retention or never existed — report back so the
+                // server drops the id from the manifest instead of looping.
+                return Ok(None);
+            }
+            if !resp.status().is_success() {
+                return Err(EnterpriseSyncError::LocalApi(format!(
+                    "GET {} -> {}",
+                    img_url,
+                    resp.status()
+                )));
+            }
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))?;
+            Ok(Some(bytes.to_vec()))
+        }
+
+        async fn fetch_memories_since(
+            &self,
+            since_ts: Option<&str>,
+            limit: u32,
+        ) -> Result<Vec<MemoryRow>, EnterpriseSyncError> {
+            // /memories filters by created_at >= start_time; ascending order
+            // means the cursor advances monotonically. Server-side dedup is
+            // on (device_id, memory_id), so a single-row overlap per tick is
+            // acceptable (same convention as /search-backed fetches above).
+            let mut url = format!(
+                "{}/memories?limit={}&order_by=created_at&order_dir=asc",
+                self.api_url_base, limit
+            );
+            if let Some(ts) = since_ts {
+                url.push_str(&format!("&start_time={}", urlencoding::encode(ts)));
+            }
+            let resp = self
+                .auth(self.http.get(&url))
+                .send()
+                .await
+                .map_err(|e| EnterpriseSyncError::LocalApi(e.to_string()))?;
+            if !resp.status().is_success() {
+                return Err(EnterpriseSyncError::LocalApi(format!(
+                    "GET {} -> {}",
+                    url,
+                    resp.status()
+                )));
+            }
+            let body: LocalMemoriesResponse = resp
+                .json()
+                .await
+                .map_err(|e| EnterpriseSyncError::LocalApi(format!("decode: {e}")))?;
+            let out = body
+                .data
+                .into_iter()
+                .map(|m| MemoryRow {
+                    memory_id: m.id,
+                    created_at: m.created_at,
+                    updated_at: m.updated_at,
+                    content: m.content,
+                    source: m.source,
+                    tags: m.tags,
+                    importance: m.importance,
+                    frame_id: m.frame_id,
+                })
+                .collect();
+            Ok(out)
+        }
     }
 
     // ─── Spawn ─────────────────────────────────────────────────────────
@@ -381,14 +498,25 @@ mod imp {
             .and_then(|h| h.into_string().ok())
             .unwrap_or_else(|| "unknown".to_string());
 
-        let cfg = match EnterpriseSyncConfig::from_env(
+        // Resolve license key from the canonical file location the
+        // in-app license prompt writes to (~/.screenpipe/enterprise.json,
+        // or the MDM Resources/ copy). Without this the env-var-only
+        // discovery in `from_env` silently no-ops on every standard
+        // install — the telemetry pipeline would never start, even with
+        // the dashboard fully configured.
+        let license_fallback = crate::commands::get_enterprise_license_key();
+
+        let cfg = match EnterpriseSyncConfig::from_env_with_fallback(
             app_data_dir,
             device_id.clone(),
             device_label.clone(),
+            license_fallback,
         ) {
             Some(c) => c,
             None => {
-                info!("enterprise sync: SCREENPIPE_ENTERPRISE_LICENSE_KEY not set, skipping");
+                info!(
+                    "enterprise sync: no license key in env or ~/.screenpipe/enterprise.json — skipping"
+                );
                 return None;
             }
         };
@@ -398,18 +526,48 @@ mod imp {
             cfg.device_id, cfg.device_label, cfg.ingest_url
         );
 
+        // Point the stalled-upload watchdog at the real app-log dirs. App logs
+        // live in the screenpipe data dir (RollingFileAppender), NOT Tauri's
+        // app_data_dir — so the from_env default would miss them.
+        let mut cfg = cfg;
+        let mut log_dirs = Vec::new();
+        if let Ok(d) = crate::log_files::get_screenpipe_data_dir(app) {
+            log_dirs.push(d);
+        }
+        if let Ok(d) = crate::log_files::get_data_dir(app) {
+            log_dirs.push(d);
+        }
+        if !log_dirs.is_empty() {
+            cfg.log_dirs = log_dirs;
+        }
+
         let api = local_api_context_from_app(app);
         let api_url_base = api.url("");
-        let local: Arc<dyn LocalApiClient> = Arc::new(ScreenpipeLocalClient::new(
-            api_url_base,
-            api.api_key.clone(),
-        ));
+        // NB: don't capture `api.api_key` here — at spawn-time the
+        // recording server hasn't finished booting and the key is
+        // usually `None`. ScreenpipeLocalClient re-reads it from
+        // RecordingState on every request via the app handle.
+        let local: Arc<dyn LocalApiClient> =
+            Arc::new(ScreenpipeLocalClient::new(api_url_base, app.clone()));
 
         let (tx, rx) = tokio::sync::watch::channel(false);
         tauri::async_runtime::spawn(async move {
             // Small startup delay so the local screenpipe server is up before
             // we hammer it. Mirrors calendar publisher's `sleep(10)`.
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+
+            // Ask the control plane what upload mode this license should run
+            // in. Replaces the old "set SCREENPIPE_ENTERPRISE_UPLOAD_MODE on
+            // every customer machine" UX — the dashboard binding is now the
+            // single source of truth, so a fresh enterprise install just
+            // needs the license key and uploads start automatically.
+            let mut cfg = cfg;
+            cfg.resolve_upload_mode().await;
+            info!(
+                "enterprise sync: resolved upload mode = {:?}",
+                std::mem::discriminant(&cfg.upload_mode)
+            );
+
             ee_sync::run(cfg, local, rx).await;
         });
 

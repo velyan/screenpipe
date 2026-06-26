@@ -4,7 +4,7 @@ version = { workspace = true }
 authors = { workspace = true }
 description = { workspace = true }
 repository = { workspace = true }
-license = { workspace = true }
+license-file = { workspace = true }
 edition = { workspace = true }
 
 # libsqlite3-sys is pulled in for the `bundled` feature so workspace crates
@@ -13,15 +13,17 @@ edition = { workspace = true }
 ignored = ["libsqlite3-sys"]
 
 [dependencies]
+specta = { workspace = true, optional = true }
 image = { workspace = true }
 reqwest = { workspace = true }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tokio = { version = "1.0", features = ["full"] }
-log = "0.4"
-anyhow = "1.0"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
+anyhow = { workspace = true }
 screenpipe-core = { path = "../screenpipe-core" }
 screenpipe-secrets = { path = "../screenpipe-secrets" }
+screenpipe-vault = { path = "../screenpipe-vault" }
 tracing = { workspace = true }
 # NOTE: dropped the `rsa` feature — it pulls `rsa = "0.10.0-rc.12"` which
 # has a `match`-arm type error against the pinned `pkcs8 = 0.11`. Ring
@@ -29,30 +31,47 @@ tracing = { workspace = true }
 # host accepts; if a user genuinely needs RSA SSH key support, re-enable
 # this feature and pin `rsa` to a version compatible with the resolved
 # `pkcs8`. v2.4.170 left this broken on a pristine cargo check.
-russh = { version = "0.57", default-features = false, features = ["ring", "flate2"] }
+russh = { version = "0.60", default-features = false, features = ["ring", "flate2"] }
 russh-sftp = "2.1"
-dirs = "6"
-chrono = "0.4"
-async-trait = "0.1"
-once_cell = "1"
-uuid = { version = "1.5.0", features = ["v4"] }
-thiserror = "1"
+dirs = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = "0.10"
+icalendar = "0.17"
+async-trait = { workspace = true }
+once_cell = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+# Bee "connect" device-pairing flow: NaCl crypto_box (X25519 + XSalsa20-Poly1305)
+# to decrypt the app-pairing token the auth service seals to our ephemeral
+# public key. `salsa20` feature = `SalsaBox` (libsodium/tweetnacl-compatible).
+crypto_box = { version = "0.9", features = ["salsa20"] }
+getrandom = { version = "0.2" }
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "builder"] }
 mdns-sd = "0.13"
-sqlx = { version = "0.7", features = ["sqlite", "runtime-tokio-rustls"] }
-libsqlite3-sys = { version = "0.26", features = ["bundled"] }
+sqlx = { workspace = true }
+libsqlite3-sys = { workspace = true }
+
+[dev-dependencies]
+wiremock = { workspace = true }
+tempfile = { workspace = true }
+
+[features]
+default = []
+specta = ["dep:specta"]
 
 [target.'cfg(target_os = "macos")'.dependencies]
-eventkit-rs = "0.1"
+eventkit-rs = { git = "https://github.com/divanshu-go/eventkit-rs", rev = "9dd52787c8435d734ed443e2d5641f45b0177cae", default-features = false, features = ["events"] }
 objc2 = "0.6"
 objc2-event-kit = "0.3"
 objc2-foundation = "0.3"
-chrono = "0.4"
+chrono = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.58", features = [
+windows = { workspace = true, features = [
     "ApplicationModel_Appointments",
     "Foundation",
     "Foundation_Collections",
 ] }
-chrono = "0.4"
+chrono = { workspace = true }

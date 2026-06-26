@@ -1,5 +1,5 @@
 // Screenpipe Enterprise Edition
-// Licensed under the Screenpipe Enterprise License (see ee/LICENSE)
+// Licensed under the Screenpipe Commercial License (see LICENSE.md)
 
 export { useEnterprise } from "./hooks/use-enterprise";
 export type { EnterpriseState } from "./hooks/use-enterprise";
@@ -16,3 +16,14 @@ export type { LicenseInfo, LicenseError } from "./lib/license-validation";
 
 export { fetchAdminPolicy, isSettingLocked, getLockedValue, isSectionHidden } from "./lib/admin-policy";
 export type { AdminPolicy } from "./lib/admin-policy";
+
+export {
+  DEFAULT_ENTERPRISE_APP_UPDATE_POLICY,
+  describeEnterpriseUpdateMode,
+  normalizeEnterpriseAppUpdatePolicy,
+} from "./lib/app-update-policy";
+export type {
+  EnterpriseAppUpdateMode,
+  EnterpriseAppUpdatePolicy,
+  EnterpriseInstallMetadata,
+} from "./lib/app-update-policy";

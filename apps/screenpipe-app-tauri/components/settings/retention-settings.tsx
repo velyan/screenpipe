@@ -5,6 +5,7 @@
 
 import React, { useEffect, useState, useCallback } from "react";
 import { useSettings } from "@/lib/hooks/use-settings";
+import { RetentionModePreview } from "./setting-previews";
 import {
   Select,
   SelectContent,
@@ -21,6 +22,8 @@ import {
   AlertTriangle,
   Clock,
   Film,
+  FileText,
+  Minimize2,
 } from "lucide-react";
 import {
   AlertDialog,
@@ -34,7 +37,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { localFetch } from "@/lib/api";
 
-type RetentionMode = "media" | "all";
+type RetentionMode = "media" | "lean" | "all";
 type EffectiveMode = "off" | RetentionMode;
 
 interface RetentionStatus {
@@ -94,6 +97,8 @@ export function RetentionSettings() {
   const [previewLoading, setPreviewLoading] = useState(false);
   const [pendingRecent, setPendingRecent] = useState<number | null>(null);
   const [deletingRecent, setDeletingRecent] = useState(false);
+  const [pendingCompact, setPendingCompact] = useState(false);
+  const [compacting, setCompacting] = useState(false);
 
   const enabled = settings.localRetentionEnabled ?? false;
   const retentionDays = settings.localRetentionDays ?? 14;
@@ -205,7 +210,9 @@ export function RetentionSettings() {
         title:
           nextMode === "media"
             ? `media eviction enabled (${retentionDays}d)`
-            : `auto-delete enabled (${retentionDays}d)`,
+            : nextMode === "lean"
+              ? `lean cleanup enabled (${retentionDays}d)`
+              : `auto-delete enabled (${retentionDays}d)`,
       });
       fetchStatus();
     } catch (e: any) {
@@ -272,6 +279,35 @@ export function RetentionSettings() {
     }
   };
 
+  const confirmCompact = async () => {
+    setPendingCompact(false);
+    setCompacting(true);
+    try {
+      const res = await localFetch("/data/compact", { method: "POST" });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `request failed (${res.status})`);
+      }
+      const r = await res.json();
+      const reclaimed = r.bytes_reclaimed || 0;
+      toast({
+        title: "database compacted",
+        description:
+          reclaimed > 0
+            ? `reclaimed ${formatBytes(reclaimed)} of disk space.`
+            : "already compact — nothing to reclaim right now.",
+      });
+    } catch (e: any) {
+      toast({
+        title: "failed to compact database",
+        description: e.message,
+        variant: "destructive",
+      });
+    } finally {
+      setCompacting(false);
+    }
+  };
+
   const handleRunNow = async () => {
     setRunning(true);
     try {
@@ -296,14 +332,16 @@ export function RetentionSettings() {
   return (
     <>
       <div className="space-y-4 pt-4 border-t border-border">
-        {/* Recent-window delete */}
-        <div className="space-y-2">
+        {/* Card 1 — one-time manual purge of just-captured activity */}
+        <div className="space-y-2 rounded border border-border p-3">
           <div className="flex items-center gap-2">
             <Clock className="h-4 w-4 text-muted-foreground" />
             <div>
-              <p className="text-sm font-medium">delete recent data</p>
+              <p className="text-sm font-medium">erase recent activity</p>
               <p className="text-xs text-muted-foreground">
-                instantly purge everything captured in the chosen window
+                wipe the last few minutes if something was captured by
+                mistake. removes clips, audio, transcripts, and ocr. asks
+                first.
               </p>
             </div>
           </div>
@@ -323,62 +361,92 @@ export function RetentionSettings() {
           </div>
         </div>
 
-        {/* Auto-cleanup section */}
-        <div className="space-y-3 pt-3 border-t border-border/50">
+        {/* Card 2 — ongoing retention policy (distinct from the manual purge above) */}
+        <div className="space-y-3 rounded border border-border p-3">
           <div className="flex items-center gap-2">
             <Trash2 className="h-4 w-4 text-muted-foreground" />
             <div>
-              <p className="text-sm font-medium">auto-delete old data</p>
+              <p className="text-sm font-medium">storage policy</p>
               <p className="text-xs text-muted-foreground">
-                free disk space without losing your timeline
+                what happens to recordings as they age
               </p>
             </div>
           </div>
 
+          {/* Current state spelled out so "recommended" never reads as "active" */}
+          <p className="text-xs text-muted-foreground pl-6">
+            {effective === "off"
+              ? "currently: keeping everything forever."
+              : effective === "media"
+                ? `currently: dropping video + audio older than ${retentionDays} days, text stays searchable.`
+                : effective === "lean"
+                  ? `currently: dropping video + audio and the bulky ocr/accessibility detail older than ${retentionDays} days, text + memories stay searchable.`
+                  : `currently: deleting everything older than ${retentionDays} days.`}
+          </p>
+
           <div className="space-y-2 pl-6">
             <ModeRow
+              testId="retention-mode-off"
+              checked={effective === "off"}
+              title="keep everything"
+              body="disk keeps growing. you monitor space yourself."
+              onClick={() => handleSelectMode("off")}
+            />
+            <ModeRow
+              testId="retention-mode-media"
               checked={effective === "media"}
               recommended
               icon={<Film className="h-4 w-4" />}
-              title="video + audio only"
-              body="reclaims mp4/wav/jpeg files. transcripts, ocr, app history stay searchable. you won't be able to replay clips past the cutoff."
+              title="drop video + audio, keep text"
+              body="reclaims mp4/wav/jpeg files. transcripts, ocr, and app history stay searchable. you won't be able to replay clips past the cutoff."
               onClick={() => handleSelectMode("media")}
             />
             <ModeRow
+              testId="retention-mode-lean"
+              checked={effective === "lean"}
+              icon={<FileText className="h-4 w-4" />}
+              title="trim heavy ui data, keep text + memories"
+              body="everything media mode does, plus drops the bulky per-element ocr + accessibility detail (the biggest part of the database) older than the cutoff. text search, transcripts, timeline, and memories still work — only the on-screen element geometry is dropped. stops the database from ballooning and frees that space for reuse."
+              onClick={() => handleSelectMode("lean")}
+            />
+            <ModeRow
+              testId="retention-mode-all"
               checked={effective === "all"}
               icon={<Trash2 className="h-4 w-4" />}
-              title="everything"
+              title="delete everything"
               body="permanently deletes all data past the cutoff. search won't find anything from that period."
               onClick={() => handleSelectMode("all")}
             />
-            <ModeRow
-              checked={effective === "off"}
-              title="off"
-              body="keep everything forever. you'll need to monitor disk usage manually."
-              onClick={() => handleSelectMode("off")}
-            />
           </div>
 
-          {effective !== "off" && (
-            <div className="flex items-center gap-3 pl-6">
-              <span className="text-sm text-muted-foreground">
-                {effective === "media" ? "evict media older than" : "delete data older than"}
-              </span>
-              <Select
-                value={retentionDays.toString()}
-                onValueChange={handleRetentionChange}
-              >
-                <SelectTrigger className="w-[120px] h-8">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {RETENTION_OPTIONS.map((opt) => (
-                    <SelectItem key={opt.value} value={opt.value}>
-                      {opt.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+          {/* Cutoff stays visible (disabled when off) so "the cutoff" always has a referent */}
+          <div className="flex flex-wrap items-center gap-3 pl-6">
+            <span className="text-sm text-muted-foreground">
+              {effective === "off"
+                ? "cutoff (applies once a policy is on)"
+                : effective === "media"
+                  ? "evict media older than"
+                  : effective === "lean"
+                    ? "clean up data older than"
+                    : "delete data older than"}
+            </span>
+            <Select
+              value={retentionDays.toString()}
+              onValueChange={handleRetentionChange}
+              disabled={effective === "off"}
+            >
+              <SelectTrigger className="w-[120px] h-8">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {RETENTION_OPTIONS.map((opt) => (
+                  <SelectItem key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {effective !== "off" && (
               <Button
                 variant="outline"
                 size="sm"
@@ -393,8 +461,10 @@ export function RetentionSettings() {
                 )}
                 clean up now
               </Button>
-            </div>
-          )}
+            )}
+          </div>
+
+          {effective !== "off" && <RetentionModePreview mode={effective} />}
 
           {effective !== "off" && status && (
             <div className="text-xs text-muted-foreground space-y-1 pl-6">
@@ -403,8 +473,13 @@ export function RetentionSettings() {
               )}
               {status.total_deleted > 0 && (
                 <p>
-                  total {effective === "media" ? "files evicted" : "records deleted"}:{" "}
-                  {status.total_deleted.toLocaleString()}
+                  total{" "}
+                  {effective === "media"
+                    ? "files evicted"
+                    : effective === "lean"
+                      ? "items cleaned"
+                      : "records deleted"}
+                  : {status.total_deleted.toLocaleString()}
                 </p>
               )}
               {status.last_error && (
@@ -415,8 +490,62 @@ export function RetentionSettings() {
               )}
             </div>
           )}
+
+          {/* Compact — physically shrink db.sqlite by rebuilding it (full
+              VACUUM). Cleanup/lean stop the DB growing and reuse freed pages,
+              but the file only returns space to the drive when compacted. */}
+          <div className="flex flex-wrap items-center gap-3 pl-6 border-t border-border pt-3">
+            <div className="flex-1 min-w-[180px]">
+              <p className="text-sm font-medium">reclaim disk space</p>
+              <p className="text-xs text-muted-foreground">
+                rebuild the database file so freed space goes back to your
+                drive. cleanup keeps the database from growing; compacting is
+                what actually shrinks the file.
+              </p>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-8 text-xs"
+              onClick={() => setPendingCompact(true)}
+              disabled={compacting}
+            >
+              {compacting ? (
+                <Loader2 className="h-3 w-3 mr-1.5 animate-spin" />
+              ) : (
+                <Minimize2 className="h-3 w-3 mr-1.5" />
+              )}
+              compact database
+            </Button>
+          </div>
         </div>
       </div>
+
+      {/* Compact confirmation */}
+      <AlertDialog
+        open={pendingCompact}
+        onOpenChange={(open) => {
+          if (!open) setPendingCompact(false);
+        }}
+      >
+        <AlertDialogContent data-testid="retention-compact-dialog">
+          <AlertDialogHeader>
+            <AlertDialogTitle>compact the database?</AlertDialogTitle>
+            <AlertDialogDescription>
+              screenpipe will rebuild db.sqlite to return freed space to your
+              drive. recording briefly pauses while it runs, and it needs free
+              disk space roughly equal to the current database size. larger
+              databases take longer.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={confirmCompact}>
+              compact now
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {/* Recent-delete confirmation */}
       <AlertDialog
@@ -425,7 +554,7 @@ export function RetentionSettings() {
           if (!open) setPendingRecent(null);
         }}
       >
-        <AlertDialogContent>
+        <AlertDialogContent data-testid="retention-recent-delete-dialog">
           <AlertDialogHeader>
             <AlertDialogTitle>
               delete the last {pendingRecent} minutes?
@@ -455,12 +584,14 @@ export function RetentionSettings() {
           if (!open) setPendingMode(null);
         }}
       >
-        <AlertDialogContent>
+        <AlertDialogContent data-testid="retention-mode-confirm-dialog">
           <AlertDialogHeader>
             <AlertDialogTitle>
               {pendingMode === "media"
                 ? "enable media eviction?"
-                : "delete everything past the cutoff?"}
+                : pendingMode === "lean"
+                  ? "enable lean cleanup?"
+                  : "delete everything past the cutoff?"}
             </AlertDialogTitle>
             <AlertDialogDescription>
               {pendingMode === "media" ? (
@@ -468,6 +599,14 @@ export function RetentionSettings() {
                   every day, screenpipe will delete video and audio files older
                   than {retentionDays} days. transcripts, ocr text, and your
                   app/window timeline stay searchable.
+                </>
+              ) : pendingMode === "lean" ? (
+                <>
+                  every day, screenpipe will reclaim video and audio files and
+                  drop the bulky per-element ocr + accessibility detail older
+                  than {retentionDays} days — the part that makes the database
+                  grow. your text search, transcripts, timeline, and memories
+                  stay intact. clip replay past the cutoff won't be available.
                 </>
               ) : (
                 <>
@@ -499,7 +638,9 @@ export function RetentionSettings() {
             <span className="text-sm text-muted-foreground">
               {pendingMode === "media"
                 ? "evict media older than"
-                : "delete data older than"}
+                : pendingMode === "lean"
+                  ? "clean up data older than"
+                  : "delete data older than"}
             </span>
             <Select
               value={retentionDays.toString()}
@@ -518,8 +659,9 @@ export function RetentionSettings() {
             </Select>
           </div>
           <AlertDialogFooter>
-            <AlertDialogCancel>cancel</AlertDialogCancel>
+            <AlertDialogCancel data-testid="retention-mode-cancel">cancel</AlertDialogCancel>
             <AlertDialogAction
+              data-testid="retention-mode-confirm"
               onClick={confirmEnable}
               className={
                 pendingMode === "all"
@@ -527,7 +669,11 @@ export function RetentionSettings() {
                   : undefined
               }
             >
-              {pendingMode === "media" ? "enable eviction" : "enable deletion"}
+              {pendingMode === "media"
+                ? "enable eviction"
+                : pendingMode === "lean"
+                  ? "enable cleanup"
+                  : "enable deletion"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -543,6 +689,7 @@ function ModeRow({
   recommended,
   icon,
   onClick,
+  testId,
 }: {
   checked: boolean;
   title: string;
@@ -550,10 +697,12 @@ function ModeRow({
   recommended?: boolean;
   icon?: React.ReactNode;
   onClick: () => void;
+  testId?: string;
 }) {
   return (
     <button
       type="button"
+      data-testid={testId}
       onClick={onClick}
       className={`w-full text-left flex gap-3 rounded border p-2.5 transition-colors ${
         checked

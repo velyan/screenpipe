@@ -13,10 +13,12 @@ use oasgen::{oasgen, OaSchema};
 use screenpipe_audio::core::device::{
     default_input_device, default_output_device, list_audio_devices,
 };
+use screenpipe_events::{send_event, AudioDeviceStatusChangedEvent};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use tracing::warn;
 
 use crate::server::AppState;
 
@@ -91,6 +93,16 @@ pub(crate) async fn start_audio_device(
 ) -> Result<Json<AudioDeviceControlResponse>, (StatusCode, JsonResponse<Value>)> {
     let device_name = payload.device_name.clone();
 
+    if state.audio_disabled || state.audio_manager.is_disabled().await {
+        return Err((
+            StatusCode::CONFLICT,
+            JsonResponse(json!({
+                "success": false,
+                "message": "Audio capture is disabled in settings"
+            })),
+        ));
+    }
+
     if let Err(e) = state.audio_manager.resume_device(&device_name).await {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -99,6 +111,11 @@ pub(crate) async fn start_audio_device(
                 "message": format!("Failed to start recording device {}: {}", device_name, e)
             })),
         ));
+    }
+
+    let event = AudioDeviceStatusChangedEvent::started(device_name.clone());
+    if let Err(err) = send_event(event.event_name(), event) {
+        warn!("failed to publish audio device status change: {}", err);
     }
 
     Ok(Json(AudioDeviceControlResponse {
@@ -122,6 +139,11 @@ pub(crate) async fn stop_audio_device(
                 "message": format!("Failed to stop recording device {}: {}", device_name, e)
             })),
         ));
+    }
+
+    let event = AudioDeviceStatusChangedEvent::stopped(device_name.clone());
+    if let Err(err) = send_event(event.event_name(), event) {
+        warn!("failed to publish audio device status change: {}", err);
     }
 
     Ok(Json(AudioDeviceControlResponse {
@@ -175,6 +197,16 @@ pub(crate) async fn audio_device_status(
 pub(crate) async fn start_audio(
     State(state): State<Arc<AppState>>,
 ) -> Result<Response, (StatusCode, JsonResponse<Value>)> {
+    if state.audio_disabled || state.audio_manager.is_disabled().await {
+        return Err((
+            StatusCode::CONFLICT,
+            JsonResponse(json!({
+                "success": false,
+                "message": "Audio capture is disabled in settings",
+            })),
+        ));
+    }
+
     match state.audio_manager.start().await {
         Ok(_) => Ok(Response::builder().status(200).body(Body::empty()).unwrap()),
         Err(e) => Err((

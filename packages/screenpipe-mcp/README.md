@@ -34,14 +34,21 @@ The MCP server can run over HTTP using the [Streamable HTTP transport](https://m
 
 ```bash
 # loopback only (default)
-npx screenpipe-mcp-http --port 3031
+npx -y screenpipe-mcp --http --port 3031
 
 # expose to your LAN with bearer auth
-npx screenpipe-mcp-http --listen-on-lan --api-key $(openssl rand -hex 16)
+npx -y screenpipe-mcp --http --listen-on-lan --api-key $(openssl rand -hex 16)
 
-# or from source
-npm run start:http -- --port 3031
+# or from source — must build first so dist/ exists
+bun install && bun run build
+bun run start:http -- --port 3031
 ```
+
+> Tip: `npx screenpipe-mcp-http` (without `--http`) does **not** work —
+> npm resolves by package name, and there is no `screenpipe-mcp-http`
+> package. The HTTP server ships as a transport inside the
+> `screenpipe-mcp` package; use `--http` as shown above, or invoke the
+> bin directly with `npx -p screenpipe-mcp screenpipe-mcp-http`.
 
 The server exposes:
 - **MCP endpoint**: `http://localhost:3031/mcp` — Streamable HTTP transport (POST for requests, GET for SSE stream)
@@ -115,7 +122,7 @@ npx @modelcontextprotocol/inspector npx screenpipe-mcp
 | Mode | Command | Use Case |
 |------|---------|----------|
 | **stdio** (default) | `npx screenpipe-mcp` | Claude Desktop, local MCP clients |
-| **HTTP** | `npx screenpipe-mcp-http` | Remote clients, network access, OpenClaw on VPS |
+| **HTTP** | `npx screenpipe-mcp --http` | Remote clients, network access, OpenClaw on VPS |
 
 ## Available Tools
 
@@ -141,12 +148,18 @@ Get a lightweight compressed activity overview for a time range:
 - Audio speaker summary
 
 ### list-meetings
-List detected meetings with duration, app, and attendees.
+List detected meetings with duration, app, and attendees. Pass `q` to filter by substring (title, attendees, notes).
 
 ### search-elements
 Search structured UI elements (accessibility tree nodes and OCR text blocks):
 - Filter by source, role, app, time range
 - Much lighter than search-content for targeted UI lookups
+- Returns a compact `outline` view by default — a deduped, indented tree of the
+  text-bearing nodes (`#id` refs, `(off-screen)` flags), ~91% fewer tokens than
+  raw element JSON
+
+### get-frame-elements
+The whole element tree for one frame, as the same compact outline.
 
 ### frame-context
 Get accessibility text, parsed tree nodes, and extracted URLs for a specific frame.
@@ -172,6 +185,7 @@ Get accessibility text, parsed tree nodes, and extracted URLs for a specific fra
 - All timestamps are handled in UTC
 - Results are formatted for readability in Claude's interface
 - macOS automation features require accessibility permissions
+- The MCP tools already return compact, readable text (the element tools default to the `outline` view). If you instead call the underlying screenpipe REST API directly (e.g. via `curl`), the list endpoints (`/search`, `/elements`, `/frames/{id}/elements`) accept `?format=csv|tsv` for a columnar table (column names written once) and `?fields=a,b,c` to select only the columns you need (dotted paths like `content.text`); the element endpoints also accept `?format=outline` (the same tree the MCP tools return, ~91% fewer tokens than JSON). On list-shaped results that is a 70–91% token cut versus the default JSON, which stays unchanged when no param is set.
 
 ## Privacy Policy
 
@@ -213,8 +227,9 @@ captures is retained according to your Screenpipe storage configuration
 and is deletable at any time (`rm -rf ~/.screenpipe` removes everything).
 
 ### Source code
-The Screenpipe MCP server is MIT-licensed and the entire source is
-public at <https://github.com/screenpipe/screenpipe/tree/main/packages/screenpipe-mcp>.
+The Screenpipe MCP server is source-available under the Screenpipe
+Commercial License and the entire source is public at
+<https://github.com/screenpipe/screenpipe/tree/main/packages/screenpipe-mcp>.
 Every line is auditable.
 
 ### Contact

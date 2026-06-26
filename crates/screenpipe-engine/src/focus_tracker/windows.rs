@@ -6,9 +6,10 @@
 //!
 //! Subscribes to `EVENT_SYSTEM_FOREGROUND` via `SetWinEventHook` on a
 //! dedicated Windows message-loop thread. When the foreground window
-//! changes, we resolve the target `HWND` to an `HMONITOR` via
-//! `MonitorFromWindow` and map that to our internal monitor id by enumerating
-//! displays via `EnumDisplayMonitors` and matching by device name + bounds.
+//! changes, we resolve the target `HWND` to a cached monitor rectangle and map
+//! that to our internal monitor id. The monitor cache is refreshed by the 5s
+//! safety-net poll, keeping foreground-event callbacks cheap during app
+//! switching.
 //!
 //! Fallback: when `GetForegroundWindow` returns NULL (e.g. during Win+L, UAC
 //! prompts, or the brief no-foreground period after closing a window), we
@@ -23,9 +24,9 @@
 //! thread-local `Arc` pointer in the WinEvent callback to reach back to it
 //! without crossing the ABI boundary with non-ABI-safe types.
 
-use super::{FocusEvent, FocusTracker};
+use super::{FocusEvent, FocusTracker, MonitorIdentity};
 use anyhow::Result;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::broadcast;
@@ -34,9 +35,9 @@ use tracing::{debug, warn};
 
 /// Plain rect used for monitor resolution — the Win32 `RECT` type is not
 /// trivially shareable across Rust modules. We convert on the edge.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct MonitorRect {
-    id: u32,
+    identity: MonitorIdentity,
     x: i32,
     y: i32,
     w: u32,
@@ -45,32 +46,29 @@ struct MonitorRect {
 
 /// Find the monitor whose bounds contain the given point. Half-open on
 /// right/bottom so adjacent monitors don't overlap at the seam.
-fn pick_monitor(rects: &[MonitorRect], x: i32, y: i32) -> Option<u32> {
+fn pick_monitor(rects: &[MonitorRect], x: i32, y: i32) -> Option<MonitorIdentity> {
     rects.iter().find_map(|r| {
         if x >= r.x && x < r.x + r.w as i32 && y >= r.y && y < r.y + r.h as i32 {
-            Some(r.id)
+            Some(r.identity.clone())
         } else {
             None
         }
     })
 }
 
-fn monitor_for_point(
+fn monitor_rects_from_monitors(
     monitors: &[screenpipe_screen::monitor::SafeMonitor],
-    x: i32,
-    y: i32,
-) -> Option<u32> {
-    let rects: Vec<MonitorRect> = monitors
+) -> Vec<MonitorRect> {
+    monitors
         .iter()
         .map(|m| MonitorRect {
-            id: m.id(),
+            identity: MonitorIdentity::from_monitor(m),
             x: m.x(),
             y: m.y(),
             w: m.width(),
             h: m.height(),
         })
-        .collect();
-    pick_monitor(&rects, x, y)
+        .collect()
 }
 
 /// Read the current cursor position in virtual-desktop coordinates.
@@ -126,36 +124,69 @@ fn foreground_window_anchor() -> Option<(i32, i32)> {
 
 struct Inner {
     tx: broadcast::Sender<FocusEvent>,
-    current: AtomicU32,
+    current: Mutex<Option<MonitorIdentity>>,
+    monitor_rects: Mutex<Vec<MonitorRect>>,
     stop_flag: AtomicBool,
     unknown_emitted: Mutex<bool>,
-    // Handle to the tokio runtime captured at start(). The WinEvent callback
-    // runs on the Win32 message-pump thread (no tokio context), so we drive
-    // async calls via this handle instead of `futures::executor::block_on`,
-    // which would panic on `tokio::task::spawn_blocking` inside list_monitors.
+    // Handle to the tokio runtime captured at start(). Normally foreground
+    // callbacks use cached monitor rects, but startup races may need one
+    // fallback refresh on the Win32 message-pump thread.
     runtime: tokio::runtime::Handle,
 }
 
 impl Inner {
+    fn set_monitor_rects(&self, rects: Vec<MonitorRect>) {
+        if let Ok(mut cached) = self.monitor_rects.lock() {
+            *cached = rects;
+        }
+    }
+
+    fn cached_monitor_rects(&self) -> Option<Vec<MonitorRect>> {
+        let cached = self.monitor_rects.lock().ok()?;
+        if cached.is_empty() {
+            None
+        } else {
+            Some(cached.clone())
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn refresh_monitor_rects_and_emit(&self) {
+        let monitors = screenpipe_screen::monitor::list_monitors().await;
+        let rects = monitor_rects_from_monitors(&monitors);
+        self.set_monitor_rects(rects.clone());
+        self.resolve_and_emit(&rects);
+    }
+
     /// Resolve focus: try the foreground-window anchor first; fall back to
     /// cursor position on failure.
     #[cfg(target_os = "windows")]
-    fn resolve_and_emit(&self, monitors: &[screenpipe_screen::monitor::SafeMonitor]) {
+    fn resolve_and_emit(&self, rects: &[MonitorRect]) {
         if self.stop_flag.load(Ordering::Relaxed) {
             return;
         }
 
         let resolved = foreground_window_anchor()
-            .and_then(|(x, y)| monitor_for_point(monitors, x, y))
-            .or_else(|| cursor_position().and_then(|(x, y)| monitor_for_point(monitors, x, y)));
+            .and_then(|(x, y)| pick_monitor(rects, x, y))
+            .or_else(|| cursor_position().and_then(|(x, y)| pick_monitor(rects, x, y)));
 
         match resolved {
-            Some(id) => {
-                let prev = self.current.load(Ordering::Relaxed);
-                if prev != id {
-                    self.current.store(id, Ordering::Relaxed);
-                    let _ = self.tx.send(FocusEvent::Focused(id));
-                    debug!("win focus tracker: focused monitor -> {}", id);
+            Some(identity) => {
+                let changed = self
+                    .current
+                    .lock()
+                    .map(|mut current| {
+                        if current.as_ref() == Some(&identity) {
+                            false
+                        } else {
+                            *current = Some(identity.clone());
+                            true
+                        }
+                    })
+                    .unwrap_or(false);
+                if changed {
+                    let _ = self.tx.send(FocusEvent::Focused(identity.clone()));
+                    debug!("win focus tracker: focused monitor -> {:?}", identity);
                 }
                 if let Ok(mut u) = self.unknown_emitted.lock() {
                     *u = false;
@@ -175,7 +206,9 @@ impl Inner {
                 };
                 if emit {
                     let _ = self.tx.send(FocusEvent::Unknown);
-                    self.current.store(0, Ordering::Relaxed);
+                    if let Ok(mut current) = self.current.lock() {
+                        *current = None;
+                    }
                     debug!("win focus tracker: no monitor resolvable");
                 }
             }
@@ -222,7 +255,8 @@ impl WindowsFocusTracker {
         let (tx, _) = broadcast::channel::<FocusEvent>(16);
         let inner = Arc::new(Inner {
             tx,
-            current: AtomicU32::new(0),
+            current: Mutex::new(None),
+            monitor_rects: Mutex::new(Vec::new()),
             stop_flag: AtomicBool::new(false),
             unknown_emitted: Mutex::new(false),
             runtime: handle.clone(),
@@ -246,16 +280,14 @@ impl WindowsFocusTracker {
                     break;
                 }
                 tokio::time::sleep(Duration::from_secs(5)).await;
-                let monitors = screenpipe_screen::monitor::list_monitors().await;
-                poll_inner.resolve_and_emit(&monitors);
+                poll_inner.refresh_monitor_rects_and_emit().await;
             }
         });
 
         // Seed initial state.
         let seed_inner = Arc::clone(&inner);
         handle.spawn(async move {
-            let monitors = screenpipe_screen::monitor::list_monitors().await;
-            seed_inner.resolve_and_emit(&monitors);
+            seed_inner.refresh_monitor_rects_and_emit().await;
         });
 
         Ok(Self {
@@ -299,6 +331,13 @@ fn run_win_event_observer() {
         if inner.stop_flag.load(Ordering::Relaxed) {
             return;
         }
+        if let Some(rects) = inner.cached_monitor_rects() {
+            inner.resolve_and_emit(&rects);
+            return;
+        }
+
+        // Startup race fallback only; steady-state foreground events use the
+        // cached monitor rectangles refreshed by the poll task.
         // `list_monitors()` is async and internally uses `tokio::task::spawn_blocking`,
         // so it MUST run on the tokio runtime captured at start(). This callback fires
         // on the Win32 message-pump thread, which has no tokio context — driving the
@@ -308,7 +347,9 @@ fn run_win_event_observer() {
         let monitors = inner
             .runtime
             .block_on(screenpipe_screen::monitor::list_monitors());
-        inner.resolve_and_emit(&monitors);
+        let rects = monitor_rects_from_monitors(&monitors);
+        inner.set_monitor_rects(rects.clone());
+        inner.resolve_and_emit(&rects);
     }
 
     // Safety: SetWinEventHook returns an HWINEVENTHOOK (0 on failure). We
@@ -355,13 +396,8 @@ fn run_win_event_observer() {
 }
 
 impl FocusTracker for WindowsFocusTracker {
-    fn current(&self) -> Option<u32> {
-        let v = self.inner.current.load(Ordering::Relaxed);
-        if v == 0 {
-            None
-        } else {
-            Some(v)
-        }
+    fn current(&self) -> Option<MonitorIdentity> {
+        self.inner.current.lock().ok()?.clone()
     }
 
     fn subscribe(&self) -> broadcast::Receiver<FocusEvent> {
@@ -389,14 +425,14 @@ mod tests {
     fn pick_monitor_basic_bounds() {
         let monitors = vec![
             MonitorRect {
-                id: 1,
+                identity: MonitorIdentity::runtime_id(1),
                 x: 0,
                 y: 0,
                 w: 1920,
                 h: 1080,
             },
             MonitorRect {
-                id: 2,
+                identity: MonitorIdentity::runtime_id(2),
                 x: 1920,
                 y: 0,
                 w: 1920,
@@ -404,9 +440,18 @@ mod tests {
             },
         ];
 
-        assert_eq!(pick_monitor(&monitors, 100, 100), Some(1));
-        assert_eq!(pick_monitor(&monitors, 2000, 100), Some(2));
-        assert_eq!(pick_monitor(&monitors, 1920, 500), Some(2));
+        assert_eq!(
+            pick_monitor(&monitors, 100, 100),
+            Some(MonitorIdentity::runtime_id(1))
+        );
+        assert_eq!(
+            pick_monitor(&monitors, 2000, 100),
+            Some(MonitorIdentity::runtime_id(2))
+        );
+        assert_eq!(
+            pick_monitor(&monitors, 1920, 500),
+            Some(MonitorIdentity::runtime_id(2))
+        );
         assert_eq!(pick_monitor(&monitors, 500, 5000), None);
         assert_eq!(pick_monitor(&monitors, -5, -5), None);
     }

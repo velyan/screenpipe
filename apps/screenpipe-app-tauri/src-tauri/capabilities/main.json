@@ -10,7 +10,7 @@
       "http://localhost:*",
       "https://api.openai.com/*",
       "https://*.openai.com/*",
-      "https://api.screenpi.pe/*",
+      "https://api.screenpipe.com/*",
       "https://*.anthropic.com/*",
       "https://*.ollama.ai/*",
       "https://*"
@@ -122,6 +122,10 @@
         },
         {
           "path": "$HOME/*",
+          "requireLiteralLeadingDot": false
+        },
+        {
+          "path": "$HOME/**",
           "requireLiteralLeadingDot": false
         },
         {
@@ -263,6 +267,7 @@
     },
     "cli:default",
     "shell:allow-spawn",
+    "permission-flow:default",
     "dialog:default",
     "updater:default",
     "os:default",

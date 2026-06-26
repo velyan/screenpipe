@@ -38,7 +38,10 @@ import {
 } from "./bus";
 import type { AgentEventEnvelope, AgentInnerEvent } from "./types";
 import { parsePipeSessionId } from "./types";
-import { saveConversationFile } from "@/lib/chat-storage";
+import {
+  conversationMetaFromJson,
+  saveConversationFile,
+} from "@/lib/chat-storage";
 import { parsePipeNdjsonToMessages } from "@/lib/pipe-ndjson-to-chat";
 import type { ChatConversation, ChatMessage } from "@/lib/hooks/use-settings";
 
@@ -66,7 +69,6 @@ let unregister: Unregister | null = null;
 
 const TERMINAL_EVENT_TYPES = new Set([
   "agent_end",
-  "turn_end",
   "pipe_done",
 ]);
 
@@ -188,7 +190,7 @@ async function finalizeBuffer(sid: string, buf: PipeRunBuffer): Promise<void> {
   }
 
   const ndjson = buf.lines.join("\n");
-  const messages: ChatMessage[] = parsePipeNdjsonToMessages(ndjson);
+  const messages: ChatMessage[] = parsePipeNdjsonToMessages(ndjson, buf.pipeName);
 
   // Skip empty conversations — pipes that emitted no parseable
   // assistant content (e.g. raw_line-only streams that the parser
@@ -202,9 +204,13 @@ async function finalizeBuffer(sid: string, buf: PipeRunBuffer): Promise<void> {
   const conv: ChatConversation = {
     id: sid,
     title: `${buf.pipeName} #${buf.executionId}`,
+    titleSource: "user",
     messages,
     createdAt: buf.firstEventAt,
     updatedAt: buf.lastEventAt,
+    // Unwatched completed pipe runs should surface as unread until opened.
+    lastContentAt: buf.lastEventAt,
+    lastViewedAt: 0,
     kind: "pipe-run",
     pipeContext: {
       pipeName: buf.pipeName,
@@ -217,6 +223,24 @@ async function finalizeBuffer(sid: string, buf: PipeRunBuffer): Promise<void> {
     await saveConversationFile(conv);
   } catch (e) {
     console.warn("[pipe-run-recorder] save failed for", sid, e);
+    return;
+  }
+
+  // Sidebar reads the in-memory chat-store, not disk. Without this
+  // upsert the new pipe-run row wouldn't show up until the next app
+  // restart (when hydrate() re-scans ~/.screenpipe/chats/). We use the
+  // same meta → SessionRecord transform as the boot hydrate path so
+  // both surfaces produce identically-shaped rows.
+  try {
+    const { useChatStore, sessionRecordFromMeta } = await import(
+      "@/lib/stores/chat-store"
+    );
+    const meta = conversationMetaFromJson(conv);
+    if (meta) {
+      useChatStore.getState().actions.upsert(sessionRecordFromMeta(meta));
+    }
+  } catch (e) {
+    console.warn("[pipe-run-recorder] sidebar upsert failed for", sid, e);
   }
 }
 

@@ -5,13 +5,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(deprecated)] // cocoa/objc crate deprecations — will migrate to objc2 later
 #![allow(unused_imports)]
+// analytics.rs builds a ~70-field json! health blob; the default recursion limit
+// (128) overflows while expanding the macro. Raise it for the whole crate.
+#![recursion_limit = "256"]
 
 use analytics::AnalyticsManager;
-use commands::show_main_window;
 use serde_json::json;
 use std::env;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::Emitter;
 use tauri::Manager;
@@ -29,17 +31,14 @@ use tracing_oslog::OsLogger;
 use updates::start_update_check;
 use window::ShowRewindWindow;
 
-// TypeScript bindings generation imports (only in debug builds)
-#[cfg(debug_assertions)]
-use specta_typescript::Typescript;
-#[cfg(debug_assertions)]
-use tauri_specta::{collect_commands, Builder};
-
 mod analytics;
+mod auth_session;
 #[allow(deprecated)]
 mod icons;
 use crate::analytics::start_analytics;
 mod agent_event_emitter;
+mod audio_exclusions;
+mod auth_token;
 mod calendar;
 mod capture_session;
 mod chatgpt_oauth;
@@ -47,27 +46,35 @@ mod chatgpt_oauth;
 mod commands;
 mod disk_usage;
 mod embedded_server;
+mod enterprise_install_metadata;
 mod enterprise_policy;
 mod enterprise_sync;
+mod events;
+mod google_calendar;
 mod hardware;
 mod ics_calendar;
 mod livetext;
 #[cfg(target_os = "macos")]
 mod livetext_ffi;
+mod db_recovery_notifications;
+mod meeting_export;
 mod meeting_live_notes;
+mod meeting_stall_notifications;
 mod oauth;
 mod owned_browser;
+mod owned_browser_transport;
 // Cross-platform shape: macOS reads Arc/Chrome/Brave/Edge cookies and
 // injects via WKHTTPCookieStore; other platforms compile to a stub
 // `cookies_for_host` that returns empty until Windows (DPAPI + AES-256-
 // GCM + WebView2) and Linux (libsecret + webkit2gtk) readers land.
+mod engine_events;
 mod monitor_events;
 mod owned_browser_cookies;
-mod permission_events;
 mod permissions;
 mod pi;
 mod pi_command_queue;
 mod pipe_suggestions_scheduler;
+mod power_awake;
 mod recording;
 mod remote_sync_commands;
 mod secrets;
@@ -108,6 +115,9 @@ pub use recording::stop_screenpipe;
 pub use server::spawn_server;
 // Removed: pub use store::get_profiles_store; // Profile functionality has been removed
 
+pub use enterprise_install_metadata::get_enterprise_install_metadata;
+pub use enterprise_policy::set_enterprise_policy;
+pub use enterprise_policy::set_sync_streams;
 pub use permissions::do_permissions_check;
 pub use permissions::open_permission_settings;
 pub use permissions::request_permission;
@@ -122,8 +132,13 @@ mod native_shortcut_reminder;
 mod notifications;
 mod safe_icon;
 mod shortcuts;
+mod skills;
+mod specta_bindings;
 mod vault;
 mod viewer;
+
+#[cfg(target_os = "macos")]
+static MIC_FOCUS_CAPTURE_RESTART: AtomicBool = AtomicBool::new(false);
 use base64::Engine;
 use health::start_health_check;
 use log_files::{get_log_files, get_screenpipe_data_dir};
@@ -162,14 +177,15 @@ use tokio::time::{sleep, Duration};
 #[tauri::command]
 #[specta::specta]
 async fn get_media_file(file_path: &str) -> Result<serde_json::Value, String> {
-    use std::path::Path;
-
     const MAX_RETRIES: u32 = 3;
     const INITIAL_DELAY_MS: u64 = 100;
 
     debug!("Reading media file: {}", file_path);
 
-    let path = Path::new(file_path);
+    // Media paths can arrive home-relative (e.g. `~/Downloads/clip.mp4`) when the
+    // agent prints a friendly path in chat. `Path::new` does not expand `~`, so
+    // resolve it the same way the in-app file viewer does before touching disk.
+    let path = viewer::expand_tilde(file_path);
 
     // Retry loop to handle files that may be in the process of being written
     let mut last_error = String::new();
@@ -184,7 +200,7 @@ async fn get_media_file(file_path: &str) -> Result<serde_json::Value, String> {
         }
 
         if !path.exists() {
-            last_error = format!("File does not exist: {}", file_path);
+            last_error = format!("File does not exist: {}", path.display());
             if attempt < MAX_RETRIES {
                 continue;
             }
@@ -192,7 +208,7 @@ async fn get_media_file(file_path: &str) -> Result<serde_json::Value, String> {
         }
 
         // Read file contents
-        match tokio::fs::read(path).await {
+        match tokio::fs::read(&path).await {
             Ok(contents) => {
                 // Check for empty or suspiciously small files (might still be writing)
                 if contents.is_empty() {
@@ -289,11 +305,17 @@ async fn upload_file_to_s3(file_path: &str, signed_url: &str) -> Result<bool, St
             .await
         {
             Ok(response) => {
-                if response.status().is_success() {
+                let status = response.status();
+                if status.is_success() {
                     debug!("Successfully uploaded file on attempt {}", attempt);
                     return Ok(true);
                 }
-                last_error = format!("Upload failed with status: {}", response.status());
+                // Surface the response body — S3/Supabase wraps the reason for
+                // 400/403 (signed URL expired, content-type mismatch, etc.) in
+                // an XML payload that we'd otherwise discard.
+                let body = response.text().await.unwrap_or_default();
+                let snippet: String = body.chars().take(500).collect();
+                last_error = format!("Upload failed with status: {} body: {}", status, snippet);
                 error!("{} (attempt {}/{})", last_error, attempt, max_retries);
             }
             Err(e) => {
@@ -326,8 +348,49 @@ async fn is_server_running(app: AppHandle) -> Result<bool, String> {
     Ok(response.is_ok())
 }
 
+/// Shared tauri-specta registry body.
+macro_rules! define_specta_builder {
+    () => {{
+        use crate::store::{OnboardingStore, SettingsStore};
+        use tauri_specta::Builder;
+
+        Builder::new()
+            .commands(tauri_helper::specta_collect_commands!())
+            .typ::<SettingsStore>()
+            .typ::<OnboardingStore>()
+            .typ::<sync::SyncStatusResponse>()
+            .typ::<sync::SyncDeviceInfo>()
+            .typ::<sync::SyncConfig>()
+            .typ::<calendar::CalendarStatus>()
+            .typ::<calendar::CalendarEventItem>()
+            .typ::<store::IcsCalendarEntry>()
+            .typ::<suggestions::CachedSuggestions>()
+            .typ::<suggestions::Suggestion>()
+            .typ::<hardware::HardwareCapability>()
+            .typ::<enterprise_install_metadata::EnterpriseInstallMetadata>()
+            .typ::<chatgpt_oauth::ChatGptOAuthStatus>()
+            .typ::<oauth::OAuthStatus>()
+            .typ::<events::JobEvent>()
+            .typ::<events::ExportEvent>()
+            .typ::<events::ExportRequestInfo>()
+            .typ::<events::EngineEvent>()
+            .typ::<events::NotificationActionEvent>()
+            .typ::<meeting_export::MeetingExportSummary>()
+            .typ::<meeting_export::StartExportRecordingResponse>()
+    }};
+}
+
 #[tokio::main]
 async fn main() {
+    // Raise the file-descriptor soft limit BEFORE any DB/socket work. The app
+    // embeds the engine in-process, so it never ran the engine binary's main()
+    // and kept macOS's default soft RLIMIT_NOFILE of 256 — too low for the
+    // high-tier SQLite pool (up to ~37 connections × 3 fds) plus video/audio/
+    // sockets. Exhausting it makes SQLite hit SQLITE_IOERR (522) mid-write and
+    // desync the WAL-index into "database disk image is malformed" (code 11).
+    // Shared single source of truth with the CLI; see engine `fd_limit` module.
+    screenpipe_engine::fd_limit::set_fd_limit();
+
     let _ = fix_path_env::fix();
 
     #[cfg(target_os = "windows")]
@@ -414,8 +477,12 @@ async fn main() {
             .find(|a| a.starts_with("screenpipe://"))
             .cloned();
 
+        let focus_port: u16 = std::env::var("SCREENPIPE_FOCUS_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(11435);
         if let Ok(resp) = reqwest::Client::new()
-            .post("http://127.0.0.1:11435/focus")
+            .post(format!("http://127.0.0.1:{}/focus", focus_port))
             .timeout(std::time::Duration::from_secs(2))
             .json(&serde_json::json!({
                 "args": args,
@@ -457,9 +524,12 @@ async fn main() {
             })
         })
     };
+    // CI / automation (GitHub Actions, etc.) always wins over the settings
+    // opt-in so the desktop-app e2e suite never reaches Sentry/PostHog.
     let telemetry_disabled = store_bool("analyticsEnabled")
         .map(|enabled| !enabled)
-        .unwrap_or(false);
+        .unwrap_or(false)
+        || screenpipe_engine::analytics::telemetry_disabled_by_env();
     let _posthog_disabled = telemetry_disabled;
 
     let app_version = env!("CARGO_PKG_VERSION");
@@ -691,209 +761,37 @@ async fn main() {
         }
     }
 
-    // Generate TypeScript bindings in debug mode
+    // Generate TypeScript bindings in debug mode (also via `cargo test` — see
+    // specta_bindings.rs).
     #[cfg(debug_assertions)]
     {
-        use crate::store::{OnboardingStore, SettingsStore};
-
         info!("Generating TypeScript bindings...");
-        let builder = Builder::new()
-            .commands(collect_commands![
-                // Commands from permissions.rs
-                permissions::open_permission_settings,
-                permissions::request_permission,
-                permissions::reset_and_request_permission,
-                permissions::do_permissions_check,
-                permissions::check_microphone_permission,
-                permissions::check_screen_recording_permission,
-                permissions::check_accessibility_permission_cmd,
-                permissions::check_arc_installed,
-                permissions::check_coreaudio_process_tap_available,
-                permissions::check_arc_automation_permission,
-                permissions::request_arc_automation_permission,
-                permissions::get_installed_browsers,
-                permissions::check_browsers_automation_permission,
-                permissions::request_browsers_automation_permission,
-                permissions::get_browsers_automation_status,
-                permissions::request_single_browser_automation,
-                // Commands from main.rs
-                get_env,
-                get_e2e_seed_flags,
-                vault_status,
-                vault_unlock,
-                get_log_files,
-                get_media_file,
-                upload_file_to_s3,
-                update_global_shortcuts,
-                spawn_screenpipe,
-                stop_screenpipe,
-                recording::start_capture,
-                recording::stop_capture,
-                recording::get_monitors,
-                recording::get_audio_devices,
-                recording::get_boot_phase,
-                // Commands from commands.rs
-                commands::is_enterprise_build_cmd,
-                commands::set_cloud_media_analysis_skill,
-                commands::get_enterprise_license_key,
-                commands::save_enterprise_license_key,
-                enterprise_policy::set_enterprise_policy,
-                commands::get_disk_usage,
-                commands::list_cache_files,
-                commands::delete_cache_files,
-                commands::open_pipe_window,
-                commands::update_show_screenpipe_shortcut,
-                commands::show_window,
-                commands::show_window_activated,
-                commands::show_main_window,
-                commands::hide_main_window,
-                commands::e2e_emit_agent_stream,
-                commands::e2e_emit_pipe_stream,
-                commands::open_login_window,
-                commands::open_google_calendar_auth_window,
-                commands::ensure_webview_focus,
-                commands::close_window,
-                commands::resize_search_window,
-                commands::search_navigate_to_timeline,
-                commands::reset_main_window,
-                commands::set_window_size,
-                // Onboarding commands
-                commands::get_onboarding_status,
-                commands::complete_onboarding,
-                commands::reset_onboarding,
-                commands::set_onboarding_step,
-                commands::show_onboarding_window,
-                commands::get_keychain_status,
-                commands::enable_keychain_encryption,
-                commands::disable_keychain_encryption,
-                commands::open_search_window,
-                // Shortcut reminder commands
-                commands::show_shortcut_reminder,
-                commands::hide_shortcut_reminder,
-                // Notification panel commands
-                commands::show_notification_panel,
-                commands::hide_notification_panel,
-                // In-app file viewer
-                viewer::open_viewer_window,
-                viewer::read_viewer_file,
-                viewer::reveal_in_default_browser,
-                // Window-specific shortcut commands (dynamic registration)
-                commands::register_window_shortcuts,
-                commands::unregister_window_shortcuts,
-                // Frame quick actions: copy frame image, copy deeplink, copy text
-                commands::copy_frame_to_clipboard,
-                commands::copy_deeplink_to_clipboard,
-                commands::copy_text_to_clipboard,
-                // Rollback commands
-                commands::rollback_to_version,
-                // Commands from tray.rs
-                set_tray_unhealth_icon,
-                set_tray_health_icon,
-                // Browser logging
-                write_browser_log,
-                write_browser_logs,
-                // Commands from sync.rs
-                sync::get_sync_status,
-                sync::set_sync_enabled,
-                sync::trigger_sync,
-                sync::get_sync_config,
-                sync::update_sync_config,
-                sync::get_sync_devices,
-                sync::remove_sync_device,
-                sync::delete_device_local_data,
-                sync::init_sync,
-                sync::lock_sync,
-                sync::delete_cloud_data,
-                // Pi commands
-                pi::pi_info,
-                pi::pi_start,
-                pi::pi_stop,
-                pi::pi_check,
-                pi::pi_install,
-                pi::pi_prompt,
-                pi::pi_steer,
-                pi::pi_pending,
-                pi::pi_cancel_queued,
-                pi::pi_abort,
-                pi::pi_new_session,
-                pi::pi_set_model,
-                pi::pi_update_config,
-                pi::bun_check,
-                // ChatGPT OAuth commands
-                chatgpt_oauth::chatgpt_oauth_login,
-                chatgpt_oauth::chatgpt_oauth_status,
-                chatgpt_oauth::chatgpt_oauth_get_token,
-                chatgpt_oauth::chatgpt_oauth_logout,
-                chatgpt_oauth::chatgpt_oauth_models,
-                // Generic OAuth commands (works for any OAuth integration)
-                oauth::oauth_connect,
-                oauth::oauth_cancel,
-                oauth::oauth_status,
-                oauth::oauth_disconnect,
-                oauth::oauth_list_instances,
-                // Pipe suggestions scheduler commands
-                pipe_suggestions_scheduler::pipe_suggestions_get_settings,
-                pipe_suggestions_scheduler::pipe_suggestions_update_settings,
-                // Calendar commands
-                calendar::calendar_status,
-                calendar::calendar_authorize,
-                calendar::calendar_reset_permission,
-                calendar::calendar_get_events,
-                calendar::calendar_get_current_meeting,
-                // ICS Calendar commands
-                ics_calendar::ics_calendar_get_entries,
-                ics_calendar::ics_calendar_save_entries,
-                ics_calendar::ics_calendar_test_url,
-                ics_calendar::ics_calendar_get_upcoming,
-                // Voice training
-                voice_training::train_voice,
-                // Suggestions
-                suggestions::get_cached_suggestions,
-                suggestions::force_regenerate_suggestions,
-                suggestions::set_enhanced_ai_suggestions,
-                // Config commands
-                config::validate_data_dir,
-                // Hardware detection
-                hardware::get_hardware_capability,
-                // Store encryption
-                store::reencrypt_store,
-            ])
-            .typ::<SettingsStore>()
-            .typ::<OnboardingStore>()
-            .typ::<sync::SyncStatusResponse>()
-            .typ::<sync::SyncDeviceInfo>()
-            .typ::<sync::SyncConfig>()
-            .typ::<calendar::CalendarStatus>()
-            .typ::<calendar::CalendarEventItem>()
-            .typ::<store::IcsCalendarEntry>()
-            .typ::<suggestions::CachedSuggestions>()
-            .typ::<suggestions::Suggestion>()
-            .typ::<hardware::HardwareCapability>()
-            .typ::<chatgpt_oauth::ChatGptOAuthStatus>()
-            .typ::<oauth::OAuthStatus>();
 
-        // Export to a temp file first, then only overwrite if content changed.
-        // This avoids triggering the Tauri dev watcher on every launch which
-        // causes an infinite rebuild loop.
-        let bindings_path = "../lib/utils/tauri.ts";
-        let tmp_path = format!("{}.tmp", bindings_path);
-        if let Err(e) = builder.export(
-            Typescript::default().bigint(specta_typescript::BigIntExportBehavior::BigInt),
-            &tmp_path,
-        ) {
-            eprintln!("Warning: Failed to export TypeScript bindings: {e}");
-        } else {
-            let new_content = std::fs::read(&tmp_path).unwrap_or_default();
-            let old_content = std::fs::read(bindings_path).unwrap_or_default();
-            if new_content != old_content {
-                if let Err(e) = std::fs::rename(&tmp_path, bindings_path) {
-                    eprintln!("Warning: Failed to move TypeScript bindings: {e}");
-                }
-            } else {
-                let _ = std::fs::remove_file(&tmp_path);
-            }
+        // tauri-specta command registry — must live in crate root scope for `collect_commands!`.
+        fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
+            define_specta_builder!()
+        }
+
+        let bindings_path = specta_bindings::default_bindings_path();
+        if let Err(error) =
+            specta_bindings::write_bindings_if_changed_with(&bindings_path, specta_builder())
+        {
+            eprintln!("Warning: {error}");
         }
     }
+
+    // #3943: migrate the cloud auth token out of the plaintext store.bin /
+    // auth.json (and the .last-good snapshot) into the encrypted secret store,
+    // seed the in-process cache, and scrub the plaintext copies. Runs here in
+    // `async main` — BEFORE the store plugin loads store.bin and before the
+    // engine spawn / `to_recording_settings` read the token. Must NOT run
+    // inside `.setup()`: a `block_on` there nests runtimes under
+    // #[tokio::main] and panics ("Cannot start a runtime from within a
+    // runtime"), killing the app at launch.
+    let _ = crate::auth_token::migrate_plaintext_token(
+        &screenpipe_core::paths::default_screenpipe_data_dir(),
+    )
+    .await;
 
     let recording_state = RecordingState {
         server: Arc::new(tokio::sync::Mutex::new(None)),
@@ -901,7 +799,10 @@ async fn main() {
         is_starting: Arc::new(AtomicBool::new(false)),
         is_starting_capture: Arc::new(AtomicBool::new(false)),
         last_spawn_epoch: Arc::new(AtomicU64::new(0)),
+        wants_recording: Arc::new(AtomicBool::new(false)),
         interrupted_meeting: Arc::new(tokio::sync::Mutex::new(None)),
+        cloud_token: Arc::new(arc_swap::ArcSwap::new(Arc::new(None))),
+        db_wedge_breaker: recording::new_db_wedge_breaker(),
     };
     let pi_state = pi::PiState(Arc::new(tokio::sync::Mutex::new(pi::PiPool::new())));
     let suggestions_state = suggestions::SuggestionsState::new();
@@ -912,6 +813,28 @@ async fn main() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_http::init())
         .on_window_event(|window, event| match event {
+            #[cfg(target_os = "macos")]
+            tauri::WindowEvent::Focused(true) => {
+                let app = window.app_handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if !permissions::check_microphone_permission().permitted() {
+                        return;
+                    }
+                    if !health::get_audio_device_status().is_empty() {
+                        return;
+                    }
+                    if MIC_FOCUS_CAPTURE_RESTART
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_err()
+                    {
+                        return;
+                    }
+                    info!(
+                        "Microphone permission newly granted (focus return) — restarting capture for audio reinit"
+                    );
+                    permissions::restart_capture_on_mic_grant(app).await;
+                });
+            }
             tauri::WindowEvent::CloseRequested { api, .. } => {
                 let _ = window.set_always_on_top(false);
                 let _ = window.set_visible_on_all_workspaces(false);
@@ -923,9 +846,46 @@ async fn main() {
                 #[cfg(target_os = "windows")]
                 {
                     if window.label() == "home" {
-                        // Minimize instead of closing so the Home window stays in the
-                        // taskbar as the persistent app icon.
-                        let _ = window.minimize();
+                        // Behavior depends on the user setting `minimizeToTrayOnClose`:
+                        //  - false (default, historical behavior): minimize the Home
+                        //    window so its icon stays in the Windows taskbar as the
+                        //    persistent app entry point.
+                        //  - true (opt-in): hide the window AND remove it from the
+                        //    taskbar so the system tray icon becomes the only entry
+                        //    point. The app process keeps running (see ExitRequested
+                        //    handler below). The tray left-click handler in
+                        //    tray.rs::setup_tray_click_handlers restores the window,
+                        //    and window/show.rs::show_existing_main resets
+                        //    skip_taskbar back to false on restore.
+                        //
+                        // Settings reads are best-effort: if the store can't be read
+                        // we fall back to the historical minimize() behavior so the
+                        // user never loses access to the window. set_skip_taskbar /
+                        // hide failures also fall back to minimize() for the same
+                        // reason, so the user is never left with a lost (hidden,
+                        // off-taskbar) window.
+                        let minimize_to_tray = crate::store::SettingsStore::get(
+                            window.app_handle(),
+                        )
+                        .ok()
+                        .flatten()
+                        .map(|s| s.minimize_to_tray_on_close)
+                        .unwrap_or(false);
+
+                        if minimize_to_tray {
+                            let skip_ok = window.set_skip_taskbar(true).is_ok();
+                            let hide_ok = window.hide().is_ok();
+                            if !(skip_ok && hide_ok) {
+                                // Hard fallback so the user is never left with an
+                                // off-taskbar but visible window.
+                                let _ = window.set_skip_taskbar(false);
+                                let _ = window.minimize();
+                            }
+                        } else {
+                            // Minimize instead of closing so the Home window stays in
+                            // the taskbar as the persistent app icon.
+                            let _ = window.minimize();
+                        }
                     } else {
                         // Overlay and other windows: hide (they're skip_taskbar anyway)
                         let _ = window.hide();
@@ -946,6 +906,7 @@ async fn main() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_permission_flow::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
@@ -960,8 +921,12 @@ async fn main() {
         let app_for_closure = app.clone();
         let args_clone = args.clone();
         let _ = app.run_on_main_thread(move || {
-            // Focus the existing window
-            show_main_window(app_for_closure.clone());
+            // A second app launch is usually the Windows taskbar/dock entry point.
+            // Open the Home app window here; `show_main_window` intentionally
+            // opens the timeline overlay for the global shortcut/tray timeline.
+            if !crate::enterprise_policy::is_app_ui_hidden() {
+                let _ = ShowRewindWindow::Home { page: None }.show(&app_for_closure);
+            }
 
             // Forward deep-link URL from args
             if let Some(url) = args_clone.iter().find(|a| a.starts_with("screenpipe://")) {
@@ -997,193 +962,7 @@ async fn main() {
         .manage(suggestions_state)
         .manage(pipe_suggestions_state)
         .manage(sync_scheduler)
-        .invoke_handler(tauri::generate_handler![
-            commands::is_enterprise_build_cmd,
-            commands::get_local_api_config,
-            commands::regenerate_api_auth_key,
-            commands::set_api_auth_key,
-            commands::set_cloud_media_analysis_skill,
-            commands::get_enterprise_license_key,
-            enterprise_policy::set_enterprise_policy,
-            commands::save_enterprise_license_key,
-            spawn_screenpipe,
-            stop_screenpipe,
-            recording::start_capture,
-            recording::stop_capture,
-            recording::get_monitors,
-            recording::get_audio_devices,
-            recording::get_boot_phase,
-            permissions::open_permission_settings,
-            permissions::request_permission,
-            permissions::do_permissions_check,
-            permissions::check_microphone_permission,
-            permissions::check_screen_recording_permission,
-            permissions::check_accessibility_permission_cmd,
-            owned_browser::owned_browser_set_bounds,
-            owned_browser::owned_browser_navigate,
-            owned_browser::owned_browser_hide,
-            owned_browser::owned_browser_resolve_session_access,
-            permissions::reset_and_request_permission,
-            permissions::get_missing_permissions,
-            permissions::check_arc_installed,
-            permissions::check_coreaudio_process_tap_available,
-            permissions::check_arc_automation_permission,
-            permissions::request_arc_automation_permission,
-            set_tray_unhealth_icon,
-            set_tray_health_icon,
-            write_browser_log,
-            write_browser_logs,
-            commands::update_show_screenpipe_shortcut,
-            commands::get_disk_usage,
-            commands::list_cache_files,
-            commands::delete_cache_files,
-            commands::open_pipe_window,
-            commands::show_window,
-            commands::show_window_activated,
-            commands::show_main_window,
-            commands::hide_main_window,
-            commands::e2e_emit_agent_stream,
-            commands::e2e_emit_pipe_stream,
-            commands::open_login_window,
-            commands::ensure_webview_focus,
-            commands::close_window,
-            commands::resize_search_window,
-            commands::search_navigate_to_timeline,
-            commands::reset_main_window,
-            commands::set_window_size,
-            // Permission recovery commands
-            commands::show_permission_recovery_window,
-            // Onboarding commands
-            commands::get_onboarding_status,
-            commands::complete_onboarding,
-            commands::reset_onboarding,
-            commands::set_onboarding_step,
-            commands::show_onboarding_window,
-            commands::get_keychain_status,
-            commands::enable_keychain_encryption,
-            commands::disable_keychain_encryption,
-            commands::open_search_window,
-            // Shortcut reminder commands
-            commands::show_shortcut_reminder,
-            commands::hide_shortcut_reminder,
-            // Notification panel commands
-            commands::show_notification_panel,
-            commands::hide_notification_panel,
-            // Window-specific shortcut commands (dynamic registration)
-            commands::register_window_shortcuts,
-            commands::unregister_window_shortcuts,
-            // Frame quick actions: copy frame image to clipboard
-            commands::copy_frame_to_clipboard,
-            commands::copy_deeplink_to_clipboard,
-            commands::copy_text_to_clipboard,
-            commands::open_note_path,
-            commands::open_windows_shell_target,
-            // In-app file viewer
-            viewer::open_viewer_window,
-            viewer::read_viewer_file,
-            viewer::reveal_in_default_browser,
-            // Overlay commands (Windows)
-            commands::enable_overlay_click_through,
-            commands::disable_overlay_click_through,
-            commands::is_overlay_click_through,
-            get_log_files,
-            get_media_file,
-            upload_file_to_s3,
-            update_global_shortcuts,
-            suspend_global_shortcuts,
-            resume_global_shortcuts,
-            get_env,
-            get_e2e_seed_flags,
-            commands::e2e_main_overlay_visible,
-            vault_status,
-            vault_unlock,
-            // Sync commands
-            sync::get_sync_status,
-            sync::set_sync_enabled,
-            sync::trigger_sync,
-            sync::get_sync_config,
-            sync::update_sync_config,
-            sync::get_sync_devices,
-            sync::remove_sync_device,
-            sync::delete_device_local_data,
-            sync::init_sync,
-            sync::lock_sync,
-            sync::delete_cloud_data,
-            // Pi commands
-            pi::pi_info,
-            pi::pi_start,
-            pi::pi_stop,
-            pi::pi_check,
-            pi::pi_install,
-            pi::pi_prompt,
-            pi::pi_steer,
-            pi::pi_pending,
-            pi::pi_cancel_queued,
-            pi::pi_abort,
-            pi::pi_new_session,
-            pi::pi_set_model,
-            pi::pi_update_config,
-            pi::bun_check,
-            // ChatGPT OAuth commands
-            chatgpt_oauth::chatgpt_oauth_login,
-            chatgpt_oauth::chatgpt_oauth_status,
-            chatgpt_oauth::chatgpt_oauth_get_token,
-            chatgpt_oauth::chatgpt_oauth_logout,
-            chatgpt_oauth::chatgpt_oauth_models,
-            // Generic OAuth commands (works for any OAuth integration)
-            oauth::oauth_connect,
-            oauth::oauth_cancel,
-            oauth::oauth_status,
-            oauth::oauth_disconnect,
-            oauth::oauth_list_instances,
-            // Pipe suggestions scheduler commands
-            pipe_suggestions_scheduler::pipe_suggestions_get_settings,
-            pipe_suggestions_scheduler::pipe_suggestions_update_settings,
-            // Calendar commands
-            calendar::calendar_status,
-            calendar::calendar_authorize,
-            calendar::calendar_reset_permission,
-            calendar::calendar_get_events,
-            calendar::calendar_get_current_meeting,
-            // ICS Calendar commands
-            ics_calendar::ics_calendar_get_entries,
-            ics_calendar::ics_calendar_save_entries,
-            ics_calendar::ics_calendar_test_url,
-            ics_calendar::ics_calendar_get_upcoming,
-            // Rollback commands
-            commands::rollback_to_version,
-            // OCR commands
-            commands::perform_ocr_on_image,
-            // Live Text (native macOS ImageAnalysisOverlayView)
-            livetext::livetext_is_available,
-            livetext::livetext_init,
-            livetext::livetext_analyze,
-            livetext::livetext_prefetch,
-            livetext::livetext_update_position,
-            livetext::livetext_highlight,
-            livetext::livetext_clear_highlights,
-            livetext::livetext_hide,
-            livetext::livetext_set_guard_rect,
-            // Voice training
-            voice_training::train_voice,
-            // Suggestions
-            suggestions::get_cached_suggestions,
-                suggestions::force_regenerate_suggestions,
-                suggestions::set_enhanced_ai_suggestions,
-            // Config commands
-            config::validate_data_dir,
-            // Hardware detection
-            hardware::get_hardware_capability,
-            // Remote sync (OpenClaw)
-            remote_sync_commands::remote_sync_test,
-            remote_sync_commands::remote_sync_now,
-            remote_sync_commands::remote_sync_discover_hosts,
-            remote_sync_commands::remote_sync_start_scheduler,
-            remote_sync_commands::remote_sync_stop_scheduler,
-            remote_sync_commands::remote_sync_scheduler_status,
-            commands::set_native_theme,
-            store::reencrypt_store,
-        ])
+        .invoke_handler(tauri_helper::tauri_collect_commands!())
         .setup(move |app| {
             //deep link register_all
             #[cfg(any(windows, target_os = "linux"))]
@@ -1197,6 +976,7 @@ async fn main() {
             #[cfg(target_os = "macos")]
             {
                 use tauri::menu::{MenuBuilder, SubmenuBuilder, PredefinedMenuItem, MenuItemBuilder};
+                let app_ui_hidden = crate::enterprise_policy::is_app_ui_hidden();
 
                 let mut app_submenu_builder = SubmenuBuilder::new(app, "screenpipe")
                     .item(&PredefinedMenuItem::about(app, Some("About screenpipe"), None)?)
@@ -1207,11 +987,14 @@ async fn main() {
                             .build(app)?)
                         .separator();
                 }
+                if !app_ui_hidden {
+                    app_submenu_builder = app_submenu_builder
+                        .item(&MenuItemBuilder::with_id("settings", "Settings...")
+                            .accelerator("CmdOrCtrl+,")
+                            .build(app)?)
+                        .separator();
+                }
                 let app_submenu = app_submenu_builder
-                    .item(&MenuItemBuilder::with_id("settings", "Settings...")
-                        .accelerator("CmdOrCtrl+,")
-                        .build(app)?)
-                    .separator()
                     .item(&PredefinedMenuItem::quit(app, Some("Quit screenpipe"))?)
                     .build()?;
 
@@ -1244,7 +1027,7 @@ async fn main() {
                             let app = app_handle.clone();
                             tauri::async_runtime::spawn(async move {
                                 let state = app.state::<std::sync::Arc<crate::updates::UpdatesManager>>();
-                                if let Err(e) = state.check_for_updates(true).await {
+                                if let Err(e) = state.check_for_updates(true, true).await {
                                     tracing::error!("menu: check for updates failed: {}", e);
                                 }
                             });
@@ -1282,15 +1065,20 @@ async fn main() {
                 .build(log_dir)?;
 
             // Create a custom layer for file logging
+            // xcap probes stale monitor / window IDs every refresh and logs
+            // ERROR for IDs that don't exist (e.g. after a display unplug).
+            // Benign noise that swamps real errors in user feedback logs.
+            const LOG_FILTER: &str = "info,hyper=error,tower_http=error,whisper_rs=warn,audiopipe=warn,ort=warn,xcap::platform::impl_window=off,xcap::platform::impl_monitor=off,xcap::platform::utils=off";
+
             let file_layer = tracing_subscriber::fmt::layer()
                 .with_writer(file_appender)
                 .with_ansi(false)
-                .with_filter(EnvFilter::new("info,hyper=error,tower_http=error,whisper_rs=warn,audiopipe=warn,ort=warn"));
+                .with_filter(EnvFilter::new(LOG_FILTER));
 
             // Create a custom layer for console logging
             let console_layer = tracing_subscriber::fmt::layer()
                 .with_writer(std::io::stdout)
-                .with_filter(EnvFilter::new("info,hyper=error,tower_http=error,whisper_rs=warn,audiopipe=warn,ort=warn"));
+                .with_filter(EnvFilter::new(LOG_FILTER));
 
             // Initialize the tracing subscriber with both layers + optional Sentry layer
             // The Sentry layer captures error!() and warn!() events (not just panics)
@@ -1362,12 +1150,30 @@ async fn main() {
             // disable_vision + disable_audio so the e2e harness can drive the
             // app without granting Screen Recording / Microphone TCC. The
             // server (DB + HTTP) still boots; only SCK + audio capture skip.
+            // "no-audio" keeps vision enabled while disabling only audio, which
+            // lets Windows hosted runners exercise OCR without booting Whisper.
             // See get_e2e_seed_flags above for parsing.
             let e2e_flags = get_e2e_seed_flags();
             if e2e_flags.iter().any(|f| f == "no-recording") {
                 store.recording.disable_audio = true;
                 store.recording.disable_vision = true;
                 info!("E2E seed: recording disabled (vision + audio)");
+            }
+            if e2e_flags.iter().any(|f| f == "no-audio") {
+                store.recording.disable_audio = true;
+                info!("E2E seed: audio disabled");
+            }
+            if e2e_flags.iter().any(|f| f == "event-trigger-capture") {
+                store.recording.capture_on_keystroke = Some(true);
+                store.recording.capture_on_clipboard = Some(true);
+                store.recording.min_capture_interval_ms = Some(50);
+                store.recording.disable_keyboard_capture = true;
+                store.recording.disable_clipboard_capture = true;
+                info!("E2E seed: event-trigger capture enabled with keyboard/clipboard DB rows disabled");
+            }
+            if e2e_flags.iter().any(|f| f == "keyboard-db-capture") {
+                store.recording.disable_keyboard_capture = false;
+                info!("E2E seed: keyboard DB capture enabled");
             }
             if e2e_flags.iter().any(|f| f == "cloud-audio-fallback") {
                 store.recording.disable_audio = false;
@@ -1394,6 +1200,22 @@ async fn main() {
             // Resolve data directory from user setting (custom dir or ~/.screenpipe)
             let (data_dir, data_dir_fell_back) = config::resolve_data_dir(&store.data_dir);
             info!("Recording data directory: {}", data_dir.display());
+
+            // Pin SCREENPIPE_DATA_DIR to the *resolved* dir so every consumer of
+            // `default_screenpipe_data_dir()` agrees with the engine on where the
+            // data lives. Without this, a user with a custom/relocated data dir
+            // hit a split: the engine (server_core) reads its SecretStore from
+            // `config.data_dir` (the custom path) while OAuth token writes
+            // (`open_secret_store`, chatgpt_oauth, …) went to the default
+            // `~/.screenpipe`. Tokens landed in one db.sqlite and were read from
+            // another → "no credentials found … cannot authenticate" 401s on
+            // every Microsoft 365 / Google / ChatGPT call, reconnecting forever
+            // never helping. Setting the env var here (before any OAuth callback
+            // can fire) makes `default_screenpipe_data_dir()` self-consistent and
+            // also propagates the correct dir to child processes (the CLI
+            // sidecar inherits this env).
+            std::env::set_var("SCREENPIPE_DATA_DIR", &data_dir);
+
             if data_dir_fell_back {
                 let app_handle_fb = app_handle.clone();
                 tauri::async_runtime::spawn(async move {
@@ -1406,12 +1228,23 @@ async fn main() {
             // Attach non-sensitive settings to all future Sentry events
             if !telemetry_disabled {
                 sentry::configure_scope(|scope| {
-                    // Set user.id to the persistent analytics UUID
-                    // This links Sentry errors to PostHog sessions and feedback reports
+                    // Set user.id to the persistent analytics UUID. Support
+                    // context env vars are attached as tags so managed
+                    // deployments can be filtered without replacing the app id.
                     scope.set_user(Some(sentry::protocol::User {
                         id: Some(store.recording.analytics_id.clone()),
                         ..Default::default()
                     }));
+                    let telemetry_context = screenpipe_engine::telemetry_context::TelemetryContext::from_env();
+                    for (key, value) in telemetry_context.pairs() {
+                        scope.set_tag(key, value);
+                    }
+                    if !telemetry_context.is_empty() {
+                        scope.set_context(
+                            "screenpipe_support",
+                            sentry::protocol::Context::Other(telemetry_context.to_json_map()),
+                        );
+                    }
                     scope.set_context("app_settings", sentry::protocol::Context::Other({
                         let mut map = std::collections::BTreeMap::new();
                         map.insert("audio_chunk_duration".into(), serde_json::json!(store.recording.audio_chunk_duration));
@@ -1532,8 +1365,13 @@ async fn main() {
                 });
             }
 
-            // Show onboarding window if not completed
-            if !onboarding_store.is_completed {
+            let app_ui_hidden = crate::enterprise_policy::is_app_ui_hidden();
+
+            // Show onboarding/home unless this device is deployed as a managed
+            // background agent. Permission recovery is handled separately below.
+            if app_ui_hidden {
+                info!("enterprise: hidden UI mode active, skipping startup app windows");
+            } else if !onboarding_store.is_completed {
                 let _ = ShowRewindWindow::Onboarding.show(&app.handle());
             } else {
                 let _ = ShowRewindWindow::Home { page: None }.show(&app.handle());
@@ -1548,7 +1386,7 @@ async fn main() {
             // macOS-only: on Windows/Linux the non-macOS chat builder doesn't
             // set .visible(false), causing a visible chat window on startup.
             #[cfg(target_os = "macos")]
-            if onboarding_store.is_completed {
+            if onboarding_store.is_completed && !app_ui_hidden {
                 let app_handle_chat = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     // Wait for main window to finish setup
@@ -1572,8 +1410,14 @@ async fn main() {
             // auto-stops it after 5 minutes of inactivity to avoid stale processes.
 
             // Show shortcut reminder overlay on app startup if enabled AND onboarding is completed
-            // Don't show reminder during first-time onboarding to reduce overwhelm
-            if store.show_shortcut_overlay && onboarding_store.is_completed {
+            // Don't show reminder during first-time onboarding to reduce overwhelm.
+            // Skip entirely when the timeline is disabled — the shortcut it
+            // advertises only opens the (now-off) timeline overlay.
+            if store.show_shortcut_overlay
+                && onboarding_store.is_completed
+                && !app_ui_hidden
+                && !store.recording.disable_timeline
+            {
                 let shortcut = store.show_screenpipe_shortcut.clone();
                 let app_handle_reminder = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
@@ -1587,7 +1431,11 @@ async fn main() {
             let app_handle = app.handle().clone();
 
             // Initialize server first (core service)
-            let server_shutdown_tx = spawn_server(app_handle.clone(), 11435);
+            let focus_port: u16 = std::env::var("SCREENPIPE_FOCUS_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(11435);
+            let server_shutdown_tx = spawn_server(app_handle.clone(), focus_port);
             app.manage(server_shutdown_tx);
 
 
@@ -1597,7 +1445,7 @@ async fn main() {
             // Uses retry loop because CGPreflightScreenCaptureAccess can return false
             // transiently on startup before TCC fully initializes.
             #[cfg(target_os = "macos")]
-            if onboarding_store.is_completed {
+            if onboarding_store.is_completed || app_ui_hidden {
                 let mut screen_ok = false;
                 let mut mic_ok = false;
                 for attempt in 0..3 {
@@ -1638,14 +1486,25 @@ async fn main() {
             // Start server core + capture on a dedicated thread with its own tokio runtime
             // to avoid competing with Tauri's UI runtime.
             // Two-phase startup: ServerCore (DB + HTTP + pipes) then CaptureSession (vision + audio).
-            {
+            'start_server: {
                 let store_clone = store.clone();
                 let data_dir_clone = data_dir.clone();
+                if !store_clone.app_entitled_or_dev() {
+                    info!("Skipping server auto-start: active screenpipe plan required");
+                    crate::health::set_recording_status(crate::health::RecordingStatus::Paused);
+                    let _ = app_handle.emit("app-entitlement-required", ());
+                    break 'start_server;
+                }
                 let recording_state = app_handle.state::<RecordingState>();
                 recording_state.is_starting.store(true, std::sync::atomic::Ordering::SeqCst);
                 let server_arc = recording_state.server.clone();
                 let capture_arc = recording_state.capture.clone();
                 let is_starting_clone = recording_state.is_starting.clone();
+                let cloud_token_arc = recording_state.cloud_token.clone();
+                // DB-wedge auto-recovery hook wiring — captured into the server
+                // thread so the freshly-built `ServerCore`'s DB gets the hook.
+                let app_for_db_wedge = app_handle.clone();
+                let db_wedge_breaker = recording_state.db_wedge_breaker.clone();
 
                 // Pipe output callback. Stage 5: legacy `pipe_event`
                 // topic dropped — every pipe stdout line goes out on
@@ -1735,6 +1594,17 @@ async fn main() {
                             // boot the server + HTTP API + DB without TCC.
                             if !disable_vision && !permissions_check.screen_recording.permitted() {
                                 warn!("Screen recording permission not granted: {:?}. Server will not start.", permissions_check.screen_recording);
+                                // Flip the recording state to a terminal Error
+                                // value so the tray stops showing "Starting…"
+                                // forever. Without this the user sees a
+                                // perpetual spinner with no signal that
+                                // anything is wrong; clearing only `is_starting`
+                                // leaves RECORDING_INFO at its default Starting
+                                // value and the health poll has no
+                                // ever_connected signal to recover from.
+                                crate::health::set_recording_status(
+                                    crate::health::RecordingStatus::Error,
+                                );
                                 is_starting_clone.store(false, std::sync::atomic::Ordering::SeqCst);
                                 return;
                             }
@@ -1769,6 +1639,7 @@ async fn main() {
                                 &config,
                                 on_pipe_output,
                                 Some(owned_browser),
+                                cloud_token_arc.clone(),
                             )
                             .await
                             {
@@ -1779,6 +1650,16 @@ async fn main() {
                                     return;
                                 }
                             };
+
+                            // Wire the persistent-failure hook so a wedged DB
+                            // auto-restarts recording (rebuilding every pool +
+                            // the shared WAL-index).
+                            server.db.set_persistent_failure_hook(
+                                crate::recording::make_db_wedge_recovery_hook(
+                                    app_for_db_wedge.clone(),
+                                    db_wedge_breaker.clone(),
+                                ),
+                            );
 
                             // Phase 2: Start capture session
                             let capture = match capture_session::CaptureSession::start(&server, &config, true).await {
@@ -1906,7 +1787,7 @@ async fn main() {
                             let port = core.port;
                             let key = core.local_api_key.clone();
                             drop(guard);
-                            crate::permission_events::start(app_handle_clone.clone(), port, key);
+                            crate::engine_events::start(app_handle_clone.clone(), port, key);
                             return;
                         }
                     }
@@ -1916,6 +1797,8 @@ async fn main() {
 
             crate::monitor_events::start(app_handle.clone());
             crate::meeting_live_notes::start(app_handle.clone());
+            crate::meeting_stall_notifications::start(app_handle.clone());
+            crate::db_recovery_notifications::start(app_handle.clone());
 
             #[cfg(target_os = "macos")]
             crate::window::reset_to_regular_and_refresh_tray(&app_handle);
@@ -1928,12 +1811,16 @@ async fn main() {
             // instance), apply_shortcuts early-returns and skips the rest. Fix this to:
             // 1. Collect per-shortcut failures instead of aborting on the first one
             // 2. Emit a user-visible notification listing the conflicting shortcuts
-            let app_handle_clone = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                if let Err(e) = initialize_global_shortcuts(&app_handle_clone).await {
-                    warn!("Failed to initialize global shortcuts: {}", e);
-                }
-            });
+            if app_ui_hidden {
+                info!("enterprise: hidden UI mode active, skipping global app shortcuts");
+            } else {
+                let app_handle_clone = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = initialize_global_shortcuts(&app_handle_clone).await {
+                        warn!("Failed to initialize global shortcuts: {}", e);
+                    }
+                });
+            }
 
             // Auto-start suggestions scheduler (always on)
             let suggestions_state = app_handle.state::<suggestions::SuggestionsState>();
@@ -1941,7 +1828,15 @@ async fn main() {
             {
                 if let Ok(Some(store)) = crate::store::SettingsStore::get(&app_handle) {
                     if store.enhanced_ai {
-                        let token = store.user.token.clone().unwrap_or_default();
+                        // #3943: the token no longer persists in store.bin —
+                        // fall back to the secret-store-backed cache.
+                        let token = store
+                            .user
+                            .token
+                            .clone()
+                            .filter(|t| !t.is_empty())
+                            .or_else(crate::auth_token::cached_cloud_token)
+                            .unwrap_or_default();
                         if !token.is_empty() {
                             // Use try_lock — blocking_lock panics inside a tokio runtime context
                             if let Ok(mut guard) = suggestions_state.enhanced_ai.try_lock() {
@@ -1992,6 +1887,14 @@ async fn main() {
                 ics_calendar::start_ics_calendar_poller(ics_app_handle).await;
             });
 
+            // Start Google Calendar publisher (polls /connections/google-calendar/events
+            // every 60s and pushes into the calendar_events bus). Required for the
+            // 2-3 min prewarm toast to work for users on gmail/gcal.
+            let gcal_app_handle = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                google_calendar::start_google_calendar_publisher(gcal_app_handle).await;
+            });
+
             // Enterprise telemetry sync (no-op stub on consumer builds).
             // Runs forever in background; only takes effect on enterprise-
             // telemetry builds with SCREENPIPE_ENTERPRISE_LICENSE_KEY env set.
@@ -2036,8 +1939,10 @@ async fn main() {
     // Setup dock right-click menu (fallback for when tray is behind the notch)
     #[cfg(target_os = "macos")]
     {
-        let app_handle_dock = app.app_handle().clone();
-        dock_menu::setup_dock_menu(app_handle_dock);
+        if !crate::enterprise_policy::is_app_ui_hidden() {
+            let app_handle_dock = app.app_handle().clone();
+            dock_menu::setup_dock_menu(app_handle_dock);
+        }
     }
 
     app.run(|app_handle, event| {
@@ -2153,6 +2058,9 @@ async fn main() {
                 tauri::RunEvent::Reopen { .. } => {
                     // Defer off the event stack so run handler stays panic-free.
                     // Open the settings/app window (not the timeline overlay).
+                    if crate::enterprise_policy::is_app_ui_hidden() {
+                        return;
+                    }
                     let app = app_handle.app_handle().clone();
                     let _ = app_handle.app_handle().run_on_main_thread(move || {
                         let _ = ShowRewindWindow::Home { page: None }.show(&app);
@@ -2165,4 +2073,9 @@ async fn main() {
             error!("panic in run event handler: {:?}", e);
         }
     });
+}
+
+#[cfg(test)]
+pub fn specta_builder() -> tauri_specta::Builder<tauri::Wry> {
+    define_specta_builder!()
 }

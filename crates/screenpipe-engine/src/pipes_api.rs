@@ -10,7 +10,9 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use screenpipe_connect::connections::render_context;
-use screenpipe_core::pipes::PipeManager;
+use screenpipe_core::pipes::{
+    describe_schedule_config, next_occurrences, PipeManager, ScheduleConfig,
+};
 use screenpipe_secrets::SecretStore;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -165,35 +167,32 @@ pub async fn run_pipe_now(
     };
 
     // Validate required connections are configured before running the pipe
-    if let Some(pipe_status) = mgr.get_pipe(&id).await {
-        let required = &pipe_status.config.connections;
-        if !required.is_empty() {
-            let screenpipe_dir = mgr
-                .pipes_dir()
-                .parent()
-                .unwrap_or(mgr.pipes_dir())
-                .to_path_buf();
-            let ss = secret_store.as_ref().map(|e| e.0.as_ref());
-            let mut missing = Vec::new();
-            for conn_id in required {
-                let configured =
-                    screenpipe_connect::connections::load_connection(ss, &screenpipe_dir, conn_id)
-                        .await
-                        .map(|c| c.enabled && !c.credentials.is_empty())
-                        .unwrap_or(false);
-                if !configured {
-                    missing.push(conn_id.as_str());
-                }
-            }
-            if !missing.is_empty() {
-                return Json(json!({
-                    "error": format!(
-                        "pipe '{}' requires unconfigured connections: {} — set them up in Settings → Connections",
-                        id,
-                        missing.join(", ")
-                    )
-                }));
-            }
+    let required_connections = mgr
+        .get_pipe(&id)
+        .await
+        .map(|pipe_status| pipe_status.config.connections)
+        .unwrap_or_default();
+    if !required_connections.is_empty() {
+        let screenpipe_dir = mgr
+            .pipes_dir()
+            .parent()
+            .unwrap_or(mgr.pipes_dir())
+            .to_path_buf();
+        let ss = secret_store.as_ref().map(|e| e.0.as_ref());
+        let missing = screenpipe_connect::missing_pipe_connections(
+            ss,
+            &screenpipe_dir,
+            &required_connections,
+        )
+        .await;
+        if !missing.is_empty() {
+            return Json(json!({
+                "error": format!(
+                    "pipe '{}' requires unconfigured connections: {} — set them up in Settings → Connections",
+                    id,
+                    missing.join(", ")
+                )
+            }));
         }
     }
 
@@ -227,7 +226,14 @@ pub async fn run_pipe_now(
 pub async fn stop_pipe(State(pm): State<SharedPipeManager>, Path(id): Path<String>) -> Json<Value> {
     let mgr = pm.lock().await;
     match mgr.stop_pipe(&id).await {
-        Ok(()) => Json(json!({ "success": true })),
+        Ok(status) => Json(json!({
+            "success": matches!(
+                status,
+                screenpipe_core::pipes::PipeStopStatus::Stopping
+                    | screenpipe_core::pipes::PipeStopStatus::StopPending
+            ),
+            "status": status,
+        })),
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
 }
@@ -314,6 +320,22 @@ pub async fn update_pipe_config(
     }
 }
 
+/// POST /pipes/schedule/preview — stateless preview for the schedule builder.
+/// Body is a `ScheduleConfig`; returns its human summary and the next few fire
+/// times so the UI can show "Next occurrence …" without duplicating timezone /
+/// recurrence math in the frontend.
+pub async fn preview_schedule(Json(cfg): Json<ScheduleConfig>) -> (StatusCode, Json<Value>) {
+    let summary = describe_schedule_config(&cfg);
+    let next: Vec<String> = next_occurrences(&cfg, 5)
+        .iter()
+        .map(|t| t.to_rfc3339())
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({ "valid": true, "summary": summary, "next": next })),
+    )
+}
+
 /// POST /pipes/install — install a pipe from URL or local path.
 pub async fn install_pipe(
     State(pm): State<SharedPipeManager>,
@@ -382,5 +404,310 @@ pub async fn set_pipe_favorite(
     match screenpipe_core::pipes::favorites::set(&dir, &id, body.favorite) {
         Ok(list) => Json(json!({ "success": true, "data": list })),
         Err(e) => Json(json!({ "error": e.to_string() })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use axum::routing::post;
+    use axum::Router;
+    use screenpipe_core::agents::{
+        install_spawned_pid, AgentExecutor, AgentOutput, ExecutionHandle, SharedPid,
+    };
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+    use tempfile::TempDir;
+    use tokio::sync::Notify;
+    use tower::ServiceExt;
+
+    #[derive(Clone, Copy)]
+    enum FakePublishMode {
+        Immediate,
+        Deferred,
+    }
+
+    struct FakeExecutor {
+        mode: FakePublishMode,
+        pid: u32,
+        started: std::sync::Arc<Notify>,
+        pid_published: std::sync::Arc<AtomicBool>,
+        allow_pid_publish: std::sync::Arc<Notify>,
+        allow_finish: std::sync::Arc<Notify>,
+        kill_calls: std::sync::Arc<AtomicUsize>,
+        last_killed_pid: std::sync::Arc<AtomicU32>,
+    }
+
+    impl FakeExecutor {
+        fn new(mode: FakePublishMode, pid: u32) -> Self {
+            Self {
+                mode,
+                pid,
+                started: std::sync::Arc::new(Notify::new()),
+                pid_published: std::sync::Arc::new(AtomicBool::new(false)),
+                allow_pid_publish: std::sync::Arc::new(Notify::new()),
+                allow_finish: std::sync::Arc::new(Notify::new()),
+                kill_calls: std::sync::Arc::new(AtomicUsize::new(0)),
+                last_killed_pid: std::sync::Arc::new(AtomicU32::new(0)),
+            }
+        }
+
+        fn publish_pid(&self, shared_pid: Option<&SharedPid>) -> bool {
+            let stop_requested = shared_pid
+                .map(|sp| install_spawned_pid(sp, self.pid))
+                .unwrap_or(false);
+            self.pid_published.store(true, Ordering::SeqCst);
+            stop_requested
+        }
+
+        async fn wait_for_pid_published(&self) {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !self.pid_published.load(Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("fake executor never published pid");
+        }
+
+        async fn run_impl(&self, shared_pid: Option<SharedPid>) -> anyhow::Result<AgentOutput> {
+            self.started.notify_one();
+
+            match self.mode {
+                FakePublishMode::Immediate => {
+                    let _ = self.publish_pid(shared_pid.as_ref());
+                }
+                FakePublishMode::Deferred => {
+                    self.allow_pid_publish.notified().await;
+                    if self.publish_pid(shared_pid.as_ref()) {
+                        return Ok(AgentOutput {
+                            stdout: String::new(),
+                            stderr: "stopped before pid publication".to_string(),
+                            success: false,
+                            pid: Some(self.pid),
+                        });
+                    }
+                }
+            }
+
+            self.allow_finish.notified().await;
+            Ok(AgentOutput {
+                stdout: String::new(),
+                stderr: String::new(),
+                success: true,
+                pid: Some(self.pid),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentExecutor for FakeExecutor {
+        async fn run(
+            &self,
+            _prompt: &str,
+            _model: &str,
+            _working_dir: &Path,
+            _provider: Option<&str>,
+            _provider_url: Option<&str>,
+            _provider_api_key: Option<&str>,
+            shared_pid: Option<SharedPid>,
+            _continue_session: bool,
+        ) -> anyhow::Result<AgentOutput> {
+            self.run_impl(shared_pid).await
+        }
+
+        async fn run_streaming(
+            &self,
+            _prompt: &str,
+            _model: &str,
+            _working_dir: &Path,
+            _provider: Option<&str>,
+            _provider_url: Option<&str>,
+            _provider_api_key: Option<&str>,
+            shared_pid: Option<SharedPid>,
+            _line_tx: tokio::sync::mpsc::UnboundedSender<String>,
+            _continue_session: bool,
+            _pipe_system_prompt: Option<&str>,
+            _mcp_server_allowlist: Option<&[String]>,
+            _session_owner: Option<&str>,
+        ) -> anyhow::Result<AgentOutput> {
+            self.run_impl(shared_pid).await
+        }
+
+        fn kill(&self, handle: &ExecutionHandle) -> anyhow::Result<()> {
+            self.last_killed_pid
+                .store(handle.current_pid(), Ordering::SeqCst);
+            self.kill_calls.fetch_add(1, Ordering::SeqCst);
+            self.allow_finish.notify_waiters();
+            Ok(())
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        async fn ensure_installed(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn name(&self) -> &str {
+            "fake"
+        }
+    }
+
+    fn write_test_pipe(dir: &TempDir, name: &str) {
+        let pipe_dir = dir.path().join(name);
+        std::fs::create_dir_all(&pipe_dir).unwrap();
+        std::fs::write(
+            pipe_dir.join("pipe.md"),
+            "---\nschedule: manual\nenabled: true\nagent: fake\n---\n\nstop test pipe\n",
+        )
+        .unwrap();
+    }
+
+    fn test_router(pm: SharedPipeManager) -> Router {
+        Router::new()
+            .route("/pipes/:id/stop", post(stop_pipe))
+            .with_state(pm)
+    }
+
+    async fn stop_payload(app: Router, pipe_name: &str) -> Value {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/pipes/{pipe_name}/stop"))
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn start_test_pipe(
+        pm: &SharedPipeManager,
+        dir: &TempDir,
+        executor: std::sync::Arc<FakeExecutor>,
+        name: &str,
+    ) {
+        write_test_pipe(dir, name);
+        let mgr = pm.lock().await;
+        mgr.reload_pipes().await.unwrap();
+        mgr.start_pipe_background(name).await.unwrap();
+        drop(mgr);
+        executor.started.notified().await;
+    }
+
+    #[tokio::test]
+    async fn stop_api_returns_not_running_when_pipe_is_absent() {
+        let dir = TempDir::new().unwrap();
+        let pm = std::sync::Arc::new(Mutex::new(PipeManager::new(
+            dir.path().to_path_buf(),
+            HashMap::new(),
+            None,
+            3030,
+        )));
+
+        let payload = stop_payload(test_router(pm), "missing").await;
+        assert_eq!(payload["success"], false);
+        assert_eq!(payload["status"], "not_running");
+    }
+
+    #[tokio::test]
+    async fn schedule_preview_returns_summary_and_next() {
+        // Stateless endpoint — no pipe manager needed.
+        let app = Router::new().route("/pipes/schedule/preview", post(preview_schedule));
+        let body = serde_json::json!({
+            "frequency": "weeks",
+            "interval": 1,
+            "days_of_week": [1, 3, 5],
+            "at_hour": 9,
+            "at_minute": 30,
+            "timezone": "America/New_York"
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/pipes/schedule/preview")
+                    .method("POST")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(payload["valid"], true);
+        assert_eq!(
+            payload["summary"],
+            "weekly on Mon, Wed, Fri at 9:30 AM (America/New_York)"
+        );
+        let next = payload["next"].as_array().expect("next array");
+        assert_eq!(next.len(), 5);
+        // Each entry is a parseable RFC3339 timestamp, strictly increasing.
+        let times: Vec<chrono::DateTime<chrono::Utc>> = next
+            .iter()
+            .map(|v| {
+                chrono::DateTime::parse_from_rfc3339(v.as_str().unwrap())
+                    .unwrap()
+                    .with_timezone(&chrono::Utc)
+            })
+            .collect();
+        assert!(times.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[tokio::test]
+    async fn stop_api_returns_stopping_for_running_pipe_with_real_pid() {
+        let dir = TempDir::new().unwrap();
+        let live_pid = std::process::id();
+        let executor = std::sync::Arc::new(FakeExecutor::new(FakePublishMode::Immediate, live_pid));
+        let mut executors: HashMap<String, std::sync::Arc<dyn AgentExecutor>> = HashMap::new();
+        executors.insert("fake".to_string(), executor.clone());
+        let pm = std::sync::Arc::new(Mutex::new(PipeManager::new(
+            dir.path().to_path_buf(),
+            executors,
+            None,
+            3030,
+        )));
+
+        start_test_pipe(&pm, &dir, executor.clone(), "demo").await;
+        executor.wait_for_pid_published().await;
+
+        let payload = stop_payload(test_router(pm), "demo").await;
+        assert_eq!(payload["success"], true);
+        assert_eq!(payload["status"], "stopping");
+        assert_eq!(executor.kill_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(executor.last_killed_pid.load(Ordering::SeqCst), live_pid);
+    }
+
+    #[tokio::test]
+    async fn stop_api_returns_stop_pending_before_pid_is_available() {
+        let dir = TempDir::new().unwrap();
+        let executor = std::sync::Arc::new(FakeExecutor::new(FakePublishMode::Deferred, 4343));
+        let mut executors: HashMap<String, std::sync::Arc<dyn AgentExecutor>> = HashMap::new();
+        executors.insert("fake".to_string(), executor.clone());
+        let pm = std::sync::Arc::new(Mutex::new(PipeManager::new(
+            dir.path().to_path_buf(),
+            executors,
+            None,
+            3030,
+        )));
+
+        start_test_pipe(&pm, &dir, executor.clone(), "demo").await;
+
+        let payload = stop_payload(test_router(pm), "demo").await;
+        assert_eq!(payload["success"], true);
+        assert_eq!(payload["status"], "stop_pending");
+        assert_eq!(executor.kill_calls.load(Ordering::SeqCst), 0);
+
+        executor.allow_pid_publish.notify_waiters();
+        executor.wait_for_pid_published().await;
     }
 }

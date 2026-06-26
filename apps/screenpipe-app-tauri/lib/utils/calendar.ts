@@ -205,7 +205,14 @@ async function fetchNativeCalendar(
       `/connections/calendar/events?hours_back=${hoursBack}&hours_ahead=${hoursAhead}`,
     );
     if (!res.ok) return null;
-    const body = (await res.json()) as { data?: RawNativeEvent[] };
+    const body = (await res.json()) as {
+      data?: RawNativeEvent[];
+      connected?: boolean;
+    };
+    // The engine reports "no native calendar here" (unsupported platform /
+    // no OS appointment store) as 200 + connected:false instead of a 500.
+    // That is "provider unavailable", not "connected with zero events".
+    if (body.connected === false) return null;
     const arr = body.data ?? [];
     return arr
       .map(normalizeNative)
@@ -218,11 +225,13 @@ async function fetchNativeCalendar(
 async function fetchGoogleCalendar(
   hoursBack: number,
   hoursAhead: number,
+  instance: string | null,
 ): Promise<CalendarEvent[] | null> {
+  const query =
+    `hours_back=${hoursBack}&hours_ahead=${hoursAhead}` +
+    (instance ? `&instance=${encodeURIComponent(instance)}` : "");
   try {
-    const res = await localFetch(
-      `/connections/google-calendar/events?hours_back=${hoursBack}&hours_ahead=${hoursAhead}`,
-    );
+    const res = await localFetch(`/connections/google-calendar/events?${query}`);
     if (!res.ok) return null;
     const body = (await res.json()) as RawGoogleEvent[] | { error?: string };
     if (!Array.isArray(body)) return null;
@@ -238,10 +247,14 @@ async function fetchNativeProvider(
   hoursBack: number,
   hoursAhead: number,
 ): Promise<ProviderCalendarResult> {
+  let statusKnown = false;
+  let statusAvailable = false;
   let statusConnected = false;
   try {
     const status = await commands.calendarStatus();
     if (status.status === "ok") {
+      statusKnown = true;
+      statusAvailable = status.data.available;
       statusConnected =
         status.data.available &&
         status.data.authorized &&
@@ -249,6 +262,16 @@ async function fetchNativeProvider(
     }
   } catch {
     // Fall through to the HTTP route below.
+  }
+
+  // No native calendar on this platform (Linux) or no OS appointment store
+  // (some Windows setups): the HTTP probe can only fail. This poller runs
+  // every 60s — skip the guaranteed-failing request instead of generating a
+  // log entry per minute forever. Unauthorized-but-available (macOS pending
+  // permission) still probes: reads can succeed right after an in-process
+  // grant even while the cached OS status lags.
+  if (statusKnown && !statusAvailable) {
+    return { source: "native", connected: false, ok: true, events: [] };
   }
 
   const events = await fetchNativeCalendar(hoursBack, hoursAhead);
@@ -260,22 +283,44 @@ async function fetchNativeProvider(
   };
 }
 
-async function fetchGoogleProvider(
+// Fetch a single Google account. `instance` is the account identifier (email)
+// or null for the implicit default — used when only one account is connected
+// or when enumeration is unavailable.
+async function fetchGoogleInstance(
+  instance: string | null,
   hoursBack: number,
   hoursAhead: number,
 ): Promise<ProviderCalendarResult> {
+  let statusKnown = false;
   let statusConnected = false;
+  let needsAttention = false;
   try {
-    const status = await commands.oauthStatus("google-calendar", null);
-    statusConnected = status.status === "ok" && status.data.connected;
+    const status = await commands.oauthStatus("google-calendar", instance);
+    if (status.status === "ok") {
+      statusKnown = true;
+      statusConnected = status.data.connected;
+      needsAttention = status.data.needs_attention === true;
+    }
   } catch {
     // Fall back to probing the events endpoint below.
   }
 
-  // The status command can report disconnected when the access token is
-  // expired, even though a refresh token is present. The events endpoint is
-  // the source of truth because it refreshes before reading the calendar.
-  const events = await fetchGoogleCalendar(hoursBack, hoursAhead);
+  // Once OAuth status is available, disconnected means there is no recoverable
+  // token. Avoid repeatedly probing an endpoint that can only fail until the
+  // user reconnects. Exception: needs_attention means a token row exists but
+  // the keychain key is unavailable (bundle ACL mismatch) — surface this as
+  // "connected but failing" so the meeting-notes UI shows the error state
+  // instead of pushing the user to a reconnect that won't actually help.
+  if (statusKnown && !statusConnected) {
+    return {
+      source: "google",
+      connected: needsAttention,
+      ok: !needsAttention,
+      events: [],
+    };
+  }
+
+  const events = await fetchGoogleCalendar(hoursBack, hoursAhead, instance);
   return {
     source: "google",
     connected: statusConnected || events !== null,
@@ -284,7 +329,52 @@ async function fetchGoogleProvider(
   };
 }
 
-async function fetchIcsProvider(): Promise<ProviderCalendarResult> {
+async function fetchGoogleProvider(
+  hoursBack: number,
+  hoursAhead: number,
+): Promise<ProviderCalendarResult> {
+  // A user can connect more than one Google account (e.g. personal + work).
+  // The events endpoint refuses an ambiguous request once >1 account exists
+  // ("specify which one with `instance`"), so enumerate the accounts and query
+  // each explicitly, then merge. Falls back to a single implicit-default call
+  // when enumeration is unavailable or only one account is connected.
+  let instances: (string | null)[] | null = null;
+  try {
+    const list = await commands.oauthListInstances("google-calendar");
+    if (list.status === "ok") {
+      instances = list.data.map((entry) => entry.instance);
+    }
+  } catch {
+    // Enumeration unavailable — fall through to the single-account path.
+  }
+
+  if (instances === null || instances.length <= 1) {
+    return fetchGoogleInstance(instances?.[0] ?? null, hoursBack, hoursAhead);
+  }
+
+  const results = await Promise.all(
+    instances.map((instance) =>
+      fetchGoogleInstance(instance, hoursBack, hoursAhead),
+    ),
+  );
+
+  const connectedResults = results.filter((result) => result.connected);
+  return {
+    source: "google",
+    connected: connectedResults.length > 0,
+    // Only flag the source as failing when every connected account failed; one
+    // healthy account shouldn't surface a global "calendar needs attention".
+    ok:
+      connectedResults.length === 0 ||
+      connectedResults.some((result) => result.ok),
+    events: results.flatMap((result) => result.events),
+  };
+}
+
+async function fetchIcsProvider(
+  hoursBack: number,
+  hoursAhead: number,
+): Promise<ProviderCalendarResult> {
   try {
     const entries = await commands.icsCalendarGetEntries();
     if (entries.status !== "ok") {
@@ -295,7 +385,10 @@ async function fetchIcsProvider(): Promise<ProviderCalendarResult> {
       return { source: "ics", connected: false, ok: true, events: [] };
     }
 
-    const upcoming = await commands.icsCalendarGetUpcoming();
+    const upcoming = await commands.icsCalendarGetUpcoming(
+      hoursBack,
+      hoursAhead,
+    );
     if (upcoming.status !== "ok") {
       return { source: "ics", connected: true, ok: false, events: [] };
     }
@@ -335,7 +428,7 @@ export async function fetchUpcomingCalendarSnapshot(opts?: {
   const providers = await Promise.all([
     fetchNativeProvider(hoursBack, hoursAhead),
     fetchGoogleProvider(hoursBack, hoursAhead),
-    fetchIcsProvider(),
+    fetchIcsProvider(hoursBack, hoursAhead),
   ]);
   const sourceConnected = (provider: ProviderCalendarResult) =>
     provider.connected || provider.events.length > 0;

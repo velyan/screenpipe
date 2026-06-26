@@ -11,7 +11,7 @@ use oasgen::{oasgen, OaSchema};
 
 use chrono::{DateTime, Utc};
 use screenpipe_audio::core::device::DeviceType;
-use screenpipe_db::{Speaker, TagContentType};
+use screenpipe_db::{Speaker, TagAutocompleteItem, TagContentType};
 
 use image::ImageFormat;
 use serde::{Deserialize, Serialize};
@@ -50,8 +50,19 @@ pub struct MemoryContent {
     pub source_context: Option<serde_json::Value>,
     pub tags: Vec<String>,
     pub importance: f64,
+    /// First frame of the workflow segment this memory describes, when known.
+    /// Lets a caller jump straight from a memory to the exact captured moment
+    /// (`GET /frames/{frame_id}`). Null for memories with no frame provenance.
+    pub frame_id: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(OaSchema, Serialize, Deserialize, Debug)]
+pub(crate) struct TagAutocompleteRequest {
+    pub q: Option<String>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
 }
 
 #[derive(OaSchema, Serialize, Deserialize, Debug, Clone)]
@@ -69,6 +80,12 @@ pub struct OCRContent {
     pub browser_url: Option<String>,
     pub focused: Option<bool>,
     pub device_name: String,
+    /// Origin of `text`. `"accessibility"` (OS-native tree, primary path) or
+    /// `"ocr"` (fallback for terminals, canvas apps, weak a11y). `None` for
+    /// legacy rows captured before the field was tracked. The variant is
+    /// historically called OCR but most captures are accessibility-derived
+    /// — read this field to know which path produced the text.
+    pub text_source: Option<String>,
 }
 
 #[derive(OaSchema, Serialize, Deserialize, Debug, Clone)]
@@ -136,6 +153,9 @@ pub struct InputContent {
     /// Element context from accessibility APIs
     pub element_role: Option<String>,
     pub element_name: Option<String>,
+    /// Frame the event triggered (linked by frame_linker)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_id: Option<i64>,
 }
 
 // Response structs
@@ -170,6 +190,29 @@ pub struct RemoveTagsRequest {
 #[derive(OaSchema, Serialize)]
 pub struct RemoveTagsResponse {
     success: bool,
+}
+
+#[oasgen]
+pub(crate) async fn autocomplete_tags(
+    State(state): State<Arc<AppState>>,
+    Query(request): Query<TagAutocompleteRequest>,
+) -> Result<JsonResponse<Vec<TagAutocompleteItem>>, (StatusCode, JsonResponse<Value>)> {
+    let limit = request.limit.unwrap_or(50).clamp(1, 100) as i64;
+    let offset = request.offset.unwrap_or(0) as i64;
+    let query = request.q.unwrap_or_default();
+
+    state
+        .db
+        .autocomplete_tags(&query, limit, offset)
+        .await
+        .map(JsonResponse)
+        .map_err(|e| {
+            error!("Failed to autocomplete tags: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonResponse(json!({"error": e.to_string()})),
+            )
+        })
 }
 
 #[oasgen]
@@ -527,6 +570,29 @@ const MAX_SQL_LIMIT: u64 = 10_000;
 
 /// Validate a raw SQL query before execution to prevent unbounded result sets.
 /// Returns Ok(()) if the query is safe to execute, or Err with a helpful message.
+/// True if `upper` (an upper-cased SQL string) calls a SQL aggregate function
+/// as a real token — not as a substring of an identifier such as `ACCOUNT(`.
+fn contains_aggregate(upper: &str) -> bool {
+    const AGGREGATES: [&str; 7] = [
+        "COUNT(",
+        "SUM(",
+        "AVG(",
+        "MIN(",
+        "MAX(",
+        "TOTAL(",
+        "GROUP_CONCAT(",
+    ];
+    AGGREGATES.iter().any(|agg| {
+        upper.match_indices(agg).any(|(idx, _)| {
+            if idx == 0 {
+                return true;
+            }
+            let prev = upper.as_bytes()[idx - 1];
+            !prev.is_ascii_alphanumeric() && prev != b'_'
+        })
+    })
+}
+
 fn validate_raw_sql(query: &str) -> Result<(), String> {
     let normalized = query
         .lines()
@@ -549,8 +615,16 @@ fn validate_raw_sql(query: &str) -> Result<(), String> {
         );
     }
 
-    // Check for LIMIT clause
-    if !upper.contains("LIMIT") {
+    // EXPLAIN queries and single-row aggregations (COUNT/MAX/… with no GROUP BY)
+    // are inherently bounded, so don't force a LIMIT on them. The chat agent is
+    // explicitly told to prefer aggregate queries for counts/stats, and
+    // rejecting a bare `SELECT COUNT(*) FROM frames` for a missing LIMIT just
+    // burns a turn making it re-issue the same query with a pointless LIMIT.
+    let is_explain = trimmed.starts_with("EXPLAIN");
+    let bounded_aggregate = !upper.contains(" GROUP BY ") && contains_aggregate(&upper);
+
+    // Check for LIMIT clause on row-returning queries
+    if !upper.contains("LIMIT") && !is_explain && !bounded_aggregate {
         return Err(format!(
             "Query rejected: SELECT without LIMIT. Add 'LIMIT n' (max {}) to your query. \
              Example: SELECT * FROM frames WHERE timestamp > '2024-01-01' LIMIT 100",
@@ -593,6 +667,16 @@ pub(crate) async fn execute_raw_sql(
 
     match state.db.execute_raw_sql(&payload.query).await {
         Ok(result) => Ok(JsonResponse(result)),
+        // A database-level error means SQLite rejected the *query* itself —
+        // unknown table/column, syntax error, etc. That's a caller mistake, not
+        // a server fault, so return 400 with the underlying message. This lets
+        // the chat agent see "I wrote bad SQL" and self-correct, instead of
+        // reading a 500 as an outage and giving up after burning turns. Reserve
+        // 500 for genuine infrastructure failures (pool timeout, IO, …).
+        Err(e @ sqlx::Error::Database(_)) => Err((
+            StatusCode::BAD_REQUEST,
+            JsonResponse(json!({"error": e.to_string()})),
+        )),
         Err(e) => {
             error!("Failed to execute raw SQL query: {}", e);
             Err((
@@ -633,5 +717,63 @@ pub(crate) async fn validate_media_handler(
             StatusCode::EXPECTATION_FAILED,
             Json(json!({"status": e.to_string()})),
         )),
+    }
+}
+
+#[cfg(test)]
+mod raw_sql_validation_tests {
+    use super::{contains_aggregate, validate_raw_sql};
+
+    #[test]
+    fn rejects_row_query_without_limit() {
+        assert!(validate_raw_sql("SELECT * FROM frames").is_err());
+        assert!(validate_raw_sql("SELECT id, name FROM frames WHERE id > 5").is_err());
+    }
+
+    #[test]
+    fn allows_row_query_with_limit() {
+        assert!(validate_raw_sql("SELECT * FROM frames LIMIT 10").is_ok());
+    }
+
+    #[test]
+    fn allows_bounded_aggregate_without_limit() {
+        // The chat prompt tells the agent to prefer COUNT/aggregate queries;
+        // these collapse to a single row, so a LIMIT must not be required.
+        assert!(validate_raw_sql("SELECT COUNT(*) FROM frames").is_ok());
+        assert!(validate_raw_sql("SELECT COUNT(*) AS n FROM frames").is_ok());
+        assert!(validate_raw_sql("SELECT MAX(timestamp), MIN(timestamp) FROM frames").is_ok());
+    }
+
+    #[test]
+    fn still_requires_limit_for_group_by() {
+        // GROUP BY can return many rows — keep requiring a LIMIT there.
+        assert!(
+            validate_raw_sql("SELECT app_name, COUNT(*) FROM frames GROUP BY app_name").is_err()
+        );
+    }
+
+    #[test]
+    fn allows_explain_without_limit() {
+        assert!(validate_raw_sql("EXPLAIN QUERY PLAN SELECT * FROM frames").is_ok());
+    }
+
+    #[test]
+    fn blocks_writes() {
+        assert!(validate_raw_sql("DELETE FROM frames").is_err());
+        assert!(validate_raw_sql("UPDATE frames SET app_name = 'x' LIMIT 1").is_err());
+        assert!(validate_raw_sql("INSERT INTO frames VALUES (1)").is_err());
+    }
+
+    #[test]
+    fn enforces_max_limit() {
+        assert!(validate_raw_sql("SELECT * FROM frames LIMIT 999999").is_err());
+    }
+
+    #[test]
+    fn aggregate_detection_respects_word_boundaries() {
+        // ACCOUNT( must not be mistaken for COUNT(.
+        assert!(!contains_aggregate("SELECT ACCOUNT(X) FROM T"));
+        assert!(contains_aggregate("SELECT COUNT(*) FROM T"));
+        assert!(contains_aggregate("SELECT SUM(DURATION) FROM T"));
     }
 }

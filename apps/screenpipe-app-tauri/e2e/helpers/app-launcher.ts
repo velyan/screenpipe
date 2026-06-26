@@ -11,8 +11,11 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 export const WEBDRIVER_PORT = 4445;
-/** Focus/server port — single-instance check posts here; must be free for E2E. */
-const FOCUS_PORT = 11435;
+/** Focus/server port — single-instance check posts here; must be free for E2E.
+ *  Defaults to a non-default port so the e2e instance can coexist with a
+ *  developer's running production screenpipe app (which holds 11435). The
+ *  Rust binary reads `SCREENPIPE_FOCUS_PORT` from env when this differs. */
+const FOCUS_PORT = Number(process.env.SCREENPIPE_FOCUS_PORT ?? '11436');
 
 /** Kill any process listening on a port. No-op if none. */
 function killPort(port: number): void {
@@ -59,7 +62,10 @@ const APP_PID_FILE = resolve(E2E_DATA_DIR, 'app.pid');
 //
 // Override with `SCREENPIPE_E2E_SEED=onboarding` (or any custom value) when
 // running on a host that DOES have TCC granted and you want to exercise the
-// real capture pipeline. `cloud-audio-fallback` is an opt-in macOS seed that
+// real capture pipeline. Add `no-audio` when a lane only needs vision/OCR and
+// should not boot Whisper. Add `event-trigger-capture` for the Windows
+// key/clipboard/window-focus trigger lane; raw key and clipboard rows stay
+// disabled unless an explicit DB-capture seed opts them in. `cloud-audio-fallback` is an opt-in macOS seed that
 // leaves audio UI enabled, disables vision, and saves Screenpipe Cloud while
 // logged out so the fallback UX can be asserted. The same env var is read by
 // specs (e.g. timeline) to skip when recording is off.
@@ -118,6 +124,7 @@ export async function startApp(port = WEBDRIVER_PORT): Promise<ReturnType<typeof
       ...process.env,
       SCREENPIPE_DATA_DIR: E2E_DATA_DIR,
       SCREENPIPE_E2E_SEED: E2E_SEED_FLAGS,
+      SCREENPIPE_FOCUS_PORT: String(FOCUS_PORT),
       TAURI_WEBDRIVER_PORT: String(port),
       // When the app panics under E2E (common during early platform bring-up),
       // a backtrace in CI logs is far more actionable than the default "run with

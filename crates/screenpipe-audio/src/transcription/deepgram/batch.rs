@@ -129,34 +129,77 @@ fn create_query_params(languages: Vec<Language>, vocabulary: &[VocabularyEntry])
         "model=nova-3&smart_format=true&sample_rate=16000&diarize=true&utterances=true",
     );
 
-    if !languages.is_empty() {
-        query_params = [
-            query_params,
-            "&".into(),
-            languages
-                .iter()
-                .map(|lang| format!("detect_language={}", lang.as_lang_code()))
-                .collect::<Vec<String>>()
-                .join("&"),
-        ]
-        .concat();
+    // Deepgram language selection (/listen). WITHOUT any language parameter Deepgram
+    // defaults to English and silently drops every other language — the cause of
+    // "automatic language detection only detects English".
+    //  - none selected → detect_language=true (auto-detect across all languages)
+    //  - one selected  → language=<code>      (force it; most accurate)
+    //  - many selected → detect_language=<code>&… (restrict auto-detection to the set)
+    match languages.as_slice() {
+        [] => query_params.push_str("&detect_language=true"),
+        [single] => query_params.push_str(&format!("&language={}", single.as_lang_code())),
+        many => {
+            for lang in many {
+                query_params.push_str(&format!("&detect_language={}", lang.as_lang_code()));
+            }
+        }
     }
 
-    // Add vocabulary as Deepgram keyterms (Nova-3 uses `keyterm` instead of `keywords`)
+    // Add vocabulary as Deepgram nova-3 keyterms. nova-3 keyterm prompting takes
+    // plain terms with NO `:intensifier` (that's the older nova-2 `keywords`
+    // syntax) — a trailing `:2` would be sent as part of the literal term.
     for entry in vocabulary.iter().take(100) {
         let keyword = entry.replacement.as_deref().unwrap_or(&entry.word);
-        // Simple percent-encode spaces for the query string
-        let encoded = keyword.replace(' ', "%20");
-        query_params.push_str(&format!("&keyterm={}:2", encoded));
+        // Percent-encode spaces (and the comma, which separates keyterms).
+        let encoded = keyword.replace(' ', "%20").replace(',', "%2C");
+        query_params.push_str(&format!("&keyterm={}", encoded));
     }
 
     query_params
 }
 
+/// Send the Deepgram request, retrying transient transport failures (timeouts,
+/// connection resets, "error sending request" blips) up to a few times with
+/// backoff. HTTP 4xx/5xx come back as `Ok(Response)` and are handled by the
+/// caller, so a `reqwest::Error` here is always transport-level — exactly the
+/// class worth retrying. Recovers transcripts previously lost to one-off blips
+/// (the recurring "error sending request" Deepgram failures in Sentry).
 async fn get_deepgram_response(
     config: &DeepgramTranscriptionConfig,
     audio_data: Vec<u8>,
     params: String,
+    content_type: &str,
+) -> Result<Response, reqwest::Error> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut last_err: Option<reqwest::Error> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match attempt_deepgram_request(config, audio_data.clone(), &params, content_type).await {
+            Ok(resp) => return Ok(resp),
+            Err(e) => {
+                if !is_transient_deepgram_error(&e) || attempt + 1 == MAX_ATTEMPTS {
+                    return Err(e);
+                }
+                let delay = Duration::from_millis(300 * 2u64.pow(attempt));
+                debug!(
+                    "deepgram request failed (attempt {}/{}): {} — retrying in {:?}",
+                    attempt + 1,
+                    MAX_ATTEMPTS,
+                    e,
+                    delay
+                );
+                last_err = Some(e);
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+    Err(last_err.expect("retry loop ran with at least one attempt"))
+}
+
+/// One Deepgram request attempt, including the IPv6→IPv4 route fallback.
+async fn attempt_deepgram_request(
+    config: &DeepgramTranscriptionConfig,
+    audio_data: Vec<u8>,
+    params: &str,
     content_type: &str,
 ) -> Result<Response, reqwest::Error> {
     let url = format!("{}?{}", config.endpoint, params);
@@ -245,6 +288,30 @@ fn should_retry_ipv4(err: &reqwest::Error) -> bool {
         || err.contains("network is unreachable")
 }
 
+/// Whether a transport-level Deepgram error is transient (worth retrying) rather
+/// than deterministic (e.g. a builder/config error). HTTP status errors never
+/// reach here — they come back as `Ok(Response)`.
+fn is_transient_deepgram_error(err: &reqwest::Error) -> bool {
+    if err.is_timeout() || err.is_connect() {
+        return true;
+    }
+    transient_error_text(&format!("{err:?}"))
+}
+
+/// String-level fallback for transient failures reqwest doesn't flag via
+/// `is_timeout`/`is_connect` (connection resets, broken pipes, the generic
+/// "error sending request").
+fn transient_error_text(debug: &str) -> bool {
+    let d = debug.to_lowercase();
+    d.contains("timed out")
+        || d.contains("timeout")
+        || d.contains("connection reset")
+        || d.contains("connection closed")
+        || d.contains("broken pipe")
+        || d.contains("connection refused")
+        || d.contains("error sending request")
+}
+
 async fn handle_deepgram_response(
     response: Result<Response, reqwest::Error>,
     device: &str,
@@ -275,14 +342,14 @@ async fn handle_deepgram_response(
                 error!(
                     "device: {}, deepgram request blocked — received HTML instead of JSON (status {}). \
                      this usually means a firewall, corporate proxy, or captive portal is intercepting \
-                     requests to api.screenpi.pe. body preview: {}",
+                     requests to api.screenpipe.com. body preview: {}",
                     device,
                     status,
                     &body_text[..body_text.len().min(500)]
                 );
                 return Err(anyhow::anyhow!(
                     "Audio transcription blocked by network (firewall/proxy). \
-                     Please check that api.screenpi.pe is accessible from your network."
+                     Please check that api.screenpipe.com is accessible from your network."
                 ));
             }
 
@@ -374,11 +441,11 @@ async fn handle_deepgram_response(
             let err_str = format!("{:?}", e);
             if err_str.contains("timed out") || err_str.contains("timeout") {
                 error!(
-                    "device: {}, deepgram request timed out — possible firewall blocking api.screenpi.pe: {:?}",
+                    "device: {}, deepgram request timed out — possible firewall blocking api.screenpipe.com: {:?}",
                     device, e
                 );
                 return Err(anyhow::anyhow!(
-                    "Audio transcription request timed out. Check if api.screenpi.pe is accessible from your network."
+                    "Audio transcription request timed out. Check if api.screenpipe.com is accessible from your network."
                 ));
             }
             if err_str.contains("dns") || err_str.contains("resolve") {
@@ -396,7 +463,7 @@ async fn handle_deepgram_response(
                     device, e
                 );
                 return Err(anyhow::anyhow!(
-                    "Connection refused to audio transcription server. A firewall may be blocking api.screenpi.pe."
+                    "Connection refused to audio transcription server. A firewall may be blocking api.screenpipe.com."
                 ));
             }
 
@@ -584,6 +651,71 @@ fn parse_utterance_diarization_segments(result: &Value) -> Vec<TranscriptionDiar
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_languages_enables_auto_detection() {
+        // Regression for #3550: with no language param Deepgram defaults to
+        // English, so auto-detect must explicitly request detect_language=true.
+        let params = create_query_params(vec![], &[]);
+        assert!(
+            params.contains("&detect_language=true"),
+            "expected detect_language=true, got: {params}"
+        );
+        assert!(!params.contains("language=en"));
+    }
+
+    #[test]
+    fn single_language_is_forced() {
+        let params = create_query_params(vec![Language::Portuguese], &[]);
+        assert!(params.contains("&language=pt"), "got: {params}");
+        assert!(!params.contains("detect_language"));
+    }
+
+    #[test]
+    fn vocabulary_becomes_plain_keyterms_without_intensifier() {
+        let vocab = vec![
+            VocabularyEntry {
+                word: "Screenpipe".into(),
+                replacement: None,
+            },
+            VocabularyEntry {
+                word: "Core Audio".into(),
+                replacement: None,
+            },
+        ];
+        let params = create_query_params(vec![], &vocab);
+        assert!(params.contains("&keyterm=Screenpipe"), "got: {params}");
+        // nova-3 keyterms take no `:intensifier` (that's nova-2 keywords).
+        assert!(!params.contains(":2"), "got: {params}");
+        assert!(params.contains("&keyterm=Core%20Audio"), "got: {params}");
+    }
+
+    #[test]
+    fn transient_error_text_flags_network_blips_only() {
+        // retryable transport failures
+        assert!(transient_error_text(
+            "reqwest::Error { kind: Request, source: error sending request for url }"
+        ));
+        assert!(transient_error_text("operation timed out"));
+        assert!(transient_error_text(
+            "Connection reset by peer (os error 54)"
+        ));
+        assert!(transient_error_text("Broken pipe (os error 32)"));
+        assert!(transient_error_text("Connection refused (os error 61)"));
+        // deterministic failures must NOT retry
+        assert!(!transient_error_text("invalid api key"));
+        assert!(!transient_error_text(
+            "400 bad request: unsupported language"
+        ));
+        assert!(!transient_error_text("decode error"));
+    }
+
+    #[test]
+    fn multiple_languages_restrict_detection() {
+        let params = create_query_params(vec![Language::English, Language::Portuguese], &[]);
+        assert!(params.contains("&detect_language=en"), "got: {params}");
+        assert!(params.contains("&detect_language=pt"), "got: {params}");
+    }
 
     #[test]
     fn parses_deepgram_word_speakers_into_turns() {

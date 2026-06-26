@@ -10,7 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
 use screenpipe_db::{
-    DatabaseManager, NewDiarizationSegment, ReplacementAudioTranscription, UntranscribedChunk,
+    ChunkOutcome, DatabaseManager, NewDiarizationSegment, ReplacementAudioTranscription,
+    UntranscribedChunk,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
@@ -23,6 +24,11 @@ static BACKFILL_LAST_TRIGGERED_MS: AtomicU64 = AtomicU64::new(0);
 
 const BACKFILL_MIN_INTERVAL: Duration = Duration::from_secs(30);
 const BACKFILL_MAX_CHUNKS_PER_PASS: usize = 12;
+/// Max gap between a live meeting segment's timestamp and an identified
+/// audio_transcriptions row when mapping the segment to a global speaker_id.
+/// The mirrored live row shares the segment's exact timestamp, so this only
+/// needs slack for clock jitter.
+const MEETING_SEGMENT_SPEAKER_WINDOW_SECS: f64 = 15.0;
 const RECONCILIATION_LOOKBACK_HOURS: i64 = 24 * 7;
 const RECONCILIATION_FRESHNESS_DELAY_SECS: i64 = 10 * 60;
 const RECONCILIATION_CHUNKS_PER_SWEEP: i64 = 50;
@@ -58,11 +64,31 @@ struct PendingTranscription {
     file_path: String,
 }
 
+/// An audio file that was written to disk but whose `audio_chunks` row insert
+/// failed (e.g. write-pool timeout under load). Persisted to disk as a JSON
+/// marker so the reconciliation sweep can re-insert the row once the write pool
+/// recovers. Without this, the audio file is orphaned: it never gets a row, so
+/// it never appears on the timeline and is never transcribed (the
+/// reconciliation candidate query only sees chunks that already have rows).
+/// See SCREENPIPE-CLI-RC ("audio chunk DB insert failed after 3 retries, data
+/// may be missing from timeline").
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub(crate) struct PendingChunk {
+    pub file_path: String,
+    pub timestamp: Option<DateTime<Utc>>,
+}
+
 /// Maximum batch duration in seconds per engine.
 /// Audio is encoded as MP3 (64 kbps mono 16 kHz) before upload, so durations
 /// are bounded by the compressed size, not raw WAV.
 ///
-/// - Deepgram via Cloudflare: 100 MB upload limit ÷ 64 kbps ≈ 3.5 h → cap at 5000 s (~83 min)
+/// - Deepgram via Cloudflare: cap at 480 s (8 min). Bounded by Deepgram's own
+///   10-minute hard ceiling — requests exceeding it return 504 Gateway Timeout
+///   on Nova models (https://github.com/orgs/deepgram/discussions/585). Bigger
+///   batches also blow past our worker's AbortSignal because Deepgram's
+///   documented minimum latency isn't sub-20s. Diarization quality plateaus
+///   above ~3 min audio per Deepgram's docs, so 8 min keeps the quality win
+///   without flirting with the 10-min cliff.
 /// - OpenAI-compatible: user-configurable (unknown engine limits), default 3000 s (~50 min)
 /// - Parakeet: ONNX int8 encoder handles up to ~52s but quality degrades past 30s.
 ///   Benchmarked: full audio = 33.1% WER, 30s chunks = 33.9% WER (best chunked).
@@ -71,7 +97,7 @@ struct PendingTranscription {
 /// - Qwen3-ASR: similar to Whisper architecture → cap at 600 s (10 min)
 pub fn default_max_batch_duration_secs(engine: &AudioTranscriptionEngine) -> u64 {
     match engine {
-        AudioTranscriptionEngine::Deepgram => 5000,
+        AudioTranscriptionEngine::Deepgram => 480,
         AudioTranscriptionEngine::OpenAICompatible => 3000,
         AudioTranscriptionEngine::Parakeet => 45,
         _ => 600,
@@ -129,13 +155,10 @@ pub async fn reconcile_untranscribed(
     batch_max_duration_secs: Option<u64>,
     metrics: Option<Arc<AudioPipelineMetrics>>,
 ) -> usize {
-    // Nothing to reconcile when transcription is disabled — skip entirely
-    // to avoid the silent-audio deletion path nuking audio files.
-    if *audio_engine == AudioTranscriptionEngine::Disabled {
-        return 0;
-    }
-
-    // Prevent concurrent reconciliation runs — two Whisper sessions = 200%+ CPU
+    // Prevent concurrent reconciliation runs — two Whisper sessions = 200%+ CPU.
+    // Acquired *before* the transcription-disabled check because orphaned-chunk
+    // recovery (below) must run regardless of the engine, and still needs to be
+    // serialized against the background sweep.
     if RECONCILIATION_RUNNING
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -151,6 +174,22 @@ pub async fn reconcile_untranscribed(
         }
     }
     let _guard = Guard;
+
+    // Re-insert audio chunks whose initial row insert was dropped under
+    // write-pool saturation: the file is on disk but has no audio_chunks row,
+    // so it is invisible to the timeline AND to the candidate query below.
+    // This is independent of transcription — those rows are what place audio on
+    // the timeline — so it runs even when the engine is disabled. It only
+    // inserts rows and clears its own markers; it never deletes audio files.
+    if let Some(dir) = data_dir {
+        retry_pending_chunks(db, dir).await;
+    }
+
+    // Transcription-specific reconciliation is skipped when transcription is
+    // disabled — this also avoids the silent-audio deletion path nuking files.
+    if *audio_engine == AudioTranscriptionEngine::Disabled {
+        return 0;
+    }
 
     // Retry any previously failed transcriptions before processing new chunks
     if let Some(dir) = data_dir {
@@ -326,16 +365,41 @@ pub async fn reconcile_untranscribed(
             Ok(output) => output,
             Err(e) => {
                 error!("reconciliation: transcription failed for batch: {}", e);
+                // Bump attempts on every chunk in the batch. Once a chunk has
+                // failed MAX_TRANSCRIPTION_ATTEMPTS times in a row the outcome
+                // helper flips it to status='failed' and it stops being picked.
+                // Without this, a wedged engine would retry the same chunks
+                // forever (one of the symptoms of the 2026-05-20 stall).
+                let reason = format!("stt batch failure: {}", e);
+                for chunk in &valid_chunks {
+                    if let Err(record_err) = db
+                        .record_chunk_outcome(
+                            chunk.id,
+                            ChunkOutcome::Failed {
+                                reason: reason.clone(),
+                            },
+                        )
+                        .await
+                    {
+                        warn!(
+                            "reconciliation: failed to record batch failure for chunk {}: {}",
+                            chunk.id, record_err
+                        );
+                    }
+                }
                 continue;
             }
         };
         let full_text = transcription_output.transcription.clone();
 
-        // Silent audio: insert an empty transcription row so these chunks are not
-        // picked up again on the next sweep. Previously we skipped recent silent
-        // chunks (< 2h old) without marking them — causing them to be re-sent to
-        // Deepgram every 120s in an infinite loop (the "zombie chunk" bug).
-        // Old silent chunks (> 2h) are deleted entirely.
+        // Silent audio. Two outcomes here, both important:
+        //   - Recent silent chunks (<2h): flip status='silent' via the
+        //     canonical outcome path. This is the loop-breaker — the old code
+        //     called replace_audio_transcription("") which silently no-op'd
+        //     on empty input, so the same chunks got picked again every 120s
+        //     forever (the zombie-chunk bug surfaced 2026-05-20).
+        //   - Old silent chunks (>2h): delete file + row entirely. ON DELETE
+        //     CASCADE wipes diarization rows. Keeping them just bloats the DB.
         if full_text.trim().is_empty() {
             let min_age = chrono::Duration::hours(2);
             let cutoff = chrono::Utc::now() - min_age;
@@ -348,23 +412,13 @@ pub async fn reconcile_untranscribed(
                 .filter(|c| c.timestamp >= cutoff)
                 .collect();
 
-            // Mark recent silent chunks as transcribed (empty) so they don't loop
             for chunk in &recent_chunks {
                 if let Err(e) = db
-                    .replace_audio_transcription(
-                        chunk.id,
-                        "",
-                        &engine_config.to_string(),
-                        &device_name,
-                        is_input,
-                        chunk.timestamp,
-                        Some(30.0),
-                        None,
-                    )
+                    .record_chunk_outcome(chunk.id, ChunkOutcome::Silent)
                     .await
                 {
                     warn!(
-                        "reconciliation: failed to mark silent chunk {} as transcribed: {}",
+                        "reconciliation: failed to mark silent chunk {} as silent: {}",
                         chunk.id, e
                     );
                     consecutive_db_errors += 1;
@@ -374,7 +428,6 @@ pub async fn reconcile_untranscribed(
                 }
             }
 
-            // Delete old silent chunks entirely
             if !old_chunks.is_empty() {
                 debug!(
                     "reconciliation: batch for {} produced empty transcription, deleting {} silent chunks (>2h old)",
@@ -523,6 +576,28 @@ pub async fn reconcile_untranscribed(
                 backfilled
             );
         }
+
+        // Map live meeting-transcript segments onto the global speaker ids the
+        // chunk backfill just resolved (reuses the same identities — no second
+        // embedding path). Pure DB; the mirrored live row shares each segment's
+        // timestamp so it matches first.
+        match db
+            .backfill_meeting_segment_speakers(
+                chrono::Utc::now() - chrono::Duration::hours(24),
+                MEETING_SEGMENT_SPEAKER_WINDOW_SECS,
+            )
+            .await
+        {
+            Ok(n) if n > 0 => info!(
+                "reconciliation: mapped {} live meeting segment(s) to global speaker ids",
+                n
+            ),
+            Ok(_) => {}
+            Err(e) => warn!(
+                "reconciliation: meeting-segment speaker mapping failed: {}",
+                e
+            ),
+        }
     }
 
     success_count
@@ -553,6 +628,282 @@ fn write_pending(data_dir: &Path, pending: &PendingTranscription) -> std::io::Re
 fn remove_pending(data_dir: &Path, audio_chunk_id: i64) {
     let path = pending_dir(data_dir).join(format!("chunk-{}.json", audio_chunk_id));
     let _ = std::fs::remove_file(&path);
+}
+
+/// Directory holding pending-chunk markers (audio files whose initial row
+/// insert failed). Kept separate from `pending-transcriptions` because
+/// `retry_pending_transcriptions` deletes any JSON in its dir that fails to
+/// parse as a `PendingTranscription` — mixing the two would nuke these markers.
+fn pending_chunks_dir(data_dir: &Path) -> PathBuf {
+    let dir = data_dir.join("pending-chunks");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Stable, unique, filesystem-safe marker filename for an audio file path.
+/// Combines a sanitized basename (for human/debug legibility) with a hash of
+/// the full path (for uniqueness — two devices can share a basename across
+/// dirs, and the sanitized form is lossy). Deterministic for a given path so
+/// repeated failures overwrite the same marker rather than piling up.
+fn pending_chunk_filename(file_path: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    file_path.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    let stem = Path::new(file_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("audio");
+    let sanitized: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(80)
+        .collect();
+    format!("{sanitized}-{hash:016x}.json")
+}
+
+/// Upper bound on pending-chunk markers held on disk at once. Each marker is a
+/// tiny JSON for one ~30s audio file per device, so this only bites during a
+/// multi-hour total write outage; it caps inode/disk use so a pathological
+/// outage can't fill the disk with markers. Recovery resumes for new audio once
+/// the sweep drains existing markers below the cap.
+const MAX_PENDING_CHUNK_MARKERS: usize = 10_000;
+
+/// Outcome of attempting to persist a pending-chunk marker. Exposed for tests
+/// so the cap behavior is assertable without writing `MAX` files.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MarkerOutcome {
+    Written,
+    /// Skipped because the marker dir is already at `cap`.
+    SkippedCapReached,
+}
+
+/// Number of `.json` markers currently in `dir`, counting at most `cap`+1 so a
+/// huge backlog doesn't turn this into an O(n) scan on every failed insert.
+fn pending_chunk_marker_count(dir: &Path, cap: usize) -> usize {
+    match std::fs::read_dir(dir) {
+        Ok(rd) => rd
+            .filter(|e| {
+                e.as_ref()
+                    .ok()
+                    .map(|e| e.path().extension().is_some_and(|x| x == "json"))
+                    .unwrap_or(false)
+            })
+            .take(cap.saturating_add(1))
+            .count(),
+        Err(_) => 0,
+    }
+}
+
+/// Persist a marker for an audio file whose `audio_chunks` row insert failed,
+/// so the next reconciliation sweep can re-insert it. Written atomically
+/// (tmp + rename) so a concurrent sweep never reads a half-written marker.
+/// Bounded by `cap` to avoid unbounded marker growth during a long outage.
+fn write_pending_chunk_capped(
+    data_dir: &Path,
+    chunk: &PendingChunk,
+    cap: usize,
+) -> std::io::Result<MarkerOutcome> {
+    let dir = pending_chunks_dir(data_dir);
+    let path = dir.join(pending_chunk_filename(&chunk.file_path));
+    // Cap only *new* markers: overwriting an existing marker for the same path
+    // doesn't grow the backlog, so it's always allowed.
+    if !path.exists() && pending_chunk_marker_count(&dir, cap) >= cap {
+        return Ok(MarkerOutcome::SkippedCapReached);
+    }
+    let json = serde_json::to_string(chunk).map_err(std::io::Error::other)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, &path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    debug!(
+        "reconciliation: wrote pending-chunk marker for {:?} to {:?}",
+        chunk.file_path, path
+    );
+    Ok(MarkerOutcome::Written)
+}
+
+/// Persist a pending-chunk marker using the production cap.
+pub(crate) fn write_pending_chunk(data_dir: &Path, chunk: &PendingChunk) -> std::io::Result<()> {
+    if write_pending_chunk_capped(data_dir, chunk, MAX_PENDING_CHUNK_MARKERS)?
+        == MarkerOutcome::SkippedCapReached
+    {
+        warn!(
+            "reconciliation: pending-chunk marker cap ({}) reached — not queuing {} for recovery (write outage?)",
+            MAX_PENDING_CHUNK_MARKERS, chunk.file_path
+        );
+    }
+    Ok(())
+}
+
+/// Queue an audio file whose `audio_chunks` row insert was dropped for later
+/// reconciliation recovery. Runs the marker write on a blocking thread so the
+/// audio capture loop never issues filesystem syscalls directly — the marker
+/// write is the only disk op left on that path, and the audio file itself was
+/// just written successfully on the same path, so the disk is known good here.
+/// Best-effort: failures are logged, not propagated.
+pub(crate) async fn persist_orphaned_chunk(
+    data_dir: &Path,
+    file_path: String,
+    timestamp: Option<DateTime<Utc>>,
+) {
+    let dir = data_dir.to_path_buf();
+    let chunk = PendingChunk {
+        file_path: file_path.clone(),
+        timestamp,
+    };
+    match tokio::task::spawn_blocking(move || write_pending_chunk(&dir, &chunk)).await {
+        Ok(Ok(())) => debug!(
+            "reconciliation: queued orphaned audio chunk {} for recovery",
+            file_path
+        ),
+        Ok(Err(e)) => warn!(
+            "reconciliation: failed to persist pending-chunk marker for {}: {}",
+            file_path, e
+        ),
+        Err(e) => warn!(
+            "reconciliation: pending-chunk marker task panicked for {}: {}",
+            file_path, e
+        ),
+    }
+}
+
+/// Stop a recovery pass after this many consecutive DB errors. The markers
+/// that caused the failures (and everything after) are left on disk for the
+/// next sweep. This bounds amplification: the write outage that created these
+/// markers is exactly when re-inserts fail, and without a cutoff a backlog of
+/// thousands of markers would fire thousands of (slow, timing-out) writes into
+/// the already-saturated pool in a single sweep, starving live capture writes.
+/// Mirrors `MAX_CONSECUTIVE_DB_ERRORS` in `reconcile_untranscribed`.
+const MAX_CONSECUTIVE_RECOVERY_DB_ERRORS: u32 = 3;
+
+/// Re-insert audio chunks whose initial row insert was dropped under write-pool
+/// saturation. Idempotent: a path that already has a row (inserted by the
+/// normal path on a later attempt, or recovered on a previous sweep) just has
+/// its marker cleared. A marker whose audio file no longer exists on disk
+/// (evicted by media retention) is dropped without resurrecting anything.
+/// Bails out after `MAX_CONSECUTIVE_RECOVERY_DB_ERRORS` consecutive DB failures
+/// so it never amplifies an ongoing write outage.
+/// Returns the number of chunks recovered (newly inserted this sweep).
+async fn retry_pending_chunks(db: &DatabaseManager, data_dir: &Path) -> usize {
+    let dir = pending_chunks_dir(data_dir);
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return 0, // dir missing / unreadable — nothing to retry
+    };
+
+    let mut recovered = 0usize;
+    let mut consecutive_errors = 0u32;
+    for entry in entries.flatten() {
+        // Pool likely still saturated — stop hammering it and leave the
+        // remaining markers for the next sweep.
+        if consecutive_errors >= MAX_CONSECUTIVE_RECOVERY_DB_ERRORS {
+            warn!(
+                "reconciliation: pausing pending-chunk recovery after {} consecutive DB errors (pool likely saturated); remaining markers left for the next sweep",
+                consecutive_errors
+            );
+            break;
+        }
+
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue; // skip stray .tmp files from an interrupted write
+        }
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "reconciliation: failed to read pending-chunk {:?}: {}",
+                    path, e
+                );
+                continue;
+            }
+        };
+        let pending: PendingChunk = match serde_json::from_str(&content) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    "reconciliation: failed to parse pending-chunk {:?}, removing: {}",
+                    path, e
+                );
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+        };
+
+        // Already has a row (later attempt succeeded, or a previous sweep
+        // recovered it) — clear the marker, nothing to do.
+        match db.find_audio_chunk_id(&pending.file_path).await {
+            Ok(Some(_)) => {
+                let _ = std::fs::remove_file(&path);
+                consecutive_errors = 0; // DB responsive
+                continue;
+            }
+            Ok(None) => {} // proceed to insert; not a success yet, don't reset
+            Err(e) => {
+                // DB still unhappy (likely the same saturation) — leave the
+                // marker so the next sweep retries.
+                consecutive_errors += 1;
+                warn!(
+                    "reconciliation: pending-chunk existence check failed for {}: {}",
+                    pending.file_path, e
+                );
+                continue;
+            }
+        }
+
+        // The audio file is gone (media eviction) — there is nothing left to
+        // re-insert, so drop the marker instead of recreating a row that points
+        // at a missing file. No DB op, so it doesn't touch the error counter.
+        if !Path::new(&pending.file_path).exists() {
+            debug!(
+                "reconciliation: pending-chunk audio file gone, dropping marker: {}",
+                pending.file_path
+            );
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+
+        match db
+            .get_or_insert_audio_chunk(&pending.file_path, pending.timestamp)
+            .await
+        {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&path);
+                recovered += 1;
+                consecutive_errors = 0;
+                debug!(
+                    "reconciliation: recovered orphaned audio chunk {}",
+                    pending.file_path
+                );
+            }
+            Err(e) => {
+                // Still failing — keep the marker for the next sweep.
+                consecutive_errors += 1;
+                warn!(
+                    "reconciliation: pending-chunk re-insert still failing for {}: {}",
+                    pending.file_path, e
+                );
+            }
+        }
+    }
+
+    if recovered > 0 {
+        info!(
+            "reconciliation: recovered {} orphaned audio chunk(s) from disk",
+            recovered
+        );
+    }
+    recovered
 }
 
 /// Attempt DB write, callback notification, and secondary chunk cleanup.
@@ -1285,6 +1636,378 @@ fn extract_device_from_path(file_path: &str) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── pending-chunk durable recovery (SCREENPIPE-CLI-RC) ──────────────────
+
+    async fn temp_db(dir: &Path) -> DatabaseManager {
+        let db_path = dir.join("db.sqlite");
+        DatabaseManager::new(&format!("sqlite:{}", db_path.display()), Default::default())
+            .await
+            .expect("open temp db")
+    }
+
+    /// Create a dummy audio file on disk and return its path string.
+    fn make_audio_file(dir: &Path, name: &str) -> String {
+        let p = dir.join(name);
+        std::fs::write(&p, b"not-real-audio").unwrap();
+        p.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn pending_chunk_filename_is_stable_and_unique() {
+        let a = "/data/Display 3 (output)_2026-02-27_23-15-38.mp4";
+        let b = "/data/MacBook Mic (input)_2026-02-27_23-15-38.mp4";
+        // Stable: same path → same name across calls.
+        assert_eq!(pending_chunk_filename(a), pending_chunk_filename(a));
+        // Unique: different paths → different names.
+        assert_ne!(pending_chunk_filename(a), pending_chunk_filename(b));
+        // Filesystem-safe: no spaces/parens/slashes survive, ends in .json.
+        let name = pending_chunk_filename(a);
+        assert!(name.ends_with(".json"));
+        assert!(!name.contains(' ') && !name.contains('(') && !name.contains('/'));
+        // Same basename in different dirs must NOT collide (hash disambiguates).
+        let c = "/other/Display 3 (output)_2026-02-27_23-15-38.mp4";
+        assert_ne!(pending_chunk_filename(a), pending_chunk_filename(c));
+    }
+
+    #[tokio::test]
+    async fn recovers_orphaned_audio_chunk_from_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let db = temp_db(data_dir).await;
+
+        let audio = make_audio_file(data_dir, "Display (output)_2026-01-01_00-00-00.mp4");
+        assert!(db.find_audio_chunk_id(&audio).await.unwrap().is_none());
+
+        write_pending_chunk(
+            data_dir,
+            &PendingChunk {
+                file_path: audio.clone(),
+                timestamp: Some(Utc::now()),
+            },
+        )
+        .unwrap();
+        // Marker exists on disk before the sweep.
+        assert_eq!(
+            std::fs::read_dir(pending_chunks_dir(data_dir))
+                .unwrap()
+                .count(),
+            1
+        );
+
+        let recovered = retry_pending_chunks(&db, data_dir).await;
+
+        assert_eq!(recovered, 1, "should re-insert exactly one orphaned chunk");
+        assert!(
+            db.find_audio_chunk_id(&audio).await.unwrap().is_some(),
+            "row must exist after recovery"
+        );
+        // Marker cleared so it isn't retried forever.
+        assert_eq!(
+            std::fs::read_dir(pending_chunks_dir(data_dir))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_is_idempotent_when_row_already_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let db = temp_db(data_dir).await;
+
+        let audio = make_audio_file(data_dir, "Mic (input)_2026-01-01_00-00-00.mp4");
+        // Row already present (the normal insert path succeeded on a later try).
+        let existing = db
+            .get_or_insert_audio_chunk(&audio, Some(Utc::now()))
+            .await
+            .unwrap();
+        write_pending_chunk(
+            data_dir,
+            &PendingChunk {
+                file_path: audio.clone(),
+                timestamp: Some(Utc::now()),
+            },
+        )
+        .unwrap();
+
+        let recovered = retry_pending_chunks(&db, data_dir).await;
+
+        assert_eq!(recovered, 0, "must not count an already-present chunk");
+        assert_eq!(
+            db.find_audio_chunk_id(&audio).await.unwrap(),
+            Some(existing),
+            "must not create a duplicate row"
+        );
+        assert_eq!(
+            std::fs::read_dir(pending_chunks_dir(data_dir))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn drops_marker_when_audio_file_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let db = temp_db(data_dir).await;
+
+        // Marker points at a file that was evicted (never created here).
+        let gone = data_dir
+            .join("evicted_2026-01-01_00-00-00.mp4")
+            .to_string_lossy()
+            .to_string();
+        write_pending_chunk(
+            data_dir,
+            &PendingChunk {
+                file_path: gone.clone(),
+                timestamp: Some(Utc::now()),
+            },
+        )
+        .unwrap();
+
+        let recovered = retry_pending_chunks(&db, data_dir).await;
+
+        assert_eq!(recovered, 0, "must not resurrect an evicted file");
+        assert!(db.find_audio_chunk_id(&gone).await.unwrap().is_none());
+        // Marker dropped so we don't retry a dead path forever.
+        assert_eq!(
+            std::fs::read_dir(pending_chunks_dir(data_dir))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_marker_is_removed_not_retried_forever() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let db = temp_db(data_dir).await;
+
+        let dir = pending_chunks_dir(data_dir);
+        std::fs::write(dir.join("garbage.json"), b"{ not valid json").unwrap();
+
+        let recovered = retry_pending_chunks(&db, data_dir).await;
+
+        assert_eq!(recovered, 0);
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "corrupt marker removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_chunk_becomes_a_transcription_candidate() {
+        // The whole point: a recovered row must be picked up for transcription,
+        // not just exist. Drive it through the real candidate query the
+        // reconciliation worker uses.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let db = temp_db(data_dir).await;
+
+        let audio = make_audio_file(data_dir, "Mic (input)_2026-01-01_00-00-00.mp4");
+        // Timestamp an hour ago: past the worker's freshness delay, inside its
+        // lookback window — i.e. eligible to transcribe.
+        let ts = Utc::now() - chrono::Duration::hours(1);
+        write_pending_chunk(
+            data_dir,
+            &PendingChunk {
+                file_path: audio.clone(),
+                timestamp: Some(ts),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(retry_pending_chunks(&db, data_dir).await, 1);
+
+        let since = Utc::now() - chrono::Duration::days(7);
+        let older_than = Utc::now() - chrono::Duration::minutes(10);
+        let candidates = db
+            .get_reconciliation_candidate_chunks(since, older_than, 50)
+            .await
+            .unwrap();
+        assert!(
+            candidates.iter().any(|c| c.file_path == audio),
+            "recovered chunk must be a pending transcription candidate"
+        );
+    }
+
+    #[test]
+    fn marker_writes_are_bounded_by_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+
+        let mk = |p: &str| PendingChunk {
+            file_path: p.to_string(),
+            timestamp: None,
+        };
+        // Cap of 2: first two distinct paths land, the third is refused.
+        assert_eq!(
+            write_pending_chunk_capped(data_dir, &mk("/a/one.mp4"), 2).unwrap(),
+            MarkerOutcome::Written
+        );
+        assert_eq!(
+            write_pending_chunk_capped(data_dir, &mk("/a/two.mp4"), 2).unwrap(),
+            MarkerOutcome::Written
+        );
+        assert_eq!(
+            write_pending_chunk_capped(data_dir, &mk("/a/three.mp4"), 2).unwrap(),
+            MarkerOutcome::SkippedCapReached
+        );
+        assert_eq!(
+            std::fs::read_dir(pending_chunks_dir(data_dir))
+                .unwrap()
+                .count(),
+            2,
+            "cap bounds marker count"
+        );
+        // Re-writing an existing path overwrites its own marker rather than
+        // counting against the cap a second time.
+        assert_eq!(
+            write_pending_chunk_capped(data_dir, &mk("/a/one.mp4"), 2).unwrap(),
+            MarkerOutcome::Written
+        );
+        assert_eq!(
+            std::fs::read_dir(pending_chunks_dir(data_dir))
+                .unwrap()
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_orphaned_chunk_writes_marker_off_thread() {
+        // The hot-path entry point: it must land a marker that retry can read.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let db = temp_db(data_dir).await;
+        let audio = make_audio_file(data_dir, "Display (output)_2026-01-01_00-00-00.mp4");
+
+        persist_orphaned_chunk(data_dir, audio.clone(), Some(Utc::now())).await;
+        assert_eq!(
+            std::fs::read_dir(pending_chunks_dir(data_dir))
+                .unwrap()
+                .count(),
+            1
+        );
+
+        assert_eq!(retry_pending_chunks(&db, data_dir).await, 1);
+        assert!(db.find_audio_chunk_id(&audio).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn recovery_is_graceful_when_db_is_unavailable() {
+        // The exact failure mode this code lives in: the DB is unhappy. Recovery
+        // must not panic, must recover nothing, and must PRESERVE the markers for
+        // a later sweep (never drop them on a transient DB error). Closing the
+        // read pool makes every existence check fail; the circuit breaker also
+        // bounds how many we attempt.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let db = temp_db(data_dir).await;
+
+        for i in 0..6 {
+            let a = make_audio_file(
+                data_dir,
+                &format!("Mic (input)_2026-01-01_00-00-{i:02}.mp4"),
+            );
+            write_pending_chunk(
+                data_dir,
+                &PendingChunk {
+                    file_path: a,
+                    timestamp: Some(Utc::now()),
+                },
+            )
+            .unwrap();
+        }
+
+        db.pool.close().await; // every find_audio_chunk_id now errors
+
+        let recovered = retry_pending_chunks(&db, data_dir).await;
+
+        assert_eq!(recovered, 0, "nothing recovered while the DB is down");
+        assert_eq!(
+            std::fs::read_dir(pending_chunks_dir(data_dir))
+                .unwrap()
+                .count(),
+            6,
+            "markers preserved for the next sweep, not dropped on a DB error"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_is_consistent_when_markers_are_written_during_a_sweep() {
+        // Production concurrency: the capture loop keeps writing markers (atomic
+        // tmp+rename) while a reconciliation sweep reads the dir. Neither should
+        // corrupt the other, and every real file ends up with a row after the
+        // dust settles. Runs on a real multi-thread runtime so the writer and
+        // reader genuinely race.
+        use std::sync::Arc;
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let db = Arc::new(temp_db(&data_dir).await);
+
+        let mut paths = Vec::new();
+        for i in 0..12 {
+            paths.push(make_audio_file(
+                &data_dir,
+                &format!("Mic (input)_2026-01-01_00-00-{i:02}.mp4"),
+            ));
+        }
+        // Seed half the markers up front.
+        for p in &paths[..6] {
+            write_pending_chunk(
+                &data_dir,
+                &PendingChunk {
+                    file_path: p.clone(),
+                    timestamp: Some(Utc::now() - chrono::Duration::hours(1)),
+                },
+            )
+            .unwrap();
+        }
+
+        // Writer task drips in the remaining markers while the reader sweeps.
+        let writer_dir = data_dir.clone();
+        let writer_paths = paths[6..].to_vec();
+        let writer = tokio::spawn(async move {
+            for p in writer_paths {
+                persist_orphaned_chunk(
+                    &writer_dir,
+                    p,
+                    Some(Utc::now() - chrono::Duration::hours(1)),
+                )
+                .await;
+                tokio::task::yield_now().await;
+            }
+        });
+        let reader_db = Arc::clone(&db);
+        let reader_dir = data_dir.clone();
+        let reader = tokio::spawn(async move {
+            retry_pending_chunks(&reader_db, &reader_dir).await;
+        });
+        let _ = tokio::join!(writer, reader);
+
+        // A final sweep drains whatever the racing reader missed.
+        retry_pending_chunks(&db, &data_dir).await;
+
+        for p in &paths {
+            assert!(
+                db.find_audio_chunk_id(p).await.unwrap().is_some(),
+                "every file recovered after the race: {p}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(pending_chunks_dir(&data_dir))
+                .unwrap()
+                .count(),
+            0,
+            "all markers cleared once recovered"
+        );
+    }
 
     fn pending_with_diarization(
         diarization_segments: Vec<TranscriptionDiarizationSegment>,

@@ -4,6 +4,7 @@
 
 use log::{error, info, warn};
 use reqwest::Client;
+use screenpipe_engine::telemetry_context::TelemetryContext;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
@@ -62,7 +63,7 @@ impl AnalyticsManager {
             posthog_api_key,
             distinct_id,
             email,
-            interval: Duration::from_secs(interval_hours * 36),
+            interval: Duration::from_secs(interval_hours * 3600),
             enabled: Arc::new(Mutex::new(analytics_enabled)),
             api_host: "https://us.i.posthog.com".to_string(),
             local_api_base_url,
@@ -82,7 +83,7 @@ impl AnalyticsManager {
 
         match self
             .client
-            .get("https://screenpi.pe/api/attribution")
+            .get("https://screenpipe.com/api/attribution")
             .timeout(Duration::from_secs(5))
             .send()
             .await
@@ -246,10 +247,16 @@ impl AnalyticsManager {
             }
         }
 
+        if let Some(payload_props) = payload["properties"].as_object_mut() {
+            TelemetryContext::from_env().insert_posthog_properties(payload_props);
+        }
+
         let response = self.client.post(posthog_url).json(&payload).send().await?;
 
-        if !response.status().is_success() {
-            return Err(format!("PostHog API error: {}", response.status()).into());
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("PostHog API error: {} — {}", status, body).into());
         }
 
         Ok(())
@@ -257,6 +264,9 @@ impl AnalyticsManager {
 
     pub async fn start_periodic_event(&self) {
         let mut interval = interval(self.interval);
+        // Don't let missed ticks (e.g. after the machine resumes from a long
+        // sleep) fire back-to-back in a burst — coalesce them into one.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             interval.tick().await;
@@ -335,9 +345,6 @@ impl AnalyticsManager {
         json!({
             // Screen capture
             "setting_disable_vision": get_bool("disableVision").unwrap_or(false),
-            "setting_disable_ocr": get_bool("disableOcr").unwrap_or(false),
-            "setting_fps": get_f64("fps").unwrap_or(0.5),
-            "setting_adaptive_fps": get_bool("adaptiveFps").unwrap_or(false),
             "setting_ocr_engine": get_str("ocrEngine").unwrap_or("unknown"),
             "setting_use_all_monitors": get_bool("useAllMonitors").unwrap_or(true),
             "setting_monitor_count": get_arr_len("monitorIds"),
@@ -357,7 +364,7 @@ impl AnalyticsManager {
 
             // Other features
             "setting_use_pii_removal": get_bool("usePiiRemoval").unwrap_or(true),
-            "setting_auto_update": get_bool("autoUpdate").unwrap_or(true),
+            "setting_auto_update": get_bool("autoUpdate").unwrap_or(false),
             "setting_languages_count": get_arr_len("languages"),
         })
     }
@@ -408,11 +415,42 @@ impl AnalyticsManager {
             "pipeline_frames_captured": pipeline["frames_captured"].as_u64(),
             "pipeline_frames_dropped": pipeline["frames_dropped"].as_u64(),
             "pipeline_frame_drop_rate": pipeline["frame_drop_rate"].as_f64(),
+            // Silent-vision-loss diagnostics: distinguish a write/DB-pool stall
+            // (timeout) from a capture failure (error) from trigger starvation
+            // (capture_attempts flat while uptime climbs). frame_drop_rate alone
+            // read 0 fleet-wide because frames_captured was only bumped on writes.
+            "pipeline_frames_dropped_timeout": pipeline["frames_dropped_timeout"].as_u64(),
+            "pipeline_frames_dropped_error": pipeline["frames_dropped_error"].as_u64(),
+            "pipeline_silent_loss": pipeline["silent_loss"].as_u64(),
+            "pipeline_silent_loss_rate": pipeline["silent_loss_rate"].as_f64(),
+            "pipeline_capture_attempts": pipeline["capture_attempts"].as_u64(),
+            "pipeline_dedup_skips": pipeline["dedup_skips"].as_u64(),
+            "pipeline_last_capture_attempt_ts": pipeline["last_capture_attempt_ts"].as_u64(),
             "pipeline_capture_fps": pipeline["capture_fps_actual"].as_f64(),
             "pipeline_avg_ocr_latency_ms": pipeline["avg_ocr_latency_ms"].as_f64(),
             "pipeline_avg_db_latency_ms": pipeline["avg_db_latency_ms"].as_f64(),
             "pipeline_stall_count": pipeline["pipeline_stall_count"].as_u64(),
-            "pipeline_ocr_cache_hit_rate": pipeline["ocr_cache_hit_rate"].as_f64(),
+            // NOTE: dropped pipeline_ocr_cache_hit_rate — no OCR cache exists
+            // (both production record_ocr call sites pass cache_hits=0), so the
+            // rate is structurally always 0.0 and only misleads a dashboard.
+            // Recording-coverage reliability metric: what % of the user's
+            // working time (recent input) had healthy screen capture. Idle and
+            // asleep time are excluded from the denominator.
+            "recording_coverage_ratio": health["recording_coverage"]["coverage_ratio"].as_f64(),
+            "recording_secs": health["recording_coverage"]["recording_secs"].as_u64(),
+            "recording_active_secs": health["recording_coverage"]["active_secs"].as_u64(),
+            "recording_active_stalled_secs": health["recording_coverage"]["active_stalled_secs"].as_u64(),
+            "recording_active_paused_secs": health["recording_coverage"]["active_paused_secs"].as_u64(),
+            "recording_idle_secs": health["recording_coverage"]["idle_secs"].as_u64(),
+            // DB write-queue wedge signals — the recording-stall root cause.
+            // These live in /health but were never forwarded to analytics, so
+            // the fleet's write-pool degradation / db-write stalls were invisible.
+            "recording_write_queue_degraded": health["write_queue_degraded"].as_bool(),
+            "recording_write_queue_consecutive_fatal": health["write_queue_consecutive_fatal"].as_u64(),
+            "recording_write_pool_reopens": health["write_pool_reopens"].as_u64(),
+            "recording_persistent_failure_signals": health["persistent_failure_signals"].as_u64(),
+            "recording_vision_db_write_stalled": health["vision_db_write_stalled"].as_bool(),
+            "recording_audio_db_write_stalled": health["audio_db_write_stalled"].as_bool(),
             // Audio pipeline quality
             "audio_chunks_sent": audio_pipeline["chunks_sent"].as_u64(),
             "audio_chunks_received": audio_pipeline["chunks_received"].as_u64(),
@@ -454,8 +492,13 @@ pub fn start_analytics(
 ) -> Result<Arc<AnalyticsManager>, Box<dyn std::error::Error>> {
     let is_debug = std::env::var("TAURI_ENV_DEBUG").unwrap_or("false".to_string()) == "true";
 
-    // Skip analytics in debug mode or when debug assertions are enabled
-    let should_enable_analytics = analytics_enabled && !is_debug && !cfg!(debug_assertions);
+    // Skip analytics in debug mode, when debug assertions are enabled, or in
+    // CI / automation (GitHub Actions, etc. — see
+    // screenpipe_engine::analytics::telemetry_disabled_by_env).
+    let should_enable_analytics = analytics_enabled
+        && !is_debug
+        && !cfg!(debug_assertions)
+        && !screenpipe_engine::analytics::telemetry_disabled_by_env();
 
     let analytics_manager = Arc::new(AnalyticsManager::new(
         posthog_api_key,

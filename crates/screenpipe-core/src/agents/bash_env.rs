@@ -11,8 +11,8 @@
 //!
 //! Fix: ship a tiny bash shim that defines a `curl` shell function which
 //! auto-injects the Bearer header **only** when the target URL is the local
-//! screenpipe API (localhost:3030). Non-screenpipe calls pass through
-//! untouched — the token never leaks.
+//! screenpipe API (localhost:3030) or local app server (localhost:11435).
+//! Non-screenpipe calls pass through untouched — the token never leaks.
 //!
 //! The shim is sourced automatically by every `bash -c` subshell via the
 //! `BASH_ENV` env var, which spawning code sets on the child `Command`.
@@ -20,11 +20,12 @@
 //! wrapper is in scope for every tool invocation the agent issues. No
 //! model effort, no prompt changes, no new system-prompt lines.
 //!
-//! The wrapper falls back to `$SCREENPIPE_API_AUTH_KEY` as a second name
-//! because the app spawn path exports `SCREENPIPE_LOCAL_API_KEY` but the
-//! core pipe-executor spawn path historically exports `SCREENPIPE_API_AUTH_KEY`
-//! for the same value. Accepting both here means we don't have to migrate
-//! the env-var name in a single PR.
+//! Reads `$SCREENPIPE_LOCAL_API_KEY` only — every spawn path (Tauri chat,
+//! core pipe-executor) is now contractually required to export it.
+//! `SCREENPIPE_API_AUTH_KEY` was a historical second name from when the two
+//! spawn paths diverged; spawn paths still export it as a deprecated alias
+//! for one release so user-installed pipe.md files that hardcode the old
+//! name keep working, but new shim code reads the canonical name only.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -36,14 +37,16 @@ pub const WRAPPER_RELATIVE_PATH: &str = "pi-agent/bash-env.sh";
 
 /// Bash shell-init content sourced by every `bash -c` subshell.
 ///
-/// Only matches literal `localhost:3030`, `127.0.0.1:3030`, `[::1]:3030`
+/// Only matches literal localhost/loopback screenpipe API or app-server
 /// substrings in command arguments. If none match, `curl` runs unchanged.
 pub const WRAPPER_SCRIPT: &str = r#"# screenpipe — auto-injected by pi-agent bash subshells (do not edit by hand)
 # Transparently adds Authorization: Bearer to curl calls that target the
-# local screenpipe API, and — when SCREENPIPE_FILTER_PII=1 — rewrites any
-# /search URL to include filter_pii=1 so responses are PII-redacted
-# before Pi sees them. Other curl calls pass through unchanged — the
-# token never leaks to third-party hosts.
+# local screenpipe API/app server, tags them with x-screenpipe-session
+# (the chat/pipe that owns this agent, from SCREENPIPE_SESSION_ID) so
+# owned-browser and notification source links route to the right chat, and — when
+# SCREENPIPE_FILTER_PII=1 — rewrites any /search URL to include filter_pii=1
+# so responses are PII-redacted before Pi sees them. Other curl calls pass
+# through unchanged — the token never leaks to third-party hosts.
 #
 # Regenerated on every pi-agent spawn from screenpipe-core::agents::bash_env.
 
@@ -59,21 +62,27 @@ pub const WRAPPER_SCRIPT: &str = r#"# screenpipe — auto-injected by pi-agent b
 unset SCREENPIPE_API_KEY
 
 _sp_auth_key() {
-  # accept either name so we don't depend on which spawn path set it
-  printf '%s' "${SCREENPIPE_LOCAL_API_KEY:-${SCREENPIPE_API_AUTH_KEY:-}}"
+  # spawn paths guarantee SCREENPIPE_LOCAL_API_KEY is set (see pi.rs).
+  printf '%s' "${SCREENPIPE_LOCAL_API_KEY:-}"
 }
 
 curl() {
-  local key has_local=0 add_filter=0 arg
-  local -a out=()
+  local key sid has_local=0 add_filter=0 arg
+  local -a out=() hdrs=()
   key="$(_sp_auth_key)"
+  # Chat/session this agent runs under. The owned-browser is a singleton shared
+  # by every chat and background pipe, so we tag local API calls with the owner
+  # (x-screenpipe-session); the navigate handler rides it to the frontend so a
+  # background pipe's page doesn't pop into whatever chat is on screen. Empty
+  # for spawn paths that don't set it — then the call is simply untagged.
+  sid="${SCREENPIPE_SESSION_ID:-}"
   if [ "${SCREENPIPE_FILTER_PII:-}" = "1" ]; then
     add_filter=1
   fi
 
   for arg in "$@"; do
     case "$arg" in
-      *localhost:3030*|*127.0.0.1:3030*|*'[::1]:3030'*)
+      *localhost:3030*|*127.0.0.1:3030*|*'[::1]:3030'*|*localhost:11435*|*127.0.0.1:11435*|*'[::1]:11435'*)
         has_local=1
         if [ "$add_filter" = "1" ]; then
           # Only /search responses contain user-visible text we want to redact.
@@ -94,8 +103,10 @@ curl() {
     out+=("$arg")
   done
 
-  if [ "$has_local" = "1" ] && [ -n "$key" ]; then
-    command curl -H "Authorization: Bearer $key" "${out[@]}"
+  if [ "$has_local" = "1" ]; then
+    [ -n "$key" ] && hdrs+=(-H "Authorization: Bearer $key")
+    [ -n "$sid" ] && hdrs+=(-H "x-screenpipe-session: $sid")
+    command curl "${hdrs[@]}" "${out[@]}"
   else
     command curl "${out[@]}"
   fi
@@ -188,9 +199,15 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_script_contains_both_env_var_names() {
+    fn wrapper_script_reads_canonical_env_var_name() {
         assert!(WRAPPER_SCRIPT.contains("SCREENPIPE_LOCAL_API_KEY"));
-        assert!(WRAPPER_SCRIPT.contains("SCREENPIPE_API_AUTH_KEY"));
+        // The deprecated alias must NOT be referenced here — every spawn
+        // path now guarantees the canonical name is set, and reading both
+        // hides bugs where a new spawn path forgets the canonical export.
+        assert!(
+            !WRAPPER_SCRIPT.contains("SCREENPIPE_API_AUTH_KEY"),
+            "shim must read only the canonical env var name"
+        );
     }
 
     #[test]
@@ -209,8 +226,15 @@ mod tests {
 
     #[test]
     fn wrapper_script_injects_only_for_localhost_3030() {
-        // Smoke check the three matched forms; any new alias needs a line here.
-        for needle in ["localhost:3030", "127.0.0.1:3030", "[::1]:3030"] {
+        // Smoke check matched forms; any new alias needs a line here.
+        for needle in [
+            "localhost:3030",
+            "127.0.0.1:3030",
+            "[::1]:3030",
+            "localhost:11435",
+            "127.0.0.1:11435",
+            "[::1]:11435",
+        ] {
             assert!(
                 WRAPPER_SCRIPT.contains(needle),
                 "wrapper should match {} in curl URL args",
@@ -228,6 +252,100 @@ mod tests {
         assert!(
             WRAPPER_SCRIPT.contains("filter_pii=1"),
             "wrapper must append the filter_pii query param"
+        );
+    }
+
+    #[test]
+    fn wrapper_script_tags_session_owner() {
+        assert!(
+            WRAPPER_SCRIPT.contains("SCREENPIPE_SESSION_ID"),
+            "wrapper must read the session id env var"
+        );
+        assert!(
+            WRAPPER_SCRIPT.contains("x-screenpipe-session"),
+            "wrapper must send the owner header so navigations route to the right chat"
+        );
+    }
+
+    /// End-to-end: the shim adds `x-screenpipe-session: <id>` to local API
+    /// calls when `SCREENPIPE_SESSION_ID` is set, and never leaks it to
+    /// third-party hosts. This is the production path that lets a background
+    /// pipe's owned-browser navigation be ignored by an unrelated chat.
+    #[test]
+    #[cfg(unix)]
+    fn shim_tags_session_header_for_local_only() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = ensure_wrapper(tmp.path()).unwrap();
+
+        let fake_curl_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&fake_curl_dir).unwrap();
+        let fake_curl = fake_curl_dir.join("curl");
+        std::fs::write(
+            &fake_curl,
+            "#!/usr/bin/env bash\nfor a in \"$@\"; do echo \"$a\" >> \"$CURL_ARGV_FILE\"; done\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_curl).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_curl, perms).unwrap();
+
+        // Local API call → owner header present.
+        let argv_local = tmp.path().join("local.argv");
+        let status = Command::new("bash")
+            .env("PATH", format!("{}:/usr/bin:/bin", fake_curl_dir.display()))
+            .env("BASH_ENV", &wrapper)
+            .env("CURL_ARGV_FILE", &argv_local)
+            .env("SCREENPIPE_LOCAL_API_KEY", "sp-test")
+            .env("SCREENPIPE_SESSION_ID", "conv-abc-123")
+            .arg("-c")
+            .arg("curl -X POST http://localhost:3030/connections/browsers/owned-default/navigate")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let local = std::fs::read_to_string(&argv_local).unwrap();
+        assert!(
+            local.contains("x-screenpipe-session: conv-abc-123"),
+            "local API call must carry the session owner header; got: {local}"
+        );
+
+        let argv_notify = tmp.path().join("notify.argv");
+        let status = Command::new("bash")
+            .env("PATH", format!("{}:/usr/bin:/bin", fake_curl_dir.display()))
+            .env("BASH_ENV", &wrapper)
+            .env("CURL_ARGV_FILE", &argv_notify)
+            .env("SCREENPIPE_LOCAL_API_KEY", "sp-test")
+            .env("SCREENPIPE_SESSION_ID", "pipe:daily:7")
+            .arg("-c")
+            .arg("curl -X POST http://localhost:11435/notify")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let notify = std::fs::read_to_string(&argv_notify).unwrap();
+        assert!(
+            notify.contains("x-screenpipe-session: pipe:daily:7"),
+            "local notification call must carry the session owner header; got: {notify}"
+        );
+
+        // Third-party host → owner header must NOT leak.
+        let argv_ext = tmp.path().join("ext.argv");
+        let status = Command::new("bash")
+            .env("PATH", format!("{}:/usr/bin:/bin", fake_curl_dir.display()))
+            .env("BASH_ENV", &wrapper)
+            .env("CURL_ARGV_FILE", &argv_ext)
+            .env("SCREENPIPE_LOCAL_API_KEY", "sp-test")
+            .env("SCREENPIPE_SESSION_ID", "conv-abc-123")
+            .arg("-c")
+            .arg("curl https://example.com/api")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let ext = std::fs::read_to_string(&argv_ext).unwrap();
+        assert!(
+            !ext.contains("x-screenpipe-session"),
+            "owner header must not leak to third-party hosts; got: {ext}"
         );
     }
 

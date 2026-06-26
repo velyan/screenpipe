@@ -9,7 +9,7 @@ import SwiftUI
 // MARK: - Data types bridged from Rust JSON
 
 struct NotificationAction: Codable {
-    let label: String
+    var label: String?
     // `action` was a required legacy field; many current callers send `id` + `type`
     // instead and omit it entirely, which was failing JSON decode and forcing
     // every notification with actions to fall back to the webview panel.
@@ -23,6 +23,11 @@ struct NotificationAction: Codable {
     var pipe: String?
     var context: [String: AnyCodable]?
     var url: String?
+    var value: String?
+    var source_url: String?
+    var sourceUrl: String?
+    var deeplink_url: String?
+    var deeplinkUrl: String?
     var method: String?
     var body: [String: AnyCodable]?
     var toast: String?
@@ -37,6 +42,9 @@ struct NotificationPayload: Codable {
     let actions: [NotificationAction]
     var autoDismissMs: Int?
     var pipe_name: String?
+    var source_session_id: String?
+    var source_message_id: String?
+    var source_url: String?
 }
 
 // Minimal AnyCodable for JSON round-trip
@@ -181,14 +189,45 @@ struct BrandTextButton: View {
 }
 
 @available(macOS 13.0, *)
+struct BrandIconTextButton: View {
+    let systemName: String
+    let label: String
+    let help: String
+    let action: () -> Void
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: systemName)
+                    .font(.system(size: 11, weight: .regular))
+                Text(label)
+                    .font(Brand.swiftUIMonoFont(size: 9, weight: .regular))
+            }
+            .foregroundColor(isHovered ? .primary.opacity(0.75) : .primary.opacity(0.34))
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .help(help)
+        .onHover { hovering in
+            withAnimation(.linear(duration: Brand.animDuration)) {
+                isHovered = hovering
+            }
+        }
+    }
+}
+
+@available(macOS 13.0, *)
 struct NotificationContentView: View {
     let payload: NotificationPayload
     let progress: Double
     let isHovered: Bool
     let onDismiss: () -> Void
     let onAction: (NotificationAction) -> Void
+    let onOpenSource: () -> Void
 
     @State private var closeHovered = false
+    @State private var copied = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -220,12 +259,27 @@ struct NotificationContentView: View {
             .padding(.top, 12)
 
             // Title
-            Text(payload.title)
-                .font(Brand.swiftUIMonoFont(size: 12, weight: .medium))
-                .foregroundColor(.primary.opacity(0.9))
-                .lineLimit(2)
+            if payload.source_url != nil {
+                Button(action: onOpenSource) {
+                    Text(payload.title)
+                        .font(Brand.swiftUIMonoFont(size: 12, weight: .medium))
+                        .foregroundColor(.primary.opacity(0.9))
+                        .lineLimit(2)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+                .contentShape(Rectangle())
                 .padding(.horizontal, 14)
                 .padding(.top, 8)
+                .help("open source chat")
+            } else {
+                Text(payload.title)
+                    .font(Brand.swiftUIMonoFont(size: 12, weight: .medium))
+                    .foregroundColor(.primary.opacity(0.9))
+                    .lineLimit(2)
+                    .padding(.horizontal, 14)
+                    .padding(.top, 8)
+            }
 
             // Body — render basic markdown inline, scrollable when long
             ScrollView(.vertical, showsIndicators: true) {
@@ -241,9 +295,26 @@ struct NotificationContentView: View {
                 HStack(spacing: 8) {
                     ForEach(Array(payload.actions.enumerated()), id: \.offset) { _, action in
                         BrandButton(
-                            label: action.label,
+                            label: actionLabel(action),
                             isPrimary: action.primary == true,
-                            action: { onAction(action) }
+                            action: {
+                                if action.type == "copy" {
+                                    var copyAction = action
+                                    if copyAction.value == nil {
+                                        copyAction.value = payload.body
+                                    }
+                                    copyActionText(copyAction)
+                                    copied = true
+                                    sendAction(copyAction)
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+                                        copied = false
+                                    }
+                                } else if action.type == "source" {
+                                    onAction(sourceActionWithFallback(action))
+                                } else {
+                                    onAction(action)
+                                }
+                            }
                         )
                     }
                     Spacer()
@@ -255,29 +326,36 @@ struct NotificationContentView: View {
                 .padding(.bottom, 6)
             }
 
-            // Footer: manage + mute
-            HStack(spacing: 6) {
-                BrandTextButton(label: "⚙ manage", fontSize: 9) {
+            // Footer: compact notification actions
+            HStack(spacing: 12) {
+                BrandIconTextButton(
+                    systemName: copied ? "checkmark" : "doc.on.doc",
+                    label: copied ? "copied" : "copy",
+                    help: "copy notification"
+                ) {
+                    copyNotificationText()
+                    sendActionPayload(["type": "copy", "value": notificationClipboardText()])
+                    copied = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) {
+                        copied = false
+                    }
+                }
+
+                if payload.source_url != nil {
+                    BrandIconTextButton(systemName: "arrow.up.right.square", label: "source", help: "open source chat") {
+                        onOpenSource()
+                    }
+                }
+
+                Spacer(minLength: 0)
+
+                BrandIconTextButton(systemName: "bell", label: "manage", help: "manage notification settings") {
                     onDismiss()
                     // Small delay so the panel hides before the window appears
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                         sendActionJson("{\"type\":\"manage\"}")
                     }
                 }
-
-                if let pipeName = payload.pipe_name {
-                    Text("·")
-                        .font(Brand.swiftUIMonoFont(size: 9))
-                        .foregroundColor(.primary.opacity(0.15))
-                    BrandTextButton(label: "mute \(pipeName)", fontSize: 9) {
-                        onDismiss()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            sendActionJson("{\"type\":\"mute\",\"pipe_name\":\"\(pipeName)\"}")
-                        }
-                    }
-                }
-
-                Spacer()
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 6)
@@ -328,6 +406,66 @@ struct NotificationContentView: View {
         if let cb = gActionCallback {
             json.withCString { cb($0) }
         }
+    }
+
+    private func sendActionPayload(_ payload: [String: String]) {
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8) else {
+            return
+        }
+        sendActionJson(json)
+    }
+
+    private func sendAction(_ action: NotificationAction) {
+        if let data = try? JSONEncoder().encode(action),
+           let json = String(data: data, encoding: .utf8) {
+            sendActionJson(json)
+        }
+    }
+
+    private func actionLabel(_ action: NotificationAction) -> String {
+        if let label = action.label, !label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return label
+        }
+        switch action.type {
+        case "copy":
+            return copied ? "copied" : "copy"
+        case "source":
+            return "source"
+        case "deeplink":
+            return "open"
+        case "dismiss":
+            return "dismiss"
+        default:
+            return action.action ?? action.type ?? "action"
+        }
+    }
+
+    private func copyActionText(_ action: NotificationAction) {
+        let text = (action.value ?? payload.body).trimmingCharacters(in: .whitespacesAndNewlines)
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+    }
+
+    private func sourceActionWithFallback(_ action: NotificationAction) -> NotificationAction {
+        var next = action
+        let source = action.url ?? action.source_url ?? action.sourceUrl ?? payload.source_url
+        next.url = source
+        next.source_url = source
+        return next
+    }
+
+    private func copyNotificationText() {
+        let text = notificationClipboardText()
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+    }
+
+    private func notificationClipboardText() -> String {
+        "\(payload.title)\n\n\(payload.body)".trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
@@ -796,6 +934,11 @@ class NotificationPanelController: NSObject {
                    let json = String(data: data, encoding: .utf8) {
                     self?.sendAction(json)
                 }
+            },
+            onOpenSource: { [weak self] in
+                guard let self = self, let url = payload.source_url else { return }
+                self.hide()
+                self.sendActionPayload(["type": "source", "url": url])
             }
         )
         // Fixed width, height determined by content
@@ -859,6 +1002,15 @@ class NotificationPanelController: NSObject {
         if let cb = gActionCallback {
             json.withCString { cb($0) }
         }
+    }
+
+    private func sendActionPayload(_ payload: [String: String]) {
+        guard JSONSerialization.isValidJSONObject(payload),
+              let data = try? JSONSerialization.data(withJSONObject: payload),
+              let json = String(data: data, encoding: .utf8) else {
+            return
+        }
+        sendAction(json)
     }
 }
 

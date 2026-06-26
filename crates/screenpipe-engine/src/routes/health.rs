@@ -16,8 +16,13 @@ use std::sync::{
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
+use screenpipe_audio::audio_manager::builder::TranscriptionMode;
+
+use crate::recording_coverage::{coverage_snapshot, CoverageSnapshot};
 use crate::server::AppState;
-use crate::ui_recorder::{tree_walker_snapshot, TreeWalkerSnapshot};
+use crate::ui_recorder::{
+    tree_walker_snapshot, ui_recorder_status_snapshot, TreeWalkerSnapshot, UiRecorderStatus,
+};
 
 /// Cached health response to avoid recomputing on every poll.
 /// Multiple WebSocket clients + HTTP polls can call /health dozens of
@@ -35,6 +40,31 @@ const AUDIO_RECONCILIATION_LOOKBACK_HOURS: i64 = 24 * 7;
 const AUDIO_RECONCILIATION_FRESHNESS_DELAY_SECS: i64 = 10 * 60;
 const AUDIO_RECONCILIATION_BACKLOG_CACHE_TTL_SECS: i64 = 30;
 
+/// Decide whether the audio transcription backlog should be flagged as a real
+/// stall. Real stall = the reconciliation worker has fallen behind. A "stall"
+/// is intentionally NOT flagged when batch mode is parking the queue while a
+/// live audio session owns the engine — that's expected, not broken.
+///
+/// Returning `false` here is what makes the difference between the user
+/// seeing a calm "ok" response and a misleading 503/degraded mid-meeting.
+fn audio_backlog_is_stalled(
+    pending_count: u64,
+    oldest_pending_age_secs: u64,
+    intentionally_deferring: bool,
+) -> bool {
+    if intentionally_deferring {
+        return false;
+    }
+    // A few pending chunks at any moment is normal (the 10-min freshness
+    // delay means there's always 10 min of in-flight audio). We flag a stall
+    // only when there's a real backlog AND the oldest chunk has been waiting
+    // noticeably longer than the freshness delay (>2x = should have been
+    // picked up by the last sweep).
+    pending_count > 20
+        && oldest_pending_age_secs
+            > (AUDIO_RECONCILIATION_FRESHNESS_DELAY_SECS as u64).saturating_mul(2)
+}
+
 /// Describe the most likely cause of a DB-write stall from pool stats.
 /// Old message always said "pool exhaustion likely" which was wrong when the
 /// real cause was elsewhere (e.g. metrics gap on reconciliation path) and the
@@ -48,6 +78,137 @@ fn suspected_stall_cause(read_idle: u32, write_idle: u32) -> &'static str {
         "read pool saturated"
     } else {
         "pools idle — cause upstream (writer path, lock contention, or missing metrics)"
+    }
+}
+
+const SILENT_AUDIO_RMS_THRESHOLD: f64 = 0.001;
+
+/// How recently the audio stream-timeout watchdog must have fired for the audio
+/// status to be reported as "active_no_data". The watchdog re-fires every recv
+/// timeout while a stream is dead, so a window comfortably larger than one cycle
+/// keeps a genuinely dead stream flagged, while a stream that recovered (no new
+/// timeouts) clears back to "ok" instead of sticking forever on a stale count.
+const STREAM_TIMEOUT_RECENCY_SECS: u64 = 90;
+
+/// Classify the raw audio capture status from health signals. Pure so it can be
+/// unit-tested in isolation. `stream_timeout_recent` must reflect a *recent*
+/// stream timeout (see `STREAM_TIMEOUT_RECENCY_SECS`), NOT a cumulative count —
+/// passing "ever had a timeout" here is exactly the bug this extraction fixes.
+#[allow(clippy::too_many_arguments)]
+fn classify_audio_status(
+    audio_disabled: bool,
+    audio_never_captured: bool,
+    has_input_device: bool,
+    stream_timeout_recent: bool,
+    global_audio_active: bool,
+    last_audio_ts: u64,
+    now_ts: u64,
+    threshold_secs: u64,
+) -> &'static str {
+    if audio_disabled {
+        "disabled"
+    } else if audio_never_captured && !has_input_device {
+        // Audio is on but there is no microphone to capture from — expected
+        // idle, not a failure. Distinct from "not_started" so /health stays 200
+        // and the desktop stall notification (which keys off "not_started")
+        // does not false-fire on machines without a mic.
+        "no_input_device"
+    } else if audio_never_captured {
+        "not_started"
+    } else if stream_timeout_recent && global_audio_active {
+        // Device active but the watchdog fired recently — hijack/dead-stream
+        // recovery in progress. Clears automatically once timeouts stop.
+        "active_no_data"
+    } else if global_audio_active {
+        "ok"
+    } else if last_audio_ts == 0 {
+        "not_started"
+    } else if now_ts.saturating_sub(last_audio_ts) < threshold_secs {
+        "ok"
+    } else {
+        "stale"
+    }
+}
+
+fn capture_status(
+    audio_disabled: bool,
+    audio_status: &str,
+    active_audio_devices: usize,
+    active_input_devices: usize,
+    paused_audio_devices: usize,
+    paused_input_devices: usize,
+    transcription_paused: bool,
+    pending_transcription_segments: Option<u64>,
+    audio_level_rms: f64,
+    chunks_sent: u64,
+    last_audio_ts: u64,
+    now_ts: u64,
+) -> CaptureStatusInfo {
+    let audio_recent = last_audio_ts > 0 && now_ts.saturating_sub(last_audio_ts) < 60;
+    let (status, severity, reason) = if audio_disabled {
+        (
+            "disabled",
+            "warning",
+            "audio capture is disabled for this recorder",
+        )
+    } else if paused_input_devices > 0 && active_input_devices == 0 {
+        (
+            "mic_paused",
+            "warning",
+            "all microphone input devices are paused by the user",
+        )
+    } else if audio_status == "no_input_device" {
+        (
+            "no_input_device",
+            "ok",
+            "no microphone detected — audio capture idle, screen recording continues",
+        )
+    } else if audio_status == "not_started" {
+        (
+            "audio_not_started",
+            "warning",
+            "audio capture has not produced data yet",
+        )
+    } else if audio_status == "stale" || (audio_status == "active_no_data" && !audio_recent) {
+        (
+            "audio_stalled",
+            "warning",
+            "audio capture is not reaching the recorder",
+        )
+    } else if transcription_paused {
+        (
+            "transcript_paused",
+            "warning",
+            "audio can continue, but transcription is paused",
+        )
+    } else if pending_transcription_segments.unwrap_or(0) > 0 {
+        (
+            "transcript_pending",
+            "waiting",
+            "audio is queued for transcription",
+        )
+    } else if (audio_status == "ok" || audio_status == "active_no_data")
+        && active_audio_devices > 0
+        && (chunks_sent > 0 || audio_recent)
+        && audio_level_rms <= SILENT_AUDIO_RMS_THRESHOLD
+    {
+        (
+            "waiting_for_voice",
+            "waiting",
+            "audio capture is ready and waiting for speech",
+        )
+    } else {
+        ("recording", "ok", "audio capture is running")
+    };
+
+    CaptureStatusInfo {
+        status: status.to_string(),
+        severity: severity.to_string(),
+        reason: reason.to_string(),
+        audio_disabled,
+        active_audio_devices,
+        paused_audio_devices,
+        pending_transcription_segments,
     }
 }
 
@@ -77,6 +238,10 @@ pub struct HealthCheckResponse {
     pub message: String,
     pub verbose_instructions: Option<String>,
     pub device_status_details: Option<String>,
+    /// Explicit audio capture state for meeting/live-note UIs. This avoids
+    /// clients inferring "recording" from meeting activity when the mic is
+    /// paused, disabled, stalled, or only waiting for speech.
+    pub capture_status: CaptureStatusInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub monitors: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -85,8 +250,29 @@ pub struct HealthCheckResponse {
     pub audio_pipeline: Option<AudioPipelineHealthInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub accessibility: Option<TreeWalkerSnapshot>,
+    /// UI/input/clipboard recorder status. Surfaces "configured but not running"
+    /// distinctly from "off" so users can tell why ui_events stopped writing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ui_recorder: Option<UiRecorderStatus>,
+    /// Recording-coverage reliability metric: what fraction of the user's
+    /// working time (recent input) had healthy screen capture. None until the
+    /// sampler has accumulated any active or idle time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_coverage: Option<CoverageSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pool_stats: Option<PoolHealthInfo>,
+    /// True once the write queue has flagged the disk-I/O wedge as degraded.
+    #[serde(default)]
+    pub write_queue_degraded: bool,
+    /// Consecutive fatal write batches right now (0 when the write path is healthy).
+    #[serde(default)]
+    pub write_queue_consecutive_fatal: u64,
+    /// How many times the write pool was reopened in-process to clear poisoned connections.
+    #[serde(default)]
+    pub write_pool_reopens: u64,
+    /// How many times the persistent-failure hook fired (engine-restart requests).
+    #[serde(default)]
+    pub persistent_failure_signals: u64,
     /// True when vision capture loop is alive but DB writes have stopped (pool exhaustion).
     #[serde(default)]
     pub vision_db_write_stalled: bool,
@@ -108,6 +294,21 @@ pub struct HealthCheckResponse {
 }
 
 #[derive(Serialize, OaSchema, Deserialize, Clone)]
+pub struct CaptureStatusInfo {
+    /// Stable machine-readable status.
+    pub status: String,
+    /// One of `ok`, `waiting`, or `warning`.
+    pub severity: String,
+    /// Short diagnostic reason for clients and logs.
+    pub reason: String,
+    pub audio_disabled: bool,
+    pub active_audio_devices: usize,
+    pub paused_audio_devices: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_transcription_segments: Option<u64>,
+}
+
+#[derive(Serialize, OaSchema, Deserialize, Clone)]
 pub struct PoolHealthInfo {
     pub read_pool_size: u32,
     pub read_pool_idle: u32,
@@ -122,6 +323,29 @@ pub struct PipelineHealthInfo {
     pub frames_db_written: u64,
     pub frames_dropped: u64,
     pub frame_drop_rate: f64,
+    /// Frames dropped because the capture op timed out (subset of frames_dropped).
+    pub frames_dropped_timeout: u64,
+    /// Frames dropped because the capture op errored (subset of frames_dropped).
+    pub frames_dropped_error: u64,
+    /// Residual loss canary: attempts - written - dedup - dropped. ~0 normally;
+    /// non-zero = a frame-loss path nothing counts. Use frames_dropped_* for the
+    /// actionable loss numbers.
+    pub silent_loss: u64,
+    /// silent_loss / (capture_attempts - dedup_skips). Should stay ~0.
+    pub silent_loss_rate: f64,
+    /// Total capture cycles attempted (loop heartbeat). Flat while uptime climbs
+    /// = trigger starvation (no capture events firing — the meeting-gap case).
+    pub capture_attempts: u64,
+    /// Capture cycles skipped by content dedup (static screen — expected/benign).
+    pub dedup_skips: u64,
+    /// Capture cycles skipped because the frame was near-all-black (excluded
+    /// window / asleep / DRM). Benign, but a spike can indicate capture trouble.
+    pub frames_corrupt_black: u64,
+    /// Capture cycles skipped because the frame had a flat green decode-garbage
+    /// band (truncated/partial capture). The field signal for green corruption.
+    pub frames_corrupt_green: u64,
+    /// Unix secs of the last capture attempt; consumers derive heartbeat age.
+    pub last_capture_attempt_ts: u64,
     pub capture_fps_actual: f64,
     pub avg_ocr_latency_ms: f64,
     pub avg_db_latency_ms: f64,
@@ -130,6 +354,9 @@ pub struct PipelineHealthInfo {
     pub time_to_first_frame_ms: Option<f64>,
     pub pipeline_stall_count: u64,
     pub ocr_cache_hit_rate: f64,
+    /// OCR runs that produced (near-)empty text (subset of ocr_completed).
+    /// `ocr_empty / ocr_completed` is the OCR-quality failure rate.
+    pub ocr_empty: u64,
 }
 
 #[derive(Serialize, OaSchema, Deserialize, Clone)]
@@ -153,6 +380,10 @@ pub struct AudioPipelineHealthInfo {
     pub chunks_received: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_errors: Option<u64>,
+    /// Audio buffers skipped because the recorder lagged the capture channel
+    /// (silent loss). Omitted when zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunks_lagged: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_level_rms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -182,6 +413,14 @@ pub struct AudioPipelineHealthInfo {
     pub meeting_app: Option<String>,
 }
 
+/// Hard ceiling on /health response time. The endpoint is on the path of
+/// the desktop tray, the meeting bar, the device watcher, and user-written
+/// launchd watchdogs — none of which expect it to stall. If
+/// `health_check_inner` blows past this budget, we'd rather serve a slightly
+/// stale cached snapshot than hang the caller (or, worse, get the whole CLI
+/// killed by a watchdog).
+const HEALTH_RESPONSE_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[oasgen]
 pub async fn health_check(State(state): State<Arc<AppState>>) -> JsonResponse<HealthCheckResponse> {
     let now_ts = std::time::SystemTime::now()
@@ -201,7 +440,25 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> JsonResponse<He
         }
     }
 
-    let response = health_check_inner(&state).await;
+    let response = match tokio::time::timeout(HEALTH_RESPONSE_BUDGET, health_check_inner(&state))
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            // Inner computation exceeded the budget. Serve the last cached
+            // snapshot (even if past TTL) so callers see continuity. If no
+            // snapshot exists yet, return a minimal "degraded" response —
+            // never block forever.
+            warn!(
+                "health_check: inner computation exceeded {:?} budget — serving last cached snapshot",
+                HEALTH_RESPONSE_BUDGET
+            );
+            let cached = HEALTH_CACHE.read().await.1.clone();
+            // Don't refresh the cache timestamp here — the next caller
+            // should re-attempt rather than amortize the stale entry.
+            return JsonResponse(cached.unwrap_or_else(degraded_response));
+        }
+    };
 
     // Cache the result
     {
@@ -210,6 +467,49 @@ pub async fn health_check(State(state): State<Arc<AppState>>) -> JsonResponse<He
     }
 
     JsonResponse(response)
+}
+
+/// Minimal response served when `/health` times out before any cached
+/// snapshot is available (cold start + slow inner). Status 503 so callers
+/// can tell this apart from a normal response.
+fn degraded_response() -> HealthCheckResponse {
+    HealthCheckResponse {
+        status: "degraded".to_string(),
+        status_code: 503,
+        last_frame_timestamp: None,
+        last_audio_timestamp: None,
+        frame_status: "unknown".to_string(),
+        audio_status: "unknown".to_string(),
+        message: "health check timed out before producing a snapshot".to_string(),
+        verbose_instructions: None,
+        device_status_details: None,
+        capture_status: CaptureStatusInfo {
+            status: "unknown".to_string(),
+            severity: "warning".to_string(),
+            reason: "health check timed out before producing a snapshot".to_string(),
+            audio_disabled: false,
+            active_audio_devices: 0,
+            paused_audio_devices: 0,
+            pending_transcription_segments: None,
+        },
+        monitors: None,
+        pipeline: None,
+        audio_pipeline: None,
+        accessibility: None,
+        ui_recorder: None,
+        recording_coverage: None,
+        pool_stats: None,
+        write_queue_degraded: false,
+        write_queue_consecutive_fatal: 0,
+        write_pool_reopens: 0,
+        persistent_failure_signals: 0,
+        vision_db_write_stalled: false,
+        audio_db_write_stalled: false,
+        drm_content_paused: false,
+        schedule_paused: false,
+        hostname: None,
+        version: None,
+    }
 }
 
 async fn get_audio_reconciliation_backlog(
@@ -255,6 +555,30 @@ async fn get_audio_reconciliation_backlog(
     result
 }
 
+/// Resolve the `transcription_mode` reported by `/health`.
+///
+/// Reports the *configured* mode (#3989). When the options lock is momentarily
+/// contended, `configured` is `None` and we fall back to the legacy
+/// observed-activity heuristic so `/health` stays non-blocking and still returns
+/// a best-effort value.
+fn transcription_mode_label(
+    configured: Option<TranscriptionMode>,
+    deferred: u64,
+    batch_processed: u64,
+) -> &'static str {
+    match configured {
+        Some(TranscriptionMode::Realtime) => "realtime",
+        Some(TranscriptionMode::Batch) => "batch",
+        None => {
+            if deferred > 0 || batch_processed > 0 {
+                "batch"
+            } else {
+                "realtime"
+            }
+        }
+    }
+}
+
 async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -266,6 +590,11 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
 
     // Get the status of all devices
     let audio_devices = state.audio_manager.current_devices();
+    let user_disabled_audio_devices: std::collections::HashSet<String> = if !state.audio_disabled {
+        state.audio_manager.user_disabled_devices().await
+    } else {
+        std::collections::HashSet::new()
+    };
     let mut device_statuses = Vec::new();
     let mut global_audio_active = false;
     let mut most_recent_audio_timestamp = 0; // Track the most recent timestamp
@@ -335,6 +664,38 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
         .filter(|count| *count > 0);
     let oldest_pending_transcription_at =
         audio_reconciliation_backlog.and_then(|(_, oldest)| oldest);
+
+    // Query meeting/audio-session state once, early, so both the stall checks
+    // below and the audio_pipeline payload further down can reuse it. The
+    // batch-mode pipeline intentionally defers background transcription while
+    // a live session is active — without this signal, the stall heuristic
+    // misreads that intentional deferral as a broken pipeline and flips the
+    // whole response to degraded/503. 500ms bound on the RwLock read so a
+    // contended writer can never stall /health.
+    let (meeting_detected, meeting_app) = if !state.audio_disabled {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            state.audio_manager.meeting_detector(),
+        )
+        .await
+        {
+            Ok(Some(detector)) => (Some(detector.is_in_meeting()), None),
+            Ok(None) => (None, None),
+            Err(_) => {
+                warn!(
+                    "health_check: audio_manager.meeting_detector() RwLock contended >500ms, skipping meeting fields"
+                );
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+    // True when the audio pipeline is *intentionally* holding the batch
+    // queue (live meeting / audio session absorbing the engine). Used to
+    // suppress false-positive stall warnings — see comments at the
+    // audio_db_write_stalled and audio_degraded gates below.
+    let intentionally_deferring = meeting_detected.unwrap_or(false);
 
     // 60 seconds — tight enough to detect real stalls, loose enough to
     // tolerate adaptive FPS (0.1-0.5 fps) and brief DB contention spikes.
@@ -414,25 +775,40 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
         && global_audio_active
         && audio_snap.uptime_secs > 120.0
     {
-        // Only flag a stall when the transcription consumer is actively processing
-        // (heartbeat recent) but DB writes have stopped. This prevents false positives
-        // during silence when VAD filters everything and nothing is written to DB.
-        let transcription_fresh = audio_snap.last_transcription_attempt_ts > 0
-            && now_ts.saturating_sub(audio_snap.last_transcription_attempt_ts) < threshold_secs;
-        let db_stale = audio_snap.last_db_write_ts == 0
-            || now_ts.saturating_sub(audio_snap.last_db_write_ts) > threshold_secs;
-        let stalled = transcription_fresh && db_stale;
+        // Direct measurement: count chunks stuck in 'pending' status. This
+        // replaces the previous pool-idle + stale-metric heuristic, which
+        // fired false positives whenever the live path's dedup short-circuit
+        // ate batches of common short words and went silent on the write
+        // pool. The pool idleness was a side effect of *expected* dedup
+        // behavior, not a real stall.
+        //
+        // A real stall now means: the reconciliation worker has pending
+        // chunks older than the freshness window — i.e. they should have
+        // been processed by now and haven't. The `intentionally_deferring`
+        // gate (handled by audio_backlog_is_stalled) prevents the same
+        // false-positive class during a live audio session.
+        let backlog = audio_reconciliation_backlog.unwrap_or((0, None));
+        let pending_count = backlog.0;
+        let oldest_pending_age_secs = backlog
+            .1
+            .map(|ts| (now.timestamp() - ts.timestamp()).max(0) as u64)
+            .unwrap_or(0);
+        let stalled = audio_backlog_is_stalled(
+            pending_count,
+            oldest_pending_age_secs,
+            intentionally_deferring,
+        );
         if stalled {
-            // throttle to once per 60s to avoid log spam (health runs every ~1s)
+            // Throttle to once per 60s to avoid log spam (health runs every ~1s).
             static LAST_AUDIO_STALL_LOG: AtomicU64 = AtomicU64::new(0);
             let prev = LAST_AUDIO_STALL_LOG.load(Ordering::Relaxed);
             if now_ts.saturating_sub(prev) >= 60 {
                 LAST_AUDIO_STALL_LOG.store(now_ts, Ordering::Relaxed);
                 let (rs, ri, ws, wi) = state.db.pool_stats();
                 warn!(
-                    "health_check: audio transcription writes stalled — transcription active but last DB write {}s ago ({}) | pool: read={}/{} idle, write={}/{} idle",
-                    if audio_snap.last_db_write_ts > 0 { now_ts.saturating_sub(audio_snap.last_db_write_ts) } else { 0 },
-                    suspected_stall_cause(ri, wi),
+                    "health_check: audio transcription backlog stalled — {} chunk(s) pending, oldest {}s old | pool: read={}/{} idle, write={}/{} idle",
+                    pending_count,
+                    oldest_pending_age_secs,
                     ri, rs, wi, ws,
                 );
             }
@@ -460,31 +836,78 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
     let audio_never_captured =
         !state.audio_disabled && audio_snap.uptime_secs > 120.0 && audio_snap.chunks_sent == 0;
 
-    // Detect "active_no_data" condition: device appears active (was selected and in
-    // the device list) but the zero-fill watchdog has fired, indicating the stream
-    // was hijacked by another app or went silent (Issue #3144). The watchdog
-    // automatically triggers a reconnect after 30s of no real audio, so this metric
-    // captures recovery attempts.
-    let stream_hijacked = audio_snap.stream_timeouts > 0;
+    // Distinguish "audio enabled but no microphone exists" from "mic present but
+    // not capturing". On machines with no input device (RDP/VM audio loopback,
+    // a desktop with speakers only), audio capture can never produce a chunk —
+    // that is the expected idle state, not a fault. It must not flip /health to
+    // 503 degraded, nor trip the desktop "mic not capturing" stall notification.
+    // Input devices are tagged "(input)" in the device list (output-only devices
+    // like "Remote Audio (output)" are not microphones).
+    let has_input_device = audio_devices
+        .iter()
+        .any(|device| device.to_string().contains("(input)"));
 
-    let audio_status = if state.audio_disabled {
-        "disabled".to_string()
-    } else if audio_never_captured {
-        "not_started".to_string()
-    } else if stream_hijacked && global_audio_active {
-        // Device is active but the watchdog has fired — indicates hijack recovery
-        // in progress or recently completed. This is the "active_no_data" state
-        // the user requested in #3144.
-        "active_no_data".to_string()
-    } else if global_audio_active {
-        "ok".to_string()
-    } else if last_audio_ts == 0 {
-        "not_started".to_string()
-    } else if now.timestamp() as u64 - last_audio_ts < threshold_secs {
-        "ok".to_string()
+    // Detect "active_no_data": the device appears active (selected and in the
+    // device list) but the zero-fill watchdog has fired *recently*, indicating
+    // the stream was hijacked by another app or went dead (Issue #3144). The
+    // watchdog reconnects after 30s of no real audio and keeps re-firing while
+    // the stream stays dead.
+    //
+    // Gate on the RECENCY of the last timeout, not the cumulative count. The old
+    // `stream_timeouts > 0` check pinned the status to "active_no_data" forever
+    // after a single historical timeout (a wake/display invalidation, a device
+    // switch, a transient glitch) — so a fully recovered mic with chunks flowing
+    // again still read as broken. A healthy-but-silent room never trips this:
+    // raw chunks keep arriving so the watchdog never fires; only a genuinely
+    // dead/hijacked stream keeps refreshing `last_stream_timeout_at`.
+    let now_ts = now.timestamp().max(0) as u64;
+    let stream_timeout_recent = audio_snap.last_stream_timeout_at > 0
+        && now_ts.saturating_sub(audio_snap.last_stream_timeout_at) < STREAM_TIMEOUT_RECENCY_SECS;
+
+    let audio_status = classify_audio_status(
+        state.audio_disabled,
+        audio_never_captured,
+        has_input_device,
+        stream_timeout_recent,
+        global_audio_active,
+        last_audio_ts,
+        now_ts,
+        threshold_secs,
+    )
+    .to_string();
+
+    let transcription_paused = if !state.audio_disabled {
+        state
+            .audio_manager
+            .transcription_paused
+            .load(Ordering::Relaxed)
     } else {
-        "stale".to_string()
+        false
     };
+    let active_audio_devices = audio_devices.len();
+    let active_input_devices = audio_devices
+        .iter()
+        .filter(|device| device.to_string().contains("(input)"))
+        .count();
+    let paused_audio_devices = user_disabled_audio_devices.len();
+    let paused_input_devices = user_disabled_audio_devices
+        .iter()
+        .filter(|device| device.contains("(input)"))
+        .count();
+    let capture_status = capture_status(
+        state.audio_disabled,
+        &audio_status,
+        active_audio_devices,
+        active_input_devices,
+        paused_audio_devices,
+        paused_input_devices,
+        transcription_paused,
+        pending_transcription_segments,
+        audio_snap.audio_level_rms,
+        audio_snap.chunks_sent,
+        last_audio_ts.max(most_recent_audio_timestamp),
+        now_ts,
+    );
 
     // Format device statuses as a string for a more detailed view
     let device_status_details = if !device_statuses.is_empty() {
@@ -549,10 +972,13 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
     // Audio degradation: chunks_channel_full > 0 means the Whisper consumer
     // couldn't keep up and audio was dropped even after a 30s backpressure wait.
     // A reconciliation backlog means audio exists but transcript has not landed
-    // yet, which should be visible instead of reported as healthy.
+    // yet, which should be visible instead of reported as healthy — *unless*
+    // the backlog is the expected result of batch mode deferring during a
+    // live session, in which case it's not a problem to surface.
     let audio_degraded = if !state.audio_disabled && audio_snap.uptime_secs > 120.0 {
         let channel_full = audio_snap.chunks_channel_full > 0;
-        let transcription_backlog = pending_transcription_segments.is_some();
+        let transcription_backlog =
+            pending_transcription_segments.is_some() && !intentionally_deferring;
         if channel_full {
             warn!(
                 "health_check: {} audio chunk(s) dropped (transcription engine too slow)",
@@ -566,7 +992,7 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
 
     let (overall_status, message, verbose_instructions, status_code) = if (frame_status == "ok"
         || frame_status == "disabled")
-        && (audio_status == "ok" || audio_status == "disabled")
+        && (audio_status == "ok" || audio_status == "disabled" || audio_status == "no_input_device")
         && !vision_degraded
         && !audio_degraded
     {
@@ -584,8 +1010,9 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
         if vision_degraded && !unhealthy_systems.contains(&"vision") {
             unhealthy_systems.push("vision");
         }
-        if audio_status != "ok" && audio_status != "disabled" {
-            // active_no_data is a degraded state (device hijacked but watchdog recovering)
+        if audio_status != "ok" && audio_status != "disabled" && audio_status != "no_input_device" {
+            // active_no_data is a degraded state (device hijacked but watchdog recovering).
+            // no_input_device is benign (no mic present) and stays out of this list.
             unhealthy_systems.push("audio");
         }
         if audio_degraded && !unhealthy_systems.contains(&"audio") {
@@ -683,6 +1110,15 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
             frames_db_written: vision_snap.frames_db_written,
             frames_dropped: vision_snap.frames_dropped,
             frame_drop_rate: vision_snap.frame_drop_rate,
+            frames_dropped_timeout: vision_snap.frames_dropped_timeout,
+            frames_dropped_error: vision_snap.frames_dropped_error,
+            silent_loss: vision_snap.silent_loss,
+            silent_loss_rate: vision_snap.silent_loss_rate,
+            capture_attempts: vision_snap.capture_attempts,
+            dedup_skips: vision_snap.dedup_skips,
+            frames_corrupt_black: vision_snap.frames_corrupt_black,
+            frames_corrupt_green: vision_snap.frames_corrupt_green,
+            last_capture_attempt_ts: vision_snap.last_capture_attempt_ts,
             capture_fps_actual: vision_snap.capture_fps_actual,
             avg_ocr_latency_ms: vision_snap.avg_ocr_latency_ms,
             avg_db_latency_ms: vision_snap.avg_db_latency_ms,
@@ -695,10 +1131,15 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
             } else {
                 0.0
             },
+            ocr_empty: vision_snap.ocr_empty,
         })
     } else {
         None
     };
+
+    // Write-queue health: disk-I/O wedge detection + recovery counters. Surfaced
+    // so remote monitoring can see degradation and engine-restart requests.
+    let wqh = state.db.write_queue_health();
 
     HealthCheckResponse {
         status: overall_status.to_string(),
@@ -717,6 +1158,7 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
         message,
         verbose_instructions,
         device_status_details,
+        capture_status,
         monitors,
         pipeline,
         accessibility: {
@@ -727,26 +1169,30 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
                 None
             }
         },
+        ui_recorder: {
+            let snap = ui_recorder_status_snapshot();
+            // Only attach when start_ui_recording has touched the atomics —
+            // otherwise the field is meaningless noise for users who never
+            // enabled UI capture.
+            if snap.configured || snap.events_inserted > 0 {
+                Some(snap)
+            } else {
+                None
+            }
+        },
+        recording_coverage: {
+            let snap = coverage_snapshot();
+            // Only attach once the sampler has observed any wall-clock time —
+            // before that the all-zero snapshot is noise.
+            if snap.active_secs + snap.idle_secs > 0 {
+                Some(snap)
+            } else {
+                None
+            }
+        },
         audio_pipeline: if !state.audio_disabled {
-            let is_paused = state
-                .audio_manager
-                .transcription_paused
-                .load(Ordering::Relaxed);
-
-            // Query meeting detector state — timeout the RwLock read so it
-            // can't stall the health check if writes are contended.
-            let (meeting_detected, meeting_app) =
-                if let Some(detector) = state.audio_manager.meeting_detector().await {
-                    let in_meeting = detector.is_in_meeting();
-                    // v2 detection reports meeting state via AtomicBool flag;
-                    // the specific app name is tracked in the v2 detection loop,
-                    // not exposed through MeetingDetector.
-                    let app: Option<String> = None;
-                    (Some(in_meeting), app)
-                } else {
-                    (None, None)
-                };
-
+            // meeting_detected / meeting_app were queried earlier (next to
+            // the stall gates that depend on them) — reuse them here.
             let device_names: Vec<String> = audio_devices.iter().map(|d| d.to_string()).collect();
             let per_device_levels = state.audio_metrics.per_device_rms_snapshot();
 
@@ -768,6 +1214,11 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
                 // Consumer stage diagnostics
                 chunks_received: Some(audio_snap.chunks_received),
                 process_errors: Some(audio_snap.process_errors),
+                chunks_lagged: if audio_snap.chunks_lagged > 0 {
+                    Some(audio_snap.chunks_lagged)
+                } else {
+                    None
+                },
                 audio_level_rms: Some(audio_snap.audio_level_rms),
                 per_device_audio_level_rms: if per_device_levels.is_empty() {
                     None
@@ -779,15 +1230,16 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
                 } else {
                     Some(device_names)
                 },
-                // Batch/Smart mode
-                transcription_mode: if audio_snap.segments_deferred > 0
-                    || audio_snap.segments_batch_processed > 0
-                {
-                    Some("batch".to_string())
-                } else {
-                    Some("realtime".to_string())
-                },
-                transcription_paused: Some(is_paused),
+                // Reflect the CONFIGURED mode, not observed activity (#3989).
+                transcription_mode: Some(
+                    transcription_mode_label(
+                        state.audio_manager.configured_transcription_mode(),
+                        audio_snap.segments_deferred,
+                        audio_snap.segments_batch_processed,
+                    )
+                    .to_string(),
+                ),
+                transcription_paused: Some(transcription_paused),
                 segments_deferred: if audio_snap.segments_deferred > 0 {
                     Some(audio_snap.segments_deferred)
                 } else {
@@ -816,6 +1268,10 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
                 write_pool_idle: wi,
             })
         },
+        write_queue_degraded: wqh.is_degraded(),
+        write_queue_consecutive_fatal: wqh.consecutive_fatal_batches(),
+        write_pool_reopens: wqh.write_pool_reopens(),
+        persistent_failure_signals: wqh.persistent_failure_signals(),
         vision_db_write_stalled,
         audio_db_write_stalled,
         drm_content_paused: crate::drm_detector::drm_content_paused(),
@@ -930,6 +1386,31 @@ pub async fn api_vision_status() -> JsonResponse<serde_json::Value> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn transcription_mode_reports_configuration_not_activity() {
+        // The #3989 bug fix: a batch-configured instance reports "batch"
+        // immediately at idle, before any deferred/batch activity is observed.
+        assert_eq!(
+            transcription_mode_label(Some(TranscriptionMode::Batch), 0, 0),
+            "batch"
+        );
+        // Realtime stays realtime even if batch activity counters are non-zero —
+        // configuration always wins over observed activity when the lock is readable.
+        assert_eq!(
+            transcription_mode_label(Some(TranscriptionMode::Realtime), 5, 3),
+            "realtime"
+        );
+    }
+
+    #[test]
+    fn transcription_mode_falls_back_to_activity_when_contended() {
+        // configured == None (options lock momentarily contended) → legacy
+        // observed-activity heuristic, keeping /health non-blocking.
+        assert_eq!(transcription_mode_label(None, 0, 0), "realtime");
+        assert_eq!(transcription_mode_label(None, 1, 0), "batch");
+        assert_eq!(transcription_mode_label(None, 0, 1), "batch");
+    }
+
     fn dummy_response(status: &str) -> HealthCheckResponse {
         HealthCheckResponse {
             status: status.to_string(),
@@ -941,11 +1422,26 @@ mod tests {
             message: "test".to_string(),
             verbose_instructions: None,
             device_status_details: None,
+            capture_status: CaptureStatusInfo {
+                status: "recording".to_string(),
+                severity: "ok".to_string(),
+                reason: "audio capture is running".to_string(),
+                audio_disabled: false,
+                active_audio_devices: 1,
+                paused_audio_devices: 0,
+                pending_transcription_segments: None,
+            },
             monitors: None,
             pipeline: None,
             audio_pipeline: None,
             accessibility: None,
+            ui_recorder: None,
+            recording_coverage: None,
             pool_stats: None,
+            write_queue_degraded: false,
+            write_queue_consecutive_fatal: 0,
+            write_pool_reopens: 0,
+            persistent_failure_signals: 0,
             vision_db_write_stalled: false,
             audio_db_write_stalled: false,
             drm_content_paused: false,
@@ -953,6 +1449,48 @@ mod tests {
             hostname: None,
             version: None,
         }
+    }
+
+    #[test]
+    fn capture_status_does_not_show_stalled_for_recovered_active_no_data() {
+        let state = capture_status(
+            false,
+            "active_no_data",
+            1,
+            1,
+            0,
+            0,
+            false,
+            None,
+            0.0,
+            4,
+            120,
+            121,
+        );
+
+        assert_eq!(state.status, "waiting_for_voice");
+        assert_eq!(state.severity, "waiting");
+    }
+
+    #[test]
+    fn capture_status_still_warns_for_active_no_data_without_fresh_audio() {
+        let state = capture_status(
+            false,
+            "active_no_data",
+            1,
+            1,
+            0,
+            0,
+            false,
+            None,
+            0.0,
+            4,
+            1,
+            120,
+        );
+
+        assert_eq!(state.status, "audio_stalled");
+        assert_eq!(state.severity, "warning");
     }
 
     #[tokio::test]
@@ -998,50 +1536,173 @@ mod tests {
     }
 
     #[test]
-    fn audio_status_active_no_data_when_stream_timeouts_nonzero() {
-        // This test verifies the fix for Issue #3144: detect when audio device
-        // is "active but producing no data" (hijacked or silent Bluetooth device).
-        // The stream_timeouts metric indicates the zero-fill watchdog has activated,
-        // which is the signal for active_no_data status.
+    fn audio_backlog_stall_gate() {
+        let freshness = AUDIO_RECONCILIATION_FRESHNESS_DELAY_SECS as u64;
+        let way_past = freshness * 3;
 
-        // Simulate the logic in the health check: when stream_timeouts > 0 and
-        // the device is globally active, we should report "active_no_data" status.
+        // Real stall: big backlog, old, no live session — must flag.
+        assert!(audio_backlog_is_stalled(200, way_past, false));
 
-        let stream_timeouts = 1; // Watchdog has fired — device hijacked or silent
-        let is_global_active = true;
+        // Same numbers but live session in flight — must NOT flag.
+        // (Mid-meeting false-positive: batch mode parks the queue while live
+        //  transcription owns the engine, and the old check misread that as
+        //  a broken pipeline.)
+        assert!(!audio_backlog_is_stalled(200, way_past, true));
 
-        let stream_hijacked = stream_timeouts > 0;
+        // Small backlog within the freshness window — never a stall.
+        assert!(!audio_backlog_is_stalled(5, freshness / 2, false));
 
-        // Validate: with stream_hijacked=true and is_global_active=true,
-        // audio_status should be "active_no_data", not "ok".
-        let audio_status = if stream_hijacked && is_global_active {
-            "active_no_data".to_string()
-        } else if is_global_active {
-            "ok".to_string()
-        } else {
-            "not_started".to_string()
+        // Big count but young enough — not a stall yet.
+        assert!(!audio_backlog_is_stalled(200, freshness, false));
+    }
+
+    /// Healthy, actively-capturing mic with no recent timeout, varying only the
+    /// two signals under test. Calls the REAL `classify_audio_status` (the old
+    /// test re-implemented the logic inline, so it could never catch a bug).
+    fn audio_status_for(stream_timeout_recent: bool, global_audio_active: bool) -> &'static str {
+        classify_audio_status(
+            false, // audio_disabled
+            false, // audio_never_captured
+            true,  // has_input_device
+            stream_timeout_recent,
+            global_audio_active,
+            1_000, // last_audio_ts
+            1_010, // now_ts
+            60,    // threshold_secs
+        )
+    }
+
+    #[test]
+    fn audio_status_active_no_data_only_while_timeout_is_recent() {
+        // Issue #3144: an active device whose zero-fill watchdog fired *recently*
+        // is "active_no_data" (hijacked / dead stream, recovery in progress).
+        assert_eq!(audio_status_for(true, true), "active_no_data");
+    }
+
+    #[test]
+    fn audio_status_recovers_to_ok_after_timeout_goes_stale() {
+        // REGRESSION for the bug this PR fixes: a *historical* timeout must not
+        // pin the status to "active_no_data". Once the watchdog stops firing
+        // (stream recovered, chunks flowing again) the recency flag goes false
+        // and the status clears to "ok". The old `stream_timeouts > 0`
+        // (cumulative) check made a single past timeout stick forever — a
+        // perfectly healthy mic permanently read as broken.
+        assert_eq!(audio_status_for(false, true), "ok");
+    }
+
+    #[test]
+    fn audio_status_silent_room_is_ok_not_active_no_data() {
+        // A healthy-but-silent mic still delivers raw chunks, so the watchdog
+        // never fires -> stream_timeout_recent stays false -> "ok", never the
+        // alarming "active_no_data"/degraded. This is the user-reported false
+        // "degraded on silence".
+        assert_eq!(audio_status_for(false, true), "ok");
+    }
+
+    #[test]
+    fn audio_status_recency_window_boundary() {
+        // Drive the exact recency computation the health route performs, proving
+        // the window boundary: a timeout 30s ago counts as recent (within 90s)
+        // -> active_no_data; one 120s ago is stale -> ok.
+        let now: u64 = 1_000_000;
+        let recent = |ago: u64| -> bool {
+            let last = now - ago;
+            last > 0 && now.saturating_sub(last) < STREAM_TIMEOUT_RECENCY_SECS
         };
+        assert!(recent(30), "30s-old timeout should be recent");
+        assert!(!recent(120), "120s-old timeout should be stale");
+        assert_eq!(audio_status_for(recent(30), true), "active_no_data");
+        assert_eq!(audio_status_for(recent(120), true), "ok");
+    }
 
+    #[test]
+    fn audio_status_non_timeout_branches_unchanged() {
+        // Guard the unrelated branches against accidental regressions.
         assert_eq!(
-            audio_status, "active_no_data",
-            "audio_status should be 'active_no_data' when stream_timeouts > 0 and device is active (Issue #3144)"
+            classify_audio_status(true, false, true, true, true, 1000, 1010, 60),
+            "disabled"
+        );
+        // never captured + no mic -> benign no_input_device (stays 200)
+        assert_eq!(
+            classify_audio_status(false, true, false, false, false, 0, 1010, 60),
+            "no_input_device"
+        );
+        // never captured but a mic exists -> not_started
+        assert_eq!(
+            classify_audio_status(false, true, true, false, false, 0, 1010, 60),
+            "not_started"
+        );
+        // not active, last audio within threshold -> ok
+        assert_eq!(
+            classify_audio_status(false, false, true, false, false, 1000, 1030, 60),
+            "ok"
+        );
+        // not active, last audio stale -> stale
+        assert_eq!(
+            classify_audio_status(false, false, true, false, false, 1000, 2000, 60),
+            "stale"
+        );
+    }
+
+    /// Replicates the audio_status decision + the overall-status gate to prove
+    /// that a machine with no microphone (audio enabled, never captured, zero
+    /// input devices — e.g. RDP loopback "Remote Audio (output)") reports the
+    /// benign "no_input_device" status and keeps /health at 200, instead of the
+    /// old false 503 "degraded: audio not_started".
+    #[test]
+    fn no_microphone_reports_no_input_device_and_stays_healthy() {
+        fn decide_audio_status(
+            audio_disabled: bool,
+            audio_never_captured: bool,
+            has_input_device: bool,
+            global_audio_active: bool,
+            stream_hijacked: bool,
+        ) -> &'static str {
+            if audio_disabled {
+                "disabled"
+            } else if audio_never_captured && !has_input_device {
+                "no_input_device"
+            } else if audio_never_captured {
+                "not_started"
+            } else if stream_hijacked && global_audio_active {
+                "active_no_data"
+            } else if global_audio_active {
+                "ok"
+            } else {
+                "not_started"
+            }
+        }
+
+        // The overall /health gate: audio contributes to "degraded" unless it is
+        // ok / disabled / no_input_device.
+        fn audio_is_degraded(audio_status: &str) -> bool {
+            audio_status != "ok" && audio_status != "disabled" && audio_status != "no_input_device"
+        }
+
+        // No mic: audio on, nothing captured, only an output device present.
+        let only_output = ["Remote Audio (output)"];
+        let has_input = only_output.iter().any(|d| d.contains("(input)"));
+        assert!(!has_input, "output-only device must not count as a mic");
+
+        let status = decide_audio_status(false, true, has_input, false, false);
+        assert_eq!(
+            status, "no_input_device",
+            "no microphone present should report no_input_device, not not_started"
+        );
+        assert!(
+            !audio_is_degraded(status),
+            "no_input_device must NOT mark /health degraded (no false 503 on mic-less machines)"
         );
 
-        // Also verify the converse: if stream_timeouts == 0, should be "ok"
-        let no_hijack = 0;
-        let is_still_active = true;
-        let stream_hijacked_2 = no_hijack > 0;
-        let audio_status_2 = if stream_hijacked_2 && is_still_active {
-            "active_no_data".to_string()
-        } else if is_still_active {
-            "ok".to_string()
-        } else {
-            "not_started".to_string()
-        };
-
-        assert_eq!(
-            audio_status_2, "ok",
-            "audio_status should be 'ok' when stream_timeouts == 0 and device is active"
+        // Regression guard: a real mic that genuinely never captured is still a
+        // fault and must remain degraded.
+        let with_mic = ["Built-in Microphone (input)"];
+        let has_input_real = with_mic.iter().any(|d| d.contains("(input)"));
+        let status_broken = decide_audio_status(false, true, has_input_real, false, false);
+        assert_eq!(status_broken, "not_started");
+        assert!(
+            audio_is_degraded(status_broken),
+            "a present-but-silent mic must still surface as degraded"
         );
     }
 }

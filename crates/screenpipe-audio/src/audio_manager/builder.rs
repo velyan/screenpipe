@@ -11,7 +11,7 @@ use screenpipe_db::DatabaseManager;
 
 use crate::{
     core::{
-        device::{default_input_device, default_output_device},
+        device::{default_input_device, default_output_device, parse_audio_device, DeviceType},
         engine::AudioTranscriptionEngine,
     },
     meeting_detector::MeetingDetector,
@@ -24,6 +24,46 @@ use crate::{
 
 use crate::audio_manager::AudioManager;
 
+/// When following system defaults, ensure both input and output types appear in
+/// `enabled_devices`. Skips enrolling the current default for a type the user
+/// has explicitly muted via tray/API (`user_disabled_devices`).
+pub(crate) async fn ensure_system_default_device_types(
+    options: &mut AudioManagerOptions,
+    user_disabled: &HashSet<String>,
+) {
+    if options.is_disabled || !options.use_system_default_audio {
+        return;
+    }
+
+    let has_output = options.enabled_devices.iter().any(|name| {
+        parse_audio_device(name)
+            .map(|d| d.device_type == DeviceType::Output)
+            .unwrap_or(false)
+    });
+    if !has_output {
+        if let Ok(output) = default_output_device().await {
+            let name = output.to_string();
+            if !user_disabled.contains(&name) {
+                options.enabled_devices.insert(name);
+            }
+        }
+    }
+
+    let has_input = options.enabled_devices.iter().any(|name| {
+        parse_audio_device(name)
+            .map(|d| d.device_type == DeviceType::Input)
+            .unwrap_or(false)
+    });
+    if !has_input {
+        if let Ok(input) = default_input_device() {
+            let name = input.to_string();
+            if !user_disabled.contains(&name) {
+                options.enabled_devices.insert(name);
+            }
+        }
+    }
+}
+
 /// Controls when Whisper transcription runs.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum TranscriptionMode {
@@ -35,6 +75,20 @@ pub enum TranscriptionMode {
     #[default]
     #[serde(alias = "Smart")]
     Batch,
+}
+
+/// Controls *when* audio is captured (persisted + transcribed).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum AudioCaptureMode {
+    /// Capture continuously, 24/7. Historical behavior and engine default.
+    #[default]
+    Always,
+    /// Capture only while a meeting / audio session is detected. Audio outside
+    /// meetings is dropped before it is persisted or transcribed — saving cloud
+    /// transcription cost, disk, and the PII/transcription CPU pipeline.
+    /// Requires the meeting detector; if it is disabled this mode falls back to
+    /// `Always` so it can never silently drop *all* audio.
+    MeetingsOnly,
 }
 
 #[derive(Clone)]
@@ -67,9 +121,14 @@ pub struct AudioManagerOptions {
     pub experimental_coreaudio_system_audio: bool,
     /// Experimental: request Windows WASAPI microphone AEC when the endpoint supports it.
     pub windows_input_aec_enabled: bool,
+    /// Use Apple VoiceProcessingIO on the default macOS microphone when supported.
+    pub macos_input_vpio_enabled: bool,
     /// Controls when local Whisper transcription runs.
     /// `Realtime` = immediate (default), `Batch` = accumulate longer chunks for quality.
     pub transcription_mode: TranscriptionMode,
+    /// Controls when audio is captured. `Always` (default) = continuous 24/7.
+    /// `MeetingsOnly` = drop audio outside detected meetings.
+    pub audio_capture_mode: AudioCaptureMode,
     /// Meeting detector for batch mode — used for metadata/summaries.
     /// Shared with UI recorder which feeds app switch events into it.
     pub meeting_detector: Option<Arc<MeetingDetector>>,
@@ -113,7 +172,9 @@ impl Default for AudioManagerOptions {
             use_system_default_audio: true,
             experimental_coreaudio_system_audio: false,
             windows_input_aec_enabled: false,
+            macos_input_vpio_enabled: false,
             transcription_mode: TranscriptionMode::default(),
+            audio_capture_mode: AudioCaptureMode::default(),
             meeting_detector: None,
             meeting_streaming: MeetingStreamingConfig::default(),
             vocabulary: vec![],
@@ -218,6 +279,11 @@ impl AudioManagerBuilder {
         self
     }
 
+    pub fn macos_input_vpio_enabled(mut self, enabled: bool) -> Self {
+        self.options.macos_input_vpio_enabled = enabled;
+        self
+    }
+
     pub fn use_system_default_audio(mut self, use_system_default_audio: bool) -> Self {
         self.options.use_system_default_audio = use_system_default_audio;
         self
@@ -225,6 +291,11 @@ impl AudioManagerBuilder {
 
     pub fn transcription_mode(mut self, transcription_mode: TranscriptionMode) -> Self {
         self.options.transcription_mode = transcription_mode;
+        self
+    }
+
+    pub fn audio_capture_mode(mut self, audio_capture_mode: AudioCaptureMode) -> Self {
+        self.options.audio_capture_mode = audio_capture_mode;
         self
     }
 
@@ -274,6 +345,8 @@ impl AudioManagerBuilder {
             }
             options.enabled_devices = HashSet::from_iter(devices);
         }
+
+        ensure_system_default_device_types(options, &HashSet::new()).await;
 
         Ok(options.clone())
     }

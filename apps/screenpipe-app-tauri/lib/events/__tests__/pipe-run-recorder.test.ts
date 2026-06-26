@@ -86,6 +86,8 @@ describe("pipe-run-recorder: finalize on terminal event", () => {
       expect.objectContaining({ pipeName: "my-pipe", executionId: 42 }),
     );
     expect(arg.title).toBe("my-pipe #42");
+    expect(arg.lastContentAt).toBe(arg.updatedAt);
+    expect(arg.lastViewedAt).toBe(0);
     expect(arg.messages.some((m: any) => m.role === "assistant" && m.content?.includes("result"))).toBe(true);
   });
 
@@ -113,7 +115,7 @@ describe("pipe-run-recorder: finalize on terminal event", () => {
     expect(saveSpy).not.toHaveBeenCalled();
   });
 
-  it("treats turn_end as a terminal event", async () => {
+  it("does not finalize on turn_end (only agent_end / pipe_done)", async () => {
     await __testing.inject(env({ type: "message_start", message: { role: "assistant" } }));
     await __testing.inject(
       env({
@@ -122,7 +124,10 @@ describe("pipe-run-recorder: finalize on terminal event", () => {
       }),
     );
     await __testing.inject(env({ type: "turn_end" }));
-    expect(saveSpy).toHaveBeenCalledTimes(1);
+    // turn_end fires between LLM turns in multi-turn pipes — finalizing
+    // here would drop the user message from subsequent saves.
+    expect(saveSpy).not.toHaveBeenCalled();
+    expect(__testing.peek(SID)).toBeDefined();
   });
 
   it("treats pipe_done as a terminal event", async () => {

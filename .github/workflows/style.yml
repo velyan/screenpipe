@@ -23,7 +23,10 @@ jobs:
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          toolchain: stable
+          # No explicit toolchain: the action reads rust-toolchain.toml, so fmt
+          # and clippy run the SAME version developers use locally. A floating
+          # `stable` here meant every new Rust release re-formatted unchanged
+          # files and turned main red until someone hand-fixed them.
           components: clippy, rustfmt
           rustflags: ""
 
@@ -52,16 +55,40 @@ jobs:
       - name: Install dependencies
         run: .github/scripts/install_dependencies.sh
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
+      - name: Install cargo tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny,cargo-consolidate
 
       - name: Security audit
         continue-on-error: true
         run: cargo audit
 
-      - name: Install cargo-deny
-        run: cargo install cargo-deny
-
       - name: Check duplicate dependencies
         continue-on-error: true
         run: cargo deny check bans
+
+      - name: Check workspace dependency consolidation
+        # Informational, like the sibling Security audit / cargo-deny steps:
+        # cargo-consolidate flags unavoidable transitive version duplicates
+        # (thiserror 1.x+2.x, the windows-* family) that can't be reconciled
+        # at the workspace level, so it was failing Code Quality on every
+        # commit. Don't block the gate on it.
+        continue-on-error: true
+        run: |
+          cargo consolidate
+          cargo consolidate --path ee/sdk
+
+  knip:
+    name: Knip (frontend dead code)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/screenpipe-app-tauri
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Run knip
+        run: bunx --bun knip --include files,dependencies,unlisted

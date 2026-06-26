@@ -9,6 +9,7 @@ btw, we prefer that you don't contribute if you are not using or will use the pr
 before you begin:
 - try to run the [pre-built app](https://docs.screenpi.pe) to get familiar with the project
 - familiarize yourself with the project structure and architecture.
+- new to contributing? the [beginner's onboarding guide](ONBOARDING.md) walks you from zero to a merged pr step by step (this file is the reference; that one is the walkthrough).
 
 ## installation and build guide
 
@@ -38,7 +39,7 @@ before you begin:
 
 4. **build the project**:
    ```bash
-   cargo build --release --features metal,apple-intelligence
+   cargo build --release --features metal
    ```
 
 5. **run screenpipe**:
@@ -50,7 +51,7 @@ before you begin:
    ```bash
    cd apps/screenpipe-app-tauri
    bun install
-   bun tauri build --features metal,apple-intelligence
+   bun tauri build --features metal
    ```
 
 ### windows
@@ -156,7 +157,9 @@ this section guides you through submitting an enhancement suggestion for screen 
 
 - fill in the required template
 - do not include issue numbers in the pr title
-- include screenshots and animated gifs in your pull request whenever possible.
+- include screenshots and animated gifs in your pull request whenever possible — but **never commit media files** to the repo (no screenshots, mockups, or recordings under `docs/`, `.github/`, or the repo root; they bloat git history and are never referenced by the code). host them on github and paste the url into the pr body:
+  - **drag-drop (anyone, browser only):** drop the file into the pr description — github hosts it as a `https://github.com/user-attachments/...` link. needs no repo access, so this is the path for fork-based contributors.
+  - **cli / agents (can't drag-drop):** attach the file as a release asset and link the url — images render inline whatever repo hosts them. maintainers with write access here: `gh release upload <tag> shot.png` (use a throwaway/`assets` release). from a fork: `gh release create media shot.png --repo <you>/screenpipe`, then link `https://github.com/<you>/screenpipe/releases/download/media/shot.png`. any external image host works too.
 - follow the rust styleguides.
 - end all files with a newline.
 
@@ -212,14 +215,38 @@ cargo test
 one command i keep using to avoid having to kill my main "production" process is:
 
 ```bash
-./target/release/screenpipe --port 3035 --data-dir /tmp/sp
+./target/release/screenpipe --port 3035 --data-dir "${TMPDIR:-/tmp}/sp"
 ```
 
 it will avoid conflicts with the port and avoid conflicts with the data dir
 
 especially useful if you've done new database migrations and want to avoid breaking your previous months of data :)
 
-on macos the /tmp dir keeps being cleaned up by the system fyi
+on macos, prefer `$TMPDIR` (a per-user temp dir) over `/tmp` — the system periodically sweeps `/tmp` and can wipe your dev data-dir mid-session, while `$TMPDIR` sticks around for the session. the `${TMPDIR:-/tmp}` form above uses it when set and falls back to `/tmp` otherwise.
+
+### macos: keeping screen/mic/accessibility permissions across dev rebuilds
+
+macos ties tcc permissions — screen recording, microphone, accessibility — to the app's *code signature*. an unsigned or ad-hoc-signed build gets a fresh signature on every rebuild, so macos sees each rebuild as a new app and re-prompts — or silently drops the permission, which shows up as "capture suddenly returns nothing" after a rebuild.
+
+`apps/screenpipe-app-tauri/scripts/build_macos.sh` already signs the app (with an `Apple Development:` cert). if you don't have an apple developer cert, you can get the same permission-persistence with a **self-signed** code-signing cert:
+
+1. create the cert once — in Keychain Access: Certificate Assistant → Create a Certificate → name it e.g. `screenpipe dev`, Identity Type: **Self-Signed Root**, Certificate Type: **Code Signing** → Create. confirm it's usable:
+
+   ```bash
+   security find-identity -v -p codesigning
+   ```
+
+2. build, then sign with your identity — same flow as `scripts/build_macos.sh`, just your cert:
+
+   ```bash
+   cd apps/screenpipe-app-tauri
+   bun tauri build --no-sign --features metal
+   APP="src-tauri/target/release/bundle/macos/screenpipe - Development.app"
+   xattr -cr "$APP"
+   codesign --force --deep --sign "screenpipe dev" "$APP"
+   ```
+
+3. grant the permissions once. since the signature is stable across rebuilds, macos won't re-prompt and capture won't silently break — as long as you keep signing with the same identity.
 
 ### debugging github action
 
@@ -251,7 +278,7 @@ RUSTFLAGS="-Z sanitizer=address" cargo run --bin screenpipe
 RUSTFLAGS="-Z sanitizer=leak" cargo run --bin screenpipe
 ```
 
-for performance monitoring, you can use the following command:
+for leak tracking, you can use the following command:
 
 ```bash
 cargo install cargo-instruments
@@ -260,6 +287,64 @@ cargo instruments -t Leaks --bin screenpipe --features metal --time-limit 600000
 ```
 
 then open the file in `target/release/instruments` using xcode -> open developer tool -> instruments.
+
+### profiling cpu
+
+to investigate "where is screenpipe burning cpu", capture a sampling profile + a cpu/mem time series against the running process. recipes below produce comparable output on macos and windows.
+
+**macos** (built-in, no install):
+
+```bash
+PID=$(pgrep -x screenpipe-app || pgrep -x screenpipe | head -1)
+
+# 1) cpu/mem time series — 10s interval for 10min
+( echo "ts,pcpu,pmem,rss_mb"
+  for i in $(seq 1 60); do
+    read pcpu pmem rss < <(ps -p $PID -o pcpu=,pmem=,rss=)
+    echo "$(date +%H:%M:%S),$pcpu,$pmem,$((rss/1024))"
+    sleep 10
+  done ) > /tmp/sp-cpu.csv
+
+# 2) sampling profile — 10min @ 1ms (call-tree, symbolicated)
+sample $PID 600 -file /tmp/sp-sample.txt
+```
+
+aggregate hot leaf functions:
+
+```bash
+awk '/Call graph/,/Binary Images/' /tmp/sp-sample.txt \
+  | grep '(in ' | sed -E 's/^[[:space:]+!|:]*//; s/  \(in .*$//' \
+  | grep -E "^[0-9]+ (screenpipe|AXUIElement|cidre|onnxruntime|sqlite)" \
+  | awk '{n=$1+0; $1=""; sub(/^ +/,"",$0); if(n>mx[$0])mx[$0]=n}
+         END{for(k in mx) printf "%8d  %s\n", mx[k], k}' \
+  | sort -rn | head -30
+```
+
+**windows** (samply, install once: `cargo install samply`):
+
+```powershell
+$sp = (Get-Process screenpipe-app,screenpipe -ErrorAction SilentlyContinue |
+       Sort-Object WorkingSet64 -Descending | Select-Object -First 1).Id
+
+# 1) cpu/mem time series — 10s interval for 10min
+"ts,pcpu,ws_mb,priv_mb" | Out-File $env:TEMP\sp-cpu.csv
+1..60 | ForEach-Object {
+  $p1=Get-Process -Id $sp; $c1=$p1.TotalProcessorTime.TotalSeconds
+  Start-Sleep 1
+  $p2=Get-Process -Id $sp; $c2=$p2.TotalProcessorTime.TotalSeconds
+  $pcpu=[math]::Round(($c2-$c1)*100,1)
+  "$(Get-Date -Format HH:mm:ss),$pcpu,$([math]::Round($p2.WorkingSet64/1MB)),$([math]::Round($p2.PrivateMemorySize64/1MB))" |
+    Add-Content $env:TEMP\sp-cpu.csv
+  Start-Sleep 9
+}
+
+# 2) sampling profile — 10min, view at https://profiler.firefox.com
+samply record --save-only -o $env:TEMP\sp.json.gz --duration 600 --pid $sp
+```
+
+fallback if samply unavailable: `wpr -start CPU -filemode; Start-Sleep 600; wpr -stop /tmp/sp.etl` and open the etl in [wpa](https://learn.microsoft.com/windows-hardware/test/wpt/windows-performance-analyzer) or perfview.
+
+share both files (`sp-cpu.csv` + `sp-sample.txt` / `sp.json.gz`) in the issue when reporting cpu regressions.
 
 ### benchmarks
 

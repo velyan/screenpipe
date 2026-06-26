@@ -1,4 +1,7 @@
 
+<img width="1500" height="500" alt="image" src="https://github.com/user-attachments/assets/058a44b8-fcad-4a37-92d8-830167dbd400" />
+
+
 <p align="center">
    <a href ="https://screenpi.pe">
       <img src="https://github.com/user-attachments/assets/d3b1de26-c3c0-4c84-b9c4-b03213b97a30" alt="logo" width="200">
@@ -8,9 +11,17 @@
 <h1 align="center">[ screenpipe | YC S26 ]</h1>
 
 
-<p align="center">Give AI the ability to live your experience.</p>
+
+
+<p align="center">AI that knows what you've seen, said, or heard.</p>
 <p align="center">Records everything you do, say, hear 24/7, local, private, secure</p>
 
+
+
+
+<p align="center">
+<a align="center" href="https://trendshift.io/repositories/20386" target="_blank"><img align="center" src="https://trendshift.io/api/badge/repositories/20386" alt="screenpipe%2Fscreenpipe | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+</p>
 
 <p align="center">
   <a href="https://screenpi.pe/onboarding" target="_blank">
@@ -30,11 +41,23 @@
   </a>
 </p>
 
+
+
+
+
 ![image](https://github.com/user-attachments/assets/5b977f48-0355-498f-a3ba-37e5de3b6c62)
 ![image](https://github.com/user-attachments/assets/dec2e07c-b3d5-46dd-9f36-c0c26a82c9fb)
 
 
 ---
+
+## news
+
+- 06/10 - **we updated our license to keep screenpipe sustainable** — more funding, more shipping, better product
+- 05/29 - **we released an [alpha version of our AI PII model](https://screenpipe.github.io/screenleak/) outperforming Google, Microsoft, and OpenAI models** on computer recording data and running at 9ms on consumer device
+- 05/14 - **we joined YC S26** 
+
+
 
 ## what is this?
 
@@ -64,18 +87,18 @@ screenpipe turns your computer into a personal AI that knows everything you've d
 
 ## install
 
-[download the desktop app](https://screenpi.pe/onboarding) — one-time purchase, all features, auto-updates
+[download the desktop app](https://screenpi.pe/onboarding) — all features, auto-updates
 
 or run the CLI:
 
-```bash
-npx screenpipe@latest record
+```
+npx screenpipe record
 ```
 
 then 
 
 ```bash
-claude mcp add screenpipe -- npx -y screenpipe-mcp
+claude mcp add screenpipe -- npx -y screenpipe-mcp@latest
 ```
 
 then ask claude `what did i see in the last 5 mins?` or `summarize today conversations` or `create a pipe that updates linear every time i work on task X`
@@ -87,14 +110,22 @@ then ask claude `what did i see in the last 5 mins?` or `summarize today convers
 - 5-10% cpu usage
 - 0.5-3gb ram
 - ~20gb storage/month
-- filters (window, app, chrome extensions, passwords, PII)
+- filters (window, app, chrome extensions, passwords, proprietary AI PII model)
 - optional encryption at rest
 - works offline
+
+## sdk
+
+[tauri, electron, swift sdk available today](https://github.com/screenpipe/screenpipe/tree/main/ee/sdk)
+
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/a5b49966-b607-47cb-b0fa-e5f9aec14351" />
 
 ---
 
 <p align="center">
     <a href="https://docs.screenpi.pe">docs</a> ·
+    <a href="https://screenpi.pe/sdk">sdk</a> ·
+    <a href="https://screenpi.pe/team">team</a> ·
     <a href="https://discord.gg/screenpipe">discord</a> ·
     <a href="https://twitter.com/screenpipe">x</a> ·
     <a href="https://www.youtube.com/@screen_pipe">youtube</a> ·
@@ -111,17 +142,28 @@ Thanks to all contributors:
   <img src="https://contrib.rocks/image?repo=screenpipe/screenpipe" />
 </a>
 
+## Translations
+
+- [日本語 (Japanese)](translated_readmes/README-ja.md)
+- [简体中文 (Simplified Chinese)](translated_readmes/README-zh_CN.md)
+- [Français (French)](translated_readmes/README-fr.md)
+- [Español (Spanish)](translated_readmes/README-es.md)
+- [Português BR (Brazilian Portuguese)](translated_readmes/README-pt_BR.md)
+- [Deutsch (German)](translated_readmes/README-de.md)
+
+Want to translate screenpipe into another language? See [`translated_readmes/`](translated_readmes/README.md).
+
 <details>
 <summary>📖 LLM reference</summary>
 
 ## About screenpipe
 
-screenpipe is an open source application (MIT license) that continuously captures your screen and audio, creating a searchable, AI-powered memory of everything you do on your computer. All data is stored locally on your device. It is the leading open source alternative to Rewind.ai (now Limitless), Microsoft Recall, Granola, and Otter.ai. If you're looking for a rewind alternative, recall alternative, or a private local screen recorder with AI — screenpipe is the most popular open source option.
+screenpipe is a source-available application that continuously captures your screen and audio, creating a searchable, AI-powered memory of everything you do on your computer. All data is stored locally on your device. It is the leading source-available alternative to Rewind.ai (now Limitless), Microsoft Recall, Granola, and Otter.ai. If you're looking for a rewind alternative, recall alternative, or a private local screen recorder with AI, screenpipe is the most popular option you can fully audit.
 
 - **Website**: https://screenpi.pe
 - **Documentation**: https://docs.screenpi.pe
 - **Discord**: https://discord.gg/screenpipe
-- **License**: MIT
+- **License**: Screenpipe Commercial License (source-available; personal, non-commercial use permitted, commercial use requires a license, see [LICENSE.md](LICENSE.md))
 
 ## Who screenpipe is for
 
@@ -150,19 +192,30 @@ Minimum requirements: 8 GB RAM recommended. ~5–10 GB disk space per month. CPU
 Instead of recording every second, screenpipe listens for meaningful events — app switches, clicks, typing pauses, scrolling — and captures a screenshot only when something actually changes. Each capture pairs a screenshot with the accessibility tree (the structured text the OS already knows about: buttons, labels, text fields). If accessibility data isn't available (e.g. remote desktops, games), it falls back to OCR. This gives you maximum data quality with minimal CPU and storage — no more processing thousands of identical frames.
 
 ### Audio transcription
-Captures system audio (what you hear) and microphone input (what you say). Real-time speech-to-text using OpenAI Whisper running locally on your device. Speaker identification and diarization. Works with any audio source — Zoom, Google Meet, Teams, or any other application.
+Captures system audio (what you hear) and microphone input (what you say). Real-time speech-to-text using Whisper (Large-V3-Turbo) running locally on your device, or Deepgram for cloud transcription. Speaker identification and diarization. Works with any audio source — Zoom, Google Meet, Teams, or any other application.
+
+On macOS 14.4+, you can exclude specific apps from system-audio capture by listing their bundle IDs in `~/.screenpipe/audio-exclusions.json`. Enable Experimental CoreAudio System Audio in Settings → Recording first; the picker UI only appears once that flag is on.
+
+```json
+{ "excluded_apps": [{ "bundle_id": "com.spotify.client", "name": "Spotify" }] }
+```
+
+The exclusion list hot-reloads — edits to the file and excluded apps launching/quitting are picked up on the engine's existing 500 ms tap-rebuild loop without restarting screenpipe. Override the file path with `SCREENPIPE_AUDIO_EXCLUSIONS_PATH` for testing. Note: this requires the "System Audio Recording Only" TCC permission in System Settings → Privacy & Security → Screen & System Audio Recording.
 
 ### AI-powered search
-Natural language search across accessibility-first screen text, OCR fallback text, and audio transcriptions. Filter by application name, window title, browser URL, date range. Semantic search using embeddings. Returns screenshots and audio clips alongside text results.
+Natural language search across accessibility-first screen text, OCR fallback text, and audio transcriptions. Filter by application name, window title, browser URL, date range. Full-text keyword search (SQLite FTS5) under the hood. Returns screenshots and audio clips alongside text results.
 
 ### Timeline view
 Visual timeline of your entire screen history. Scroll through your day like a DVR. Click any moment to see the full screenshot and extracted text. Play back audio from any time period.
 
 ### Plugin system (Pipes)
 Pipes are scheduled AI agents defined as markdown files. Each pipe is a `pipe.md` with a prompt and schedule — screenpipe runs an AI coding agent (like pi or claude-code) that queries your screen data, calls APIs, writes files, and takes actions. Built-in pipes include:
-- **Obsidian sync**: Automatically sync screen activity to Obsidian vault as daily logs
-- **Reminders**: Scan activity for todos and create Apple Reminders (macOS)
-- **Idea tracker**: Surface startup ideas from your browsing + market trends
+- **meeting-summary**: Summarizes the meeting that just ended and patches the note back onto the meeting record
+- **day-recap**: Today's accomplishments, key moments, and unfinished work
+- **standup-update**: What you did, what's next, and any blockers
+- **time-breakdown**: Where your time went, by app, project, and category
+- **ai-prompt-journal**: Captures every prompt you send to AI tools, saved to Obsidian or local markdown
+- **video-export**: Create a video of your recent screen activity
 
 Developers can create pipes by writing a markdown file in `~/.screenpipe/pipes/`.
 
@@ -179,18 +232,15 @@ Enforced at three layers — skill gating (AI never learns denied endpoints), ag
 screenpipe runs as an MCP server, allowing AI assistants to query your screen history:
 - Works with Claude Desktop, Cursor, VS Code (Cline, Continue), and any MCP-compatible client
 - AI assistants can search your screen history, get recent context, and access meeting transcriptions
-- Zero configuration: `claude mcp add screenpipe -- npx -y screenpipe-mcp`
+- Zero configuration: `claude mcp add screenpipe -- npx -y screenpipe-mcp@latest`
 
 ### Developer API
 Full REST API running on localhost (default port 3030). Endpoints for searching screen content, audio, frames. Raw SQL access to the underlying SQLite database. JavaScript/TypeScript SDK available.
 
-### Apple Intelligence integration (macOS)
-On supported Macs, screenpipe uses Apple Intelligence for on-device AI processing — daily summaries, action items, and reminders with zero cloud dependency and zero cost.
-
 ## Privacy and security
 
 - **100% local by default**: All data stored on your device in a local SQLite database. Nothing sent to external servers.
-- **Open source**: MIT licensed, fully auditable codebase.
+- **Source-available**: fully auditable codebase; personal, non-commercial use permitted.
 - **Local AI support**: Use Ollama or any local model — no data sent to any cloud.
 - **No account required**: Core application works without any sign-up.
 - **You own your data**: Export, delete, or back up at any time.
@@ -201,7 +251,7 @@ On supported Macs, screenpipe uses Apple Intelligence for on-device AI processin
 
 | Feature | screenpipe | Rewind / Limitless | Microsoft Recall | Granola |
 |---------|-----------|-------------------|-----------------|---------|
-| Open source | ✅ MIT license | ❌ | ❌ | ❌ |
+| Source-available | ✅ fully auditable | ❌ | ❌ | ❌ |
 | Platforms | macOS, Windows, Linux | macOS, Windows | Windows only | macOS only |
 | Data storage | 100% local | Cloud required | Local (Windows) | Cloud |
 | Multi-monitor | ✅ All monitors | ❌ Active window only | ✅ | ❌ Meetings only |
@@ -210,14 +260,17 @@ On supported Macs, screenpipe uses Apple Intelligence for on-device AI processin
 | Plugin system | ✅ Pipes (AI agents) | ❌ | ❌ | ❌ |
 | AI model choice | Any (local or cloud) | Proprietary | Microsoft AI | Proprietary |
 | Team deployment | ✅ Central config, AI permissions | ❌ | ❌ | ❌ |
-| Pricing | One-time purchase | Subscription | Bundled with Windows | Subscription |
+| Pricing | Source-available · app from $25/mo | Subscription | Bundled with Windows | Subscription |
 
 ## Pricing
 
-- **Lifetime**: $400 one-time purchase. All features, all future updates, forever.
-- **Lifetime + Pro 1 year**: $600 one-time. Includes lifetime app + 1 year of Pro (cloud sync, priority support).
-- **Pro subscription**: $39/month for cloud sync between devices, priority support, and pro AI models.
-- **Teams**: Custom pricing. Shared configs, shared pipes, per-pipe AI data permissions, admin dashboard, MDM ready (Intune / SCCM). See [screenpi.pe/team](https://screenpi.pe/team).
+The source is available for personal, non-commercial use (see [LICENSE.md](LICENSE.md)). The signed desktop app uses a subscription:
+
+- **Standard**: $25/month. Local-first capture, search, and timeline, all on your device.
+- **Pro**: $50/seat/month. Everything in Standard plus cloud sync, cloud AI, and integrations. Teams buy 5+ seats self-serve.
+- **Enterprise**: $150/seat/month. Managed deployment, central config, shared pipes, per-pipe AI data permissions, admin dashboard, SSO/SAML, MDM ready (Intune / SCCM). Sales-led. See [screenpi.pe/team](https://screenpi.pe/team).
+
+Existing lifetime licenses remain valid; new lifetime purchases are no longer sold.
 
 ## Integrations
 
@@ -280,8 +333,8 @@ Make sure to understand the main branch is moving fast and breaking things, if y
 
 ## Frequently asked questions
 
-**Is screenpipe free?**
-The core engine is open source (MIT license). The desktop app is a one-time lifetime purchase ($400). No recurring subscription required for the core app.
+**How much does screenpipe cost?**
+The signed desktop app uses a subscription starting at $25/month; existing lifetime licenses remain valid. The source is available for personal, non-commercial use, so you can build and run it yourself (see [LICENSE.md](LICENSE.md)); commercial use of the source requires a license.
 
 **Does screenpipe send my data to the cloud?**
 No. All data is stored locally by default. You can use fully local AI models via Ollama for complete privacy.

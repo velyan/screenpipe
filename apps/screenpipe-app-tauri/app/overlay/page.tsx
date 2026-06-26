@@ -19,13 +19,14 @@ import { useHealthCheck } from "@/lib/hooks/use-health-check";
 import { commands } from "@/lib/utils/tauri";
 import localforage from "localforage";
 import { LoginDialog } from "@/components/login-dialog";
-import { UpdateBanner, useUpdateListener } from "@/components/update-banner";
+import { UpdateBanner } from "@/components/update-banner";
 import { useIsEnterpriseBuild } from "@/lib/hooks/use-is-enterprise-build";
 import { ModelDownloadTracker } from "@/components/model-download-tracker";
 import Timeline from "@/components/rewind/timeline";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { RefreshCw, AlertTriangle, WifiOff, Upload, Loader, Check, Calendar, X } from "lucide-react";
+import { useFeedbackStore } from "@/lib/stores/feedback-store";
 
 import { open as openUrl } from "@tauri-apps/plugin-shell";
 import { readTextFile } from "@tauri-apps/plugin-fs";
@@ -37,7 +38,36 @@ import { usePlatform } from "@/lib/hooks/use-platform";
 import SplashScreen from "@/components/splash-screen";
 import { useTimelineStore } from "@/lib/hooks/use-timeline-store";
 import { hasCachedData } from "@/lib/hooks/use-timeline-cache";
-import { invoke } from "@tauri-apps/api/core";
+
+function TimelineErrorFallback({
+  error,
+  onRetry,
+}: {
+  error: Error | null;
+  onRetry: () => void;
+}) {
+  const openFeedback = useFeedbackStore((s) => s.openFeedback);
+  return (
+    <div className="flex items-center justify-center h-screen bg-background">
+      <div className="text-center space-y-4 max-w-md">
+        <p className="text-lg font-medium">timeline crashed</p>
+        <p className="text-sm text-muted-foreground">{error?.message}</p>
+        <div className="flex gap-2 justify-center">
+          <Button onClick={onRetry} variant="outline">
+            <RefreshCw className="h-4 w-4 mr-2" />
+            retry
+          </Button>
+          <Button
+            variant="outline"
+            onClick={() => openFeedback(`Timeline crashed: ${error?.message || "unknown error"}`)}
+          >
+            report crash
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 class TimelineErrorBoundary extends React.Component<
   { children: React.ReactNode },
@@ -59,19 +89,10 @@ class TimelineErrorBoundary extends React.Component<
   render() {
     if (this.state.hasError) {
       return (
-        <div className="flex items-center justify-center h-screen bg-background">
-          <div className="text-center space-y-4 max-w-md">
-            <p className="text-lg font-medium">timeline crashed</p>
-            <p className="text-sm text-muted-foreground">{this.state.error?.message}</p>
-            <Button
-              onClick={() => this.setState({ hasError: false, error: null })}
-              variant="outline"
-            >
-              <RefreshCw className="h-4 w-4 mr-2" />
-              retry
-            </Button>
-          </div>
-        </div>
+        <TimelineErrorFallback
+          error={this.state.error}
+          onRetry={() => this.setState({ hasError: false, error: null })}
+        />
       );
     }
     return this.props.children;
@@ -81,6 +102,7 @@ class TimelineErrorBoundary extends React.Component<
 export default function OverlayPage() {
   const { settings, updateSettings, loadUser, reloadStore, isSettingsLoaded, loadingError } = useSettings();
   const { toast } = useToast();
+  const openFeedback = useFeedbackStore((s) => s.openFeedback);
   const { onboardingData } = useOnboarding();
   const isEnterprise = useIsEnterpriseBuild();
   const { isServerDown, isLoading: isHealthLoading } = useHealthCheck();
@@ -89,9 +111,6 @@ export default function OverlayPage() {
   const [isSendingLogs, setIsSendingLogs] = useState(false);
   const [logsSent, setLogsSent] = useState(false);
   const isProcessingRef = useRef(false);
-  
-  // Listen for update events from Rust backend
-  useUpdateListener();
   
   // Optimistic UI: track if user has any data (cached or live)
   const { frames, isConnected, loadFromCache } = useTimelineStore();
@@ -222,7 +241,7 @@ export default function OverlayPage() {
       if (!password) return;
 
       try {
-        await invoke("init_sync", { password });
+        await commands.initSync(password);
         console.log("cloud sync auto-initialized from saved password");
       } catch (e) {
         console.log("cloud sync auto-init failed:", e);
@@ -238,7 +257,7 @@ export default function OverlayPage() {
   const sendLogs = async () => {
     setIsSendingLogs(true);
     try {
-      const BASE_URL = "https://screenpi.pe";
+      const BASE_URL = "https://screenpipe.com";
       const machineId = localStorage?.getItem("machineId") || crypto.randomUUID();
       try { localStorage?.setItem("machineId", machineId); } catch {}
       const identifier = settings.user?.id || machineId;
@@ -326,9 +345,20 @@ export default function OverlayPage() {
       console.error("failed to restart server:", error);
       toast({
         title: "restart failed",
-        description: "failed to restart screenpipe server. please check the logs.",
+        description: (
+          <span>
+            failed to restart screenpipe server.{" "}
+            <button
+              type="button"
+              className="underline underline-offset-2 text-inherit opacity-80 hover:opacity-100"
+              onClick={() => openFeedback(`Server restart failed: ${error instanceof Error ? error.message : String(error)}`)}
+            >
+              report issue
+            </button>
+          </span>
+        ),
         variant: "destructive",
-        duration: 5000,
+        duration: 8000,
       });
     } finally {
       setIsRestarting(false);

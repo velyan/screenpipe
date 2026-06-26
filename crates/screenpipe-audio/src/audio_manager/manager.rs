@@ -4,8 +4,10 @@
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
+use futures::FutureExt;
 use std::{
     collections::HashSet,
+    panic::AssertUnwindSafe,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -22,7 +24,26 @@ use whisper_rs::WhisperContext;
 
 use screenpipe_db::DatabaseManager;
 
-use super::{start_device_monitor, stop_device_monitor, AudioManagerOptions, TranscriptionMode};
+/// True if `e` is the VPIO-relevant kind of stream death: a receive-timeout
+/// (the stream was created but delivered no data). A zero-fill hijack
+/// (`StreamDeath::ZeroFill`) is deliberately excluded — that is another process
+/// seizing the device, not a VPIO fault, and the HAL path would be hijacked too.
+/// Walks the `anyhow` cause chain so it stays correct even if a caller later
+/// wraps the error with `.context(...)`.
+#[cfg(target_os = "macos")]
+fn is_vpio_relevant_stream_death(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<crate::core::StreamDeath>(),
+            Some(crate::core::StreamDeath::ReceiveTimeout { .. })
+        )
+    })
+}
+
+use super::{
+    start_device_monitor, stop_device_monitor, AudioCaptureMode, AudioManagerOptions,
+    TranscriptionMode,
+};
 use crate::{
     core::{
         device::{parse_audio_device, AudioDevice},
@@ -152,8 +173,17 @@ impl AudioManager {
         let device_manager = DeviceManager::new(
             options.experimental_coreaudio_system_audio,
             options.windows_input_aec_enabled,
+            options.macos_input_vpio_enabled,
         )
         .await?;
+        if options.windows_input_aec_enabled {
+            info!("screenpipe-audio: Windows WASAPI microphone AEC enabled in settings");
+        }
+        if options.macos_input_vpio_enabled {
+            info!(
+                "screenpipe-audio: macOS VoiceProcessingIO (AEC) enabled in settings (default input only)"
+            );
+        }
         let segmentation_manager = Arc::new(SegmentationManager::new(options.is_disabled).await?);
         let status = RwLock::new(AudioManagerStatus::Stopped);
         let vad_engine: Arc<Mutex<Box<dyn VadEngine + Send>>> = if options.is_disabled {
@@ -220,7 +250,10 @@ impl AudioManager {
     /// live-meeting provider, devices, language, vocabulary, and batch mode
     /// update on a capture-level restart.
     pub async fn apply_options(&self, options: AudioManagerOptions) -> Result<()> {
-        if self.status().await == AudioManagerStatus::Running {
+        if self.status().await == AudioManagerStatus::Running
+            || options.is_disabled
+            || !self.recording_handles.is_empty()
+        {
             self.stop_internal().await?;
         }
 
@@ -249,8 +282,14 @@ impl AudioManager {
         self.device_manager.configure_backend_flags(
             options.experimental_coreaudio_system_audio,
             options.windows_input_aec_enabled,
+            options.macos_input_vpio_enabled,
         );
         *self.meeting_detector.write().await = options.meeting_detector.clone();
+
+        let user_disabled = self.user_disabled_devices.read().await.clone();
+        let mut options = options;
+        super::builder::ensure_system_default_device_types(&mut options, &user_disabled).await;
+
         *self.options.write().await = options;
         *self.engine.write().await = None;
         Ok(())
@@ -314,41 +353,61 @@ impl AudioManager {
                 // Wait for model to load + initial recordings
                 tokio::time::sleep(Duration::from_secs(120)).await;
                 loop {
-                    if let Some(detector) = &meeting_detector_bg {
-                        detector.check_grace_period().await;
-                        if detector.is_in_audio_session() {
-                            debug!(
-                                "reconciliation: skipping background sweep during active audio session"
-                            );
-                            tokio::time::sleep(Duration::from_secs(120)).await;
-                            continue;
+                    // Contain a panic inside a sweep so it cannot kill this
+                    // long-lived worker (issue #3498: a single panic used to
+                    // stop the loop permanently, silently piling up pending
+                    // chunks until the app was restarted). The sweep stays on
+                    // this task, so shutdown still cancels an in-flight sweep at
+                    // its next await. The locks it holds are tokio::sync locks,
+                    // which do not poison, so a caught panic releases them
+                    // cleanly.
+                    let swept = AssertUnwindSafe(async {
+                        if let Some(detector) = &meeting_detector_bg {
+                            detector.check_grace_period().await;
+                            if detector.is_in_audio_session() {
+                                debug!(
+                                    "reconciliation: skipping background sweep during active audio session"
+                                );
+                                return;
+                            }
                         }
-                    }
 
-                    let engine_guard = engine_ref.read().await;
-                    if let Some(ref transcription_engine) = *engine_guard {
-                        let opts = options_ref.read().await;
-                        let audio_engine = opts.transcription_engine.clone();
-                        let batch_max_dur = opts.batch_max_duration_secs;
-                        drop(opts);
+                        let engine_guard = engine_ref.read().await;
+                        if let Some(ref transcription_engine) = *engine_guard {
+                            let opts = options_ref.read().await;
+                            let audio_engine = opts.transcription_engine.clone();
+                            let batch_max_dur = opts.batch_max_duration_secs;
+                            drop(opts);
 
-                        let data_dir = output_path_bg.as_deref();
-                        let count = super::reconciliation::reconcile_untranscribed(
-                            &db,
-                            transcription_engine,
-                            on_insert_bg.as_ref(),
-                            audio_engine,
-                            Some(seg_mgr.clone()),
-                            data_dir,
-                            batch_max_dur,
-                            Some(metrics_bg.clone()),
-                        )
-                        .await;
-                        if count > 0 {
-                            info!("reconciliation: transcribed {} orphaned chunks", count);
+                            let count = super::reconciliation::reconcile_untranscribed(
+                                &db,
+                                transcription_engine,
+                                on_insert_bg.as_ref(),
+                                audio_engine,
+                                Some(seg_mgr.clone()),
+                                output_path_bg.as_deref(),
+                                batch_max_dur,
+                                Some(metrics_bg.clone()),
+                            )
+                            .await;
+                            if count > 0 {
+                                info!("reconciliation: transcribed {} orphaned chunks", count);
+                            }
                         }
+                    })
+                    .catch_unwind()
+                    .await;
+                    if let Err(panic) = swept {
+                        let reason = panic
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("unknown cause");
+                        error!(
+                            "reconciliation: sweep panicked, worker continues: {}",
+                            reason
+                        );
                     }
-                    drop(engine_guard);
                     tokio::time::sleep(Duration::from_secs(120)).await;
                 }
             });
@@ -432,11 +491,9 @@ impl AudioManager {
     }
 
     pub async fn stop(&self) -> Result<()> {
-        if self.status().await == AudioManagerStatus::Stopped {
+        if self.status().await == AudioManagerStatus::Stopped && self.recording_handles.is_empty() {
             return Ok(());
         }
-        *self.status.write().await = AudioManagerStatus::Stopped;
-        stop_device_monitor().await?;
         self.stop_internal().await
     }
 
@@ -492,6 +549,10 @@ impl AudioManager {
         self.status.read().await.clone()
     }
 
+    pub async fn is_disabled(&self) -> bool {
+        self.options.read().await.is_disabled
+    }
+
     /// Temporarily pause a device without changing the configured device list.
     /// Idempotent — safe to call if already paused. Never errors.
     pub async fn pause_device(&self, device_name: &str) -> Result<()> {
@@ -511,8 +572,20 @@ impl AudioManager {
 
     /// Resume a previously paused device. Idempotent — safe to call if already running.
     pub async fn resume_device(&self, device_name: &str) -> Result<()> {
+        if self.options.read().await.is_disabled {
+            return Err(anyhow!("audio capture is disabled"));
+        }
+
         // Remove from disabled FIRST so start_device gate allows it
         self.user_disabled_devices.write().await.remove(device_name);
+
+        if self.status().await != AudioManagerStatus::Running {
+            info!(
+                "user re-enabled audio device while audio manager is stopped: {}",
+                device_name
+            );
+            return Ok(());
+        }
 
         let device = match parse_audio_device(device_name) {
             Ok(device) => device,
@@ -544,6 +617,14 @@ impl AudioManager {
     }
 
     pub async fn start_device(&self, device: &AudioDevice) -> Result<()> {
+        if self.options.read().await.is_disabled {
+            debug!(
+                "skipping start of audio device because audio capture is disabled: {}",
+                device
+            );
+            return Ok(());
+        }
+
         // Don't restart devices that are paused due to DRM content detection.
         // The monitor watcher will call start_output_devices() when DRM clears.
         if self
@@ -621,6 +702,9 @@ impl AudioManager {
         let device_clone = device.clone();
         let metrics = self.metrics.clone();
         let meeting_audio_tap = self.meeting_audio_tap.clone();
+        // Used only on macOS to demote a runtime-dead VPIO device to the HAL path.
+        #[cfg(target_os = "macos")]
+        let device_manager = self.device_manager.clone();
 
         let recording_handle = tokio::spawn(async move {
             let record_result = tokio::spawn(record_and_transcribe_with_live_tap(
@@ -645,6 +729,17 @@ impl AudioManager {
                     "recording for device {} exited with error: {}",
                     device_clone, e
                 );
+                // macOS VPIO can create a stream that delivers no audio then dies
+                // at the receive timeout; the recovery monitor would rebuild it
+                // with VPIO still on and loop forever. Count the death so the
+                // device falls back to the plain HAL input path after a few
+                // rapid failures (no-op when VPIO is off / already demoted).
+                #[cfg(target_os = "macos")]
+                if device_clone.device_type == crate::core::device::DeviceType::Input
+                    && is_vpio_relevant_stream_death(e)
+                {
+                    device_manager.note_vpio_runtime_failure(&device_clone);
+                }
                 return Err(anyhow!("record_device {} failed: {}", device_clone, e));
             }
 
@@ -684,6 +779,7 @@ impl AudioManager {
         let audio_transcription_engine = options.transcription_engine.clone();
         let vocabulary = options.vocabulary.clone();
         let is_batch_mode = options.transcription_mode == TranscriptionMode::Batch;
+        let audio_capture_mode = options.audio_capture_mode.clone();
         let batch_max_duration_secs = options.batch_max_duration_secs;
         let filter_music = options.filter_music;
         let vad_engine = self.vad_engine.clone();
@@ -744,6 +840,10 @@ impl AudioManager {
                 //   silence = 0.0, audio playing = 0.0028, loud output = 0.06
                 // For output we just need "is audio playing?" not "is someone speaking?"
                 if let Some(ref meeting) = meeting_detector {
+                    // Stamp chunk receipt first (unconditional) — the device
+                    // monitor's speaker watchdog uses this to tell a dead
+                    // loopback stream apart from a quiet one.
+                    meeting.on_audio_chunk(&audio.device.device_type);
                     let rms = {
                         let sum_sq: f32 = audio.data.iter().map(|&x| x * x).sum();
                         (sum_sq / audio.data.len() as f32).sqrt()
@@ -753,6 +853,26 @@ impl AudioManager {
                         crate::core::device::DeviceType::Input => rms > 0.05,
                     };
                     meeting.on_audio_activity(&audio.device.device_type, has_activity);
+                }
+
+                // Meetings-only capture: drop this chunk before it is persisted or
+                // transcribed unless a meeting / audio session is active. The detector
+                // was just fed this chunk's activity above, so a meeting that is
+                // starting still flips the session on in time. With no detector we
+                // cannot tell whether we're in a meeting, so we keep capturing rather
+                // than silently dropping everything.
+                if audio_capture_mode == AudioCaptureMode::MeetingsOnly {
+                    let in_session = meeting_detector
+                        .as_ref()
+                        .map(|m| m.is_in_audio_session())
+                        .unwrap_or(true);
+                    if !in_session {
+                        debug!(
+                            "meetings-only capture: no active meeting, dropping audio chunk from {:?}",
+                            audio.device.name
+                        );
+                        continue;
+                    }
                 }
 
                 // ALWAYS persist audio to disk immediately, before any deferral.
@@ -793,6 +913,11 @@ impl AudioManager {
                             // Without this, audio files are written to disk but orphaned from the DB,
                             // causing silent data loss on the timeline.
                             let mut inserted = false;
+                            // Keep the last failure so the final error log can name
+                            // the actual cause. Without it every distinct DB failure
+                            // (pool timeout vs stuck transaction vs cantopen) collapses
+                            // into one undiagnosable Sentry issue.
+                            let mut last_err: Option<String> = None;
                             for retry in 0..3u32 {
                                 match db.insert_audio_chunk(&path, capture_dt).await {
                                     Ok(_) => {
@@ -805,6 +930,7 @@ impl AudioManager {
                                             retry + 1,
                                             e
                                         );
+                                        last_err = Some(format!("{:?}", e));
                                         if retry < 2 {
                                             tokio::time::sleep(std::time::Duration::from_millis(
                                                 500 * (retry as u64 + 1),
@@ -817,11 +943,27 @@ impl AudioManager {
                             if !inserted {
                                 // path is a structured field so Sentry dedups the
                                 // issue across different devices; otherwise every
-                                // device name creates a new Sentry issue.
+                                // device name creates a new Sentry issue. error is a
+                                // separate field so the underlying cause is filterable
+                                // within that one issue rather than lost.
                                 error!(
                                     audio_chunk_path = %path,
+                                    error = last_err.as_deref().unwrap_or("unknown"),
                                     "audio chunk DB insert failed after 3 retries, data may be missing from timeline"
                                 );
+                                // Durable recovery: the audio file is on disk but
+                                // has no audio_chunks row, so it is invisible to the
+                                // timeline and the reconciliation candidate query
+                                // (which only sees existing rows). Persist a marker
+                                // (off the hot path) so the reconciliation sweep
+                                // re-inserts the row once the write pool recovers.
+                                // See SCREENPIPE-CLI-RC.
+                                super::reconciliation::persist_orphaned_chunk(
+                                    out,
+                                    path.clone(),
+                                    capture_dt,
+                                )
+                                .await;
                             }
                             Some(path)
                         }
@@ -1036,8 +1178,30 @@ impl AudioManager {
             .collect::<Vec<AudioDevice>>()
     }
 
+    /// Non-blocking read of the *configured* transcription mode. Returns `None`
+    /// if the options lock is momentarily contended, so callers such as
+    /// `/health` never block on it.
+    pub fn configured_transcription_mode(&self) -> Option<TranscriptionMode> {
+        self.options
+            .try_read()
+            .ok()
+            .map(|o| o.transcription_mode.clone())
+    }
+
     pub async fn enabled_devices(&self) -> HashSet<String> {
         self.options.read().await.enabled_devices.clone()
+    }
+
+    /// Drop a name from `enabled_devices` without trying to parse it or stop
+    /// a running stream. Used to scrub legacy sentinel entries (e.g. bare
+    /// "default" from older versions) that have no corresponding parseable
+    /// device and would otherwise stay in the set forever.
+    pub async fn forget_device(&self, device_name: &str) {
+        self.options
+            .write()
+            .await
+            .enabled_devices
+            .remove(device_name);
     }
 
     /// Stop all SCK-based (Output) audio devices for DRM pause.
@@ -1561,6 +1725,30 @@ mod tests {
         assert!(!result.transcription_restarted);
         assert!(result.recording_error.is_none());
         assert!(result.transcription_error.is_none());
+    }
+
+    /// The VPIO-fallback classifier must fire only on a receive-timeout death —
+    /// not a zero-fill hijack (not VPIO's fault) and not unrelated errors.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn vpio_relevant_death_matches_only_receive_timeout() {
+        use crate::core::StreamDeath;
+
+        assert!(is_vpio_relevant_stream_death(&anyhow!(
+            StreamDeath::ReceiveTimeout { secs: 8 }
+        )));
+        assert!(is_vpio_relevant_stream_death(
+            &anyhow!(StreamDeath::ReceiveTimeout { secs: 8 }).context("rebuilding device")
+        ));
+        assert!(!is_vpio_relevant_stream_death(&anyhow!(
+            StreamDeath::ZeroFill {
+                device: "Mic (input)".to_string(),
+                secs: 30
+            }
+        )));
+        assert!(!is_vpio_relevant_stream_death(&anyhow!(
+            "device disconnected"
+        )));
     }
 
     // ── DRM stopped devices tracking tests ─────────────────────

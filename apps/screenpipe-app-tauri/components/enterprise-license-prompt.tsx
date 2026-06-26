@@ -32,8 +32,8 @@ export function EnterpriseLicensePrompt({ onSubmit }: EnterpriseLicensePromptPro
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm">
-      <div className="w-full max-w-sm mx-4 border border-border bg-background p-6 rounded-lg shadow-lg">
+    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-background/80 px-4 pt-12 pb-6 backdrop-blur-sm">
+      <div className="w-full max-w-sm border border-border bg-background p-6 rounded-lg shadow-lg">
         <h2 className="text-lg font-semibold mb-1">enterprise license</h2>
         <p className="text-sm text-muted-foreground mb-4">
           enter the license key provided by your IT admin to configure this device

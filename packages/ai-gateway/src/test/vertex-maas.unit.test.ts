@@ -4,6 +4,7 @@
 
 import { describe, it, expect } from 'bun:test';
 import {
+	backfillToolCallIds,
 	isVertexMaasModel,
 	parseVertexMaasJsonResponse,
 	promoteReasoningStream,
@@ -43,7 +44,7 @@ describe('isVertexMaasModel', () => {
 		expect(isVertexMaasModel('claude-haiku-4-5')).toBe(false);
 		expect(isVertexMaasModel('gemini-3-flash')).toBe(false);
 		// OpenRouter-style names with publisher prefix shouldn't be treated as Vertex MaaS.
-		expect(isVertexMaasModel('deepseek/deepseek-chat')).toBe(false);
+		expect(isVertexMaasModel('mistralai/mistral-small')).toBe(false);
 		expect(isVertexMaasModel('meta-llama/llama-4-scout')).toBe(false);
 	});
 
@@ -173,6 +174,159 @@ describe('VertexMaasProvider.formatMessages', () => {
 		}]);
 
 		expect(result[0].content).toEqual([{ type: 'text', text: 'hello' }]);
+	});
+
+	// Vertex MaaS 400 "No tool calls but found tool output" — see Sentry
+	// SCREENPIPE-AI-PROXY-13 (escalating, 22 users / 7d). Pi chats can prune
+	// or edit history mid-conversation, leaving a tool-role reply whose
+	// originating assistant tool_calls turn is gone. Vertex rejects the whole
+	// batch unless we drop the orphan.
+	it('drops orphan tool messages whose tool_call_id never appeared', () => {
+		const result = provider.formatMessages([
+			{ role: 'user', content: 'hi' },
+			{ role: 'tool', content: 'ghost result', tool_call_id: 'call_ghost' } as any,
+			{ role: 'user', content: 'are you there?' },
+		]);
+		expect(result).toHaveLength(2);
+		expect(result.map((m: any) => m.role)).toEqual(['user', 'user']);
+	});
+
+	it('keeps tool messages that reference a prior assistant tool_call', () => {
+		const result = provider.formatMessages([
+			{ role: 'user', content: 'list files' },
+			{
+				role: 'assistant',
+				content: '',
+				tool_calls: [{ id: 'call_42', type: 'function', function: { name: 'ls', arguments: '{}' } }],
+			} as any,
+			{ role: 'tool', content: 'a.txt', tool_call_id: 'call_42' } as any,
+			{ role: 'assistant', content: 'found a.txt' },
+		]);
+		expect(result).toHaveLength(4);
+		expect(result[2]).toMatchObject({ role: 'tool', tool_call_id: 'call_42' });
+	});
+
+	it('drops orphan tool_result content parts on user messages', () => {
+		const result = provider.formatMessages([
+			{ role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_ghost', content: 'gone' }] as any },
+			{ role: 'user', content: 'continue' },
+		]);
+		expect(result).toHaveLength(1);
+		expect(result[0]).toMatchObject({ role: 'user' });
+	});
+
+	it('drops tool messages with missing tool_call_id (would otherwise reach Vertex bare)', () => {
+		// Output mapper strips tool_call_id when falsy via conditional spread,
+		// so a kept tool message with no id reaches Vertex as { role: 'tool' }
+		// alone and trips 400 "No tool calls but found tool output".
+		const result = provider.formatMessages([
+			{ role: 'user', content: 'list files' },
+			{
+				role: 'assistant',
+				content: '',
+				tool_calls: [{ id: 'call_42', type: 'function', function: { name: 'ls', arguments: '{}' } }],
+			} as any,
+			{ role: 'tool', content: 'orphan output, no id' } as any,
+		]);
+		expect(result).toHaveLength(2);
+		expect(result.map((m: any) => m.role)).toEqual(['user', 'assistant']);
+	});
+
+	it('drops tool messages with empty-string tool_call_id', () => {
+		const result = provider.formatMessages([
+			{ role: 'user', content: 'hi' },
+			{ role: 'tool', content: 'empty id', tool_call_id: '' } as any,
+		]);
+		expect(result).toHaveLength(1);
+		expect(result[0]).toMatchObject({ role: 'user' });
+	});
+
+	// Without this preservation, the string-content branch of
+	// formatMessageContent silently drops the OpenAI-style tool_calls field,
+	// and Vertex 400s on the next tool-role message because the assistant
+	// payload it sees has no tool_calls to bind to.
+	it('preserves OpenAI-style tool_calls on assistant with string content', () => {
+		const result = provider.formatMessages([
+			{ role: 'user', content: 'what files?' },
+			{
+				role: 'assistant',
+				content: '',
+				tool_calls: [{ id: 'call_42', type: 'function', function: { name: 'ls', arguments: '{}' } }],
+			} as any,
+			{ role: 'tool', content: 'a.txt b.txt', tool_call_id: 'call_42' } as any,
+		]);
+		expect(result).toHaveLength(3);
+		expect(result[1]).toMatchObject({
+			role: 'assistant',
+			tool_calls: [{ id: 'call_42' }],
+		});
+		expect(result[2]).toMatchObject({ role: 'tool', tool_call_id: 'call_42' });
+	});
+
+	// SCREENPIPE-AI-PROXY-C: a tool-call turn arriving without an id used to be
+	// forwarded verbatim, so Vertex 400'd with "Expected the 'id' of a(n)
+	// 'assistant' 'tool_calls' array element to be populated" and the whole
+	// request failed. formatMessages must hand it a populated id and keep the
+	// matching tool result paired to it.
+	it('populates id-less assistant tool_calls so Vertex does not 400', () => {
+		const result = provider.formatMessages([
+			{ role: 'user', content: 'list files' },
+			{
+				role: 'assistant',
+				content: '',
+				tool_calls: [{ type: 'function', function: { name: 'ls', arguments: '{}' } }],
+			} as any,
+			{ role: 'tool', content: 'a.txt' } as any,
+		]);
+		expect(result).toHaveLength(3);
+		const id = result[1].tool_calls[0].id;
+		expect(id).toBeTruthy();
+		expect(result[2]).toMatchObject({ role: 'tool', tool_call_id: id });
+	});
+});
+
+describe('backfillToolCallIds', () => {
+	it('synthesizes an id for an id-less assistant tool_call and pairs its result', () => {
+		const out = backfillToolCallIds([
+			{ role: 'user', content: 'list files' },
+			{ role: 'assistant', content: '', tool_calls: [{ type: 'function', function: { name: 'ls', arguments: '{}' } }] },
+			{ role: 'tool', content: 'a.txt' },
+		] as any);
+		const id = (out[1] as any).tool_calls[0].id;
+		expect(id).toBeTruthy();
+		expect((out[2] as any).tool_call_id).toBe(id);
+	});
+
+	it('leaves well-formed messages untouched (same object references)', () => {
+		const input = [
+			{ role: 'assistant', content: '', tool_calls: [{ id: 'call_42', type: 'function', function: { name: 'ls', arguments: '{}' } }] },
+			{ role: 'tool', content: 'x', tool_call_id: 'call_42' },
+		] as any;
+		const out = backfillToolCallIds(input);
+		expect(out[0]).toBe(input[0]);
+		expect(out[1]).toBe(input[1]);
+	});
+
+	it('pairs multiple id-less calls to their results in order', () => {
+		const out = backfillToolCallIds([
+			{
+				role: 'assistant',
+				content: '',
+				tool_calls: [
+					{ type: 'function', function: { name: 'a', arguments: '{}' } },
+					{ type: 'function', function: { name: 'b', arguments: '{}' } },
+				],
+			},
+			{ role: 'tool', content: 'result a' },
+			{ role: 'tool', content: 'result b' },
+		] as any);
+		const id0 = (out[0] as any).tool_calls[0].id;
+		const id1 = (out[0] as any).tool_calls[1].id;
+		expect(id0).toBeTruthy();
+		expect(id1).toBeTruthy();
+		expect(id0).not.toBe(id1);
+		expect((out[1] as any).tool_call_id).toBe(id0);
+		expect((out[2] as any).tool_call_id).toBe(id1);
 	});
 });
 

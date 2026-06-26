@@ -2,16 +2,12 @@ use anyhow::Result;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::NaiveDateTime;
 use chrono::{DateTime, Utc};
-use image::codecs::jpeg::JpegEncoder;
-use image::{DynamicImage, GenericImageView, Rgba};
-use imageproc::filter::gaussian_blur_f32;
+use image::DynamicImage;
 use oasgen::OaSchema;
-use screenpipe_core::pii_removal::PiiRegion;
 use screenpipe_core::{ffmpeg_cmd_async, find_ffmpeg_path};
 use screenpipe_db::VideoMetadata as DBVideoMetadata;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::LazyLock;
@@ -29,7 +25,7 @@ static VIDEO_METADATA_CACHE: LazyLock<RwLock<HashMap<String, (f64, f64)>>> =
 
 /// Get ffprobe path from ffmpeg path, handling Windows .exe extension.
 /// Falls back to searching PATH via `which` if ffprobe isn't alongside ffmpeg.
-fn get_ffprobe_path(ffmpeg_path: &Path) -> PathBuf {
+pub fn get_ffprobe_path(ffmpeg_path: &Path) -> PathBuf {
     #[cfg(windows)]
     let candidates = [
         ffmpeg_path.with_file_name("ffprobe.exe"),
@@ -397,7 +393,7 @@ pub async fn extract_frames_from_video(
     Ok(frames)
 }
 
-async fn get_video_fps(ffmpeg_path: &std::path::Path, video_path: &str) -> Result<f64> {
+pub async fn get_video_fps(ffmpeg_path: &std::path::Path, video_path: &str) -> Result<f64> {
     let (fps, _) = get_video_fps_and_duration(ffmpeg_path, video_path).await?;
     Ok(fps)
 }

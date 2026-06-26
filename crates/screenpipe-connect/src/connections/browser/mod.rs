@@ -73,6 +73,24 @@ pub trait Browser: Send + Sync {
         timeout: Duration,
     ) -> Result<EvalResult, EvalError>;
 
+    /// Like [`eval`](Self::eval) but tags any navigation the eval triggers
+    /// (the owned webview treats a non-`None` `url` as a navigate-and-eval)
+    /// with the chat/session that issued it. Same purpose and `owner` formats
+    /// as [`navigate_with_owner`](Self::navigate_with_owner): the tag flows to
+    /// the embedded owned-browser sidebar so a background pipe's
+    /// navigate-then-scrape call doesn't pop its page into an unrelated chat.
+    /// Default impl ignores `owner` and behaves exactly like `eval`; only the
+    /// owned browser, whose webview is user-visible, overrides it.
+    async fn eval_with_owner(
+        &self,
+        code: &str,
+        url: Option<&str>,
+        timeout: Duration,
+        _owner: Option<&str>,
+    ) -> Result<EvalResult, EvalError> {
+        self.eval(code, url, timeout).await
+    }
+
     /// Navigate the browser to `url`. Fire-and-forget: returns as soon as
     /// the navigation has been dispatched, NOT when the page has loaded.
     /// Callers that need to wait for content to be ready should follow up
@@ -96,6 +114,19 @@ pub trait Browser: Send + Sync {
         )
         .await
         .map(|_| ())
+    }
+
+    /// Like [`navigate`](Self::navigate) but tags the navigation with the
+    /// chat/session that issued it. `owner` flows to the frontend navigate
+    /// event so the embedded owned-browser sidebar — a singleton shared by
+    /// every chat and background pipe — can ignore navigations that belong to a
+    /// conversation other than the one on screen. Default impl ignores `owner`
+    /// and behaves exactly like `navigate`; only the owned browser, whose
+    /// webview is user-visible, overrides it. `owner` formats: a chat session
+    /// id (equals the frontend `conversationId`) or `pipe:<name>` for a
+    /// background pipe; `None` means "the chat on screen" and is always honored.
+    async fn navigate_with_owner(&self, url: &str, _owner: Option<&str>) -> Result<(), EvalError> {
+        self.navigate(url).await
     }
 }
 

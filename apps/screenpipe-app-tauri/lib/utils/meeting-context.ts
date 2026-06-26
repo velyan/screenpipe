@@ -67,6 +67,47 @@ function timestampMs(iso: string): number {
   return Number.isFinite(ms) ? ms : 0;
 }
 
+function isGenericMeetingTitle(title: string | null | undefined, meetingApp: string | null | undefined): boolean {
+  const normalizedTitle = title?.trim().toLowerCase();
+  if (!normalizedTitle) return true;
+  if (["untitled", "untitled meeting", "meeting"].includes(normalizedTitle)) {
+    return true;
+  }
+
+  const normalizedApp = meetingApp?.trim().toLowerCase();
+  if (normalizedApp && normalizedTitle === normalizedApp) {
+    return true;
+  }
+
+  return false;
+}
+
+function formatMeetingLabelTime(iso: string): string {
+  return new Date(iso)
+    .toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    })
+    .replace(",", "");
+}
+
+export function buildMeetingSummarizeDisplayLabel(meeting: MeetingRecord): string {
+  const title = meeting.title?.trim();
+  if (!isGenericMeetingTitle(title, meeting.meeting_app) && title) {
+    return `Summarize meeting: ${title}`;
+  }
+
+  const app = meeting.meeting_app?.trim();
+  const formattedTime = formatMeetingLabelTime(meeting.meeting_start);
+  if (app && app.toLowerCase() !== "manual") {
+    return `Summarize ${app} meeting: ${formattedTime}`;
+  }
+
+  return `Summarize meeting: ${formattedTime}`;
+}
+
 function sortAudioChunks(chunks: MeetingAudioChunk[]): MeetingAudioChunk[] {
   return [...chunks].sort((a, b) => {
     const byTime = timestampMs(a.timestamp) - timestampMs(b.timestamp);
@@ -76,6 +117,53 @@ function sortAudioChunks(chunks: MeetingAudioChunk[]): MeetingAudioChunk[] {
     if (bySource !== 0) return bySource;
     return a.audioChunkId - b.audioChunkId;
   });
+}
+
+interface SpeakerTurn {
+  speakerName: string;
+  /** Timestamp of the first chunk in this turn — used for display. */
+  timestamp: string;
+  /** Timestamp of the most recent chunk merged in — used to gate further
+   *  merging. Comparing against the first chunk would let arbitrarily long
+   *  turns swallow new turns as long as adjacent chunks stay close. */
+  lastTimestamp: string;
+  text: string;
+}
+
+/**
+ * Collapse a sorted chunk stream into speaker turns. The live engine writes
+ * one row per ~2-3 s VAD chunk; without grouping, a 30-minute meeting becomes
+ * 500+ single-word lines that drown the summarize prompt. Two consecutive
+ * chunks fold into the same turn when they share a speaker label and the gap
+ * between them is under 10 s. The 10 s window is long enough to bridge a
+ * thinking pause, short enough to start a new turn after a real exchange.
+ */
+function groupConsecutiveSpeakerTurns(
+  chunks: MeetingAudioChunk[],
+): SpeakerTurn[] {
+  const MAX_GAP_MS = 10_000;
+  const turns: SpeakerTurn[] = [];
+  for (const c of chunks) {
+    const speakerName = c.speakerName ?? "";
+    const text = c.transcription.replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    const last = turns[turns.length - 1];
+    const gap = last
+      ? timestampMs(c.timestamp) - timestampMs(last.lastTimestamp)
+      : Infinity;
+    if (last && last.speakerName === speakerName && gap < MAX_GAP_MS) {
+      last.text = `${last.text} ${text}`;
+      last.lastTimestamp = c.timestamp;
+    } else {
+      turns.push({
+        speakerName,
+        timestamp: c.timestamp,
+        lastTimestamp: c.timestamp,
+        text,
+      });
+    }
+  }
+  return turns;
 }
 
 export interface SpeakerSummary {
@@ -133,7 +221,7 @@ export async function fetchActivitySummary(
   const { start, end } = rangeFor(meeting);
   try {
     const res = await localFetch(
-      `/activity-summary?start_time=${encodeURIComponent(start)}&end_time=${encodeURIComponent(end)}`,
+      `/activity-summary?start_time=${encodeURIComponent(start)}&end_time=${encodeURIComponent(end)}&include_memories=false&include_snippets=false&include_recording=false&include_guidance=false`,
     );
     if (!res.ok) return null;
     return (await res.json()) as ActivitySummary;
@@ -270,6 +358,10 @@ interface SummarizeInput {
   meeting: MeetingRecord;
   context: MeetingContext;
   transcript?: MeetingAudioChunk[] | null;
+  /** Image data URLs extracted from the user's meeting note and attached to
+   * the chat turn. Used only to tell the model that placeholders in `notes:`
+   * have corresponding images. */
+  noteImages?: string[] | null;
   /** Replace the built-in directive with the body of a user-chosen summary
    * pipe (e.g. one selected from the Meeting summary pipe picker). The
    * meeting id is prepended so the pipe body doesn't have to look it up. */
@@ -286,6 +378,7 @@ export function buildEnrichedSummarizePrompt({
   meeting,
   context,
   transcript,
+  noteImages,
   directiveOverride,
 }: SummarizeInput): string {
   const start = new Date(meeting.meeting_start);
@@ -300,9 +393,18 @@ export function buildEnrichedSummarizePrompt({
   ];
   if (meeting.title) meetingLines.push(`title: ${meeting.title}`);
   if (meeting.attendees) meetingLines.push(`attendees: ${meeting.attendees}`);
-  if (meeting.note) meetingLines.push(`notes: ${meeting.note}`);
+  if (meeting.note) {
+    meetingLines.push(`notes: ${replaceNoteImageDataUrlsWithPlaceholders(meeting.note)}`);
+  }
 
   const sections: string[] = [`meeting:\n${meetingLines.join("\n")}`];
+  const attachedNoteImageCount =
+    noteImages?.length ?? extractImageDataUrlsFromMarkdown(meeting.note).length;
+  if (attachedNoteImageCount > 0) {
+    sections.push(
+      `meeting note images:\n${attachedNoteImageCount} image${attachedNoteImageCount === 1 ? "" : "s"} from the user's notes are attached to this chat message. use them as part of the meeting-note context when summarizing.`,
+    );
+  }
 
   const a = context.activity;
   if (a) {
@@ -374,16 +476,49 @@ export function buildEnrichedSummarizePrompt({
   return `${directive}\n\n${sections.join("\n\n")}`;
 }
 
+export function extractImageDataUrlsFromMarkdown(
+  markdown: string | null | undefined,
+  limit = 8,
+): string[] {
+  if (!markdown) return [];
+
+  const urls: string[] = [];
+  const seen = new Set<string>();
+  for (const match of markdown.matchAll(markdownImageDataUrlRegex())) {
+    const url = match[2];
+    if (!url || seen.has(url)) continue;
+    seen.add(url);
+    urls.push(url);
+    if (urls.length >= limit) break;
+  }
+  return urls;
+}
+
+function replaceNoteImageDataUrlsWithPlaceholders(markdown: string): string {
+  let index = 0;
+  return markdown.replace(markdownImageDataUrlRegex(), (_match, alt: string) => {
+    index += 1;
+    const label = alt.trim();
+    return label
+      ? `[attached image ${index}: ${label}]`
+      : `[attached image ${index}]`;
+  });
+}
+
+function markdownImageDataUrlRegex(): RegExp {
+  return /!\[([^\]]*)\]\(\s*(data:image\/[^)\s]+)(?:\s+["'][^"']*["'])?\s*\)/gi;
+}
+
 /**
- * Static instructions for "summarize this meeting and patch it back onto the
+ * Static instructions for "summarize this meeting and save it back onto the
  * record". Used by:
  *   - the in-app "summarize with AI" button (chat path) — passes the known
  *     meeting id and asks for the speaker/connector follow-up
  *   - the bundled meeting-summary pipe (background event-triggered path) —
  *     keep the wording in sync with crates/screenpipe-core/assets/pipes/meeting-summary/pipe.md
  *
- * The agent decides whether to PATCH. Empty transcript / nothing worth saving
- * → say so out loud, skip the PATCH. Useful summary → append under "## Summary"
+ * The agent decides whether to save. Empty transcript / nothing worth saving
+ * → say so out loud, skip the PUT. Useful summary → append under "## Summary"
  * preserving the user's existing notes via the same endpoint the autosave uses.
  */
 export function buildMeetingSummarizeInstructions(
@@ -396,18 +531,21 @@ export function buildMeetingSummarizeInstructions(
     `meeting id: ${meetingId}`,
     `primary transcript source: GET "http://localhost:3030/meetings/${meetingId}/transcript" and use each row's "transcript", "speakerName", "capturedAt", and "source" fields. sort rows by capturedAt before summarizing.`,
     `fallback transcript source: /search?content_type=audio for the meeting time window. audio rows use content.transcription (not content.text); content.text may be missing for audio and should not be treated as an empty transcript.`,
+    `also read the screenpipe-api skill and query the screen for what was *shown* during the meeting: GET /search?content_type=ocr for the meeting window (this returns the frame's on-screen text — accessibility tree + OCR merged, not just OCR) — shared slides, docs, code, demos, and the on-screen name tags video-call apps render for participants. fold anything useful into the summary, and use on-screen names to fill in attendees who never spoke.`,
+    `then name the speakers from the screen (do this every run, don't ask first): for every speaker still unnamed or generic ("speaker 1", "unknown", "") in the transcript above, line up when they were talking with the on-screen name tag showing at that moment, then GET /speakers/unnamed?limit=20 and POST /speakers/update {"id": <SPEAKER_ID>, "name": "<NAME_FROM_SCREEN>"} for each confident match. only rename when the on-screen evidence is unambiguous — never guess from voice alone. note which speakers you renamed (and which you left as-is) in your reply.`,
+    `*if available*, use the cloud media (video/audio) model for what text alone can't capture: the screenpipe-api skill includes a "Cloud media analysis" block (the gemma4-e4b multimodal model) only when cloud media analysis is enabled and the user is signed into screenpipe cloud. when it's there, use it for visual-only content the transcript and OCR miss — diagrams, charts, whiteboards, slide figures, UI demos, screen-shared video. export the meeting (POST /export with this meeting_id) or ffmpeg-sample a few keyframes, then send up to 4 frames per request as image_url[] to POST /v1/chat/completions with "model": "gemma4-e4b" and ask what they show; it can also take audio_url directly for hard-to-transcribe spans. optional — if the block isn't in the skill, or the call returns 503 cloud_token_missing (signed out), skip it and summarize from transcript + OCR.`,
     `if your summary is worth saving, append it to the meeting note (and refresh the title in the same call) via:`,
-    `  curl -s -X PATCH "http://localhost:3030/meetings/${meetingId}" \\`,
-    `    -H "Authorization: Bearer $SCREENPIPE_API_AUTH_KEY" \\`,
+    `  curl -s -X PUT "http://localhost:3030/meetings/${meetingId}" \\`,
+    `    -H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY" \\`,
     `    -H "Content-Type: application/json" \\`,
     `    -d '{"title": "<NEW_TITLE_OR_OMIT>", "note": "<EXISTING_NOTE>\\n\\n## Summary\\n<YOUR_SUMMARY>"}'`,
-    `replace <EXISTING_NOTE> with the meeting's current notes (shown above as "notes:" — empty string if none) so you don't overwrite the user's work; just append your summary under a "## Summary" heading. for the title: if the current "title:" is missing, generic ("untitled", "meeting", just the app name) or doesn't capture what actually happened, replace it with a 5-8 word plain-english title (no quotes, no "meeting about…" prefix) — otherwise omit the field so a user-set title is left alone. if there's nothing useful to summarize (empty transcript, irrelevant audio), say so out loud and skip the PATCH — don't write a placeholder.`,
+    `replace <EXISTING_NOTE> with the meeting's current notes (shown above as "notes:" — empty string if none) so you don't overwrite the user's work; just append your summary under a "## Summary" heading. for the title: if the current "title:" is missing, generic ("untitled", "meeting", just the app name) or doesn't capture what actually happened, replace it with a 5-8 word plain-english title (no quotes, no "meeting about…" prefix) — otherwise omit the field so a user-set title is left alone. if there's nothing useful to summarize (empty transcript, irrelevant audio), say so out loud and skip the PUT — don't write a placeholder.`,
   ];
 
   if (options?.followUpAsk) {
     lines.push(
       ``,
-      `after the PATCH, ask the user — in one short message — whether they'd like you to (a) update speaker assignments for any of the audio segments above, or (b) push this summary into one of the apps they were using during the meeting (use the "apps used during meeting" + "tabs/docs visited" sections to list 2-3 plausible targets like Notion, Linear, GitHub, etc.). don't act on either until they reply.`,
+      `after the PUT, offer to push the summary into one of the user's *connected* apps — ask first, never push on your own. don't guess at the integration list: GET http://localhost:3030/connections and keep only the ones with "connected": true, then ask in one short message which of those (if any) to push to. rank them by relevance — an app used during the meeting (see "apps used during meeting" / "tabs/docs visited") comes first. if nothing is connected, say so in one line (connecting Notion/Slack/Telegram/… would let you push next time) and stop. when they pick one, push via that connection's endpoint (POST /connections/<id>/send for slack/gmail/telegram/discord, POST /connections/<id>/proxy/... for notion/linear/etc.) and confirm specifics (channel, parent page) before anything leaves the machine.`,
     );
   }
 
@@ -545,15 +683,14 @@ function renderTranscript(
   activity: ActivitySummary | null,
 ): string {
   if (full && full.length > 0) {
-    return sortAudioChunks(full)
-      .map((c) => {
-        const ts = formatTimeShort(c.timestamp);
+    return groupConsecutiveSpeakerTurns(sortAudioChunks(full))
+      .map((g) => {
+        const ts = formatTimeShort(g.timestamp);
         const sp =
-          c.speakerName && c.speakerName !== "unknown"
-            ? `[${c.speakerName}] `
+          g.speakerName && g.speakerName !== "unknown"
+            ? `[${g.speakerName}] `
             : "";
-        const txt = c.transcription.replace(/\s+/g, " ").trim();
-        return `- ${ts} ${sp}${txt}`;
+        return `- ${ts} ${sp}${g.text}`;
       })
       .join("\n");
   }
@@ -723,9 +860,12 @@ function mergeMeetingAudioChunks(
   const out: MeetingAudioChunk[] = [];
 
   for (const chunk of merged) {
+    // /search returns DeviceType as "Input"/"Output" (PascalCase enum), while
+    // /meetings/:id/transcript returns the raw DB column "input"/"output".
+    // Lowercase both so the same chunk pulled from both endpoints collapses.
     const key = [
       Math.round(timestampMs(chunk.timestamp) / 1000),
-      chunk.deviceType,
+      chunk.deviceType.toLowerCase(),
       chunk.speakerName,
       chunk.transcription.replace(/\s+/g, " ").trim().toLowerCase(),
     ].join("|");

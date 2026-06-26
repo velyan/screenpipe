@@ -4,7 +4,7 @@
 
 import { useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
+
 import { commands } from "@/lib/utils/tauri";
 import { getFrameAppName } from "@/components/rewind/timeline/timeline";
 import { toast } from "@/components/ui/use-toast";
@@ -153,9 +153,7 @@ export function useTimelineKeyboard(opts: {
 			if (!frameId) return;
 
 			e.preventDefault();
-			invoke("copy_frame_to_clipboard", {
-				frameId: parseInt(String(frameId), 10),
-			})
+			commands.copyFrameToClipboard(parseInt(String(frameId), 10))
 				.then(() =>
 					toast({
 						title: "copied image",
@@ -336,6 +334,10 @@ export function useTimelineKeyboard(opts: {
 
 		window.addEventListener("keydown", handleArrowKeys);
 		return () => window.removeEventListener("keydown", handleArrowKeys);
-	}, [frames, setCurrentFrame, showSearchModal, isPlaying, seekPlayback, pausePlayback, inSearchReviewMode, searchResultIndex, searchResults, hasSearchHighlight, dismissSearchHighlight]);
+		// findNextDevice + setCurrentIndex are used inside the handler; without
+		// them in deps the listener keeps a stale findNextDevice after a filter
+		// change (its identity tracks selectedDeviceId/app/matchingIndices), so
+		// arrow nav would ignore the active filter until frames next change.
+	}, [frames, findNextDevice, setCurrentIndex, setCurrentFrame, showSearchModal, isPlaying, seekPlayback, pausePlayback, inSearchReviewMode, searchResultIndex, searchResults, hasSearchHighlight, dismissSearchHighlight]);
 
 }

@@ -42,6 +42,12 @@ fn read_lines_lossy(reader: &mut BufReader<impl std::io::Read>) -> Option<String
 const TEXT_DELTA_EMIT_BATCH_MS: u128 = 50;
 const TEXT_DELTA_EMIT_BATCH_CHARS: usize = 1_200;
 
+/// Session-ID prefix for internal title-generation sessions.
+/// These sessions produce very short output (≤50 chars) and must bypass
+/// text-delta batching so titles stream visibly token-by-token.
+/// Keep in sync with TypeScript: lib/utils/internal-session.ts → INTERNAL_TITLE_PREFIX
+const TITLE_SESSION_PREFIX: &str = "__title:";
+
 struct PendingAgentTextDelta {
     event: Value,
     delta: String,
@@ -95,10 +101,8 @@ fn flush_pending_text_delta(
         }
     }
 }
-#[cfg(windows)]
-use std::path::Path;
-use std::path::PathBuf;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tauri::Emitter;
@@ -108,6 +112,37 @@ use tracing::{debug, error, info, warn};
 
 /// Signals that the background Pi install has finished (success or failure).
 static PI_INSTALL_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Captures the last bun-install error so `pi_start` can surface it to the UI
+/// when the install silently failed (e.g. Windows EPERM on bun's atomic rename).
+/// Without this, the user only sees the downstream "Pi exited with code 1" and
+/// the crash-loop, with the actual install stderr buried in app logs.
+static PI_INSTALL_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn set_pi_install_error(msg: String) {
+    if let Ok(mut guard) = PI_INSTALL_ERROR.lock() {
+        *guard = Some(msg);
+    }
+}
+
+fn take_pi_install_error() -> Option<String> {
+    PI_INSTALL_ERROR.lock().ok().and_then(|mut g| g.take())
+}
+
+/// Trim bun stderr to the last ~800 bytes for inclusion in a UI toast.
+/// The full output stays in the log file.
+fn truncate_stderr(stderr: &str) -> String {
+    const MAX: usize = 800;
+    let trimmed = stderr.trim();
+    if trimmed.len() <= MAX {
+        return trimmed.to_string();
+    }
+    let mut start = trimmed.len().saturating_sub(MAX);
+    while start < trimmed.len() && !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("...{}", &trimmed[start..])
+}
 
 /// On Windows, `.cmd` files cannot be spawned directly with `Command::new()` since
 /// Rust 1.77+ (CVE-2024-24576 fix). We must use `cmd.exe /C` to run them.
@@ -257,8 +292,10 @@ fn check_package_bin(pkg_dir: std::path::PathBuf, bin_name: &str) -> Option<Stri
     }
 }
 
-const PI_PACKAGE: &str = "@mariozechner/pi-coding-agent@0.60.0";
-const SCREENPIPE_API_URL: &str = "https://api.screenpi.pe/v1";
+const PI_PACKAGE: &str = "@earendil-works/pi-coding-agent@0.75.4";
+const PI_AI_PACKAGE: &str = "@earendil-works/pi-ai@0.75.4";
+const PI_NAMESPACE_DIR: &str = "@earendil-works";
+const SCREENPIPE_API_URL: &str = "https://api.screenpipe.com/v1";
 
 /// Pool of Pi sessions — each session_id gets its own PiManager/process.
 pub struct PiPool {
@@ -320,6 +357,78 @@ pub(crate) struct RpcResponse {
 /// Pending response channels keyed by request ID.
 /// Shared between PiManager (sender side) and the stdout reader thread (resolver side).
 type PendingResponses = Arc<std::sync::Mutex<HashMap<String, oneshot::Sender<RpcResponse>>>>;
+
+fn pi_session_has_in_flight_work(
+    queue_state: Option<&Arc<crate::pi_command_queue::PiQueueState>>,
+    pending_responses: &PendingResponses,
+) -> bool {
+    let pending_rpc = pending_responses
+        .lock()
+        .map(|pending| !pending.is_empty())
+        .unwrap_or(true);
+    pending_rpc || queue_state.map(|state| state.is_busy()).unwrap_or(false)
+}
+
+fn event_tool_call_ids(event: &Value) -> Vec<String> {
+    match event.get("type").and_then(|t| t.as_str()) {
+        Some("tool_execution_start") | Some("tool_execution_end") => event
+            .get("toolCallId")
+            .and_then(|id| id.as_str())
+            .map(|id| vec![id.to_string()])
+            .unwrap_or_default(),
+        Some("message_update") => {
+            let Some(update) = event.get("assistantMessageEvent") else {
+                return Vec::new();
+            };
+            if update.get("type").and_then(|t| t.as_str()) != Some("toolcall_end") {
+                return Vec::new();
+            }
+            update
+                .get("toolCall")
+                .and_then(|tool_call| tool_call.get("id"))
+                .and_then(|id| id.as_str())
+                .map(|id| vec![id.to_string()])
+                .unwrap_or_default()
+        }
+        Some("message_end") => {
+            let Some(message) = event.get("message") else {
+                return Vec::new();
+            };
+            match message.get("role").and_then(|role| role.as_str()) {
+                Some("assistant")
+                    if message.get("stopReason").and_then(|reason| reason.as_str())
+                        == Some("toolUse") =>
+                {
+                    message
+                        .get("content")
+                        .and_then(|content| content.as_array())
+                        .map(|content| {
+                            content
+                                .iter()
+                                .filter(|item| {
+                                    item.get("type").and_then(|t| t.as_str()) == Some("toolCall")
+                                })
+                                .filter_map(|item| {
+                                    item.get("id")
+                                        .or_else(|| item.get("toolCallId"))
+                                        .and_then(|id| id.as_str())
+                                        .map(|id| id.to_string())
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                }
+                Some("toolResult") => message
+                    .get("toolCallId")
+                    .and_then(|id| id.as_str())
+                    .map(|id| vec![id.to_string()])
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            }
+        }
+        _ => Vec::new(),
+    }
+}
 
 #[allow(dead_code)]
 pub struct PiManager {
@@ -429,12 +538,70 @@ impl PiManager {
     pub fn is_running(&mut self) -> bool {
         self.check_alive()
     }
+
+    fn has_in_flight_work(&self) -> bool {
+        pi_session_has_in_flight_work(self.queue_state.as_ref(), &self.pending_responses)
+    }
 }
 
-/// Get the Pi config directory (~/.pi/agent)
+/// Get the Pi config directory — screenpipe's isolated agent dir
+/// (`~/.screenpipe/pi-config`), never the user's global `~/.pi/agent`.
+/// Delegates to screenpipe-core, which also runs the one-time seed
+/// migration from the global dir.
+/// See https://github.com/screenpipe/screenpipe/issues/4002
+/// and https://github.com/screenpipe/screenpipe/issues/3812.
 fn get_pi_config_dir() -> Result<PathBuf, String> {
-    let home_dir = dirs::home_dir().ok_or_else(|| "Could not find home directory".to_string())?;
-    Ok(home_dir.join(".pi").join("agent"))
+    screenpipe_core::agents::pi::pi_config_dir().map_err(|e| e.to_string())
+}
+
+fn remove_screenpipe_auth_from_path(auth_path: &Path) -> Result<(), String> {
+    if !auth_path.exists() {
+        return Ok(());
+    }
+
+    let content =
+        std::fs::read_to_string(auth_path).map_err(|e| format!("Failed to read pi auth: {}", e))?;
+    let mut auth: serde_json::Value = serde_json::from_str(&content).unwrap_or_else(|_| json!({}));
+
+    let removed = auth
+        .as_object_mut()
+        .map(|obj| obj.remove("screenpipe").is_some())
+        .unwrap_or(false);
+
+    if !removed {
+        return Ok(());
+    }
+
+    let auth_str = serde_json::to_string_pretty(&auth)
+        .map_err(|e| format!("Failed to serialize pi auth: {}", e))?;
+    std::fs::write(auth_path, auth_str).map_err(|e| format!("Failed to write pi auth: {}", e))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        let _ = std::fs::set_permissions(auth_path, perms);
+    }
+
+    Ok(())
+}
+
+pub(crate) fn clear_screenpipe_auth_token_files() -> Result<(), String> {
+    let auth_path = get_pi_config_dir()?.join("auth.json");
+    remove_screenpipe_auth_from_path(&auth_path)
+}
+
+/// chmod 600 (unix): pi's `auth.json` / `models.json` embed the user's raw
+/// cloud JWT while signed in (#3943) — keep them out of reach of other local
+/// users. No-op on Windows (per-user ACLs already apply under %USERPROFILE%).
+fn harden_secret_file(path: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// Parse the output of `where pi` on Windows, preferring .cmd files
@@ -469,54 +636,133 @@ fn pi_local_install_dir() -> Option<PathBuf> {
     Some(screenpipe_core::paths::default_screenpipe_data_dir().join("pi-agent"))
 }
 
+fn pi_package_dir(install_dir: &Path) -> PathBuf {
+    install_dir
+        .join("node_modules")
+        .join(PI_NAMESPACE_DIR)
+        .join("pi-coding-agent")
+}
+
 /// Seed the pi-agent package.json with overrides and dependencies to fix resolution.
 /// `hosted-git-info` requires `lru-cache@^10`, but bun on Windows can hoist
 /// an ESM-only lru-cache@7.x that breaks CJS `require()`.
-/// `@mariozechner/pi-ai` requires `@anthropic-ai/sdk`, but bun on Windows
-/// fails to hoist it from the transitive dependency tree.
-/// Writing these before `bun add` ensures correct versions are used.
+/// `@earendil-works/pi-ai` and `@anthropic-ai/sdk` are transitive deps that
+/// bun on Windows fails to hoist into the top-level node_modules, so we
+/// pin them as direct deps. Writing these before `bun add` ensures correct
+/// versions are used.
+///
+/// Also strips legacy `@mariozechner/*` keys (the namespace was renamed
+/// upstream — see issue #3527) so installs migrating from 2.4.258 and
+/// earlier don't carry stale entries.
 fn seed_pi_package_json(install_dir: &std::path::Path) {
     let pkg_path = install_dir.join("package.json");
-    // Only seed if package.json doesn't exist yet — don't overwrite user/bun changes
+    // Force-pin the current expected versions even when package.json already
+    // exists. Earlier this only *added* missing fields, which left stale
+    // version ranges in place after a pi-coding-agent bump. The 0.60.0 → 0.73.1
+    // jump silently leaves users on the old `^0.33.1` anthropic-sdk range that
+    // bun cannot reconcile with the new pi-ai's `^0.91.1` requirement →
+    // pi process dies 2s after spawn, supervisor gives up after 18 retries,
+    // main app exits with code 255. macOS Enterprise v2.4.244 hit this on
+    // every upgrade from 243.
+    let expected_sdk = json!("^0.91.1");
+    let expected_pi_version = json!(PI_PACKAGE.rsplit('@').next().unwrap_or(""));
+    let expected_pi_ai_version = json!(PI_AI_PACKAGE.rsplit('@').next().unwrap_or(""));
+    let expected_cross_spawn = json!("^7.0.6");
+    let expected_overrides = json!({
+        "hosted-git-info": {
+            "lru-cache": "^10.0.0"
+        }
+    });
+
     if pkg_path.exists() {
-        if let Ok(contents) = std::fs::read_to_string(&pkg_path) {
-            let mut changed = false;
-            if let Ok(mut pkg) = serde_json::from_str::<serde_json::Value>(&contents) {
+        match std::fs::read_to_string(&pkg_path)
+            .ok()
+            .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok())
+        {
+            Some(mut pkg) => {
+                let mut changed = false;
+                let mut removed_legacy = 0usize;
                 if let Some(obj) = pkg.as_object_mut() {
-                    // Ensure overrides are present
-                    if !contents.contains("overrides") {
-                        obj.insert(
-                            "overrides".to_string(),
-                            json!({
-                                "hosted-git-info": {
-                                    "lru-cache": "^10.0.0"
-                                }
-                            }),
-                        );
+                    if obj.get("overrides") != Some(&expected_overrides) {
+                        obj.insert("overrides".to_string(), expected_overrides.clone());
                         changed = true;
                     }
-                    // Ensure @anthropic-ai/sdk is a direct dependency (Windows bun fix)
-                    if !contents.contains("@anthropic-ai/sdk") {
-                        let deps = obj.entry("dependencies").or_insert_with(|| json!({}));
-                        if let Some(deps_obj) = deps.as_object_mut() {
-                            deps_obj.insert("@anthropic-ai/sdk".to_string(), json!("^0.73.0"));
+                    let deps = obj.entry("dependencies").or_insert_with(|| json!({}));
+                    if let Some(deps_obj) = deps.as_object_mut() {
+                        let legacy_keys: Vec<String> = deps_obj
+                            .keys()
+                            .filter(|k| k.starts_with("@mariozechner/"))
+                            .cloned()
+                            .collect();
+                        for k in &legacy_keys {
+                            deps_obj.remove(k);
+                            changed = true;
                         }
-                        changed = true;
+                        removed_legacy = legacy_keys.len();
+                        if deps_obj.get("@anthropic-ai/sdk") != Some(&expected_sdk) {
+                            deps_obj.insert("@anthropic-ai/sdk".to_string(), expected_sdk.clone());
+                            changed = true;
+                        }
+                        if deps_obj.get("@earendil-works/pi-coding-agent")
+                            != Some(&expected_pi_version)
+                        {
+                            deps_obj.insert(
+                                "@earendil-works/pi-coding-agent".to_string(),
+                                expected_pi_version.clone(),
+                            );
+                            changed = true;
+                        }
+                        if deps_obj.get("@earendil-works/pi-ai") != Some(&expected_pi_ai_version) {
+                            deps_obj.insert(
+                                "@earendil-works/pi-ai".to_string(),
+                                expected_pi_ai_version.clone(),
+                            );
+                            changed = true;
+                        }
+                        if deps_obj.get("cross-spawn") != Some(&expected_cross_spawn) {
+                            deps_obj
+                                .insert("cross-spawn".to_string(), expected_cross_spawn.clone());
+                            changed = true;
+                        }
                     }
                 }
                 if changed {
                     if let Ok(new_contents) = serde_json::to_string_pretty(&pkg) {
                         let _ = std::fs::write(&pkg_path, new_contents);
-                        info!("Patched pi-agent package.json (overrides + anthropic sdk)");
+                        // bun.lock pins the old transitive tree — must be
+                        // dropped so the next `bun install` re-resolves
+                        // against the corrected ranges.
+                        let _ = std::fs::remove_file(install_dir.join("bun.lock"));
+                        let _ = std::fs::remove_file(install_dir.join("bun.lockb"));
+                        info!(
+                            "Patched pi-agent package.json (pins: pi {}, anthropic sdk {}, pi-ai {}, cross-spawn {}; dropped {} legacy @mariozechner deps)",
+                            expected_pi_version,
+                            expected_sdk,
+                            expected_pi_ai_version,
+                            expected_cross_spawn,
+                            removed_legacy
+                        );
                     }
                 }
+                return;
+            }
+            None => {
+                warn!(
+                    "pi-agent package.json at {} is unreadable or corrupted — re-seeding",
+                    pkg_path.display()
+                );
+                let _ = std::fs::remove_file(&pkg_path);
+                let _ = std::fs::remove_file(install_dir.join("bun.lock"));
+                let _ = std::fs::remove_file(install_dir.join("bun.lockb"));
             }
         }
-        return;
     }
     let pkg_json = json!({
         "dependencies": {
-            "@anthropic-ai/sdk": "^0.73.0"
+            "@anthropic-ai/sdk": expected_sdk,
+            "@earendil-works/pi-coding-agent": expected_pi_version,
+            "@earendil-works/pi-ai": expected_pi_ai_version,
+            "cross-spawn": expected_cross_spawn,
         },
         "overrides": {
             "hosted-git-info": {
@@ -528,18 +774,14 @@ fn seed_pi_package_json(install_dir: &std::path::Path) {
         &pkg_path,
         serde_json::to_string_pretty(&pkg_json).unwrap_or_default(),
     ) {
-        Ok(_) => info!("Seeded pi-agent package.json with lru-cache overrides"),
+        Ok(_) => info!("Seeded pi-agent package.json with direct deps + overrides"),
         Err(e) => warn!("Failed to seed pi-agent package.json: {}", e),
     }
 }
 
 /// Check if the locally-installed pi version matches the expected version.
 fn is_local_pi_version_current(install_dir: &std::path::Path) -> bool {
-    let pkg_json = install_dir
-        .join("node_modules")
-        .join("@mariozechner")
-        .join("pi-coding-agent")
-        .join("package.json");
+    let pkg_json = pi_package_dir(install_dir).join("package.json");
     let contents = match std::fs::read_to_string(&pkg_json) {
         Ok(c) => c,
         Err(_) => return false,
@@ -552,7 +794,7 @@ fn is_local_pi_version_current(install_dir: &std::path::Path) -> bool {
         Some(v) => v,
         None => return false,
     };
-    // PI_PACKAGE is "@mariozechner/pi-coding-agent@0.60.0" — extract version after last '@'
+    // PI_PACKAGE is "<scope>/pi-coding-agent@<ver>" — extract version after last '@'
     let expected = PI_PACKAGE.rsplit('@').next().unwrap_or("");
     if installed != expected {
         info!(
@@ -564,15 +806,201 @@ fn is_local_pi_version_current(install_dir: &std::path::Path) -> bool {
     true
 }
 
+fn node_module_package_dir(base_dir: &Path, package_name: &str) -> PathBuf {
+    let mut package_dir = base_dir.join("node_modules");
+    for segment in package_name.split('/') {
+        package_dir.push(segment);
+    }
+    package_dir
+}
+
+fn resolve_node_module_package_from(
+    start_dir: &Path,
+    stop_dir: &Path,
+    package_name: &str,
+) -> Option<PathBuf> {
+    let mut cursor = start_dir.to_path_buf();
+    loop {
+        let package_dir = node_module_package_dir(&cursor, package_name);
+        if package_dir.join("package.json").exists() {
+            return Some(package_dir);
+        }
+        if cursor == stop_dir || !cursor.pop() {
+            break;
+        }
+    }
+    None
+}
+
+fn local_pi_install_integrity_error(install_dir: &Path) -> Option<String> {
+    let pi_dir = pi_package_dir(install_dir);
+    let cli_js = pi_dir.join("dist").join("cli.js");
+    if !cli_js.exists() {
+        return Some(format!("missing Pi entrypoint at {}", cli_js.display()));
+    }
+
+    if !is_local_pi_version_current(install_dir) {
+        return Some(format!("Pi package version is not {}", PI_PACKAGE));
+    }
+
+    let resolve_start = pi_dir.join("dist");
+    for package_name in ["@earendil-works/pi-ai", "@anthropic-ai/sdk", "cross-spawn"] {
+        if resolve_node_module_package_from(&resolve_start, install_dir, package_name).is_none() {
+            return Some(format!(
+                "missing Pi dependency {} from {}",
+                package_name,
+                pi_dir.display()
+            ));
+        }
+    }
+
+    None
+}
+
+fn clear_pi_install_artifacts(install_dir: &Path) {
+    let _ = std::fs::remove_dir_all(install_dir.join("node_modules"));
+    let _ = std::fs::remove_file(install_dir.join("bun.lock"));
+    let _ = std::fs::remove_file(install_dir.join("bun.lockb"));
+    let _ = std::fs::remove_file(install_dir.join("package-lock.json"));
+}
+
+fn apply_no_window(_cmd: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        _cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
+fn run_command_output(mut cmd: Command) -> Result<Output, String> {
+    apply_no_window(&mut cmd);
+    cmd.output().map_err(|e| format!("failed to spawn: {}", e))
+}
+
+fn format_install_failure(tool: &str, output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Prefer stderr, fall back to stdout (bun reports some failures there),
+    // and never let both-empty reduce the message to a bare "stderr: " —
+    // signal deaths (SIGILL/SIGKILL) produce exactly that shape.
+    let details = if !stderr.trim().is_empty() {
+        truncate_stderr(&stderr)
+    } else if !stdout.trim().is_empty() {
+        format!("(stdout) {}", truncate_stderr(&stdout))
+    } else {
+        "(no output captured)".to_string()
+    };
+    format!(
+        "{} install failed ({}). output: {}",
+        tool,
+        screenpipe_core::agents::pi::describe_exit_status(&output.status),
+        details
+    )
+}
+
+fn should_retry_install_with_npm(stderr: &str) -> bool {
+    let lower = stderr.to_lowercase();
+    lower.contains("eperm")
+        && (lower.contains("ntsetinformationfile")
+            || lower.contains("cache dir")
+            || lower.contains("extracting tarball")
+            || lower.contains("moving"))
+}
+
+fn npm_install_command(install_dir: &Path) -> Command {
+    #[cfg(windows)]
+    {
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/C", "npm", "install", "--no-audit", "--no-fund"])
+            .current_dir(install_dir);
+        cmd
+    }
+
+    #[cfg(not(windows))]
+    {
+        let mut cmd = Command::new("npm");
+        cmd.args(["install", "--no-audit", "--no-fund"])
+            .current_dir(install_dir);
+        cmd
+    }
+}
+
+fn verify_pi_package_install(install_dir: &Path) -> Result<(), String> {
+    match local_pi_install_integrity_error(install_dir) {
+        Some(error) => Err(format!(
+            "Pi install completed but dependency verification failed: {}",
+            error
+        )),
+        None => Ok(()),
+    }
+}
+
+fn run_pi_package_install(install_dir: &Path, bun: &str) -> Result<(), String> {
+    let cache_dir = install_dir.join(".bun-cache");
+    let _ = std::fs::create_dir_all(&cache_dir);
+
+    // Log the exact command + bun version so a failed install is reproducible
+    // from the log alone; a bun that can't even execute (e.g. SIGILL on an
+    // unsupported CPU) shows up right here as the version probe failing.
+    info!(
+        "Running Pi dependency install: {} install (cwd: {}, bun version: {})",
+        bun,
+        install_dir.display(),
+        screenpipe_core::agents::pi::bun_version_string(bun),
+    );
+
+    let mut bun_cmd = Command::new(bun);
+    bun_cmd
+        .current_dir(install_dir)
+        .env("BUN_INSTALL_CACHE_DIR", &cache_dir)
+        .args(["install"]);
+
+    match run_command_output(bun_cmd) {
+        Ok(output) if output.status.success() => verify_pi_package_install(install_dir),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let combined_output = format!("{}\n{}", stderr, stdout);
+            let bun_failure = format_install_failure("bun", &output);
+            if should_retry_install_with_npm(&combined_output) {
+                warn!(
+                    "Pi bun install hit cache/EPERM failure; retrying with npm: {}",
+                    bun_failure
+                );
+                match run_command_output(npm_install_command(install_dir)) {
+                    Ok(npm_output) if npm_output.status.success() => {
+                        verify_pi_package_install(install_dir)
+                    }
+                    Ok(npm_output) => Err(format!(
+                        "{}; npm fallback also failed: {}",
+                        bun_failure,
+                        format_install_failure("npm", &npm_output)
+                    )),
+                    Err(e) => Err(format!(
+                        "{}; npm fallback could not run: {}",
+                        bun_failure, e
+                    )),
+                }
+            } else {
+                Err(bun_failure)
+            }
+        }
+        Err(e) => Err(format!("could not spawn bun: {}", e)),
+    }
+}
+
+fn repair_local_pi_install(install_dir: &Path, bun: &str, reason: &str) -> Result<(), String> {
+    warn!("Repairing local pi-agent install: {}", reason);
+    clear_pi_install_artifacts(install_dir);
+    seed_pi_package_json(install_dir);
+    run_pi_package_install(install_dir, bun)
+}
+
 /// Find the JS entrypoint for the locally-installed pi package.
 fn find_local_pi_entrypoint() -> Option<String> {
     let dir = pi_local_install_dir()?;
-    let cli_js = dir
-        .join("node_modules")
-        .join("@mariozechner")
-        .join("pi-coding-agent")
-        .join("dist")
-        .join("cli.js");
+    let cli_js = pi_package_dir(&dir).join("dist").join("cli.js");
     if cli_js.exists() {
         Some(cli_js.to_string_lossy().to_string())
     } else {
@@ -580,37 +1008,15 @@ fn find_local_pi_entrypoint() -> Option<String> {
     }
 }
 
-/// Extract the plain-text content from a pi-mono `message` JSON value (the
-/// shape that ships in `message_start`/`message_end` events). pi-mono encodes
-/// user messages as either `content: "string"` or
-/// `content: [{type: "text", text: "..."}, ...]`. We concatenate all text
-/// parts in order. Used to match an incoming user message against the queued
-/// prompt rail's preview text.
-fn extract_user_message_text(msg: &serde_json::Value) -> String {
-    let content = match msg.get("content") {
-        Some(c) => c,
-        None => return String::new(),
-    };
-    if let Some(s) = content.as_str() {
-        return s.to_string();
-    }
-    if let Some(arr) = content.as_array() {
-        let mut out = String::new();
-        for part in arr {
-            if part.get("type").and_then(|t| t.as_str()) == Some("text") {
-                if let Some(t) = part.get("text").and_then(|v| v.as_str()) {
-                    out.push_str(t);
-                }
-            }
-        }
-        return out;
-    }
-    String::new()
-}
-
 fn find_pi_executable() -> Option<String> {
     // 1. Check screenpipe-managed local install first (preferred — we control the deps)
     if let Some(js) = find_local_pi_entrypoint() {
+        if let Some(install_dir) = pi_local_install_dir() {
+            if let Some(error) = local_pi_install_integrity_error(&install_dir) {
+                warn!("Ignoring unhealthy local pi-agent install: {}", error);
+                return None;
+            }
+        }
         return Some(js);
     }
 
@@ -722,6 +1128,42 @@ fn ensure_web_search_extension(
         );
     }
 
+    Ok(())
+}
+
+/// Install the MCP bridge extension. Registers proxy tools that route
+/// `sp_mcp_call` / `sp_mcp_list_tools` requests through the local
+/// `/mcp-servers/*` API. Always installed — does nothing when zero
+/// servers are registered.
+fn ensure_mcp_bridge_extension(project_dir: &str) -> Result<(), String> {
+    let ext_dir = std::path::Path::new(project_dir)
+        .join(".pi")
+        .join("extensions");
+    std::fs::create_dir_all(&ext_dir)
+        .map_err(|e| format!("Failed to create extensions dir: {}", e))?;
+
+    let ext_path = ext_dir.join("mcp-bridge.ts");
+    let ext_content = include_str!("../assets/extensions/mcp-bridge.ts");
+    std::fs::write(&ext_path, ext_content)
+        .map_err(|e| format!("Failed to write mcp-bridge extension: {}", e))?;
+
+    debug!("mcp-bridge extension installed at {:?}", ext_path);
+    Ok(())
+}
+
+fn ensure_save_artifact_extension(project_dir: &str) -> Result<(), String> {
+    let ext_dir = std::path::Path::new(project_dir)
+        .join(".pi")
+        .join("extensions");
+    std::fs::create_dir_all(&ext_dir)
+        .map_err(|e| format!("Failed to create extensions dir: {}", e))?;
+
+    let ext_path = ext_dir.join("save-artifact.ts");
+    let ext_content = include_str!("../assets/extensions/save-artifact.ts");
+    std::fs::write(&ext_path, ext_content)
+        .map_err(|e| format!("Failed to write save-artifact extension: {}", e))?;
+
+    debug!("save-artifact extension installed at {:?}", ext_path);
     Ok(())
 }
 
@@ -905,10 +1347,11 @@ async fn ensure_pi_config(
         .map_err(|e| format!("Failed to serialize models config: {}", e))?;
     std::fs::write(&models_path, models_str)
         .map_err(|e| format!("Failed to write pi models config: {}", e))?;
+    harden_secret_file(&models_path);
 
     // -- auth.json: merge screenpipe token, preserve other providers --
-    if let Some(token) = user_token {
-        let auth_path = config_dir.join("auth.json");
+    let auth_path = config_dir.join("auth.json");
+    if let Some(token) = user_token.filter(|token| !token.is_empty()) {
         let mut auth: serde_json::Value = if auth_path.exists() {
             let content = std::fs::read_to_string(&auth_path).unwrap_or_default();
             serde_json::from_str(&content).unwrap_or_else(|_| json!({}))
@@ -924,6 +1367,9 @@ async fn ensure_pi_config(
             .map_err(|e| format!("Failed to serialize auth: {}", e))?;
         std::fs::write(&auth_path, auth_str)
             .map_err(|e| format!("Failed to write pi auth: {}", e))?;
+        harden_secret_file(&auth_path);
+    } else {
+        remove_screenpipe_auth_from_path(&auth_path)?;
     }
 
     info!("Pi config merged at {:?}", models_path);
@@ -1041,7 +1487,7 @@ const PI_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2
 
 /// Resolve a model name for the screenpipe provider.
 ///
-/// The gateway (api.screenpi.pe) is the source of truth for model validation
+/// The gateway (api.screenpipe.com) is the source of truth for model validation
 /// and supports many more models than the local hardcoded list (OpenRouter,
 /// Gemini, Anthropic, etc.). We only do lightweight normalization here
 /// (strip date suffixes) and pass through to the gateway which will reject
@@ -1109,6 +1555,12 @@ pub async fn pi_start_inner(
     // Install web-search extension only for screenpipe-cloud presets
     ensure_web_search_extension(&project_dir, provider_config.as_ref())?;
 
+    // MCP bridge: lets the agent reach user-registered MCP servers.
+    ensure_mcp_bridge_extension(&project_dir)?;
+
+    // Save artifact: lets the agent register deliverables in the Artifacts library.
+    ensure_save_artifact_extension(&project_dir)?;
+
     // Ensure Pi is configured with the user's provider
     ensure_pi_config(user_token.as_deref(), provider_config.as_ref()).await?;
 
@@ -1138,6 +1590,16 @@ pub async fn pi_start_inner(
     if let Some(m) = pool.sessions.get_mut(&sid) {
         if m.is_running() {
             let old_pid = m.child.as_ref().map(|c| c.id());
+            if m.has_in_flight_work() {
+                warn!(
+                    "Refusing to restart busy pi instance (pid {:?}) for session '{}'",
+                    old_pid, sid
+                );
+                return Err(format!(
+                    "Pi session '{}' is still working; retry the restart after the current turn finishes",
+                    sid
+                ));
+            }
             info!(
                 "Stopping existing pi instance (pid {:?}) for session '{}' to start new one",
                 old_pid, sid
@@ -1231,7 +1693,10 @@ pub async fn pi_start_inner(
                 .ok_or_else(|| {
                     let bun_found = find_bun_executable().is_some();
                     if bun_found {
-                        format!("Pi not found after install attempt. Try restarting the app or delete ~/.screenpipe/pi-agent and restart.")
+                        let install_err = take_pi_install_error()
+                            .map(|e| format!(" Install error: {}", e))
+                            .unwrap_or_default();
+                        format!("Pi not found after install attempt.{} Try restarting the app or delete ~/.screenpipe/pi-agent and restart.", install_err)
                     } else {
                         format!("Pi not found: bun is not installed. Screenpipe needs bun to run the AI assistant. Expected bundled bun next to the app executable.")
                     }
@@ -1377,6 +1842,11 @@ pub async fn pi_start_inner(
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
+    // Scope pi to screenpipe's isolated agent dir (never ~/.pi/agent).
+    screenpipe_core::agents::pi::apply_pi_isolation_env(&mut |k, v| {
+        cmd.env(k, v);
+    });
+
     if let Some(ref token) = user_token {
         cmd.env("SCREENPIPE_API_KEY", token);
     }
@@ -1392,31 +1862,22 @@ pub async fn pi_start_inner(
         }
     }
 
+    // Tag this chat's local API calls with its session id so the owned-browser
+    // sidebar reveals the agent's browser only in the chat that launched it.
+    // `sid` equals the frontend `conversationId`; the bash shim forwards it as
+    // x-screenpipe-session and the navigate handler rides it to the frontend.
+    // If the user switches to another chat mid-run, this agent's later
+    // navigations no longer match the on-screen conversation and stay hidden.
+    cmd.env("SCREENPIPE_SESSION_ID", &sid);
+
+    // Chat session ID for per-session artifact isolation
+    cmd.env("SCREENPIPE_CHAT_SESSION_ID", &sid);
+
     // Auto-auth the agent's `curl localhost:3030/...` calls via a bash
     // shim sourced from $BASH_ENV on every subshell. See bash_env.rs in
     // screenpipe-core.
     if let Ok(p) = screenpipe_core::agents::bash_env::ensure_wrapper_in_default_dir() {
         cmd.env("BASH_ENV", p);
-    }
-
-    // Privacy filter: if the user enabled the toggle in chat, set the env
-    // var the shim reads so every `curl .../search*` gets rewritten with
-    // `filter_pii=1`. Pro-gated client-side — non-pro can't flip the UI
-    // toggle so this branch won't fire for them.
-    if let Some(home) = dirs::home_dir() {
-        let store_path = home.join(".screenpipe").join("store.bin");
-        if let Ok(data) = std::fs::read_to_string(&store_path) {
-            if let Ok(store) = serde_json::from_str::<serde_json::Value>(&data) {
-                let settings = store.get("settings").unwrap_or(&store);
-                if settings
-                    .get("piPrivacyFilter")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
-                    cmd.env("SCREENPIPE_FILTER_PII", "1");
-                }
-            }
-        }
     }
 
     // Pass the user's API key as env var for non-screenpipe providers
@@ -1453,6 +1914,16 @@ pub async fn pi_start_inner(
                 }
             }
         }
+    }
+
+    // Backstop: if local_api_context_from_app couldn't resolve a key earlier
+    // (line ~1477) but the disk-backed store has one, set it here so
+    // mcp-bridge.ts can authenticate its GET /mcp-servers calls. Sets the
+    // canonical name + the deprecated alias for old pipe.md files on disk.
+    // TODO(remove next release): drop SCREENPIPE_API_AUTH_KEY alias.
+    if let Some(key) = crate::store::resolved_api_auth_key() {
+        cmd.env("SCREENPIPE_LOCAL_API_KEY", &key);
+        cmd.env("SCREENPIPE_API_AUTH_KEY", key); // deprecated alias
     }
 
     // Spawn process
@@ -1551,6 +2022,7 @@ pub async fn pi_start_inner(
     // so pi_start_inner can return without a blind 1500ms sleep.
     let ready_notify = Arc::new(tokio::sync::Notify::new());
     let ready_notify_reader = ready_notify.clone();
+    let first_stderr_line = Arc::new(std::sync::Mutex::new(None::<String>));
 
     // Spawn stdout reader thread — this is the SOLE emitter of `pi_terminated`.
     let app_handle = app.clone();
@@ -1612,45 +2084,77 @@ pub async fn pi_start_inner(
                         // mid-stream `response` ACK doesn't unblock the
                         // queue early.
                         qs.mark_agent_active();
+                        // If a steer was in flight, it has now started its
+                        // agent turn. The drain loop can rely on agent_active
+                        // from here on.
+                        qs.clear_steer_in_flight();
                     }
                     Some("agent_end") => {
-                        // Note: pi-mono fires `agent_end` mid-prompt during
-                        // its auto-retry path. Only `mark_agent_idle` here —
-                        // pi-mono's followUp queue (engaged via
-                        // `streamingBehavior: "followUp"` on prompt commands)
-                        // is what serializes back-to-back prompts now, so we
-                        // don't need `signal_done` to gate the next prompt.
-                        // The done_notify is still fired so WaitDone callers
-                        // (new_session/abort) advance.
                         qs.mark_agent_idle();
-                        qs.signal_done();
+                        qs.signal_done_if_idle();
                     }
                     Some("message_start") => {
-                        // Pi-mono just started processing a message. If it's
-                        // a user message, find the matching entry in the
-                        // queued-prompt rail and remove it — this is the
-                        // moment the prompt transitions from "queued in
-                        // pi-mono's followUp queue" to in-flight.
-                        if let Some(parsed_v) = parsed.as_ref() {
-                            if let Some(msg) = parsed_v.get("message") {
-                                let role = msg.get("role").and_then(|r| r.as_str());
-                                if role == Some("user") {
-                                    let text = extract_user_message_text(msg);
-                                    if !text.is_empty() {
-                                        qs.dequeue_first_matching_text(&text);
+                        // Native steer may not emit agent_start — it goes
+                        // straight from message_start to text deltas. If a
+                        // steer is in flight, treat message_start as the
+                        // start of the steered turn so the drain loop
+                        // stays blocked via agent_active until agent_end.
+                        if qs.is_steer_in_flight() {
+                            qs.mark_agent_active();
+                            qs.clear_steer_in_flight();
+                        }
+                    }
+                    Some("message_end") => {
+                        if let Some(event) = parsed.as_ref() {
+                            let ids = event_tool_call_ids(event);
+                            let role = event
+                                .get("message")
+                                .and_then(|message| message.get("role"))
+                                .and_then(|role| role.as_str());
+                            match role {
+                                Some("assistant") => {
+                                    for id in ids {
+                                        qs.mark_tool_active(id);
                                     }
                                 }
+                                Some("toolResult") => {
+                                    for id in ids {
+                                        qs.mark_tool_idle(&id);
+                                    }
+                                    qs.signal_done_if_idle();
+                                }
+                                _ => {}
                             }
                         }
                     }
+                    Some("message_update") => {
+                        if let Some(event) = parsed.as_ref() {
+                            for id in event_tool_call_ids(event) {
+                                qs.mark_tool_active(id);
+                            }
+                        }
+                    }
+                    Some("tool_execution_start") => {
+                        if let Some(event) = parsed.as_ref() {
+                            for id in event_tool_call_ids(event) {
+                                qs.mark_tool_active(id);
+                            }
+                        }
+                    }
+                    Some("tool_execution_end") => {
+                        if let Some(event) = parsed.as_ref() {
+                            for id in event_tool_call_ids(event) {
+                                qs.mark_tool_idle(&id);
+                            }
+                        }
+                        qs.signal_done_if_idle();
+                    }
                     Some("response") => {
                         // Only meaningful for new_session/abort — those don't
-                        // fire agent_start/agent_end. For prompts (which use
-                        // WriteOnly and rely on pi-mono's internal queue),
-                        // firing done here is unnecessary; suppress while a
-                        // prompt is mid-stream so we don't race the active
-                        // turn for any blocking caller.
-                        if !qs.is_agent_active() {
+                        // fire agent_start/agent_end. Suppress while a prompt
+                        // or tool is mid-turn so the queue never advances on
+                        // an ACK while the assistant is still working.
+                        if !qs.has_active_turn_work() {
                             // Note: this runs on a std::thread (not tokio),
                             // so use std::thread::spawn + std::thread::sleep.
                             let qs = qs.clone();
@@ -1681,23 +2185,35 @@ pub async fn pi_start_inner(
                     }
 
                     if let Some(delta) = assistant_text_delta(&event).map(str::to_owned) {
-                        let pending =
-                            pending_text_delta.get_or_insert_with(|| PendingAgentTextDelta {
-                                event: event.clone(),
-                                delta: String::new(),
-                                started_at: std::time::Instant::now(),
-                            });
-                        pending.event = event;
-                        pending.delta.push_str(&delta);
+                        // Title sessions bypass batching — they produce ≤50 chars
+                        // and must stream token-by-token for visible animation.
+                        if sid_clone.starts_with(TITLE_SESSION_PREFIX) {
+                            let mut immediate = event;
+                            set_assistant_text_delta(&mut immediate, delta);
+                            if let Err(e) = emit_agent_event(&app_handle, &sid_clone, immediate) {
+                                error!("Failed to emit title text_delta: {}", e);
+                            }
+                        } else {
+                            // Normal sessions: batch text deltas to reduce IPC chatter.
+                            let pending =
+                                pending_text_delta.get_or_insert_with(|| PendingAgentTextDelta {
+                                    event: event.clone(),
+                                    delta: String::new(),
+                                    started_at: std::time::Instant::now(),
+                                });
+                            pending.event = event;
+                            pending.delta.push_str(&delta);
 
-                        if pending.delta.len() >= TEXT_DELTA_EMIT_BATCH_CHARS
-                            || pending.started_at.elapsed().as_millis() >= TEXT_DELTA_EMIT_BATCH_MS
-                        {
-                            flush_pending_text_delta(
-                                &app_handle,
-                                &sid_clone,
-                                &mut pending_text_delta,
-                            );
+                            if pending.delta.len() >= TEXT_DELTA_EMIT_BATCH_CHARS
+                                || pending.started_at.elapsed().as_millis()
+                                    >= TEXT_DELTA_EMIT_BATCH_MS
+                            {
+                                flush_pending_text_delta(
+                                    &app_handle,
+                                    &sid_clone,
+                                    &mut pending_text_delta,
+                                );
+                            }
                         }
                     } else {
                         flush_pending_text_delta(&app_handle, &sid_clone, &mut pending_text_delta);
@@ -1718,7 +2234,8 @@ pub async fn pi_start_inner(
                 }
             }
             if !is_stdout_text_delta {
-                if let Err(e) = app_handle.emit("pi_output", &line) {
+                let event_name = format!("pi_output:{}", sid_clone);
+                if let Err(e) = app_handle.emit(&event_name, &line) {
                     error!("Failed to emit pi_output: {}", e);
                 }
             }
@@ -1757,10 +2274,18 @@ pub async fn pi_start_inner(
     if let Some(stderr) = stderr {
         let app_handle = app.clone();
         let sid_stderr = sid.clone();
+        let first_stderr_for_error = first_stderr_line.clone();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stderr);
             info!("Pi stderr reader started (session: {})", sid_stderr);
             while let Some(line) = read_lines_lossy(&mut reader) {
+                if !line.trim().is_empty() {
+                    if let Ok(mut first) = first_stderr_for_error.lock() {
+                        if first.is_none() {
+                            *first = Some(line.clone());
+                        }
+                    }
+                }
                 // Try to parse as JSON RPC event and forward like stdout
                 if let Ok(event) = serde_json::from_str::<Value>(&line) {
                     let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("?");
@@ -1778,7 +2303,8 @@ pub async fn pi_start_inner(
                     if let Err(e) = app_handle.emit("agent_event", &unified) {
                         error!("Failed to emit agent_event from stderr: {}", e);
                     }
-                    if let Err(e) = app_handle.emit("pi_output", &line) {
+                    let event_name = format!("pi_output:{}", sid_stderr);
+                    if let Err(e) = app_handle.emit(&event_name, &line) {
                         error!("Failed to emit pi_output from stderr: {}", e);
                     }
                 } else {
@@ -1811,7 +2337,21 @@ pub async fn pi_start_inner(
                         error!("Pi process exited immediately with code {} — check 'Pi stderr:' warnings above for details (bun path: {})", code, bun_path);
                         m.child = None;
                         m.stdin = None;
-                        return Err(format!("Pi exited immediately with code {} (bun: {}). Check app logs for 'Pi stderr:' lines.", code, bun_path));
+                        let install_hint = take_pi_install_error()
+                            .map(|e| format!(" The Pi install previously failed: {} Try removing ~/.screenpipe/pi-agent and restarting.", e))
+                            .unwrap_or_default();
+                        let stderr_hint = first_stderr_line
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.clone())
+                            .map(|line| format!(" First Pi stderr: {}", truncate_stderr(&line)))
+                            .unwrap_or_else(|| {
+                                " Check app logs for 'Pi stderr:' lines.".to_string()
+                            });
+                        return Err(format!(
+                            "Pi exited immediately with code {} (bun: {}).{}{}",
+                            code, bun_path, install_hint, stderr_hint
+                        ));
                     }
                     Ok(None) => {
                         // Still running — good
@@ -1842,17 +2382,82 @@ pub struct PiImageContent {
     pub data: String, // base64-encoded image data
 }
 
+fn build_prompt_command(
+    message: String,
+    images: Option<Vec<PiImageContent>>,
+) -> Result<Value, String> {
+    let mut cmd = json!({
+        "type": "prompt",
+        "message": message,
+    });
+    if let Some(imgs) = images {
+        if !imgs.is_empty() {
+            cmd["images"] = serde_json::to_value(imgs).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(cmd)
+}
+
+async fn open_secret_store_for_connection_context() -> Option<screenpipe_secrets::SecretStore> {
+    let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    let db_path = data_dir.join("db.sqlite");
+    let secret_key = match crate::secrets::get_key_if_encryption_enabled() {
+        crate::secrets::KeyResult::Found(k) => Some(k),
+        _ => None,
+    };
+    screenpipe_secrets::SecretStore::open(&db_path.to_string_lossy(), secret_key)
+        .await
+        .ok()
+}
+
+async fn foreground_connections_context(app: &AppHandle) -> String {
+    let api = crate::recording::local_api_context_from_app(app);
+    let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    let store = open_secret_store_for_connection_context().await;
+    screenpipe_connect::connections::render_context(&data_dir, api.port, store.as_ref()).await
+}
+
+async fn attach_foreground_connections_context(app: &AppHandle, message: String) -> String {
+    let ctx = foreground_connections_context(app).await;
+    if ctx.trim().is_empty() {
+        return message;
+    }
+    format!(
+        "Current Screenpipe connected integrations context, refreshed for this turn:\n{}\n\nUser request:\n{}",
+        ctx, message
+    )
+}
+
+fn queued_payload_to_steer_command(payload: Value) -> Result<Value, String> {
+    let message = payload
+        .get("message")
+        .and_then(|v| v.as_str())
+        .ok_or("queued prompt is missing message")?
+        .to_string();
+
+    let mut cmd = json!({
+        "type": "steer",
+        "message": message,
+    });
+    if let Some(images) = payload.get("images") {
+        cmd["images"] = images.clone();
+    }
+    Ok(cmd)
+}
+
 /// Send a prompt to Pi, optionally with images.
 /// The command is serialized through the queue — it will wait for any prior
 /// command (new_session, abort) to fully complete before being written to stdin.
 #[tauri::command]
 #[specta::specta]
 pub async fn pi_prompt(
+    app: AppHandle,
     state: State<'_, PiState>,
     session_id: Option<String>,
     message: String,
     images: Option<Vec<PiImageContent>>,
-) -> Result<(), String> {
+    display_preview: Option<String>,
+) -> Result<String, String> {
     let sid = session_id.unwrap_or_else(|| "chat".to_string());
     let queue = {
         let mut pool = state.0.lock().await;
@@ -1866,39 +2471,60 @@ pub async fn pi_prompt(
             .ok_or("Pi command queue not initialized")?
     };
 
-    // `streamingBehavior: "followUp"` tells pi-mono to internally queue this
-    // prompt when its agent is mid-stream (instead of throwing "Agent is
-    // already processing"). pi-mono ignores this option when idle, so it's
-    // safe to set unconditionally. This is the SDK-blessed way to handle
-    // back-to-back prompts and is robust against pi-mono's auto-retry path,
-    // which otherwise fires `agent_end` mid-prompt and would race our queue.
-    let mut cmd = json!({
-        "type": "prompt",
-        "message": message,
-        "streamingBehavior": "followUp",
-    });
-    if let Some(imgs) = images {
-        if !imgs.is_empty() {
-            cmd["images"] = serde_json::to_value(imgs).map_err(|e| e.to_string())?;
-        }
-    }
-
-    // Send through the prompt-aware path so the queue UI surfaces this entry
-    // until pi-mono confirms it's started processing (via message_start).
-    // WriteOnly mode: the drain loop writes to stdin and advances immediately
-    // — pi-mono's followUp queue handles serialization with any in-flight
-    // prompt. Combined with `streamingBehavior: "followUp"` on the command,
-    // this avoids the "already processing" race that fires when the agent
-    // momentarily idles between auto-retries.
-    let (_queue_id, rx) = queue
+    let preview = display_preview.unwrap_or_else(|| message.clone());
+    let message = attach_foreground_connections_context(&app, message).await;
+    let cmd = build_prompt_command(message, images)?;
+    let (queue_id, rx) = queue
         .send_prompt(
             cmd,
-            crate::pi_command_queue::WaitMode::WriteOnly,
-            message.clone(),
+            crate::pi_command_queue::WaitMode::Prompt,
+            preview,
+            false,
         )
         .await?;
     rx.await
-        .map_err(|_| "Pi command queue dropped".to_string())?
+        .map_err(|_| "Pi command queue dropped".to_string())??;
+    Ok(queue_id)
+}
+
+/// Queue a follow-up prompt for the current session. Unlike `pi_prompt`, this
+/// returns as soon as Rust owns the queued item; the prompt is written only
+/// after the active turn finishes.
+#[tauri::command]
+#[specta::specta]
+pub async fn pi_queue_prompt(
+    app: AppHandle,
+    state: State<'_, PiState>,
+    session_id: Option<String>,
+    message: String,
+    images: Option<Vec<PiImageContent>>,
+    display_preview: Option<String>,
+) -> Result<String, String> {
+    let sid = session_id.unwrap_or_else(|| "chat".to_string());
+    let queue = {
+        let mut pool = state.0.lock().await;
+        let m = pool.sessions.get_mut(&sid).ok_or("Pi not initialized")?;
+        if !m.is_running() {
+            return Err("Pi is not running".to_string());
+        }
+        m.last_activity = std::time::Instant::now();
+        m.queue_handle
+            .clone()
+            .ok_or("Pi command queue not initialized")?
+    };
+
+    let preview = display_preview.unwrap_or_else(|| message.clone());
+    let message = attach_foreground_connections_context(&app, message).await;
+    let cmd = build_prompt_command(message, images)?;
+    let (queue_id, _rx) = queue
+        .send_prompt(
+            cmd,
+            crate::pi_command_queue::WaitMode::Prompt,
+            preview,
+            true,
+        )
+        .await?;
+    Ok(queue_id)
 }
 
 /// Steer the active Pi reply using Pi's native steering command.
@@ -1907,6 +2533,7 @@ pub async fn pi_prompt(
 #[tauri::command]
 #[specta::specta]
 pub async fn pi_steer(
+    app: AppHandle,
     state: State<'_, PiState>,
     session_id: Option<String>,
     message: String,
@@ -1925,6 +2552,7 @@ pub async fn pi_steer(
             .ok_or("Pi command queue not initialized")?
     };
 
+    let message = attach_foreground_connections_context(&app, message).await;
     let mut cmd = json!({
         "type": "steer",
         "message": message,
@@ -1935,11 +2563,38 @@ pub async fn pi_steer(
         }
     }
 
-    let rx = queue
-        .send(cmd, crate::pi_command_queue::WaitMode::WriteOnly)
-        .await?;
-    rx.await
-        .map_err(|_| "Pi command queue dropped".to_string())?
+    queue.send_immediate(cmd).await
+}
+
+/// Promote a queued follow-up into Pi's native steer path. The prompt is
+/// removed from the Rust queue first, so it cannot later run as a normal
+/// follow-up.
+#[tauri::command]
+#[specta::specta]
+pub async fn pi_steer_queued(
+    state: State<'_, PiState>,
+    session_id: Option<String>,
+    prompt_id: String,
+) -> Result<bool, String> {
+    let sid = session_id.unwrap_or_else(|| "chat".to_string());
+    let queue = {
+        let mut pool = state.0.lock().await;
+        let m = pool.sessions.get_mut(&sid).ok_or("Pi not initialized")?;
+        if !m.is_running() {
+            return Err("Pi is not running".to_string());
+        }
+        m.last_activity = std::time::Instant::now();
+        m.queue_handle
+            .clone()
+            .ok_or("Pi command queue not initialized")?
+    };
+
+    let Some(payload) = queue.take_queued_payload(prompt_id).await? else {
+        return Ok(false);
+    };
+    let cmd = queued_payload_to_steer_command(payload)?;
+    queue.send_immediate(cmd).await?;
+    Ok(true)
 }
 
 /// Cancel a single queued prompt. Returns true if it was still in the queue
@@ -2006,6 +2661,28 @@ pub async fn pi_abort(state: State<'_, PiState>, session_id: Option<String>) -> 
             .ok_or("Pi command queue not initialized")?
     };
     queue.abort().await
+}
+
+/// Abort only the active Pi operation. Pending queued follow-ups remain queued.
+#[tauri::command]
+#[specta::specta]
+pub async fn pi_abort_active(
+    state: State<'_, PiState>,
+    session_id: Option<String>,
+) -> Result<(), String> {
+    let sid = session_id.unwrap_or_else(|| "chat".to_string());
+    let queue = {
+        let mut pool = state.0.lock().await;
+        let m = pool.sessions.get_mut(&sid).ok_or("Pi not initialized")?;
+        if !m.is_running() {
+            return Err("Pi is not running".to_string());
+        }
+        m.last_activity = std::time::Instant::now();
+        m.queue_handle
+            .clone()
+            .ok_or("Pi command queue not initialized")?
+    };
+    queue.abort_active_only().await
 }
 
 /// Start a new Pi session (clears conversation history).
@@ -2127,6 +2804,113 @@ pub async fn pi_set_model(
         .map_err(|_| "Pi command queue dropped".to_string())?
 }
 
+fn write_pi_settings(settings: &serde_json::Value) -> Result<(), String> {
+    let settings_path = get_pi_config_dir()?.join("settings.json");
+    let s = serde_json::to_string_pretty(settings)
+        .map_err(|e| format!("Failed to serialize settings: {}", e))?;
+    std::fs::write(&settings_path, s)
+        .map_err(|e| format!("Failed to write settings.json: {}", e))
+}
+
+fn read_pi_settings() -> Result<serde_json::Value, String> {
+    let settings_path = get_pi_config_dir()?.join("settings.json");
+    if !settings_path.exists() {
+        return Ok(json!({}));
+    }
+    let content = std::fs::read_to_string(&settings_path)
+        .map_err(|e| format!("Failed to read settings.json: {}", e))?;
+    match serde_json::from_str(&content) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            warn!("Pi settings.json is malformed, treating as empty: {}", e);
+            Ok(json!({}))
+        }
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn pi_set_thinking_level(
+    state: State<'_, PiState>,
+    session_id: Option<String>,
+    level: String,
+) -> Result<(), String> {
+    let valid_levels = ["low", "medium", "high"];
+    if !valid_levels.contains(&level.as_str()) {
+        return Err(format!(
+            "Invalid thinking level '{}'. Valid values: {:?}",
+            level, valid_levels
+        ));
+    }
+
+    info!("pi_set_thinking_level: session={:?} level={}", session_id, level);
+
+    // Always persist — Pi reads this on startup, so changing before a conversation works.
+    // Pi also re-writes the clamped value after handling the RPC, which wins.
+    let mut settings = read_pi_settings()?;
+    if let Some(obj) = settings.as_object_mut() {
+        obj.insert("defaultThinkingLevel".to_string(), json!(level));
+    }
+    write_pi_settings(&settings)?;
+
+    // If a live session is specified, also push via RPC for immediate effect
+    if let Some(ref sid) = session_id {
+        let queue_opt = {
+            let mut pool = state.0.lock().await;
+            pool.sessions
+                .get_mut(sid.as_str())
+                .and_then(|m| if m.is_running() { m.queue_handle.clone() } else { None })
+        };
+        if let Some(queue) = queue_opt {
+            let cmd = json!({ "type": "set_thinking_level", "level": &level });
+            match queue.send_immediate(cmd).await {
+                Ok(()) => info!("pi_set_thinking_level RPC sent ok: session={} level={}", sid, level),
+                Err(e) => warn!("pi_set_thinking_level RPC failed: session={} level={} err={}", sid, level, e),
+            }
+        } else {
+            info!("pi_set_thinking_level: session {} not running, saved to settings.json only", sid);
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn pi_request_state(
+    state: State<'_, PiState>,
+    session_id: String,
+) -> Result<(), String> {
+    info!("pi_request_state: session={}", session_id);
+    let queue = {
+        let mut pool = state.0.lock().await;
+        pool.sessions
+            .get_mut(session_id.as_str())
+            .and_then(|m| if m.is_running() { m.queue_handle.clone() } else { None })
+            .ok_or_else(|| format!("pi_request_state: session {} not found or not running", session_id))?
+    };
+    match queue.send_immediate(json!({ "type": "get_state" })).await {
+        Ok(()) => { info!("pi_request_state RPC sent ok: session={}", session_id); Ok(()) }
+        Err(e) => { warn!("pi_request_state RPC failed: session={} err={}", session_id, e); Err(e) }
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn pi_get_thinking_level() -> Result<String, String> {
+    let settings = read_pi_settings()?;
+    let raw = settings
+        .get("defaultThinkingLevel")
+        .and_then(|l| l.as_str())
+        .unwrap_or("medium");
+    // Clamp to supported values — settings.json may have stale levels from old versions
+    let level = match raw {
+        "low" | "medium" | "high" => raw,
+        _ => "medium",
+    };
+    Ok(level.to_string())
+}
+
 /// Update Pi config and restart the chat session so the new model takes effect.
 /// Without restart, Pi keeps using the provider/model from its original CLI args.
 ///
@@ -2181,35 +2965,15 @@ pub async fn pi_install(app: AppHandle) -> Result<(), String> {
 
     let app_handle = app.clone();
     std::thread::spawn(move || {
-        // Seed package.json with overrides to fix lru-cache resolution on Windows
         seed_pi_package_json(&install_dir);
-
-        let mut cmd = std::process::Command::new(&bun);
-        cmd.current_dir(&install_dir).args(["add", PI_PACKAGE]);
-
-        // On Windows, prevent console window from appearing
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-
-        let output = cmd.output();
-
-        match output {
-            Ok(output) => {
-                if output.status.success() {
-                    info!("Pi installed successfully");
-                    let _ = app_handle.emit("pi_installed", true);
-                } else {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    error!("Pi installation failed: {}", stderr);
-                    let _ = app_handle.emit("pi_installed", false);
-                }
+        match run_pi_package_install(&install_dir, &bun) {
+            Ok(()) => {
+                info!("Pi installed successfully");
+                let _ = app_handle.emit("pi_installed", true);
             }
             Err(e) => {
-                error!("Failed to run bun: {}", e);
+                error!("Pi installation failed: {}", e);
+                set_pi_install_error(e);
                 let _ = app_handle.emit("pi_installed", false);
             }
         }
@@ -2292,10 +3056,34 @@ pub fn ensure_pi_installed_background() {
             });
     }
 
-    // If Pi is already installed locally, check if it needs dependency fixes
-    // or a version upgrade.
+    // If Pi is already installed locally, check if it needs dependency fixes,
+    // a version upgrade, or a repair after a partial/interrupted install.
     if find_local_pi_entrypoint().is_some() {
         if let Some(install_dir) = pi_local_install_dir() {
+            if let Some(integrity_error) = local_pi_install_integrity_error(&install_dir) {
+                if let Some(bun) = find_bun_executable() {
+                    let _ = std::thread::Builder::new()
+                        .name("pi-repair".to_string())
+                        .spawn(move || {
+                            match repair_local_pi_install(&install_dir, &bun, &integrity_error) {
+                                Ok(()) => info!("Pi repair install successful"),
+                                Err(e) => {
+                                    error!("Pi repair install failed: {}", e);
+                                    set_pi_install_error(e);
+                                }
+                            }
+                            PI_INSTALL_DONE.store(true, Ordering::SeqCst);
+                        });
+                } else {
+                    set_pi_install_error(format!(
+                        "Pi install is corrupt ({}) and bundled bun was not found",
+                        integrity_error
+                    ));
+                    PI_INSTALL_DONE.store(true, Ordering::SeqCst);
+                }
+                return;
+            }
+
             let pkg_path = install_dir.join("package.json");
             let pkg_contents = pkg_path
                 .exists()
@@ -2321,8 +3109,11 @@ pub fn ensure_pi_installed_background() {
                     );
                 }
                 seed_pi_package_json(&install_dir);
-                if needs_lru_fix || needs_anthropic_sdk {
-                    // Delete bun.lock so bun resolves deps with new overrides/deps
+                // Drop bun.lock whenever ANY patch fires — a stale lockfile
+                // pins the resolved tree to the prior version graph, so a
+                // version bump without lockfile invalidation leaves bun
+                // reinstalling the same broken set.
+                if needs_lru_fix || needs_anthropic_sdk || needs_upgrade {
                     let _ = std::fs::remove_file(install_dir.join("bun.lock"));
                     let _ = std::fs::remove_file(install_dir.join("bun.lockb"));
                 }
@@ -2333,28 +3124,14 @@ pub fn ensure_pi_installed_background() {
                     let _ = std::thread::Builder::new()
                         .name("pi-upgrade".to_string())
                         .spawn(move || {
-                            let args = if needs_upgrade {
-                                vec!["add", PI_PACKAGE]
-                            } else {
-                                vec!["install"]
-                            };
-                            let mut cmd = std::process::Command::new(&bun);
-                            cmd.current_dir(&install_dir).args(&args);
-                            #[cfg(windows)]
-                            {
-                                use std::os::windows::process::CommandExt;
-                                const CREATE_NO_WINDOW: u32 = 0x08000000;
-                                cmd.creation_flags(CREATE_NO_WINDOW);
-                            }
-                            match cmd.output() {
-                                Ok(output) if output.status.success() => {
+                            match run_pi_package_install(&install_dir, &bun) {
+                                Ok(()) => {
                                     info!("Pi upgrade/fix: install successful");
                                 }
-                                Ok(output) => {
-                                    let stderr = String::from_utf8_lossy(&output.stderr);
-                                    warn!("Pi upgrade/fix: install failed: {}", stderr);
+                                Err(e) => {
+                                    error!("Pi upgrade/fix: install failed: {}", e);
+                                    set_pi_install_error(e);
                                 }
-                                Err(e) => warn!("Pi upgrade/fix: bun error: {}", e),
                             }
                             PI_INSTALL_DONE.store(true, Ordering::SeqCst);
                         });
@@ -2396,32 +3173,21 @@ pub fn ensure_pi_installed_background() {
                     return;
                 }
 
-                info!("Pi not found — installing into {} via bun", install_dir.display());
+                info!(
+                    "Pi not found — installing into {} via bundled package manager",
+                    install_dir.display()
+                );
 
                 // Seed package.json with overrides to fix lru-cache resolution on Windows
                 seed_pi_package_json(&install_dir);
 
-                let mut cmd = std::process::Command::new(&bun);
-                cmd.current_dir(&install_dir)
-                    .args(["add", PI_PACKAGE]);
-
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    const CREATE_NO_WINDOW: u32 = 0x08000000;
-                    cmd.creation_flags(CREATE_NO_WINDOW);
-                }
-
-                match cmd.output() {
-                    Ok(output) if output.status.success() => {
+                match run_pi_package_install(&install_dir, &bun) {
+                    Ok(()) => {
                         info!("Pi installed successfully into {}", install_dir.display());
                     }
-                    Ok(output) => {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        warn!("Pi background install failed (non-fatal): {}", stderr);
-                    }
                     Err(e) => {
-                        warn!("Pi background install error (non-fatal): {}", e);
+                        error!("Pi background install failed: {}", e);
+                        set_pi_install_error(e);
                     }
                 }
             });
@@ -2453,6 +3219,267 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn parses_tool_call_ids_from_pi_events() {
+        let assistant_tool_call = json!({
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "stopReason": "toolUse",
+                "content": [
+                    {"type": "text", "text": "checking"},
+                    {"type": "toolCall", "id": "tool-1", "name": "bash"}
+                ]
+            }
+        });
+        assert_eq!(
+            super::event_tool_call_ids(&assistant_tool_call),
+            vec!["tool-1".to_string()]
+        );
+
+        let assistant_tool_update = json!({
+            "type": "message_update",
+            "assistantMessageEvent": {
+                "type": "toolcall_end",
+                "toolCall": {
+                    "type": "toolCall",
+                    "id": "tool-1",
+                    "name": "bash",
+                    "arguments": { "command": "ls" }
+                }
+            }
+        });
+        assert_eq!(
+            super::event_tool_call_ids(&assistant_tool_update),
+            vec!["tool-1".to_string()]
+        );
+
+        let assistant_stop_with_historical_tool = json!({
+            "type": "message_end",
+            "message": {
+                "role": "assistant",
+                "stopReason": "stop",
+                "content": [
+                    {"type": "toolCall", "id": "tool-2", "name": "bash"}
+                ]
+            }
+        });
+        assert!(
+            super::event_tool_call_ids(&assistant_stop_with_historical_tool).is_empty()
+        );
+
+        let tool_result = json!({
+            "type": "message_end",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "tool-1",
+                "content": [{"type": "text", "text": "done"}]
+            }
+        });
+        assert_eq!(
+            super::event_tool_call_ids(&tool_result),
+            vec!["tool-1".to_string()]
+        );
+
+        let tool_end = json!({
+            "type": "tool_execution_end",
+            "toolCallId": "tool-1",
+        });
+        assert_eq!(
+            super::event_tool_call_ids(&tool_end),
+            vec!["tool-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn pi_session_busy_tracks_queue_tools_and_pending_rpc() {
+        let pending: super::PendingResponses =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let queue_state = crate::pi_command_queue::PiQueueState::new();
+
+        assert!(!super::pi_session_has_in_flight_work(
+            Some(&queue_state),
+            &pending
+        ));
+
+        queue_state.mark_agent_active();
+        assert!(super::pi_session_has_in_flight_work(
+            Some(&queue_state),
+            &pending
+        ));
+        queue_state.mark_agent_idle();
+
+        queue_state.mark_tool_active("tool-1");
+        assert!(super::pi_session_has_in_flight_work(
+            Some(&queue_state),
+            &pending
+        ));
+        queue_state.mark_tool_idle("tool-1");
+        assert!(!super::pi_session_has_in_flight_work(
+            Some(&queue_state),
+            &pending
+        ));
+
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        pending.lock().unwrap().insert("req_1".to_string(), tx);
+        assert!(super::pi_session_has_in_flight_work(None, &pending));
+    }
+
+    fn write_package_json(package_dir: &std::path::Path, name: &str, version: &str) {
+        std::fs::create_dir_all(package_dir).expect("create package dir");
+        std::fs::write(
+            package_dir.join("package.json"),
+            serde_json::to_string_pretty(&json!({
+                "name": name,
+                "version": version,
+            }))
+            .unwrap(),
+        )
+        .expect("write package.json");
+    }
+
+    fn write_pi_package(install_dir: &std::path::Path) {
+        let pi_dir = super::pi_package_dir(install_dir);
+        write_package_json(
+            &pi_dir,
+            "@earendil-works/pi-coding-agent",
+            super::PI_PACKAGE.rsplit('@').next().unwrap_or(""),
+        );
+        let dist = pi_dir.join("dist");
+        std::fs::create_dir_all(&dist).expect("create dist");
+        std::fs::write(dist.join("cli.js"), "console.log('pi')").expect("write cli");
+    }
+
+    /// Regression guard for the empty "Pi background install failed: " log
+    /// (Linux AppImage report, 2026-06-12): a bun that exits non-zero without
+    /// writing to either stream must still produce an actionable message with
+    /// the exit status in it.
+    #[cfg(unix)]
+    #[test]
+    fn format_install_failure_never_empty_details() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::{ExitStatus, Output};
+
+        let silent = Output {
+            status: ExitStatus::from_raw(0x0100), // exit code 1
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        let msg = super::format_install_failure("bun", &silent);
+        assert_eq!(
+            msg,
+            "bun install failed (exit code 1). output: (no output captured)"
+        );
+
+        let sigkill = Output {
+            status: ExitStatus::from_raw(9), // killed by signal 9
+            stdout: b"partial progress".to_vec(),
+            stderr: Vec::new(),
+        };
+        let msg = super::format_install_failure("bun", &sigkill);
+        assert!(
+            msg.contains("killed by signal 9") && msg.contains("(stdout) partial progress"),
+            "signal + stdout fallback must both surface: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn clear_screenpipe_auth_preserves_other_provider_tokens() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        std::fs::write(
+            &auth_path,
+            serde_json::to_string_pretty(&json!({
+                "screenpipe": "stale-jwt",
+                "openai": "sk-keep",
+                "anthropic": {"apiKey": "anthropic-keep"}
+            }))
+            .unwrap(),
+        )
+        .expect("write auth");
+
+        super::remove_screenpipe_auth_from_path(&auth_path).expect("clear screenpipe auth");
+
+        let auth: Value =
+            serde_json::from_str(&std::fs::read_to_string(&auth_path).unwrap()).unwrap();
+        assert!(auth.get("screenpipe").is_none());
+        assert_eq!(auth["openai"], json!("sk-keep"));
+        assert_eq!(auth["anthropic"]["apiKey"], json!("anthropic-keep"));
+    }
+
+    #[test]
+    fn clear_screenpipe_auth_missing_file_is_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("missing-auth.json");
+
+        super::remove_screenpipe_auth_from_path(&auth_path).expect("missing auth is ok");
+
+        assert!(!auth_path.exists());
+    }
+
+    #[test]
+    fn local_pi_integrity_detects_missing_pi_ai_dependency() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let install_dir = dir.path();
+        write_pi_package(install_dir);
+        write_package_json(
+            &super::node_module_package_dir(install_dir, "@anthropic-ai/sdk"),
+            "@anthropic-ai/sdk",
+            "0.91.1",
+        );
+        write_package_json(
+            &super::node_module_package_dir(install_dir, "cross-spawn"),
+            "cross-spawn",
+            "7.0.6",
+        );
+
+        let error = super::local_pi_install_integrity_error(install_dir)
+            .expect("missing pi-ai should make install unhealthy");
+        assert!(
+            error.contains("@earendil-works/pi-ai"),
+            "unexpected integrity error: {}",
+            error
+        );
+    }
+
+    #[test]
+    fn local_pi_integrity_accepts_nested_transitive_dependency() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let install_dir = dir.path();
+        let pi_dir = super::pi_package_dir(install_dir);
+        write_pi_package(install_dir);
+        write_package_json(
+            &super::node_module_package_dir(install_dir, "@earendil-works/pi-ai"),
+            "@earendil-works/pi-ai",
+            super::PI_AI_PACKAGE.rsplit('@').next().unwrap_or(""),
+        );
+        write_package_json(
+            &super::node_module_package_dir(install_dir, "@anthropic-ai/sdk"),
+            "@anthropic-ai/sdk",
+            "0.91.1",
+        );
+        write_package_json(
+            &super::node_module_package_dir(&pi_dir, "cross-spawn"),
+            "cross-spawn",
+            "7.0.6",
+        );
+
+        assert_eq!(super::local_pi_install_integrity_error(install_dir), None);
+    }
+
+    #[test]
+    fn detects_bun_windows_cache_rename_failures() {
+        let stderr = r#"EPERM: Operation not permitted (NtSetInformationFile())
+error: moving "" to cache dir failed
+error: InstallFailed extracting tarball"#;
+
+        assert!(super::should_retry_install_with_npm(stderr));
+        assert!(!super::should_retry_install_with_npm(
+            "error: package not found @earendil-works/nope"
+        ));
+    }
 
     /// Helper: spawn Pi in RPC mode with piped stdin/stdout using the same
     /// command-building logic the app uses (bun <pi_path> on Unix).
@@ -2955,7 +3982,7 @@ mod tests {
         assert_eq!(providers.len(), 1);
 
         let sp = &providers["screenpipe"];
-        assert_eq!(sp["baseUrl"], "https://api.screenpi.pe/v1");
+        assert_eq!(sp["baseUrl"], "https://api.screenpipe.com/v1");
         assert_eq!(sp["api"], "openai-completions");
         assert_eq!(sp["apiKey"], "SCREENPIPE_API_KEY");
         assert_eq!(sp["authHeader"], true);

@@ -6,23 +6,32 @@
 
 import { useEffect, useState, useCallback, useRef } from "react";
 import { listen, emit } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
+import { commands } from "@/lib/utils/tauri";
 import posthog from "posthog-js";
 import ReactMarkdown from "react-markdown";
+import {
+  notificationUrlTransform,
+  openScreenpipeViewerLink,
+  screenpipeViewerPathFromHref,
+} from "@/components/markdown";
 import { showChatWithPrefill } from "@/lib/chat-utils";
 import localforage from "localforage";
 import { localFetch } from "@/lib/api";
+import { Bell, Check, Copy, ExternalLink } from "lucide-react";
 
 interface NotificationAction {
-  label: string;
-  action: string;
+  label?: string;
+  action?: string;
   primary?: boolean;
   // Pipe notification action fields
   id?: string;
-  type?: "pipe" | "api" | "deeplink" | "meeting_join" | "dismiss";
+  type?: "pipe" | "api" | "deeplink" | "link" | "meeting_join" | "copy" | "source" | "dismiss";
   pipe?: string;
   context?: Record<string, unknown>;
   url?: string;
+  value?: string;
+  source_url?: string;
+  sourceUrl?: string;
   deeplink_url?: string;
   deeplinkUrl?: string;
   method?: string;
@@ -39,6 +48,9 @@ interface NotificationPayload {
   actions: NotificationAction[];
   autoDismissMs?: number;
   pipe_name?: string;
+  source_session_id?: string;
+  source_message_id?: string;
+  source_url?: string;
 }
 
 function windowForDeeplink(url: string) {
@@ -48,27 +60,11 @@ function windowForDeeplink(url: string) {
     : "Main";
 }
 
-/** Extract `path` from a `screenpipe://view?path=…` deeplink, or null. */
-function viewerPathFromHref(href: string): string | null {
-  if (!href.startsWith("screenpipe://view")) return null;
-  try {
-    const u = new URL(href);
-    return u.searchParams.get("path");
-  } catch {
-    return null;
-  }
-}
-
 async function openNotificationLink(href: string) {
   const raw = href.trim();
   if (!raw) return;
 
-  // Viewer deeplink — opens the file in the in-app viewer window.
-  const viewerPath = viewerPathFromHref(raw);
-  if (viewerPath) {
-    await invoke("open_viewer_window", { path: viewerPath });
-    return;
-  }
+  if (await openScreenpipeViewerLink(raw)) return;
 
   let localPath: string | null = null;
   if (raw.startsWith("~/")) {
@@ -82,11 +78,15 @@ async function openNotificationLink(href: string) {
 
   const { open } = await import("@tauri-apps/plugin-shell");
   if (localPath) {
-    await invoke("open_note_path", { path: localPath });
+    await commands.openNotePath(localPath);
     return;
   }
 
   await open(raw);
+}
+
+function notificationClipboardText(payload: NotificationPayload): string {
+  return `${payload.title}\n\n${payload.body}`.trim();
 }
 
 export default function NotificationPanelPage() {
@@ -100,9 +100,11 @@ export default function NotificationPanelPage() {
   >("idle");
   const [restartError, setRestartError] = useState<string | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autoDismissMsRef = useRef(20000);
   const hoveredRef = useRef(false);
   const pausedProgressRef = useRef<number | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const hide = useCallback(
     async (auto: boolean) => {
@@ -117,7 +119,7 @@ export default function NotificationPanelPage() {
         auto,
       });
       try {
-        await invoke("hide_notification_panel");
+        await commands.hideNotificationPanel();
       } catch {
         // ignore
       }
@@ -128,7 +130,7 @@ export default function NotificationPanelPage() {
   const handleAction = useCallback(
     async (actionOrObj: string | NotificationAction) => {
       // Support both old string-based actions and new typed action objects
-      const actionStr = typeof actionOrObj === "string" ? actionOrObj : actionOrObj.action;
+      const actionStr = typeof actionOrObj === "string" ? actionOrObj : actionOrObj.action || actionOrObj.type;
       const actionObj = typeof actionOrObj === "object" ? actionOrObj : null;
 
       posthog.capture("notification_action", {
@@ -142,6 +144,42 @@ export default function NotificationPanelPage() {
         // New typed action dispatch (pipe notifications)
         if (actionObj?.type) {
           switch (actionObj.type) {
+            case "copy": {
+              const text = actionObj.value || payload?.body || "";
+              if (text) {
+                await commands.copyTextToClipboard(text);
+                if (copyResetRef.current) clearTimeout(copyResetRef.current);
+                setCopied(true);
+                copyResetRef.current = setTimeout(() => setCopied(false), 1400);
+                posthog.capture("notification_copied", {
+                  type: payload?.type,
+                  id: payload?.id,
+                  source: "action",
+                });
+              }
+              return;
+            }
+            case "source": {
+              const sourceUrl =
+                actionObj.url ||
+                actionObj.source_url ||
+                actionObj.sourceUrl ||
+                actionObj.deeplink_url ||
+                actionObj.deeplinkUrl ||
+                payload?.source_url;
+              if (sourceUrl) {
+                if (sourceUrl.startsWith("screenpipe://")) {
+                  await commands.showWindowActivated(windowForDeeplink(sourceUrl));
+                  await new Promise((r) => setTimeout(r, 150));
+                  await emit("deep-link-received", sourceUrl);
+                } else {
+                  const { open } = await import("@tauri-apps/plugin-shell");
+                  await open(sourceUrl);
+                }
+              }
+              await hide(false);
+              return;
+            }
             case "pipe": {
               const pipeName = actionObj.pipe || payload?.pipe_name;
               if (pipeName) {
@@ -169,14 +207,31 @@ export default function NotificationPanelPage() {
             }
             case "api": {
               if (actionObj.url) {
-                await localFetch(actionObj.url, {
+                const res = await localFetch(actionObj.url, {
                   method: actionObj.method || "POST",
                   headers: { "Content-Type": "application/json" },
                   body: actionObj.body ? JSON.stringify(actionObj.body) : undefined,
                 });
+                // "open note + HD": the meeting-start HD action embeds the
+                // live-note deeplink so a single click both starts HD capture
+                // (this api call) and opens the note. Without this the note
+                // never opens — the button only starts HD. Gated on res.ok so
+                // a failed start doesn't navigate. Mirrors the native handler
+                // in components/notification-handler.tsx.
+                const noteUrl = actionObj.deeplinkUrl || actionObj.deeplink_url;
+                if (
+                  res.ok &&
+                  typeof noteUrl === "string" &&
+                  noteUrl.startsWith("screenpipe://")
+                ) {
+                  await commands.showWindowActivated(windowForDeeplink(noteUrl));
+                  await new Promise((r) => setTimeout(r, 150));
+                  await emit("deep-link-received", noteUrl);
+                }
               }
               break;
             }
+            case "link":
             case "deeplink": {
               if (actionObj.url) {
                 if (actionObj.url.startsWith("screenpipe://")) {
@@ -188,9 +243,7 @@ export default function NotificationPanelPage() {
                   // emitting. Without this ordering, the emit fires into a
                   // handler that hasn't subscribed yet and the click silently
                   // does nothing.
-                  await invoke("show_window_activated", {
-                    window: windowForDeeplink(actionObj.url),
-                  });
+                  await commands.showWindowActivated(windowForDeeplink(actionObj.url));
                   await new Promise((r) => setTimeout(r, 150));
                   await emit("deep-link-received", actionObj.url);
                 } else {
@@ -222,9 +275,7 @@ export default function NotificationPanelPage() {
               }
               const deeplink = actionObj.deeplink_url || actionObj.deeplinkUrl;
               if (typeof deeplink === "string" && deeplink.startsWith("screenpipe://")) {
-                await invoke("show_window_activated", {
-                  window: windowForDeeplink(deeplink),
-                });
+                await commands.showWindowActivated(windowForDeeplink(deeplink));
                 await new Promise((r) => setTimeout(r, 150));
                 await emit("deep-link-received", deeplink);
               }
@@ -244,9 +295,9 @@ export default function NotificationPanelPage() {
         // from the notification panel always surface the window above other
         // apps, regardless of overlay_mode.
         if (actionStr === "open_timeline") {
-          await invoke("show_window_activated", { window: "Main" });
+          await commands.showWindowActivated("Main");
         } else if (actionStr === "open_chat") {
-          await invoke("show_window_activated", { window: "Chat" });
+          await commands.showWindowActivated("Chat");
         } else if (actionStr === "open_pipe_suggestions") {
           await showChatWithPrefill({
             context: PIPE_SUGGESTION_PROMPT,
@@ -264,12 +315,12 @@ export default function NotificationPanelPage() {
           }
           try {
             try {
-              await invoke("stop_screenpipe");
+              await commands.stopScreenpipe();
             } catch {
               // may already be stopped
             }
             await new Promise((r) => setTimeout(r, 2000));
-            await invoke("spawn_screenpipe");
+            await commands.spawnScreenpipe(null);
             // Poll health endpoint to confirm restart succeeded
             let healthy = false;
             for (let i = 0; i < 15; i++) {
@@ -291,7 +342,7 @@ export default function NotificationPanelPage() {
                 await hide(false);
               } catch {
                 // fallback: force-hide via invoke directly
-                try { await invoke("hide_notification_panel"); } catch {}
+                try { await commands.hideNotificationPanel(); } catch {}
               }
             } else {
               setRestartState("error");
@@ -325,8 +376,50 @@ export default function NotificationPanelPage() {
 
       await hide(false);
     },
-    [payload?.type, payload?.id, payload?.pipe_name, hide]
+    [payload?.type, payload?.id, payload?.body, payload?.pipe_name, payload?.source_url, hide]
   );
+
+  const openSource = useCallback(async () => {
+    if (!payload?.source_url) return;
+    const url = payload.source_url;
+    if (url.startsWith("screenpipe://")) {
+      await commands.showWindowActivated(windowForDeeplink(url));
+      await new Promise((r) => setTimeout(r, 150));
+      await emit("deep-link-received", url);
+      await hide(false);
+      return;
+    }
+    try {
+      const { open } = await import("@tauri-apps/plugin-shell");
+      await open(url);
+      await hide(false);
+    } catch (e) {
+      console.error("notification source open failed:", e);
+    }
+  }, [payload?.source_url, hide]);
+
+  const copyNotification = useCallback(async () => {
+    if (!payload) return;
+    try {
+      await commands.copyTextToClipboard(notificationClipboardText(payload));
+      if (copyResetRef.current) clearTimeout(copyResetRef.current);
+      setCopied(true);
+      copyResetRef.current = setTimeout(() => setCopied(false), 1400);
+      posthog.capture("notification_copied", {
+        type: payload.type,
+        id: payload.id,
+      });
+    } catch (e) {
+      console.error("notification copy failed:", e);
+    }
+  }, [payload]);
+
+  useEffect(() => {
+    setCopied(false);
+    return () => {
+      if (copyResetRef.current) clearTimeout(copyResetRef.current);
+    };
+  }, [payload?.id]);
 
   // Listen for notification payloads from Rust
   useEffect(() => {
@@ -551,11 +644,14 @@ export default function NotificationPanelPage() {
         {/* Body */}
         <div className="notif-body" style={{ padding: "8px 14px", flex: 1, overflow: "auto", minHeight: 0 }}>
           <div
+            onClick={payload.source_url ? openSource : undefined}
+            title={payload.source_url ? "open source chat" : undefined}
             style={{
               fontSize: "12px",
               fontWeight: 500,
               marginBottom: "4px",
               color: "rgba(0, 0, 0, 0.9)",
+              cursor: payload.source_url ? "pointer" : "default",
             }}
           >
             {payload.title}
@@ -566,15 +662,17 @@ export default function NotificationPanelPage() {
               fontSize: "11px",
               lineHeight: "1.4",
               color: "rgba(0, 0, 0, 0.5)",
+              userSelect: "text",
             }}
           >
             <ReactMarkdown
+              urlTransform={notificationUrlTransform}
               components={{
                 a: ({ href, children }) => {
                   // Viewer deeplinks get a sibling ↗ button so the user can
                   // override and open in the OS default app (e.g. Obsidian
                   // for .md, Preview for .json).
-                  const viewerPath = href ? viewerPathFromHref(href) : null;
+                  const viewerPath = href ? screenpipeViewerPathFromHref(href) : null;
                   return (
                     <>
                       <a
@@ -597,7 +695,7 @@ export default function NotificationPanelPage() {
                             e.preventDefault();
                             e.stopPropagation();
                             try {
-                              await invoke("open_note_path", { path: viewerPath });
+                              await commands.openNotePath(viewerPath);
                             } catch (err) {
                               console.error("failed to open in default app:", err);
                             }
@@ -679,10 +777,18 @@ export default function NotificationPanelPage() {
                 restart failed{restartError ? `: ${restartError}` : ""}
               </span>
             ) : (
-              payload.actions.map((action) => (
+              payload.actions.map((action, index) => {
+                const actionLabel =
+                  action.label ||
+                  (action.type === "copy" ? (copied ? "copied" : "copy") : undefined) ||
+                  (action.type === "source" ? "source" : undefined) ||
+                  action.action ||
+                  action.type ||
+                  "action";
+                return (
                 <button
-                  key={action.id || action.action}
-                  onClick={() => handleAction(action.type ? action : action.action)}
+                  key={action.id || action.action || action.type || index}
+                  onClick={() => handleAction(action.type ? action : action.action || "")}
                   style={{
                     background: action.primary
                       ? "rgba(0, 0, 0, 0.06)"
@@ -705,91 +811,102 @@ export default function NotificationPanelPage() {
                       : "none")
                   }
                 >
-                  {action.label}
+                  {actionLabel}
                 </button>
-              ))
+              );
+              })
             )}
-            <span
-              onClick={() => hide(false)}
-              style={{
-                marginLeft: "auto",
-                fontSize: "10px",
-                color: "rgba(0, 0, 0, 0.3)",
-                cursor: "pointer",
-                fontFamily: '"IBM Plex Mono", monospace',
-              }}
-              onMouseEnter={(e) =>
-                (e.currentTarget.style.color = "rgba(0, 0, 0, 0.6)")
-              }
-              onMouseLeave={(e) =>
-                (e.currentTarget.style.color = "rgba(0, 0, 0, 0.3)")
-              }
-            >
-              dismiss →
-            </span>
           </div>
         )}
 
-        {/* Manage / Mute footer */}
+        {/* Popup utility footer */}
         <div
           style={{
             display: "flex",
             alignItems: "center",
             padding: "4px 14px 8px 14px",
-            gap: "8px",
+            gap: "12px",
             borderTop: "1px solid rgba(0, 0, 0, 0.06)",
           }}
         >
-          <span
-            onClick={async () => {
-              await hide(false);
-              await emit("navigate", { url: "/home?section=notifications" });
-              try { await invoke("show_window", { window: { Home: { page: null } } }); } catch {}
-            }}
+          <button
+            onClick={copyNotification}
+            title="copy notification"
             style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "4px",
+              padding: 0,
+              border: "none",
+              background: "none",
+              flexShrink: 0,
               fontSize: "9px",
+              lineHeight: 1,
               color: "rgba(0, 0, 0, 0.3)",
               cursor: "pointer",
               fontFamily: '"IBM Plex Mono", monospace',
+              whiteSpace: "nowrap",
             }}
             onMouseEnter={(e) => (e.currentTarget.style.color = "rgba(0, 0, 0, 0.6)")}
             onMouseLeave={(e) => (e.currentTarget.style.color = "rgba(0, 0, 0, 0.3)")}
           >
-            ⚙ manage
-          </span>
-          {payload.pipe_name && (
-            <>
-              <span style={{ fontSize: "9px", color: "rgba(0, 0, 0, 0.15)" }}>·</span>
-              <span
-                onClick={async () => {
-                  try {
-                    const raw = await localforage.getItem<string>("screenpipe-settings");
-                    const settings = raw ? JSON.parse(raw) : {};
-                    const prefs = settings.notificationPrefs || {
-                      captureStalls: true, appUpdates: true,
-                      pipeSuggestions: true, pipeNotifications: true, mutedPipes: [],
-                    };
-                    if (!prefs.mutedPipes.includes(payload.pipe_name!)) {
-                      prefs.mutedPipes.push(payload.pipe_name!);
-                    }
-                    settings.notificationPrefs = prefs;
-                    await localforage.setItem("screenpipe-settings", JSON.stringify(settings));
-                  } catch {}
-                  await hide(false);
-                }}
-                style={{
-                  fontSize: "9px",
-                  color: "rgba(0, 0, 0, 0.3)",
-                  cursor: "pointer",
-                  fontFamily: '"IBM Plex Mono", monospace',
-                }}
-                onMouseEnter={(e) => (e.currentTarget.style.color = "rgba(0, 0, 0, 0.6)")}
-                onMouseLeave={(e) => (e.currentTarget.style.color = "rgba(0, 0, 0, 0.3)")}
-              >
-                mute {payload.pipe_name}
-              </span>
-            </>
+            {copied ? <Check size={12} strokeWidth={1.8} /> : <Copy size={12} strokeWidth={1.8} />}
+          </button>
+          {payload.source_url && (
+            <button
+              onClick={openSource}
+              title="open source chat"
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: "4px",
+                padding: 0,
+                border: "none",
+                background: "none",
+                flexShrink: 0,
+                fontSize: "9px",
+                lineHeight: 1,
+                color: "rgba(0, 0, 0, 0.3)",
+                cursor: "pointer",
+                fontFamily: '"IBM Plex Mono", monospace',
+                whiteSpace: "nowrap",
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.color = "rgba(0, 0, 0, 0.6)")}
+              onMouseLeave={(e) => (e.currentTarget.style.color = "rgba(0, 0, 0, 0.3)")}
+            >
+              <ExternalLink size={12} strokeWidth={1.8} />
+              source
+            </button>
           )}
+          <button
+            onClick={async () => {
+              await hide(false);
+              await emit("navigate", { url: "/home?section=notifications" });
+              try { await commands.showWindow({ Home: { page: null } }); } catch {}
+            }}
+            title="manage notification settings"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "4px",
+              marginLeft: "auto",
+              padding: 0,
+              border: "none",
+              background: "none",
+              flexShrink: 0,
+              fontSize: "9px",
+              lineHeight: 1,
+              color: "rgba(0, 0, 0, 0.3)",
+              cursor: "pointer",
+              fontFamily: '"IBM Plex Mono", monospace',
+              whiteSpace: "nowrap",
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.color = "rgba(0, 0, 0, 0.6)")}
+            onMouseLeave={(e) => (e.currentTarget.style.color = "rgba(0, 0, 0, 0.3)")}
+          >
+            <Bell size={12} strokeWidth={1.8} />
+            manage
+          </button>
         </div>
 
         {/* Progress bar */}

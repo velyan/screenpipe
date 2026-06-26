@@ -21,7 +21,7 @@
 import { openHomeWindow, waitForAppReady, t } from "../helpers/test-utils.js";
 import { closeWindow } from "../helpers/tauri.js";
 
-const FOCUS_SERVER_PORT = 11435;
+const FOCUS_SERVER_PORT = Number(process.env.SCREENPIPE_FOCUS_PORT ?? "11436");
 const MAIN_LABELS = ["main", "main-window"] as const;
 type MainLabel = (typeof MAIN_LABELS)[number];
 

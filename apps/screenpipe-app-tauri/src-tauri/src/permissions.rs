@@ -16,6 +16,8 @@ pub enum OSPermission {
     Microphone,
     Accessibility,
     Automation,
+    InputMonitoring,
+    Calendar,
 }
 
 #[tauri::command(async)]
@@ -47,6 +49,14 @@ pub fn open_permission_settings(permission: OSPermission) {
                 .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Automation")
                 .spawn()
                 .expect("Failed to open Automation settings"),
+            OSPermission::InputMonitoring => Command::new("open")
+                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+                .spawn()
+                .expect("Failed to open Input Monitoring settings"),
+            OSPermission::Calendar => Command::new("open")
+                .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars")
+                .spawn()
+                .expect("Failed to open Calendar settings"),
         };
     }
 }
@@ -54,7 +64,7 @@ pub fn open_permission_settings(permission: OSPermission) {
 #[tauri::command]
 #[specta::specta]
 #[allow(unused_variables)] // permission used on macOS
-pub async fn request_permission(permission: OSPermission) {
+pub async fn request_permission(app: tauri::AppHandle, permission: OSPermission) {
     #[cfg(target_os = "macos")]
     {
         use nokhwa_bindings_macos::AVMediaType;
@@ -82,7 +92,7 @@ pub async fn request_permission(permission: OSPermission) {
                     }
                     AVAuthorizationStatus::NotDetermined => {
                         // First time — show the system prompt
-                        request_av_permission(AVMediaType::Audio);
+                        request_av_permission(app.clone(), AVMediaType::Audio);
                     }
                     _ => {
                         open_permission_settings(OSPermission::Microphone);
@@ -99,17 +109,43 @@ pub async fn request_permission(permission: OSPermission) {
                 // Open Automation settings — user must toggle manually
                 open_permission_settings(OSPermission::Automation);
             }
+            OSPermission::InputMonitoring => {
+                // Defer to the dedicated request flow (opens Settings + calls
+                // CGRequestListenEventAccess). No probe tap is created — the
+                // check reads from INPUT_MONITORING_GROUND_TRUTH or preflight.
+                let _ = request_input_monitoring_permission().await;
+            }
+            OSPermission::Calendar => {
+                if let Err(e) = crate::calendar::calendar_authorize().await {
+                    warn!("calendar permission request failed: {}", e);
+                    open_permission_settings(OSPermission::Calendar);
+                }
+            }
         }
     }
 }
 
 #[cfg(target_os = "macos")]
-fn request_av_permission(media_type: nokhwa_bindings_macos::AVMediaType) {
+fn request_av_permission(app: tauri::AppHandle, media_type: nokhwa_bindings_macos::AVMediaType) {
+    use nokhwa_bindings_macos::AVMediaType;
+
+    let is_audio = media_type == AVMediaType::Audio;
+    let app_for_callback = app.clone();
     crate::window::with_autorelease_pool(|| {
         use objc::{runtime::*, *};
         use tauri_nspanel::block::ConcreteBlock;
 
-        let callback = move |_: BOOL| {};
+        let callback = move |granted: BOOL| {
+            if is_audio && granted != NO {
+                info!(
+                    "Microphone permission granted via AV callback — restarting capture for audio reinit"
+                );
+                let app = app_for_callback.clone();
+                tauri::async_runtime::spawn(async move {
+                    restart_capture_on_mic_grant(app).await;
+                });
+            }
+        };
         let cls = class!(AVCaptureDevice);
         let objc_fn_block: ConcreteBlock<(BOOL,), (), _> = ConcreteBlock::new(callback);
         let objc_fn_pass = objc_fn_block.copy();
@@ -117,6 +153,69 @@ fn request_av_permission(media_type: nokhwa_bindings_macos::AVMediaType) {
             let _: () = msg_send![cls, requestAccessForMediaType:media_type.into_ns_str() completionHandler:objc_fn_pass];
         };
     });
+}
+
+/// Stop and restart capture so `capture_session::start` re-queries TCC and
+/// repopulates audio devices. Matches the settings-toggle path.
+///
+/// When the user grants the mic permission immediately on first launch, the
+/// AVCaptureDevice completion callback can fire before the backend
+/// `ServerCore` has been constructed — `start_capture` then errors with
+/// "Server not running" and capture stays dead until the user manually toggles
+/// it. Wait up to ~10s with short backoff so we ride out backend boot before
+/// giving up.
+#[cfg(target_os = "macos")]
+pub(crate) async fn restart_capture_on_mic_grant(app: tauri::AppHandle) {
+    use tauri::Manager;
+
+    let need_stop = {
+        let state = app.state::<crate::recording::RecordingState>();
+        let is_running = state.capture.lock().await.is_some();
+        is_running
+    };
+    if need_stop {
+        let state = app.state::<crate::recording::RecordingState>();
+        if let Err(e) = crate::recording::stop_capture(state, app.clone()).await {
+            warn!("stop_capture before mic-grant audio reinit: {}", e);
+        }
+    }
+
+    // Retry start_capture with backoff while the backend is still booting.
+    // "Server not running" / "Server not responding" are the two transient
+    // errors emitted before `ServerCore` is wired into RecordingState.
+    const MAX_ATTEMPTS: u32 = 20;
+    const BACKOFF_MS: u64 = 500;
+    let mut last_err: Option<String> = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        let state = app.state::<crate::recording::RecordingState>();
+        match crate::recording::start_capture(state, app.clone()).await {
+            Ok(()) => {
+                if attempt > 1 {
+                    info!(
+                        "start_capture after mic grant: succeeded on attempt {}/{}",
+                        attempt, MAX_ATTEMPTS
+                    );
+                }
+                return;
+            }
+            Err(e) => {
+                let transient = e.contains("Server not running")
+                    || e.contains("Server not responding");
+                if !transient {
+                    warn!("start_capture after mic grant: {}", e);
+                    return;
+                }
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(BACKOFF_MS)).await;
+            }
+        }
+    }
+    warn!(
+        "start_capture after mic grant: gave up after {} attempts ({}s): {}",
+        MAX_ATTEMPTS,
+        (MAX_ATTEMPTS as u64 * BACKOFF_MS) / 1000,
+        last_err.unwrap_or_else(|| "unknown error".to_string())
+    );
 }
 
 // Accessibility permission APIs using ApplicationServices framework
@@ -210,7 +309,7 @@ pub fn check_microphone_permission() -> OSPermissionStatus {
 #[tauri::command(async)]
 #[specta::specta]
 pub fn check_screen_recording_permission() -> OSPermissionStatus {
-    core_to_os_status(screenpipe_core::permissions::check_screen_recording())
+    core_to_os_status(screenpipe_core::permissions::check_screen_recording_tauri())
 }
 
 /// Check only accessibility permission
@@ -219,6 +318,167 @@ pub fn check_screen_recording_permission() -> OSPermissionStatus {
 #[specta::specta]
 pub fn check_accessibility_permission_cmd() -> OSPermissionStatus {
     core_to_os_status(screenpipe_core::permissions::check_accessibility())
+}
+
+/// Check Input Monitoring permission (macOS only).
+///
+/// Input Monitoring is a TCC category separate from Accessibility. Without
+/// it the recorder can still capture clipboard (via NSPasteboard polling)
+/// and app/window switches, but not keystrokes or clicks. Polling-safe —
+/// uses the preflight variant that doesn't trigger the system prompt.
+#[tauri::command(async)]
+#[specta::specta]
+pub fn check_input_monitoring_permission_cmd() -> OSPermissionStatus {
+    #[cfg(target_os = "macos")]
+    {
+        if screenpipe_a11y::check_input_monitoring() {
+            OSPermissionStatus::Granted
+        } else {
+            // The TCC preflight API doesn't distinguish NotDetermined from
+            // Denied — both return false. We surface as Empty so the UI
+            // shows "request" rather than "open settings"; the request
+            // flow handles both cases identically (prompt on first call,
+            // open System Settings as fallback).
+            OSPermissionStatus::Empty
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        OSPermissionStatus::NotNeeded
+    }
+}
+
+/// Request Input Monitoring permission (macOS only).
+///
+/// Calls `cg_access::listen_request()` to trigger the system permission
+/// flow. On first call this either shows the native prompt (if NotDetermined)
+/// or silently no-ops (if already Denied — macOS doesn't re-prompt). For
+/// reliability we also open System Settings → Input Monitoring so the user
+/// can grant manually if the prompt didn't appear.
+///
+/// Returns the post-request permission status so the UI can update without
+/// waiting for the next poll.
+#[tauri::command(async)]
+#[specta::specta]
+pub async fn request_input_monitoring_permission() -> OSPermissionStatus {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        if screenpipe_a11y::check_input_monitoring() {
+            return OSPermissionStatus::Granted;
+        }
+        // Open the Input Monitoring pane first so when the OS prompt
+        // appears it's layered on top of the settings UI the user lands
+        // in if they dismiss the prompt. Matches the pattern used by
+        // request_permission for ScreenRecording above.
+        let _ = Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+            .spawn();
+        // Triggers the native consent prompt the first time the process
+        // calls it. Subsequent calls are no-ops if denied — the user has
+        // to enable from System Settings, which we just opened.
+        if screenpipe_a11y::request_input_monitoring() {
+            OSPermissionStatus::Granted
+        } else {
+            OSPermissionStatus::Denied
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        OSPermissionStatus::NotNeeded
+    }
+}
+
+#[tauri::command(async)]
+#[specta::specta]
+pub async fn check_permission(permission: OSPermission) -> OSPermissionStatus {
+    #[cfg(target_os = "macos")]
+    {
+        match permission {
+            OSPermission::ScreenRecording => check_screen_recording_permission(),
+            OSPermission::Microphone => check_microphone_permission(),
+            OSPermission::Accessibility => check_accessibility_permission(),
+            OSPermission::InputMonitoring => {
+                if screenpipe_a11y::check_input_monitoring() {
+                    OSPermissionStatus::Granted
+                } else {
+                    OSPermissionStatus::Denied
+                }
+            }
+            OSPermission::Calendar => {
+                use eventkit::AuthorizationStatus;
+                match crate::calendar::calendar_status().await {
+                    Ok(status) if status.authorized => OSPermissionStatus::Granted,
+                    Ok(status)
+                        if status.authorization_status
+                            == AuthorizationStatus::NotDetermined.to_string() =>
+                    {
+                        OSPermissionStatus::Empty
+                    }
+                    _ => OSPermissionStatus::Denied,
+                }
+            }
+            OSPermission::Automation => OSPermissionStatus::Denied,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = permission;
+        OSPermissionStatus::NotNeeded
+    }
+}
+
+#[tauri::command(async)]
+#[specta::specta]
+pub async fn reset_permission(app: tauri::AppHandle, permission: OSPermission) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+
+        let service = match &permission {
+            OSPermission::ScreenRecording => "ScreenCapture",
+            OSPermission::Microphone => "Microphone",
+            OSPermission::Accessibility => "Accessibility",
+            OSPermission::InputMonitoring => "ListenEvent",
+            OSPermission::Calendar => "Calendar",
+            OSPermission::Automation => {
+                open_permission_settings(OSPermission::Automation);
+                return Ok(());
+            }
+        };
+
+        let bundle_id = app.config().identifier.as_str();
+        if bundle_id.is_empty() {
+            return Err("no bundle identifier in app config".to_string());
+        }
+
+        let output = Command::new("tccutil")
+            .args(["reset", service, bundle_id])
+            .output()
+            .map_err(|e| format!("failed to run tccutil: {}", e))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("tccutil reset {} failed: {}", service, stderr.trim()));
+        }
+
+        if matches!(permission, OSPermission::Calendar) {
+            tokio::task::spawn_blocking(|| {
+                let cal = screenpipe_connect::calendar::ScreenpipeCalendar::new();
+                cal.reset();
+            })
+            .await
+            .map_err(|e| format!("failed to reset EventKit store: {}", e))?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, permission);
+        Ok(())
+    }
 }
 
 /// Reset a permission using tccutil and re-request it
@@ -238,6 +498,8 @@ pub async fn reset_and_request_permission(
             OSPermission::ScreenRecording => "ScreenCapture",
             OSPermission::Microphone => "Microphone",
             OSPermission::Accessibility => "Accessibility",
+            OSPermission::InputMonitoring => "ListenEvent",
+            OSPermission::Calendar => "Calendar",
             OSPermission::Automation => {
                 // Automation doesn't use tccutil reset flow — just open settings
                 open_permission_settings(OSPermission::Automation);
@@ -264,7 +526,7 @@ pub async fn reset_and_request_permission(
         sleep(Duration::from_millis(500)).await;
 
         // Re-request the permission
-        request_permission(permission).await;
+        request_permission(app, permission).await;
 
         Ok(())
     }
@@ -909,6 +1171,6 @@ pub fn request_arc_automation_permission(_app: tauri::AppHandle) -> bool {
 // NOTE: Runtime permission monitoring is now handled by
 // `screenpipe-engine::permission_monitor` which emits `permission_lost` /
 // `permission_restored` events on the shared event bus. The Tauri app
-// subscribes via `crate::permission_events` over /ws/events. This module
+// subscribes via `crate::engine_events::permission` over /ws/events. This module
 // keeps the synchronous TCC/AV check helpers used by the onboarding UI
 // and the preflight startup check.

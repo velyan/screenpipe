@@ -7,11 +7,13 @@ pub mod apple;
 pub mod core;
 pub mod custom_ocr;
 pub mod frame_comparison;
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
 pub mod microsoft;
 pub mod monitor;
 #[cfg(target_os = "windows")]
 pub mod wgc_capture;
+#[cfg(target_os = "macos")]
+pub use monitor::HdCapture;
 pub use monitor::MonitorListError;
 pub mod metrics;
 pub mod ocr_cache;
@@ -62,5 +64,15 @@ pub mod stream_invalidation {
     /// stream is lazily recreated on the next capture call after focus returns.
     pub fn invalidate_monitor_stream(monitor_id: u32) {
         sck_rs::invalidate_monitor_stream(monitor_id);
+    }
+
+    /// Current frame-delivery sequence for a monitor's persistent stream, if
+    /// one is cached. Monotonic; bumped once per OS-latched frame. `None` when
+    /// no stream exists yet. Compared across captures to detect a wedged
+    /// stream: a healthy stream keeps advancing this even on a static screen
+    /// (SCK delivers identical frames at the frame interval), so a stalled
+    /// sequence means the OS callback died, not that the screen is idle.
+    pub fn monitor_frame_seq(monitor_id: u32) -> Option<u64> {
+        sck_rs::monitor_frame_seq(monitor_id)
     }
 }

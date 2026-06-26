@@ -16,8 +16,9 @@
 //!
 //! 1. The explicit `api_key` on [`TinfoilConfig`] when constructed.
 //! 2. The `SCREENPIPE_PRIVACY_FILTER_API_KEY` env var.
-//! 3. The `SCREENPIPE_API_AUTH_KEY` env var (matches the convention
-//!    the rest of the codebase uses for screenpipe-cloud auth).
+//! 3. The `SCREENPIPE_LOCAL_API_KEY` env var (the local-API bearer the
+//!    rest of the codebase uses), with `SCREENPIPE_API_AUTH_KEY` honored
+//!    as a deprecated alias.
 //!
 //! If none is set, requests still go out un-authenticated — the
 //! adapter logs a warning at construction time so misconfiguration is
@@ -110,16 +111,29 @@ pub struct TinfoilConfig {
     /// `SCREENPIPE_PRIVACY_FILTER_REPO`, then [`DEFAULT_REPO`].
     pub repo: Option<String>,
     /// Bearer token for the enclave. Falls back through
-    /// `SCREENPIPE_PRIVACY_FILTER_API_KEY` and `SCREENPIPE_API_AUTH_KEY`.
+    /// `SCREENPIPE_PRIVACY_FILTER_API_KEY`, `SCREENPIPE_LOCAL_API_KEY`,
+    /// and `SCREENPIPE_API_AUTH_KEY` (deprecated alias).
     pub api_key: Option<String>,
     /// Per-request HTTP timeout. Default: 60s.
     pub timeout: Option<Duration>,
+    /// Canonical [`crate::SpanLabel`] snake_case names the enclave
+    /// should redact (e.g. `["secret", "email", "person"]`). The
+    /// enclave detects every class but only rewrites these. Empty =
+    /// let the enclave use its own default (back-compat). The desktop
+    /// app populates this from the `piiRedactionLabels` setting.
+    pub labels: Vec<String>,
 }
 
 #[derive(Serialize)]
 struct FilterRequest<'a> {
     text: &'a str,
     include_spans: bool,
+    /// Server-side allow-list. Older enclave builds ignore this field
+    /// (pydantic drops unknown keys); newer builds filter to exactly
+    /// these classes. Sent only when non-empty so an unconfigured
+    /// caller falls back to the enclave's own default policy.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    labels: &'a Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -134,8 +148,7 @@ struct FilterResponse {
 /// [`reqwest::Client`] for actual request dispatch.
 struct CachedClient {
     /// Keeps the SDK verifier alive for `http`'s lifetime.
-    #[allow(dead_code)]
-    inner: tinfoil::Client,
+    _inner: tinfoil::Client,
     http: reqwest::Client,
     created_at: Instant,
 }
@@ -148,6 +161,10 @@ pub struct TinfoilRedactor {
     /// the OpenAI chat path), so we keep the header logic local.
     bearer: Option<HeaderValue>,
     timeout: Duration,
+    /// Server-side redaction allow-list (canonical snake_case label
+    /// names). Forwarded on every `/filter` request; empty = enclave
+    /// default.
+    labels: Vec<String>,
     /// Cached attested client. RwLock so reads (the hot path) don't
     /// serialize, write lock only on (re-)attest. Lazy: the first
     /// `http()` call pays the ~1-2 s attestation handshake.
@@ -175,6 +192,7 @@ impl TinfoilRedactor {
         let api_key = cfg.api_key.or_else(|| {
             std::env::var("SCREENPIPE_PRIVACY_FILTER_API_KEY")
                 .ok()
+                .or_else(|| std::env::var("SCREENPIPE_LOCAL_API_KEY").ok())
                 .or_else(|| std::env::var("SCREENPIPE_API_AUTH_KEY").ok())
         });
 
@@ -203,6 +221,7 @@ impl TinfoilRedactor {
             repo,
             bearer,
             timeout: cfg.timeout.unwrap_or(DEFAULT_TIMEOUT),
+            labels: cfg.labels,
             client: RwLock::new(None),
             has_auth,
         }
@@ -266,7 +285,7 @@ impl TinfoilRedactor {
             .clone();
         let http_clone = http.clone();
         *g = Some(CachedClient {
-            inner,
+            _inner: inner,
             http,
             created_at: Instant::now(),
         });
@@ -354,6 +373,7 @@ impl TinfoilRedactor {
             .json(&FilterRequest {
                 text,
                 include_spans: false,
+                labels: &self.labels,
             });
         if let Some(b) = &self.bearer {
             req = req.header(AUTHORIZATION, b.clone());
@@ -404,6 +424,7 @@ mod tests {
             repo: Some("test/never".into()),
             api_key: None,
             timeout: None,
+            labels: vec![],
         }
     }
 
@@ -444,6 +465,7 @@ mod tests {
             repo: Some("test/never".into()),
             api_key: Some("test-token-abc".into()),
             timeout: None,
+            labels: vec![],
         });
         assert!(
             r.has_auth(),
@@ -455,12 +477,14 @@ mod tests {
     async fn no_api_key_means_no_auth() {
         // Make sure no env var is leaking in.
         std::env::remove_var("SCREENPIPE_PRIVACY_FILTER_API_KEY");
+        std::env::remove_var("SCREENPIPE_LOCAL_API_KEY");
         std::env::remove_var("SCREENPIPE_API_AUTH_KEY");
         let r = TinfoilRedactor::new(TinfoilConfig {
             enclave: Some("example.invalid".into()),
             repo: Some("test/never".into()),
             api_key: None,
             timeout: None,
+            labels: vec![],
         });
         assert!(!r.has_auth(), "no api key should mean no auth header");
     }

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use screenpipe_audio::audio_manager::builder::AudioManagerOptions;
+use screenpipe_audio::core::device::resolve_audio_devices_for_capture;
 use screenpipe_audio::core::engine::AudioTranscriptionEngine;
 use screenpipe_audio::meeting_detector::MeetingDetector;
 use screenpipe_audio::transcription::deepgram::{
@@ -25,6 +26,7 @@ use screenpipe_engine::{
     vision_manager::{start_monitor_watcher, stop_monitor_watcher, VisionManager},
     RecordingConfig,
 };
+use screenpipe_events::{send_event, PermissionEvent, PermissionKind};
 use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
@@ -39,6 +41,7 @@ use crate::server_core::ServerCore;
 /// callers don't need to reach into `ServerCore` to stop capture.
 pub struct CaptureSession {
     shutdown_tx: broadcast::Sender<()>,
+    vision_task: Option<tokio::task::JoinHandle<()>>,
     ui_recorder_handle: Option<screenpipe_engine::UiRecorderHandle>,
     audio_manager: Arc<screenpipe_audio::audio_manager::AudioManager>,
     audio_disabled: bool,
@@ -68,21 +71,57 @@ impl CaptureSession {
         // --- Capture trigger sender (set by VisionManager, consumed by UI recorder) ---
         let mut capture_trigger_tx: Option<screenpipe_engine::event_driven_capture::TriggerSender> =
             None;
+        // --- Frame-linker sender (set by VisionManager, consumed by UI recorder + capture loops) ---
+        let mut linker_tx: Option<screenpipe_engine::frame_linker_actor::LinkerSender> = None;
+        let mut vision_task = None;
 
         // --- Vision ---
-        if !config.disable_vision {
+        // Gate on screen recording permission before calling any ScreenCaptureKit API.
+        // On macOS 15+ SCShareableContent::current() (called by list_monitors inside
+        // VisionManager::start) shows Apple's native TCC padlock dialog if the app has
+        // not been granted Screen Recording access yet — even before onboarding runs.
+        // check_screen_recording_tauri() skips capture_probe on macOS 15+ (avoids the
+        // native TCC dialog CGWindowListCreateImage triggers). Skip vision entirely when not granted;
+        // spawn_screenpipe is called again from onboarding after the user grants access.
+        #[cfg(target_os = "macos")]
+        let screen_recording_permitted =
+            screenpipe_core::permissions::check_screen_recording_tauri().is_granted();
+        #[cfg(not(target_os = "macos"))]
+        let screen_recording_permitted = true;
+
+        if !config.disable_vision && !screen_recording_permitted {
+            warn!("Screen recording permission not yet granted — skipping VisionManager to avoid native TCC dialog; will start on next spawn_screenpipe after onboarding grants access");
+            crate::health::set_recording_status(crate::health::RecordingStatus::Starting);
+            // Emit permission_needed event so frontend can trigger onboarding/permission flow
+            let _ = send_event(
+                PermissionEvent::needed(PermissionKind::ScreenRecording).event_name(),
+                PermissionEvent::needed(PermissionKind::ScreenRecording),
+            );
+        }
+
+        if !config.disable_vision && screen_recording_permitted {
             let db_clone = server.db.clone();
             let output_path = server.data_path.to_string_lossy().into_owned();
             let vision_config =
                 config.to_vision_manager_config(output_path, server.vision_metrics.clone());
 
+            // Only the timeline streaming endpoint reads the hot frame cache.
+            // When the timeline is disabled, don't buffer captured frames into
+            // it (skips push_frame's per-frame work for nothing to consume).
+            let hot_cache_for_capture = if config.disable_timeline {
+                None
+            } else {
+                Some(server.hot_frame_cache.clone())
+            };
             let vision_manager = Arc::new(
                 VisionManager::new(vision_config, db_clone, tokio::runtime::Handle::current())
-                    .with_hot_frame_cache(server.hot_frame_cache.clone())
-                    .with_power_profile(server.power_manager.subscribe()),
+                    .with_hot_frame_cache(hot_cache_for_capture)
+                    .with_power_profile(server.power_manager.subscribe())
+                    .with_high_fps_controller(server.high_fps_controller.clone()),
             );
 
             capture_trigger_tx = Some(vision_manager.trigger_sender());
+            linker_tx = Some(vision_manager.linker_sender());
 
             let shutdown_rx = shutdown_tx.subscribe();
             let audio_manager_for_drm = if !config.disable_audio {
@@ -91,22 +130,22 @@ impl CaptureSession {
                 None
             };
 
-            // Await VisionManager::start inline so its Err can propagate back to
-            // start_capture. Previously this was inside a detached `tokio::spawn`,
-            // which returned the outer `Ok(Self)` before the spawn even ran — so
-            // a silent failure (e.g. stale allowlist matching zero monitors) left
-            // a "dead" CaptureSession parked in RecordingState.capture and every
-            // subsequent tray click short-circuited on is_some().
-            vision_manager.start().await.map_err(|e| {
-                error!("Failed to start VisionManager: {:?}", e);
-                format!("Failed to start VisionManager: {e}")
-            })?;
-            info!("VisionManager started successfully");
+            // A failed initial start() (e.g. 0 monitors while screen is locked at boot)
+            // is recoverable — the monitor watcher below retries on unlock/topology change.
+            // Don't propagate the error; keep the session alive so the watcher can run.
+            match vision_manager.start().await {
+                Ok(()) => info!("VisionManager started successfully"),
+                Err(e) => {
+                    warn!("VisionManager initial start failed ({e}); monitor watcher will retry");
+                    crate::health::set_recording_status(crate::health::RecordingStatus::Starting);
+                }
+            }
 
             // Long-running parts (monitor watcher + shutdown handler) stay in the
-            // spawn — they're fire-and-forget by design.
+            // spawn. Keep the handle so stop() can wait for SCK cleanup before
+            // another capture session starts in this long-lived app process.
             let vm_spawn = vision_manager.clone();
-            tokio::spawn(async move {
+            vision_task = Some(tokio::spawn(async move {
                 let mut shutdown_rx = shutdown_rx;
 
                 if let Err(e) = start_monitor_watcher(vm_spawn.clone(), audio_manager_for_drm).await
@@ -122,7 +161,7 @@ impl CaptureSession {
                 if let Err(e) = vm_spawn.shutdown().await {
                     error!("Error shutting down VisionManager: {:?}", e);
                 }
-            });
+            }));
         }
 
         // --- Audio recording ---
@@ -143,14 +182,35 @@ impl CaptureSession {
         }
 
         // --- UI event recording ---
-        let ui_recorder_handle = {
+        // Gate on accessibility permission before calling start_ui_recording.
+        // Internally it calls recorder.request_permissions() →
+        // AXIsProcessTrustedWithOptions(prompt: true) which shows Apple's
+        // native accessibility TCC dialog for users who haven't granted it yet.
+        // AXIsProcessTrusted() (used by check_accessibility) is silent.
+        #[cfg(target_os = "macos")]
+        let accessibility_permitted =
+            screenpipe_core::permissions::check_accessibility().is_granted();
+        #[cfg(not(target_os = "macos"))]
+        let accessibility_permitted = true;
+
+        let ui_recorder_handle = if !accessibility_permitted {
+            warn!("Accessibility permission not yet granted — skipping UI event recording to avoid native TCC dialog; will start on next spawn_screenpipe after onboarding grants access");
+            // Emit permission_needed event so frontend can trigger onboarding/permission flow
+            let _ = send_event(
+                PermissionEvent::needed(PermissionKind::Accessibility).event_name(),
+                PermissionEvent::needed(PermissionKind::Accessibility),
+            );
+            None
+        } else {
             let ui_config = config.to_ui_recorder_config();
             let db_clone = server.db.clone();
             match start_ui_recording(
                 db_clone,
                 ui_config,
                 capture_trigger_tx,
+                linker_tx,
                 config.ignored_windows.clone(),
+                cfg!(debug_assertions), // debug: dragflow unavailable, fall back to native dialog; release: dragflow handles it
             )
             .await
             {
@@ -176,6 +236,7 @@ impl CaptureSession {
                 shutdown_tx.subscribe(),
                 Some(meeting_detector),
                 close_orphaned_meetings_on_start,
+                config.ignored_meeting_apps.clone(),
             );
             info!("meeting watcher started (v2 UI scanning)");
         } else {
@@ -210,6 +271,7 @@ impl CaptureSession {
 
         Ok(Self {
             shutdown_tx,
+            vision_task,
             ui_recorder_handle,
             audio_manager: server.audio_manager.clone(),
             audio_disabled: config.disable_audio,
@@ -239,6 +301,25 @@ impl CaptureSession {
             }
         }
 
+        // Wait until VisionManager releases its ScreenCaptureKit handles. The
+        // desktop app keeps this process alive across stop/start cycles, unlike
+        // the CLI, so returning before this finishes can leave stale SCStreams
+        // producing OS-level "stream output NOT found" frame drops.
+        if let Some(mut vision_task) = self.vision_task.take() {
+            info!("Waiting for VisionManager shutdown...");
+            match tokio::time::timeout(Duration::from_secs(10), &mut vision_task).await {
+                Ok(Ok(())) => info!("VisionManager shutdown finished cleanly"),
+                Ok(Err(e)) => warn!("VisionManager shutdown task failed: {}", e),
+                Err(_) => {
+                    warn!("VisionManager shutdown did not finish within 10s; aborting task");
+                    vision_task.abort();
+                    let _ = vision_task.await;
+                }
+            }
+        }
+
+        invalidate_macos_screen_streams("capture session stop").await;
+
         // Wait for UI recorder tasks to finish
         if let Some(ui_handle) = self.ui_recorder_handle.take() {
             info!("Waiting for UI recorder tasks to finish...");
@@ -251,6 +332,29 @@ impl CaptureSession {
         info!("Capture session stopped");
     }
 }
+
+#[cfg(target_os = "macos")]
+async fn invalidate_macos_screen_streams(reason: &str) {
+    info!("Invalidating macOS ScreenCaptureKit screenshot streams ({reason})");
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(|| {
+            screenpipe_screen::stream_invalidation::invalidate_streams();
+        }),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(())) => info!("macOS ScreenCaptureKit screenshot streams invalidated"),
+        Ok(Err(e)) => warn!("macOS ScreenCaptureKit invalidation task failed: {}", e),
+        Err(_) => warn!("macOS ScreenCaptureKit stream invalidation timed out after 5s"),
+    }
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn invalidate_macos_screen_streams(_reason: &str) {}
 
 fn log_capture_transcription_config(config: &RecordingConfig, options: &AudioManagerOptions) {
     let deepgram_diag = match &config.deepgram_config {
@@ -318,8 +422,15 @@ async fn reconfigure_audio_manager(
             None
         };
 
+    let audio_devices = if config.disable_audio {
+        Vec::new()
+    } else {
+        resolve_audio_devices_for_capture(&config.audio_devices, config.use_system_default_audio)
+            .await
+    };
+
     let mut audio_manager_builder = config
-        .to_audio_manager_builder(server.data_path.clone(), config.audio_devices.clone())
+        .to_audio_manager_builder(server.data_path.clone(), audio_devices)
         .transcription_mode(config.transcription_mode.clone())
         .openai_compatible_config(openai_compatible_config);
 

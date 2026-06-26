@@ -20,7 +20,7 @@ interface ChangelogEntry {
   commitCount: number;
 }
 
-const CHANGELOG_API = "https://screenpi.pe/api/changelog?limit=50";
+const CHANGELOG_API = "https://screenpipe.com/api/changelog?limit=50";
 
 async function fetchRemote(): Promise<ChangelogEntry[] | null> {
   try {
@@ -117,7 +117,7 @@ export const ChangelogDialog: React.FC = () => {
         <div className="px-6 pt-6 pb-4 border-b border-border flex items-center justify-between">
           <h1 className="text-xl font-semibold">changelog</h1>
           <a
-            href="https://screenpi.pe/changelog"
+            href="https://screenpipe.com/changelog"
             target="_blank"
             rel="noopener noreferrer"
             className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
@@ -200,12 +200,12 @@ export const ChangelogDialog: React.FC = () => {
             <div className="text-sm text-muted-foreground font-mono">
               couldn&apos;t reach the changelog. try again later or visit{" "}
               <a
-                href="https://screenpi.pe/changelog"
+                href="https://screenpipe.com/changelog"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="underline hover:text-foreground"
               >
-                screenpi.pe/changelog
+                screenpipe.com/changelog
               </a>
             </div>
           )}

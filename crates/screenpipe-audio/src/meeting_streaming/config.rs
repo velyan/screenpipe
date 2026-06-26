@@ -7,8 +7,7 @@ use std::{env, str::FromStr};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-const SCREENPIPE_CLOUD_REALTIME_URL: &str = "wss://api.screenpi.pe/v1/realtime";
-const OPENAI_REALTIME_URL: &str = "wss://api.openai.com/v1/realtime";
+const SCREENPIPE_CLOUD_REALTIME_URL: &str = "wss://api.screenpipe.com/v1/realtime";
 const DEEPGRAM_LIVE_URL: &str = "wss://api.deepgram.com/v1/listen";
 const SCREENPIPE_CLOUD_REALTIME_PATH: &str = "/v1/realtime";
 const DEEPGRAM_LIVE_PATH: &str = "/v1/listen";
@@ -24,7 +23,6 @@ pub enum MeetingStreamingProvider {
     Disabled,
     SelectedEngine,
     ScreenpipeCloud,
-    OpenAiRealtime,
     DeepgramLive,
 }
 
@@ -34,7 +32,6 @@ impl MeetingStreamingProvider {
             Self::Disabled => "disabled",
             Self::SelectedEngine => "selected-engine",
             Self::ScreenpipeCloud => "screenpipe-cloud",
-            Self::OpenAiRealtime => "openai-realtime",
             Self::DeepgramLive => "deepgram-live",
         }
     }
@@ -56,11 +53,15 @@ pub struct MeetingStreamingConfig {
     pub auth_token: Option<String>,
     pub api_key: Option<String>,
     pub endpoint: String,
-    pub session_model: String,
     pub model: Option<String>,
     pub language: Option<String>,
     pub local_speaker_name: Option<String>,
     pub persist_finals: bool,
+    /// Domain / proper-noun terms to bias the live transcriber toward (Deepgram
+    /// nova-3 keyterm prompting). Seeded from the user's custom vocabulary; the
+    /// streaming analog of the batch path's keyterms. Empty = no biasing.
+    #[serde(default)]
+    pub keyterms: Vec<String>,
 }
 
 impl Default for MeetingStreamingConfig {
@@ -72,11 +73,6 @@ impl Default for MeetingStreamingConfig {
             .unwrap_or(MeetingStreamingProvider::SelectedEngine);
         let api_key = provider_api_key(&provider);
         let endpoint = match provider {
-            MeetingStreamingProvider::OpenAiRealtime => endpoint_from_env(
-                &["SCREENPIPE_MEETING_OPENAI_REALTIME_URL"],
-                OPENAI_REALTIME_URL,
-                SCREENPIPE_CLOUD_REALTIME_PATH,
-            ),
             MeetingStreamingProvider::DeepgramLive => endpoint_from_env(
                 &["SCREENPIPE_MEETING_DEEPGRAM_LIVE_URL"],
                 DEEPGRAM_LIVE_URL,
@@ -89,7 +85,6 @@ impl Default for MeetingStreamingConfig {
             ),
         };
         let default_model = match provider {
-            MeetingStreamingProvider::OpenAiRealtime => "gpt-4o-transcribe",
             MeetingStreamingProvider::SelectedEngine => "selected transcription engine",
             MeetingStreamingProvider::Disabled
             | MeetingStreamingProvider::ScreenpipeCloud
@@ -104,8 +99,6 @@ impl Default for MeetingStreamingConfig {
                 .filter(|s| !s.trim().is_empty()),
             api_key,
             endpoint,
-            session_model: env_non_empty("SCREENPIPE_MEETING_OPENAI_SESSION_MODEL")
-                .unwrap_or_else(|| "gpt-realtime-2".to_string()),
             model: Some(
                 env_non_empty("SCREENPIPE_MEETING_TRANSCRIPTION_MODEL")
                     .unwrap_or_else(|| default_model.to_string()),
@@ -115,6 +108,7 @@ impl Default for MeetingStreamingConfig {
                 .filter(|s| !s.trim().is_empty()),
             local_speaker_name: env_non_empty("SCREENPIPE_MEETING_LOCAL_SPEAKER_NAME"),
             persist_finals: true,
+            keyterms: Vec::new(),
         }
     }
 }
@@ -139,7 +133,6 @@ impl FromStr for MeetingStreamingProvider {
             "screenpipe-cloud" | "screenpipe_cloud" | "screenpipe" | "cloud" => {
                 Ok(Self::ScreenpipeCloud)
             }
-            "openai" | "openai_realtime" | "openai-realtime" => Ok(Self::OpenAiRealtime),
             "deepgram" | "deepgram_live" | "deepgram-live" => Ok(Self::DeepgramLive),
             "auto" => Err(()),
             _ => Err(()),
@@ -148,6 +141,14 @@ impl FromStr for MeetingStreamingProvider {
 }
 
 impl MeetingStreamingConfig {
+    /// Seed the keyterms used to bias the live transcriber (attendee names,
+    /// product/company terms). Carried through provider re-resolution since
+    /// `with_provider` preserves it.
+    pub fn with_keyterms(mut self, keyterms: Vec<String>) -> Self {
+        self.keyterms = keyterms;
+        self
+    }
+
     pub fn with_provider(mut self, provider: MeetingStreamingProvider) -> Self {
         self.provider = provider;
         match self.provider {
@@ -180,18 +181,6 @@ impl MeetingStreamingConfig {
                         .unwrap_or_else(|| "nova-3".to_string()),
                 );
             }
-            MeetingStreamingProvider::OpenAiRealtime => {
-                self.api_key = provider_api_key(&self.provider);
-                self.endpoint = endpoint_from_env(
-                    &["SCREENPIPE_MEETING_OPENAI_REALTIME_URL"],
-                    OPENAI_REALTIME_URL,
-                    SCREENPIPE_CLOUD_REALTIME_PATH,
-                );
-                self.model = Some(
-                    env_non_empty("SCREENPIPE_MEETING_TRANSCRIPTION_MODEL")
-                        .unwrap_or_else(|| "gpt-4o-transcribe".to_string()),
-                );
-            }
             MeetingStreamingProvider::Disabled => {}
         }
         self
@@ -205,14 +194,17 @@ impl MeetingStreamingConfig {
         language: Option<String>,
         local_speaker_name: Option<String>,
     ) -> Self {
-        let provider = MeetingStreamingProvider::from_str(provider)
+        let requested_provider = MeetingStreamingProvider::from_str(provider)
             .unwrap_or(MeetingStreamingProvider::SelectedEngine);
+        let auth_token = cloud_token.and_then(|token| non_empty_trimmed(&token));
+        let provider =
+            resolve_settings_provider(enabled, requested_provider, auth_token.as_deref());
         let provider_api_key_override =
             provider_api_key_override.and_then(|key| non_empty_trimmed(&key));
         let mut config = Self {
             enabled,
             provider,
-            auth_token: cloud_token.filter(|s| !s.trim().is_empty()),
+            auth_token,
             language: language.filter(|s| !s.trim().is_empty()),
             local_speaker_name: local_speaker_name.and_then(|name| non_empty_trimmed(&name)),
             ..Self::default()
@@ -222,17 +214,6 @@ impl MeetingStreamingConfig {
             config.api_key = None;
             config.endpoint = String::new();
             config.model = Some("selected transcription engine".to_string());
-        } else if config.provider == MeetingStreamingProvider::OpenAiRealtime {
-            config.api_key = provider_api_key(&config.provider);
-            config.endpoint = endpoint_from_env(
-                &["SCREENPIPE_MEETING_OPENAI_REALTIME_URL"],
-                OPENAI_REALTIME_URL,
-                SCREENPIPE_CLOUD_REALTIME_PATH,
-            );
-            config.model = Some(
-                env_non_empty("SCREENPIPE_MEETING_TRANSCRIPTION_MODEL")
-                    .unwrap_or_else(|| "gpt-4o-transcribe".to_string()),
-            );
         } else if config.provider == MeetingStreamingProvider::DeepgramLive {
             config.api_key =
                 provider_api_key_override.or_else(|| provider_api_key(&config.provider));
@@ -268,10 +249,6 @@ impl MeetingStreamingConfig {
                 .auth_token
                 .as_deref()
                 .is_some_and(|token| !token.trim().is_empty()),
-            MeetingStreamingProvider::OpenAiRealtime => self
-                .api_key
-                .as_deref()
-                .is_some_and(|key| !key.trim().is_empty()),
             MeetingStreamingProvider::DeepgramLive => self
                 .api_key
                 .as_deref()
@@ -280,11 +257,28 @@ impl MeetingStreamingConfig {
     }
 }
 
+fn resolve_settings_provider(
+    enabled: bool,
+    requested_provider: MeetingStreamingProvider,
+    cloud_token: Option<&str>,
+) -> MeetingStreamingProvider {
+    if !enabled || requested_provider != MeetingStreamingProvider::SelectedEngine {
+        return requested_provider;
+    }
+
+    if cloud_token.is_some_and(|token| !token.trim().is_empty()) {
+        // Paid/cloud users expect live meeting notes to use Screenpipe Cloud by
+        // default. `selected-engine` remains the non-cloud default, but once a
+        // cloud token is configured we promote it to cloud live unless the user
+        // disables live transcription or explicitly chooses another provider.
+        MeetingStreamingProvider::ScreenpipeCloud
+    } else {
+        MeetingStreamingProvider::SelectedEngine
+    }
+}
+
 fn provider_api_key(provider: &MeetingStreamingProvider) -> Option<String> {
     let keys: &[&str] = match provider {
-        MeetingStreamingProvider::OpenAiRealtime => {
-            &["SCREENPIPE_MEETING_OPENAI_API_KEY", "OPENAI_API_KEY"]
-        }
         MeetingStreamingProvider::DeepgramLive => {
             &["SCREENPIPE_MEETING_DEEPGRAM_API_KEY", "DEEPGRAM_API_KEY"]
         }
@@ -384,6 +378,37 @@ mod tests {
             config.model.as_deref(),
             Some("selected transcription engine")
         );
+    }
+
+    #[test]
+    fn selected_engine_promotes_to_cloud_when_cloud_is_configured() {
+        let config = MeetingStreamingConfig::from_settings(
+            true,
+            "selected-engine",
+            Some("cloud-token".to_string()),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(config.provider, MeetingStreamingProvider::ScreenpipeCloud);
+        assert!(config.live_transcription_ready());
+        assert_eq!(config.model.as_deref(), Some("nova-3"));
+    }
+
+    #[test]
+    fn disabled_live_transcription_does_not_promote_cloud() {
+        let config = MeetingStreamingConfig::from_settings(
+            false,
+            "selected-engine",
+            Some("cloud-token".to_string()),
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(config.provider, MeetingStreamingProvider::SelectedEngine);
+        assert!(!config.enabled);
     }
 
     #[test]

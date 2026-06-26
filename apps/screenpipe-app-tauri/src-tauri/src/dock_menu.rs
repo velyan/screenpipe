@@ -58,7 +58,7 @@ pub fn setup_dock_menu(app_handle: AppHandle) {
                     let app = app.clone();
                     tauri::async_runtime::spawn(async move {
                         let state = app.state::<std::sync::Arc<crate::updates::UpdatesManager>>();
-                        if let Err(e) = state.check_for_updates(true).await {
+                        if let Err(e) = state.check_for_updates(true, true).await {
                             tracing::error!("dock menu: check for updates failed: {}", e);
                         }
                     });

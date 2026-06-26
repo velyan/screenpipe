@@ -30,6 +30,16 @@ const CONSECUTIVE_FAILURES_THRESHOLD: u32 = 30;
 /// dedicated `permission_monitor` + capture-module events, not through this debounce.
 const CONSECUTIVE_UNHEALTHY_THRESHOLD: u32 = 120;
 
+/// Connection-failure checks before the watchdog treats the embedded engine as
+/// crashed and respawns it. Reuses the Stopped threshold (30 ≈ 30s at 1Hz),
+/// which already clears the ~20s sleep/wake timeout window.
+const SERVER_DOWN_THRESHOLD: u32 = CONSECUTIVE_FAILURES_THRESHOLD;
+/// Cap auto-respawns within the window so an engine that can't come back up
+/// (bad config, revoked permission, corrupt DB) can't restart-storm — it falls
+/// back to the existing Stopped tray state instead.
+const SERVER_RESPAWN_MAX_ATTEMPTS: u32 = 3;
+const SERVER_RESPAWN_WINDOW: Duration = Duration::from_secs(600);
+
 // ─────────────────────────────────────────────────────────────────────────
 // Boot phase — tracks where we are inside ServerCore::start.
 //
@@ -111,6 +121,61 @@ pub fn get_boot_phase_snapshot() -> BootPhaseSnapshot {
     BOOT_PHASE.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// Snapshot of where the boot lifecycle currently is.
+///
+/// Used as a gate before actions that race process teardown against
+/// still-initializing native sessions — see #3622 (onnxruntime SIGSEGV during
+/// auto-updater restart while `AudioManager::new` is mid-`create_session`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BootReadiness {
+    /// Phase is still pre-ready (`starting`, `migrating_database`,
+    /// `building_audio`, `starting_pipes`). Process teardown is unsafe.
+    Pending,
+    /// Phase is `ready`. Safe to restart.
+    Ready,
+    /// Phase is `error`. Process is in a stuck state; restart won't help and
+    /// callers should fail fast rather than waiting.
+    Errored,
+}
+
+fn read_boot_phase() -> String {
+    // Match existing pattern in this file: recover from poisoning rather than
+    // silently returning a wrong answer (which would cause wait loops to spin
+    // until timeout on a poisoned lock).
+    BOOT_PHASE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .phase
+        .clone()
+}
+
+pub fn boot_readiness() -> BootReadiness {
+    match read_boot_phase().as_str() {
+        "ready" => BootReadiness::Ready,
+        "error" => BootReadiness::Errored,
+        _ => BootReadiness::Pending,
+    }
+}
+
+/// Block until boot reaches a terminal state (`Ready` or `Errored`) or `timeout`
+/// elapses, then return the final readiness. Callers decide what to do with
+/// `Errored` and timed-out `Pending`.
+pub async fn wait_for_boot_ready(timeout: Duration) -> BootReadiness {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match boot_readiness() {
+            BootReadiness::Ready => return BootReadiness::Ready,
+            BootReadiness::Errored => return BootReadiness::Errored,
+            BootReadiness::Pending => {
+                if Instant::now() >= deadline {
+                    return BootReadiness::Pending;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+}
+
 // Shared recording status that can be read by the tray menu
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum RecordingStatus {
@@ -118,6 +183,10 @@ pub enum RecordingStatus {
     Recording,
     /// Capture paused but server (HTTP/pipes/search) still alive.
     Paused,
+    /// Capture intentionally stopped by the user's work-hours schedule. Kept
+    /// distinct from `Paused` so the tray can say "outside work hours" rather
+    /// than implying a transient/manual pause the user can just click to resume.
+    ScheduledPause,
     Stopped,
     Error,
 }
@@ -192,8 +261,40 @@ pub fn set_audio_device_status(devices: Vec<AudioDeviceEntry>) {
     *guard = devices;
 }
 
-#[allow(dead_code)]
-fn set_recording_status(status: RecordingStatus) {
+/// Mirror of `routes::capture::HighFpsState` — what the tray needs to
+/// render the "HD recording" menu item label and checked state.
+/// Updated by the health poll so the tray reads from a local cache
+/// instead of blocking on an HTTP round-trip, AND mutated optimistically
+/// by the tray click handler so rapid clicks compute the next action
+/// from post-click state instead of the 1-sec-stale poll snapshot.
+#[derive(Clone, Debug, Default)]
+pub struct HighFpsCacheEntry {
+    /// True iff an HD session is currently active.
+    pub active: bool,
+    /// Capture debounce (ms). Cached so the label can show "~10 fps".
+    pub interval_ms: u64,
+    /// Session kind serialized as `"meeting"` | `"timer"` | empty.
+    pub session_kind: String,
+    /// Seconds until the active session auto-expires. 0 when idle.
+    pub remaining_secs: u64,
+}
+
+static HIGH_FPS_STATUS: Lazy<RwLock<HighFpsCacheEntry>> =
+    Lazy::new(|| RwLock::new(HighFpsCacheEntry::default()));
+
+pub fn get_high_fps_status() -> HighFpsCacheEntry {
+    HIGH_FPS_STATUS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+pub fn set_high_fps_status(entry: HighFpsCacheEntry) {
+    let mut guard = HIGH_FPS_STATUS.write().unwrap_or_else(|e| e.into_inner());
+    *guard = entry;
+}
+
+pub fn set_recording_status(status: RecordingStatus) {
     RECORDING_INFO
         .write()
         .unwrap_or_else(|e| e.into_inner())
@@ -259,6 +360,12 @@ struct HealthCheckResponse {
     /// DRM streaming content detected — capture should be fully stopped
     #[serde(default)]
     drm_content_paused: bool,
+    /// Recording intentionally paused by the user's work-hours schedule. The
+    /// engine reports this in /health; when true it has stopped capture on
+    /// purpose, so the tray must say "outside work hours" instead of letting a
+    /// stale start flag render a stuck "Starting…".
+    #[serde(default)]
+    schedule_paused: bool,
 }
 
 /// Decide recording status based on health check result and time since startup.
@@ -328,14 +435,185 @@ fn decide_status(
     }
 }
 
+/// Snapshot of everything the engine-respawn decision needs, taken once per
+/// health tick. A struct (not 11 positional args) so call sites and tests read
+/// as named guards.
+struct EngineRespawnCheck {
+    /// Capture is supposed to be running (vs a deliberate stop).
+    wants_recording: bool,
+    /// Active subscription / dev build — don't respawn a lapsed install.
+    entitled: bool,
+    /// The server was up at some point → this is a crash, not a boot failure.
+    ever_connected: bool,
+    past_startup_grace: bool,
+    /// Already mid-restart (ours, a manual one, or a settings-applied one).
+    in_restart_grace: bool,
+    /// Sleep/wake transiently kills the HTTP server; let it recover on its own.
+    recently_woke: bool,
+    /// A start/respawn is already in flight.
+    start_in_progress: bool,
+    /// Consecutive connection failures, vs `down_threshold`.
+    consecutive_failures: u32,
+    down_threshold: u32,
+    /// Respawns already used this window, vs `max_respawns` (storm guard).
+    respawns_in_window: u32,
+    max_respawns: u32,
+}
+
+impl EngineRespawnCheck {
+    /// Pure decision: should the health watchdog respawn the embedded engine?
+    ///
+    /// The desktop app embeds and supervises the engine in-process; unlike the
+    /// CLI daemon (launchd `KeepAlive` / systemd `Restart=always`), nothing
+    /// brought a crashed embedded engine back — recording just sat `Stopped`.
+    /// This restores parity. True only when recording is supposed to be ON but
+    /// the server has been unreachable long enough to be a genuine crash — not a
+    /// sleep/wake blip, a deliberate stop, a still-booting or merely-degraded
+    /// server — and the per-window respawn budget isn't spent.
+    fn should_respawn(&self) -> bool {
+        self.wants_recording
+            && self.entitled
+            && self.ever_connected
+            && self.past_startup_grace
+            && !self.in_restart_grace
+            && !self.recently_woke
+            && !self.start_in_progress
+            && self.consecutive_failures >= self.down_threshold
+            && self.respawns_in_window < self.max_respawns
+    }
+}
+
+/// Respawn the embedded engine if it has crashed while capture should be on.
+/// Ages out the respawn-attempt window, resets the budget once the server is
+/// reachable again, applies every guard via [`EngineRespawnCheck`], and on a
+/// decision records the attempt, opens the shared restart grace, and spawns the
+/// restart. Extracted from the health loop body to keep that loop readable.
+fn respawn_engine_if_crashed(
+    app: &tauri::AppHandle,
+    health_ok: bool,
+    ever_connected: bool,
+    consecutive_failures: u32,
+    start_in_progress: bool,
+    start_elapsed: Duration,
+    server_respawns: &mut std::collections::VecDeque<Instant>,
+    last_restart_triggered: &mut Option<Instant>,
+) {
+    let now = Instant::now();
+    while server_respawns
+        .front()
+        .is_some_and(|t| now.duration_since(*t) > SERVER_RESPAWN_WINDOW)
+    {
+        server_respawns.pop_front();
+    }
+    // Server reachable again → reset the budget so a later, unrelated crash gets
+    // fresh respawn attempts. (Nothing to respawn while it's up.)
+    if health_ok {
+        server_respawns.clear();
+        return;
+    }
+
+    let check = EngineRespawnCheck {
+        wants_recording: app
+            .try_state::<crate::recording::RecordingState>()
+            .map(|s| s.capture_intended())
+            .unwrap_or(false),
+        entitled: crate::store::SettingsStore::get(app)
+            .ok()
+            .flatten()
+            .map(|s| s.app_entitled_or_dev())
+            .unwrap_or(false),
+        ever_connected,
+        past_startup_grace: start_elapsed > STARTUP_GRACE_PERIOD,
+        in_restart_grace: last_restart_triggered
+            .map(|t| t.elapsed() < NOTIFICATION_COOLDOWN)
+            .unwrap_or(false),
+        recently_woke: screenpipe_engine::sleep_monitor::recently_woke_from_sleep(),
+        start_in_progress,
+        consecutive_failures,
+        down_threshold: SERVER_DOWN_THRESHOLD,
+        respawns_in_window: server_respawns.len() as u32,
+        max_respawns: SERVER_RESPAWN_MAX_ATTEMPTS,
+    };
+    if !check.should_respawn() {
+        return;
+    }
+
+    warn!(
+        "embedded engine unreachable for {} checks while recording should be ON \
+         — auto-respawning (attempt {}/{})",
+        consecutive_failures,
+        server_respawns.len() + 1,
+        SERVER_RESPAWN_MAX_ATTEMPTS
+    );
+    server_respawns.push_back(now);
+    // Share the post-restart grace so stall detection and a second respawn both
+    // hold off while the new engine boots.
+    *last_restart_triggered = Some(now);
+    let app_for_respawn = app.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::recording::spawn_screenpipe(
+            app_for_respawn.state::<crate::recording::RecordingState>(),
+            app_for_respawn.clone(),
+            None,
+        )
+        .await
+        {
+            warn!("engine auto-respawn failed: {}", e);
+        }
+    });
+}
+
+/// Cap how long the `is_starting*` session flags may pin the tray on
+/// "Starting…" while the server is RESPONDING. The flags are AtomicBools
+/// cleared across many exit paths in recording.rs, and `capture_running`
+/// comes from a `try_lock` that can fail under contention — a leaked flag or
+/// permanently contended lock pinned a Windows enterprise machine on
+/// "Starting…" for hours while /health showed capture flowing (2026-06-11
+/// feedback log, device 40af21d0). A real server-up-but-capture-booting
+/// window is seconds; even a 100GB DB migration happens BEFORE the server
+/// responds. Past this ceiling we stop trusting the flag and let the
+/// health-derived status through. Generous on purpose.
+const START_PIN_CEILING: Duration = Duration::from_secs(300);
+
+/// Returns the start-in-progress flag, clamped: once it has been
+/// continuously true for longer than `ceiling` (tracked via `since`), it
+/// reads as false so a leaked flag can't pin the status forever. Resets the
+/// timer whenever the raw flag drops.
+fn clamp_start_in_progress(
+    raw: bool,
+    since: &mut Option<Instant>,
+    ceiling: Duration,
+) -> bool {
+    if !raw {
+        *since = None;
+        return false;
+    }
+    let started = since.get_or_insert_with(Instant::now);
+    if started.elapsed() > ceiling {
+        return false;
+    }
+    true
+}
+
 fn apply_capture_session_status(
     base_status: RecordingStatus,
     server_responding: bool,
     capture_running: Option<bool>,
     start_in_progress: bool,
+    schedule_paused: bool,
 ) -> RecordingStatus {
     if !server_responding {
         return base_status;
+    }
+
+    // The work-hours schedule intentionally parks capture outside the user's
+    // window. Honor it BEFORE the start-in-progress / capture-absent branches:
+    // when a boot lands outside work hours, capture never comes up (it's held
+    // off on purpose) and never errors, so the asserted start flag would
+    // otherwise pin the tray on a misleading "Starting…" forever — the exact
+    // bug a user with a work-hours schedule hit when booting before their window.
+    if schedule_paused {
+        return RecordingStatus::ScheduledPause;
     }
 
     if capture_running == Some(true) {
@@ -358,6 +636,9 @@ fn status_to_icon_key(status: RecordingStatus) -> &'static str {
         RecordingStatus::Starting => "starting",
         RecordingStatus::Recording => "healthy",
         RecordingStatus::Paused => "starting",
+        // Outside work hours is a neutral, intentional state — show the calm
+        // "starting"/amber icon, never the red error/unhealthy variant.
+        RecordingStatus::ScheduledPause => "starting",
         RecordingStatus::Stopped => "error",
         RecordingStatus::Error => "unhealthy",
     }
@@ -468,6 +749,15 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
     let mut last_restart_triggered: Option<Instant> = None;
     // Track last known spawn epoch to detect user-initiated restarts
     let mut last_known_spawn_epoch: u64 = 0;
+    // How long the recording-session "start in progress" flags have been
+    // continuously true — feeds clamp_start_in_progress so a leaked flag
+    // can't pin the tray on "Starting…" forever (see START_PIN_CEILING).
+    let mut start_in_progress_since: Option<Instant> = None;
+    let mut start_pin_warned = false;
+    // Timestamps of recent engine auto-respawns (crash recovery), aged by
+    // SERVER_RESPAWN_WINDOW so a server that can't come back up can't storm.
+    let mut server_respawns: std::collections::VecDeque<Instant> =
+        std::collections::VecDeque::new();
 
     tokio::spawn(async move {
         loop {
@@ -512,7 +802,7 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
                 current_status,
             );
 
-            let (capture_running, start_in_progress) = if let Some(recording_state) =
+            let (capture_running, start_in_progress_raw) = if let Some(recording_state) =
                 app.try_state::<crate::recording::RecordingState>()
             {
                 let start_in_progress = recording_state.is_starting.load(Ordering::SeqCst)
@@ -526,12 +816,53 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
             } else {
                 (None, false)
             };
+            // Clamp the flag so a leaked atomic / contended capture lock can't
+            // pin the tray on "Starting…" forever while capture is actually
+            // flowing (see START_PIN_CEILING).
+            let start_in_progress = clamp_start_in_progress(
+                start_in_progress_raw,
+                &mut start_in_progress_since,
+                START_PIN_CEILING,
+            );
+            if start_in_progress_raw && !start_in_progress {
+                if !start_pin_warned {
+                    start_pin_warned = true;
+                    warn!(
+                        "start-in-progress flag stuck for >{}s while server responding — \
+                         ignoring it for tray status (capture_running={:?})",
+                        START_PIN_CEILING.as_secs(),
+                        capture_running
+                    );
+                }
+            } else if !start_in_progress_raw {
+                start_pin_warned = false;
+            }
 
+            // Engine intentionally pauses capture outside the work-hours
+            // schedule and reports it in /health; surface it as ScheduledPause
+            // so the tray doesn't show a stuck "Starting…".
+            let schedule_paused = matches!(&health_result, Ok(h) if h.schedule_paused);
             let status = apply_capture_session_status(
                 status,
                 health_result.is_ok(),
                 capture_running,
                 start_in_progress,
+                schedule_paused,
+            );
+
+            // Bring the embedded engine back if it has crashed while capture
+            // should be on (parity with the CLI daemon's launchd/systemd
+            // KeepAlive). All the crash-vs-deliberate-stop and storm guards live
+            // in respawn_engine_if_crashed / EngineRespawnCheck.
+            respawn_engine_if_crashed(
+                &app,
+                health_result.is_ok(),
+                ever_connected,
+                consecutive_failures,
+                start_in_progress,
+                start_time.elapsed(),
+                &mut server_respawns,
+                &mut last_restart_triggered,
             );
 
             // NOTE: Runtime permission-loss detection has moved to
@@ -540,7 +871,7 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
             // it was slow (60s startup + 120s restart grace + 10s debounce) and
             // frequently missed transitions because CGPreflightScreenCaptureAccess
             // returns stale results. The app now subscribes to `permission_lost`
-            // / `permission_restored` events via /ws/events (see permission_events.rs).
+            // / `permission_restored` events via /ws/events (see engine_events.rs).
 
             // Parse device info from health response, filtered by monitor settings
             let mut devices = parse_devices_from_health(&health_result);
@@ -629,6 +960,31 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
                     }
 
                     set_audio_device_status(entries);
+                }
+            }
+
+            // Poll the HD controller state for the tray's menu item.
+            // 503 is normal (vision disabled / older engine) — keep last known.
+            if let Ok(res) = api
+                .apply_auth(reqwest::Client::new().get(api.url("/capture/hd")))
+                .send()
+                .await
+            {
+                if res.status().is_success() {
+                    if let Ok(body) = res.json::<serde_json::Value>().await {
+                        let kind = body
+                            .get("session")
+                            .and_then(|s| s.get("kind"))
+                            .and_then(|k| k.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        set_high_fps_status(HighFpsCacheEntry {
+                            active: body["active"].as_bool().unwrap_or(false),
+                            interval_ms: body["intervalMs"].as_u64().unwrap_or(100),
+                            session_kind: kind,
+                            remaining_secs: body["remainingSecs"].as_u64().unwrap_or(0),
+                        });
+                    }
                 }
             }
 
@@ -940,6 +1296,7 @@ mod tests {
             vision_db_write_stalled: false,
             audio_db_write_stalled: false,
             drm_content_paused: false,
+            schedule_paused: false,
         })
     }
 
@@ -961,6 +1318,7 @@ mod tests {
             vision_db_write_stalled: false,
             audio_db_write_stalled: false,
             drm_content_paused: false,
+            schedule_paused: false,
         })
     }
 
@@ -1193,36 +1551,90 @@ mod tests {
     #[test]
     fn test_capture_absent_with_live_server_is_paused() {
         let status =
-            apply_capture_session_status(RecordingStatus::Recording, true, Some(false), false);
+            apply_capture_session_status(RecordingStatus::Recording, true, Some(false), false, false);
         assert_eq!(status, RecordingStatus::Paused);
     }
 
     #[test]
     fn test_capture_absent_while_starting_stays_starting() {
         let status =
-            apply_capture_session_status(RecordingStatus::Recording, true, Some(false), true);
+            apply_capture_session_status(RecordingStatus::Recording, true, Some(false), true, false);
         assert_eq!(status, RecordingStatus::Starting);
     }
 
     #[test]
     fn test_capture_status_does_not_mask_connection_error() {
         let status =
-            apply_capture_session_status(RecordingStatus::Stopped, false, Some(false), false);
+            apply_capture_session_status(RecordingStatus::Stopped, false, Some(false), false, false);
         assert_eq!(status, RecordingStatus::Stopped);
     }
 
     #[test]
     fn test_running_capture_keeps_recording_status() {
         let status =
-            apply_capture_session_status(RecordingStatus::Recording, true, Some(true), false);
+            apply_capture_session_status(RecordingStatus::Recording, true, Some(true), false, false);
         assert_eq!(status, RecordingStatus::Recording);
     }
 
     #[test]
     fn test_running_capture_wins_over_stale_starting_flag() {
         let status =
-            apply_capture_session_status(RecordingStatus::Recording, true, Some(true), true);
+            apply_capture_session_status(RecordingStatus::Recording, true, Some(true), true, false);
         assert_eq!(status, RecordingStatus::Recording);
+    }
+
+    // ── Work-hours schedule pause ───────────────────────────────────────────
+    //
+    // Repro of a field report: a user with a work-hours schedule booted
+    // before their window, the engine started then immediately
+    // stopped capture ("outside work-hours schedule — stopping all capture"),
+    // and the tray sat on a stuck "Starting…". The inputs below are identical
+    // to `test_capture_absent_while_starting_stays_starting` (server up, no
+    // capture session, start flag still asserted) — only `schedule_paused` is
+    // true. Before the fix this returned Starting; now it must report the
+    // honest ScheduledPause so the tray can say "outside work hours".
+    #[test]
+    fn test_schedule_paused_overrides_stuck_starting() {
+        let status =
+            apply_capture_session_status(RecordingStatus::Recording, true, Some(false), true, true);
+        assert_eq!(status, RecordingStatus::ScheduledPause);
+    }
+
+    // A live capture session struct that the engine has schedule-stopped behind
+    // our back must NOT keep reading as Recording — that's the "overlay says
+    // recording but nothing is captured" footgun. schedule_paused wins.
+    #[test]
+    fn test_schedule_paused_overrides_recording() {
+        let status =
+            apply_capture_session_status(RecordingStatus::Recording, true, Some(true), false, true);
+        assert_eq!(status, RecordingStatus::ScheduledPause);
+    }
+
+    // Within the work-hours window (schedule_paused = false) nothing changes:
+    // the stale-start-flag path still yields Starting, exactly as before.
+    #[test]
+    fn test_within_schedule_leaves_starting_untouched() {
+        let status =
+            apply_capture_session_status(RecordingStatus::Recording, true, Some(false), true, false);
+        assert_eq!(status, RecordingStatus::Starting);
+    }
+
+    // schedule_paused only comes from a successful /health read, but guard the
+    // precedence anyway: a connection error must surface the real Stopped/boot
+    // state, never a stale "outside work hours".
+    #[test]
+    fn test_schedule_paused_ignored_when_server_down() {
+        let status =
+            apply_capture_session_status(RecordingStatus::Stopped, false, Some(false), false, true);
+        assert_eq!(status, RecordingStatus::Stopped);
+    }
+
+    // Outside work hours is intentional, not a failure — calm icon, not red.
+    #[test]
+    fn test_scheduled_pause_shows_healthy_icon() {
+        assert!(!is_unhealthy_icon(status_to_icon_key(
+            RecordingStatus::ScheduledPause
+        )));
     }
 
     #[test]
@@ -1424,5 +1836,266 @@ mod tests {
             is_unhealthy_icon(status_to_icon_key(status)),
             "should show failed icon if server never started"
         );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Boot-readiness gate (#3622)
+    //
+    // These tests mutate the process-wide BOOT_PHASE singleton. They share a
+    // mutex so they run serially even under `cargo test`'s default parallel
+    // runner — otherwise one test's `set_boot_phase("ready")` would race
+    // another's `set_boot_phase("error")` and flap.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    use std::sync::Mutex as StdMutex;
+    static BOOT_PHASE_TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn with_boot_phase<F: FnOnce()>(phase: &str, body: F) {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_boot_phase(phase, None);
+        body();
+        // Reset so other tests see a known-pending baseline.
+        set_boot_phase("idle", None);
+    }
+
+    #[test]
+    fn boot_readiness_ready_when_ready_phase() {
+        with_boot_phase("ready", || {
+            assert_eq!(boot_readiness(), BootReadiness::Ready);
+            assert_eq!(boot_readiness(), BootReadiness::Ready);
+        });
+    }
+
+    #[test]
+    fn boot_readiness_errored_when_error_phase() {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // set_boot_error uses a different code path than set_boot_phase
+        set_boot_error("simulated boot failure");
+        assert_eq!(boot_readiness(), BootReadiness::Errored);
+        assert_ne!(boot_readiness(), BootReadiness::Ready);
+        set_boot_phase("idle", None);
+    }
+
+    #[test]
+    fn boot_readiness_pending_during_intermediate_phases() {
+        for phase in [
+            "starting",
+            "migrating_database",
+            "building_audio",
+            "starting_pipes",
+        ] {
+            with_boot_phase(phase, || {
+                assert_eq!(
+                    boot_readiness(),
+                    BootReadiness::Pending,
+                    "phase {phase} should be pending"
+                );
+                assert_ne!(
+                    boot_readiness(),
+                    BootReadiness::Ready,
+                    "phase {phase} should not be ready"
+                );
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_boot_ready_returns_immediately_when_ready() {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_boot_phase("ready", None);
+        let start = Instant::now();
+        let result = wait_for_boot_ready(Duration::from_secs(5)).await;
+        assert_eq!(result, BootReadiness::Ready);
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "should not poll when already ready (took {:?})",
+            start.elapsed()
+        );
+        set_boot_phase("idle", None);
+    }
+
+    #[tokio::test]
+    async fn wait_for_boot_ready_fails_fast_on_error_phase() {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_boot_error("simulated startup failure");
+        let start = Instant::now();
+        let result = wait_for_boot_ready(Duration::from_secs(60)).await;
+        assert_eq!(
+            result,
+            BootReadiness::Errored,
+            "must short-circuit on error, not wait out full timeout"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "error phase must fail fast (took {:?})",
+            start.elapsed()
+        );
+        set_boot_phase("idle", None);
+    }
+
+    #[tokio::test]
+    async fn wait_for_boot_ready_returns_pending_on_timeout() {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_boot_phase("building_audio", None);
+        // 200 ms is long enough for the polling loop to make at least one
+        // pass (poll interval is 500 ms, deadline check fires first), short
+        // enough not to slow the suite.
+        let start = Instant::now();
+        let result = wait_for_boot_ready(Duration::from_millis(200)).await;
+        let elapsed = start.elapsed();
+        assert_eq!(
+            result,
+            BootReadiness::Pending,
+            "timeout while still pending should return Pending"
+        );
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "should not overshoot timeout by much (took {:?})",
+            elapsed
+        );
+        set_boot_phase("idle", None);
+    }
+
+    #[tokio::test]
+    async fn wait_for_boot_ready_observes_transition_to_ready() {
+        let _guard = BOOT_PHASE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        set_boot_phase("building_audio", None);
+
+        // Flip to ready after 100 ms. The waiter polls every 500 ms, so
+        // worst case it observes the transition within ~500 ms of the flip.
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            set_boot_phase("ready", None);
+        });
+
+        let result = wait_for_boot_ready(Duration::from_secs(5)).await;
+        assert_eq!(result, BootReadiness::Ready);
+        set_boot_phase("idle", None);
+    }
+
+    #[test]
+    fn clamp_start_in_progress_passes_within_ceiling_and_resets() {
+        let mut since: Option<Instant> = None;
+        // raw=false → false, no timer
+        assert!(!clamp_start_in_progress(false, &mut since, Duration::from_secs(60)));
+        assert!(since.is_none());
+        // raw=true within ceiling → true, timer starts
+        assert!(clamp_start_in_progress(true, &mut since, Duration::from_secs(60)));
+        assert!(since.is_some());
+        // raw drops → false + timer resets (a fresh start later gets a fresh window)
+        assert!(!clamp_start_in_progress(false, &mut since, Duration::from_secs(60)));
+        assert!(since.is_none());
+    }
+
+    #[test]
+    fn clamp_start_in_progress_stops_trusting_leaked_flag_past_ceiling() {
+        // Timer started in the past; with a ZERO ceiling any elapsed time
+        // exceeds it — models the leaked-flag case that pinned the Windows
+        // enterprise tray on "Starting…" for hours.
+        let mut since = Some(Instant::now() - Duration::from_secs(1));
+        assert!(!clamp_start_in_progress(true, &mut since, Duration::ZERO));
+        // Timer must NOT reset while raw stays true — the episode is one pin.
+        assert!(since.is_some());
+    }
+
+    // ==================== EngineRespawnCheck tests ====================
+
+    // The "crash while capture should be on" baseline that SHOULD respawn.
+    // Each test flips exactly one field to prove its guard blocks the respawn.
+    fn crash_baseline() -> EngineRespawnCheck {
+        EngineRespawnCheck {
+            wants_recording: true,
+            entitled: true,
+            ever_connected: true,
+            past_startup_grace: true,
+            in_restart_grace: false,
+            recently_woke: false,
+            start_in_progress: false,
+            consecutive_failures: SERVER_DOWN_THRESHOLD,
+            down_threshold: SERVER_DOWN_THRESHOLD,
+            respawns_in_window: 0,
+            max_respawns: SERVER_RESPAWN_MAX_ATTEMPTS,
+        }
+    }
+
+    #[test]
+    fn respawns_on_crash_while_recording_intended() {
+        assert!(crash_baseline().should_respawn());
+    }
+
+    #[test]
+    fn never_respawns_when_user_stopped() {
+        // wants_recording = false → deliberate stop (incl. the tray "stop").
+        assert!(!EngineRespawnCheck { wants_recording: false, ..crash_baseline() }.should_respawn());
+    }
+
+    #[test]
+    fn never_respawns_when_not_entitled() {
+        assert!(!EngineRespawnCheck { entitled: false, ..crash_baseline() }.should_respawn());
+    }
+
+    #[test]
+    fn never_respawns_a_never_started_server() {
+        // ever_connected = false → boot failure, not a crash; don't fight it.
+        assert!(!EngineRespawnCheck { ever_connected: false, ..crash_baseline() }.should_respawn());
+    }
+
+    #[test]
+    fn never_respawns_during_startup_grace_or_restart_grace() {
+        assert!(!EngineRespawnCheck { past_startup_grace: false, ..crash_baseline() }.should_respawn());
+        assert!(!EngineRespawnCheck { in_restart_grace: true, ..crash_baseline() }.should_respawn());
+    }
+
+    #[test]
+    fn never_respawns_right_after_wake() {
+        // Sleep/wake transiently kills the HTTP server — let it recover itself.
+        assert!(!EngineRespawnCheck { recently_woke: true, ..crash_baseline() }.should_respawn());
+    }
+
+    #[test]
+    fn never_respawns_while_a_start_is_in_flight() {
+        assert!(!EngineRespawnCheck { start_in_progress: true, ..crash_baseline() }.should_respawn());
+    }
+
+    #[test]
+    fn respects_the_down_threshold() {
+        // not down long enough yet
+        assert!(!EngineRespawnCheck {
+            consecutive_failures: SERVER_DOWN_THRESHOLD - 1,
+            ..crash_baseline()
+        }
+        .should_respawn());
+        // exactly at the bar → respawn
+        assert!(EngineRespawnCheck {
+            consecutive_failures: SERVER_DOWN_THRESHOLD,
+            ..crash_baseline()
+        }
+        .should_respawn());
+    }
+
+    #[test]
+    fn stops_respawning_once_budget_is_spent() {
+        assert!(!EngineRespawnCheck {
+            respawns_in_window: SERVER_RESPAWN_MAX_ATTEMPTS,
+            ..crash_baseline()
+        }
+        .should_respawn());
+        assert!(EngineRespawnCheck {
+            respawns_in_window: SERVER_RESPAWN_MAX_ATTEMPTS - 1,
+            ..crash_baseline()
+        }
+        .should_respawn());
     }
 }

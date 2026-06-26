@@ -1,5 +1,5 @@
 // Screenpipe Enterprise Edition
-// Licensed under the Screenpipe Enterprise License (see ee/LICENSE)
+// Licensed under the Screenpipe Commercial License (see LICENSE.md)
 
 export interface LicenseInfo {
   valid: boolean;
@@ -29,7 +29,7 @@ export async function validateLicense(
   licenseKey: string
 ): Promise<{ ok: true; license: LicenseInfo } | { ok: false; error: LicenseError }> {
   try {
-    const res = await fetch("https://screenpi.pe/api/license/validate", {
+    const res = await fetch("https://screenpipe.com/api/license/validate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ license_key: licenseKey }),

@@ -1,7 +1,7 @@
 ---
-title: "MCP server setup for Codex, Claude, Cursor, and other AI tools"
+title: "MCP server setup for Codex, Claude, Cursor, and AI tools"
 sidebarTitle: "mcp server"
-description: "Set up screenpipe as a Model Context Protocol server so Codex, Claude Desktop, Cursor, and other AI assistants can search your screen history and audio transcripts."
+description: "Set up screenpipe as a Model Context Protocol server so Codex, Claude, and Cursor can search your screen history and audio transcripts."
 icon: "server"
 ---
 
@@ -100,7 +100,7 @@ if the one-click install doesn't appear or you prefer manual config, edit `~/.co
 ```toml
 [mcp_servers.screenpipe]
 command = "npx"
-args = ["-y", "screenpipe-mcp@latest"]
+args = ["-y", "screenpipe-mcp"]
 enabled = true
 ```
 
@@ -125,7 +125,7 @@ Warp's Agent Mode supports MCP. Open **Settings** → **AI** → **Manage MCP se
 {
   "screenpipe": {
     "command": "npx",
-    "args": ["-y", "screenpipe-mcp@latest"],
+    "args": ["-y", "screenpipe-mcp"],
     "start_on_launch": true
   }
 }
@@ -153,16 +153,33 @@ add this as a stdio MCP server in your editor's MCP settings. see also:
 
 ## HTTP transport (optional)
 
-if you need remote MCP access or prefer HTTP over stdio, the `screenpipe-mcp` package also provides an HTTP server:
+if you need remote MCP access or prefer HTTP over stdio, the `screenpipe-mcp` npm package includes an HTTP server binary. both the stdio (`screenpipe-mcp`) and HTTP (`screenpipe-mcp-http`) commands come from the same npm package.
+
+### localhost only (default)
 
 ```bash
 npx -y screenpipe-mcp-http --port 3031
 ```
 
-this is useful for tools like [Msty](https://msty.studio) that support HTTP MCP transport. both `screenpipe-mcp` (stdio) and `screenpipe-mcp-http` (HTTP) come from the same npm package `screenpipe-mcp`.
+this starts an HTTP MCP server on `http://127.0.0.1:3031`. useful for tools like [Msty](https://msty.studio) that support HTTP MCP transport.
+
+### expose to your LAN
+
+to access the server from other machines on your network, use `--listen-on-lan`. **this requires an API key for security:**
+
+```bash
+npx -y screenpipe-mcp-http --port 3031 --listen-on-lan --api-key your-secret-key
+```
+
+then from a remote machine, call the server with the bearer token:
+
+```bash
+curl -H "Authorization: Bearer your-secret-key" \
+  http://<your-machine-ip>:3031/mcp/search?q=example
+```
 
 <Warning>
-HTTP MCP can expose screen history to whatever can reach the server. keep it on trusted machines and networks, and do not bind it publicly unless you know exactly how it is protected.
+HTTP MCP can expose screen history. when using `--listen-on-lan`, always set an `--api-key` — screenpipe will refuse to start without it. keep the key secret and only share with trusted services.
 </Warning>
 
 ## available tools
@@ -217,11 +234,12 @@ test your setup with MCP Inspector:
 npx @modelcontextprotocol/inspector npx screenpipe-mcp
 ```
 
-## troubleshooting matrix
+## troubleshooting
 
 | symptom | likely fix |
 | --- | --- |
 | no MCP tools appear | restart the client and verify the config path |
+| mcp not connecting | ensure screenpipe is running and reachable at `http://localhost:3030/health`, then restart the client after config changes |
 | `npx` not found | install Node.js 18+ or use the one-click in-app setup |
 | `403` or unauthorized | set `SCREENPIPE_LOCAL_API_KEY` or refresh API auth in settings |
 | empty results | wait for capture, broaden the query, or verify `/search?limit=1` |
@@ -229,6 +247,9 @@ npx @modelcontextprotocol/inspector npx screenpipe-mcp
 | Claude Desktop on Windows cannot see config | check whether you use the normal or Microsoft Store/MSIX install |
 | Codex does not see screenpipe | open a new Codex session after the app writes `~/.codex/config.toml` |
 | HTTP transport not reachable | confirm `screenpipe-mcp-http` port and firewall/LAN rules |
+| macOS automation not working | grant accessibility permissions in System Settings → Privacy & Security → Accessibility |
+
+still stuck? [ask in our discord](https://discord.gg/screenpipe) — the community can help debug MCP issues.
 
 ## requirements
 
@@ -243,24 +264,11 @@ npx @modelcontextprotocol/inspector npx screenpipe-mcp
 
 ## manual config (advanced)
 
+the per-client manual setups above (Claude Desktop, Codex) cover most cases. these extra targets are for editors not listed above:
+
 <Expandable title="manual JSON configuration">
 
-if the one-click methods above don't work, you can manually edit config files.
-
-**claude desktop** — edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%AppData%\Claude\claude_desktop_config.json` (Windows):
-
-```json
-{
-  "mcpServers": {
-    "screenpipe": {
-      "command": "npx",
-      "args": ["-y", "screenpipe-mcp"]
-    }
-  }
-}
-```
-
-**cursor** — create `.cursor/mcp.json` in your project root:
+**cursor (project-scoped)** — create `.cursor/mcp.json` in your project root:
 
 ```json
 {
@@ -284,15 +292,3 @@ npm install && npm run build
 then point your editor to `node /path/to/screenpipe-mcp/dist/index.js`.
 
 </Expandable>
-
-## troubleshooting
-
-**mcp not connecting?**
-- ensure screenpipe is running (`screenpipe` in terminal)
-- check it's accessible at http://localhost:3030/health
-- restart Claude Desktop / Cursor after config changes
-
-**macos automation not working?**
-- grant accessibility permissions in System Settings > Privacy & Security > Accessibility
-
-still stuck? [ask in our discord](https://discord.gg/screenpipe) — the community can help debug MCP issues.

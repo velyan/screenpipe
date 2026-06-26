@@ -4,6 +4,8 @@
 
 import { describe, expect, it } from "vitest";
 import {
+  aggregateSourceCitations,
+  computeChatCitationPlan,
   formatSourceCitationsMarkdown,
   sourceCitationsFromMessage,
 } from "../source-citations";
@@ -183,6 +185,45 @@ describe("source citations", () => {
     expect(citations[1].title).toBe("Read: standalone-chat.tsx");
   });
 
+  it("carries the absolute path on file/memory citations so the footer can open a preview", () => {
+    const citations = sourceCitationsFromMessage({
+      contentBlocks: [
+        {
+          type: "tool",
+          toolCall: {
+            toolName: "read",
+            args: { path: "/Users/louisbeaumont/.codex/memories/MEMORY.md" },
+            result: "notes",
+            isRunning: false,
+          },
+        },
+        {
+          type: "tool",
+          toolCall: {
+            toolName: "write",
+            args: { path: "/tmp/out/report.md" },
+            result: "ok",
+            isRunning: false,
+          },
+        },
+      ],
+    });
+
+    expect(citations[0].path).toBe("/Users/louisbeaumont/.codex/memories/MEMORY.md");
+    expect(citations[1].path).toBe("/tmp/out/report.md");
+  });
+
+  it("preserves an explicit citation's path so server-provided file sources stay openable", () => {
+    const citations = sourceCitationsFromMessage({
+      sourceCitations: [
+        { id: "x", kind: "file", title: "Read: a.md", path: "/tmp/a.md" },
+      ],
+    });
+
+    expect(citations).toHaveLength(1);
+    expect(citations[0].path).toBe("/tmp/a.md");
+  });
+
   it("normalizes pi tool namespaces before deriving citations", () => {
     const citations = sourceCitationsFromMessage({
       contentBlocks: [
@@ -224,6 +265,7 @@ describe("source citations", () => {
     expect(citations[0].title).toBe("Local file: standalone-chat.tsx");
   });
 
+  // legacy name from sessions recorded before the sp_ rename
   it("extracts web links from web_search results and dedupes duplicates", () => {
     const citations = sourceCitationsFromMessage({
       contentBlocks: [
@@ -248,13 +290,13 @@ describe("source citations", () => {
     });
   });
 
-  it("uses structured web_search sources when available", () => {
+  it("uses structured sp_web_search sources when available", () => {
     const citations = sourceCitationsFromMessage({
       contentBlocks: [
         {
           type: "tool",
           toolCall: {
-            toolName: "web_search",
+            toolName: "sp_web_search",
             args: { query: "screenpipe docs" },
             result: {
               content: [{ type: "text", text: "See the docs." }],
@@ -310,6 +352,150 @@ describe("source citations", () => {
     expect(citations[0].subtitle).toContain("query: roadmap");
   });
 
+  it("anchors screenpipe_search tool citations to the capture moment", () => {
+    const citations = sourceCitationsFromMessage({
+      contentBlocks: [
+        {
+          type: "tool",
+          toolCall: {
+            toolName: "screenpipe_search",
+            args: {
+              content_type: "ocr",
+              start_time: "2026-05-15T17:00:00Z",
+              end_time: "2026-05-15T18:00:00Z",
+            },
+            result: { content: [{ type: "text", text: "{}" }] },
+            isRunning: false,
+          },
+        },
+      ],
+    });
+
+    expect(citations).toHaveLength(1);
+    expect(citations[0].kind).toBe("screenpipe");
+    expect(citations[0].timestamp).toBe("2026-05-15T17:00:00Z");
+  });
+
+  it("anchors bash screenpipe /search citations to the url-encoded start_time", () => {
+    const citations = sourceCitationsFromMessage({
+      contentBlocks: [
+        {
+          type: "tool",
+          toolCall: {
+            toolName: "bash",
+            args: {
+              command:
+                'curl -s "http://localhost:3030/search?content_type=audio&start_time=2026-05-15T17%3A00%3A00Z"',
+            },
+            result: '{"data":[]}',
+            isRunning: false,
+          },
+        },
+      ],
+    });
+
+    expect(citations).toHaveLength(1);
+    expect(citations[0].kind).toBe("screenpipe");
+    expect(citations[0].timestamp).toBe("2026-05-15T17:00:00Z");
+  });
+
+  it("does not anchor non-capture citations (memory) to a timeline moment", () => {
+    const citations = sourceCitationsFromMessage({
+      contentBlocks: [
+        {
+          type: "tool",
+          toolCall: {
+            toolName: "bash",
+            args: { command: 'curl -s "http://localhost:3030/memories?q=pricing&limit=5"' },
+            result: '{"data":[]}',
+            isRunning: false,
+          },
+        },
+      ],
+    });
+
+    expect(citations).toHaveLength(1);
+    expect(citations[0].kind).toBe("memory");
+    expect(citations[0].timestamp).toBeUndefined();
+  });
+
+  it("leaves screenpipe_search citations without a start_time unanchored", () => {
+    const citations = sourceCitationsFromMessage({
+      contentBlocks: [
+        {
+          type: "tool",
+          toolCall: {
+            toolName: "screenpipe_search",
+            args: { content_type: "ocr", query: "roadmap" },
+            result: { content: [{ type: "text", text: "{}" }] },
+            isRunning: false,
+          },
+        },
+      ],
+    });
+
+    expect(citations).toHaveLength(1);
+    expect(citations[0].timestamp).toBeUndefined();
+  });
+
+  it("carries the search term so screen captures can open in search", () => {
+    const citations = sourceCitationsFromMessage({
+      contentBlocks: [
+        {
+          type: "tool",
+          toolCall: {
+            toolName: "screenpipe_search",
+            args: { content_type: "ocr", query: "roadmap", start_time: "2026-05-15T17:00:00Z" },
+            result: { content: [{ type: "text", text: "{}" }] },
+            isRunning: false,
+          },
+        },
+      ],
+    });
+
+    expect(citations).toHaveLength(1);
+    expect(citations[0].query).toBe("roadmap");
+  });
+
+  it("carries the search term from bash /search calls (url-decoded)", () => {
+    const citations = sourceCitationsFromMessage({
+      contentBlocks: [
+        {
+          type: "tool",
+          toolCall: {
+            toolName: "bash",
+            args: { command: 'curl -s "http://localhost:3030/search?content_type=ocr&q=pricing%20deck"' },
+            result: '{"data":[]}',
+            isRunning: false,
+          },
+        },
+      ],
+    });
+
+    expect(citations).toHaveLength(1);
+    expect(citations[0].kind).toBe("screenpipe");
+    expect(citations[0].query).toBe("pricing deck");
+  });
+
+  it("leaves non-search captures (activity-summary) without a query term", () => {
+    const citations = sourceCitationsFromMessage({
+      contentBlocks: [
+        {
+          type: "tool",
+          toolCall: {
+            toolName: "bash",
+            args: { command: 'curl -s "http://localhost:3030/activity-summary?start_time=2026-05-15T17:00:00Z"' },
+            result: '{"data":[]}',
+            isRunning: false,
+          },
+        },
+      ],
+    });
+
+    expect(citations).toHaveLength(1);
+    expect(citations[0].query).toBeUndefined();
+  });
+
   it("ignores running and errored tool calls", () => {
     const citations = sourceCitationsFromMessage({
       contentBlocks: [
@@ -333,6 +519,168 @@ describe("source citations", () => {
     });
 
     expect(citations).toEqual([]);
+  });
+
+  it("does not leak file paths from heredoc script bodies", () => {
+    // Common pipe pattern: write a script via heredoc then run it. Without
+    // stripping the heredoc body, every quoted "/Users/..." string literal
+    // and `process.platform`-style token inside the embedded source gets
+    // tokenized as a path and pollutes the footer.
+    const citations = sourceCitationsFromMessage({
+      contentBlocks: [
+        {
+          type: "tool",
+          toolCall: {
+            toolName: "bash",
+            args: {
+              command:
+                "cat > /tmp/sync.ts << 'SCRIPT_EOF'\n" +
+                'const IMESSAGE_DB = "/Users/me/Library/Messages/chat.db";\n' +
+                'const HINT = ".clawdbot/credentials/telegram-pairing.json";\n' +
+                'if (process.platform !== "darwin") return null;\n' +
+                "SCRIPT_EOF\n" +
+                "bun run /tmp/sync.ts",
+            },
+            result: "Done\n",
+            isRunning: false,
+          },
+        },
+      ],
+    });
+
+    const titles = citations.map((c) => c.title);
+    expect(titles).toContain("Local file: sync.ts");
+    expect(titles).not.toContain("Local file: chat.db");
+    expect(titles).not.toContain("Local file: telegram-pairing.json");
+    expect(titles).not.toContain("Local file: null");
+    expect(titles).not.toContain("Local file: undefined");
+  });
+
+  it("aggregates citations across pipe-run messages and dedupes repeats", () => {
+    // Real pipe-run pattern from chat-memory-sync_2341.json: the agent reads
+    // the same state file across multiple debug steps. Per-message footers
+    // would render N "Read: state.json" rows; the aggregator emits one.
+    const readState = {
+      contentBlocks: [
+        {
+          type: "tool",
+          toolCall: {
+            toolName: "read",
+            args: { path: "/Users/me/.screenpipe/pipes/sync/state.json" },
+            result: "{}",
+            isRunning: false,
+          },
+        },
+      ],
+    };
+    const writeScript = {
+      contentBlocks: [
+        {
+          type: "tool",
+          toolCall: {
+            toolName: "write",
+            args: { path: "/tmp/sync.ts" },
+            result: "ok",
+            isRunning: false,
+          },
+        },
+      ],
+    };
+
+    const aggregated = aggregateSourceCitations([
+      readState,
+      writeScript,
+      readState, // repeated step in the agentic loop
+    ]);
+
+    expect(aggregated.map((c) => c.title)).toEqual([
+      "Read: state.json",
+      "Wrote: sync.ts",
+    ]);
+  });
+
+  describe("computeChatCitationPlan", () => {
+    const readMsg = (id: string, path: string) => ({
+      id,
+      role: "assistant" as const,
+      contentBlocks: [
+        {
+          type: "tool",
+          toolCall: {
+            toolName: "read",
+            args: { path },
+            result: "ok",
+            isRunning: false,
+          },
+        },
+      ],
+    });
+    const userMsg = (id: string) => ({ id, role: "user" as const, contentBlocks: [] });
+
+    it("leaves single-tool turns alone", () => {
+      const plan = computeChatCitationPlan([
+        userMsg("u1"),
+        readMsg("a1", "/tmp/x.ts"),
+      ]);
+      expect(plan.deferredMessageIds.size).toBe(0);
+      expect(plan.aggregatedAfter.size).toBe(0);
+    });
+
+    it("aggregates an agentic loop turn (≥2 citation-bearing assistants)", () => {
+      const plan = computeChatCitationPlan([
+        userMsg("u1"),
+        readMsg("a1", "/tmp/state.json"),
+        readMsg("a2", "/tmp/state.json"),
+        readMsg("a3", "/tmp/script.ts"),
+      ]);
+      expect([...plan.deferredMessageIds]).toEqual(["a1", "a2", "a3"]);
+      expect(plan.aggregatedAfter.has("a3")).toBe(true);
+      expect(plan.aggregatedAfter.get("a3")?.map((c) => c.title)).toEqual([
+        "Read: state.json",
+        "Read: script.ts",
+      ]);
+    });
+
+    it("scopes aggregation per turn so separate user questions stay separate", () => {
+      const plan = computeChatCitationPlan([
+        userMsg("u1"),
+        readMsg("a1", "/tmp/a.ts"),
+        readMsg("a2", "/tmp/a.ts"),
+        userMsg("u2"),
+        readMsg("b1", "/tmp/b.ts"),
+        readMsg("b2", "/tmp/b.ts"),
+      ]);
+      expect(plan.aggregatedAfter.has("a2")).toBe(true);
+      expect(plan.aggregatedAfter.has("b2")).toBe(true);
+      expect(plan.aggregatedAfter.get("a2")?.map((c) => c.title)).toEqual(["Read: a.ts"]);
+      expect(plan.aggregatedAfter.get("b2")?.map((c) => c.title)).toEqual(["Read: b.ts"]);
+    });
+
+    it("forceAggregate folds even single-step turns (pipe sessions)", () => {
+      const plan = computeChatCitationPlan(
+        [userMsg("u1"), readMsg("a1", "/tmp/once.ts")],
+        { forceAggregate: true },
+      );
+      expect(plan.deferredMessageIds.has("a1")).toBe(true);
+      expect(plan.aggregatedAfter.get("a1")?.map((c) => c.title)).toEqual([
+        "Read: once.ts",
+      ]);
+    });
+
+    it("ignores assistant messages without citations when deciding to aggregate", () => {
+      const plain = {
+        id: "a1",
+        role: "assistant" as const,
+        contentBlocks: [{ type: "text", text: "hi" }],
+      };
+      const plan = computeChatCitationPlan([
+        userMsg("u1"),
+        plain,
+        readMsg("a2", "/tmp/x.ts"),
+      ]);
+      // Only one citation-bearing assistant — below the default threshold.
+      expect(plan.aggregatedAfter.size).toBe(0);
+    });
   });
 
   it("formats citations for chat markdown exports", () => {

@@ -37,17 +37,20 @@ pub async fn resolve_api_auth_key(data_dir: &Path, settings_key: Option<&str>) -
     // can read the secrets table but the keychain ACL denies the decrypt
     // for `screenpi.pe`. Result: rotation, mismatched in-memory caches,
     // 401 storms — observed for chris@lovephoenixhomes.com 2026-05-06.
+    let mut stored_unreadable = false;
     let stored_key: Option<String> = if let Some(ref s) = store {
         match s.get("api_auth_key").await {
             Ok(Some(bytes)) => String::from_utf8(bytes).ok().filter(|k| !k.is_empty()),
             Ok(None) => None,
             Err(e) => {
+                stored_unreadable = true;
                 tracing::error!(
                     "api auth: failed to read api_auth_key from secret store — \
-                     resolver will fall through to auto-generate, rotating the \
-                     key out from under cached consumers. Likely cause: keychain \
-                     ACL mismatch (dev↔prod bundle id, recent encryption toggle, \
-                     or revoked keychain item). Error: {}",
+                     keeping the encrypted blob intact and minting a one-shot \
+                     ephemeral key for this process to avoid overwriting the \
+                     user's persisted key. Likely cause: keychain ACL mismatch \
+                     (dev↔prod bundle id, recent encryption toggle, or revoked \
+                     keychain item). Error: {}",
                     e
                 );
                 None
@@ -72,8 +75,15 @@ pub async fn resolve_api_auth_key(data_dir: &Path, settings_key: Option<&str>) -
     // reader (running server, MCP, `screenpipe auth token` CLI) agrees on
     // the same value regardless of which source it originally came from.
     // Skip the write if the stored value already matches.
+    //
+    // SAFETY: never persist when the existing row was unreadable. Writing
+    // would clobber the encrypted blob with a fresh plaintext key, silently
+    // rotating the user's API key (SCREENPIPE-APP-9Z: 25 events / 18 users,
+    // including the Pattern.com whitelabel build). The in-memory key still
+    // works for this process; the user can recover by clearing the secrets
+    // table or restoring the keychain item.
     if let Some(s) = store {
-        if stored_key.as_deref() != Some(key.as_str()) {
+        if !stored_unreadable && stored_key.as_deref() != Some(key.as_str()) {
             if let Err(e) = s.set("api_auth_key", key.as_bytes()).await {
                 tracing::warn!("failed to persist api auth key: {}", e);
             }
@@ -141,8 +151,6 @@ pub async fn regenerate_api_auth_key(data_dir: &Path) -> Result<String> {
 
 async fn open_secret_store(data_dir: &Path) -> Result<screenpipe_secrets::SecretStore> {
     let db_path = data_dir.join("db.sqlite");
-    let db_url = format!("sqlite:{}?mode=rwc", db_path.display());
-    let pool = sqlx::SqlitePool::connect(&db_url).await?;
     // Load the keychain encryption key if the user has opted into encryption,
     // otherwise pass None (plaintext mode). Without this, the previous code
     // ALWAYS opened the store unkeyed — so as soon as the user toggled
@@ -163,7 +171,9 @@ async fn open_secret_store(data_dir: &Path) -> Result<screenpipe_secrets::Secret
     } else {
         None
     };
-    let store = screenpipe_secrets::SecretStore::new(pool, key).await?;
+    // Shared, engine-matched pool — not an ad-hoc per-call connection, which
+    // churns the WAL-index and corrupts db.sqlite (#4263).
+    let store = screenpipe_secrets::SecretStore::open(&db_path.to_string_lossy(), key).await?;
     Ok(store)
 }
 
@@ -216,4 +226,88 @@ pub async fn find_api_auth_key() -> Option<String> {
     }
 
     read_legacy_auth_json()
+}
+
+// ---------------------------------------------------------------------------
+// Cloud auth token (Clerk JWT — the Bearer for api.screenpipe.com).
+//
+// Distinct from the local `api_auth_key` above. Since #3943 the desktop app
+// stores this in the shared encrypted SecretStore (`db.sqlite`) instead of
+// plaintext `store.bin`/`auth.json`, so the CLI (which shares the same
+// `db.sqlite`) must read it there too — otherwise a standalone `screenpipe`
+// run would lose cloud auth (STT, screenpipe-cloud pipes) once the app has
+// migrated the token out of store.bin.
+// ---------------------------------------------------------------------------
+
+/// SecretStore key for the cloud auth token. MUST match the desktop app's
+/// `auth_token` module (`apps/screenpipe-app-tauri/src-tauri/src/auth_token.rs`).
+const CLOUD_AUTH_TOKEN_KEY: &str = "cloud.auth_token";
+
+/// Read the cloud auth token. Priority:
+///   1. The shared encrypted SecretStore key `cloud.auth_token` — written by
+///      the desktop app (`auth_token.rs`).
+///   2. Fallback: `store.bin` `settings.user.token` — where the `screenpipe
+///      login` CLI persists the token. The desktop app is the only writer of
+///      the SecretStore key, so without this fallback a CLI-only / headless
+///      login (e.g. `screenpipe login` on a VPS, no app) leaves the engine
+///      with no cloud token and cloud features like the `/v1/chat/completions`
+///      proxy stay disabled — exactly the "screenpipe on the go" case.
+/// Returns `None` if neither source has a usable token.
+pub async fn find_cloud_token(data_dir: &Path) -> Option<String> {
+    if let Ok(store) = open_secret_store(data_dir).await {
+        if let Ok(Some(bytes)) = store.get(CLOUD_AUTH_TOKEN_KEY).await {
+            if let Some(tok) = String::from_utf8(bytes).ok().filter(|s| !s.is_empty()) {
+                return Some(tok);
+            }
+        }
+    }
+    cloud_token_from_store_json(data_dir)
+}
+
+/// Read the cloud token from `store.bin`'s `settings.user.token` (the location
+/// the `screenpipe login` CLI writes). Skips app-managed encrypted stores
+/// (SPSTORE1 magic) — those resolve via the SecretStore path instead.
+fn cloud_token_from_store_json(data_dir: &Path) -> Option<String> {
+    let bytes = std::fs::read(data_dir.join("store.bin")).ok()?;
+    if bytes.starts_with(b"SPSTORE1") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v.pointer("/settings/user/token")?
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod cloud_token_tests {
+    use super::*;
+
+    #[test]
+    fn test_cloud_token_from_store_json() {
+        let dir = std::env::temp_dir().join(format!("sp-authkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // CLI-login style plaintext store.bin → token resolves.
+        std::fs::write(
+            dir.join("store.bin"),
+            r#"{"settings":{"user":{"token":"jwt-abc-123","email":"x@y.z"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cloud_token_from_store_json(&dir).as_deref(),
+            Some("jwt-abc-123")
+        );
+
+        // App-managed encrypted store → None (SecretStore path handles it).
+        std::fs::write(dir.join("store.bin"), b"SPSTORE1\x00\x01junk").unwrap();
+        assert_eq!(cloud_token_from_store_json(&dir), None);
+
+        // Missing/empty token → None.
+        std::fs::write(dir.join("store.bin"), r#"{"settings":{"user":{}}}"#).unwrap();
+        assert_eq!(cloud_token_from_store_json(&dir), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -43,6 +43,11 @@ let mounted = false;
 let mountPromise: Promise<() => void> | null = null;
 let unregister: Unregister | null = null;
 
+/** Per-session user prompt captured from streaming events. Used as a
+ *  fallback when agent_end.messages omits the user message (common for
+ *  single-turn, no-tool-use pipes). */
+const streamingUserPrompts = new Map<string, string>();
+
 export async function mountPipeWatchWriter(): Promise<() => void> {
   if (mounted) return unmountPipeWatchWriter;
   if (mountPromise) return mountPromise;
@@ -62,6 +67,7 @@ function unmountPipeWatchWriter(): void {
     // ignore — tearing down
   }
   unregister = null;
+  streamingUserPrompts.clear();
   mounted = false;
   mountPromise = null;
 }
@@ -114,6 +120,28 @@ function apply(sid: string, payload: AgentInnerEvent): void {
   const inner = (payload as any).assistantMessageEvent as
     | { type?: string; delta?: string; content?: string }
     | undefined;
+
+  if (t === "notification_sent") {
+    store.actions.appendMessage(sid, notificationEventToMessage(payload));
+    store.actions.patch(sid, {
+      draft: false,
+      updatedAt: Date.now(),
+    });
+    return;
+  }
+
+  // ── capture user prompt from streaming events ──────────────────────
+  // The Pi agent emits message_start/message_end with role "user" for the
+  // prompt. We stash it so we can inject it when agent_end.messages
+  // omits the user message (single-turn, no-tool-use pipes).
+  if (
+    (t === "message_start" || t === "message_end") &&
+    (payload as any).message?.role === "user"
+  ) {
+    const text = extractText((payload as any).message?.content);
+    if (text.trim()) streamingUserPrompts.set(sid, text.trim());
+    return;
+  }
 
   // ── text_delta (flat) and message_update wrapping text_delta ────────
   const isTextDelta =
@@ -311,11 +339,35 @@ function apply(sid: string, payload: AgentInnerEvent): void {
   if (t === "agent_end" || t === "pipe_done") {
     const messages = (payload as any).messages;
     if (Array.isArray(messages) && messages.length > 0) {
-      const reconstructed = reconstructFromAgentEnd(messages);
-      if (reconstructed.length > 0) {
-        store.actions.setMessages(sid, reconstructed as any);
+      const sessionPipeName = useChatStore.getState().sessions[sid]?.pipeContext?.pipeName || "pipe";
+      const reconstructed = reconstructFromAgentEnd(messages, sessionPipeName);
+
+      // If agent_end.messages didn't include the user prompt (common
+      // for single-turn pipes), inject it from the streaming events we
+      // captured earlier.
+      if (!reconstructed.some((m: any) => m.role === "user")) {
+        const cachedPrompt = streamingUserPrompts.get(sid);
+        if (cachedPrompt) {
+          const label = pipePromptLabel(sessionPipeName, cachedPrompt);
+          reconstructed.unshift({
+            id: `pipe-user-${Date.now()}`,
+            role: "user",
+            content: cachedPrompt,
+            timestamp: Date.now(),
+            displayContent: label,
+          });
+        }
+      }
+
+      const notificationMarkers = ((useChatStore.getState().sessions[sid]?.messages as any[]) ?? [])
+        .filter(isNotificationMessage);
+      const merged = appendUniqueNotificationMessages(reconstructed, notificationMarkers);
+      if (merged.length > 0) {
+        store.actions.setMessages(sid, merged as any);
       }
     }
+    // Clean up the cached prompt — this session is done.
+    streamingUserPrompts.delete(sid);
     store.actions.endTurn(sid);
     return;
   }
@@ -323,6 +375,39 @@ function apply(sid: string, payload: AgentInnerEvent): void {
   // Anything else — status events, raw_line, etc. — is handled by the
   // pi-event-router for sidebar status mirroring. We intentionally
   // don't duplicate that here.
+}
+
+function notificationEventToMessage(payload: AgentInnerEvent): any {
+  const evt = payload as any;
+  const title = typeof evt.title === "string" ? evt.title.trim() : "notification";
+  const body = typeof evt.body === "string" ? evt.body.trim() : "";
+  const timestamp =
+    typeof evt.timestamp === "number"
+      ? evt.timestamp
+      : typeof evt.timestamp === "string"
+        ? new Date(evt.timestamp).getTime()
+        : Date.now();
+  const content = [`notification sent`, title ? `**${title}**` : "", body]
+    .filter(Boolean)
+    .join("\n\n");
+  return {
+    id: typeof evt.id === "string" && evt.id ? evt.id : `notification-${Date.now()}`,
+    role: "assistant",
+    content,
+    timestamp: Number.isFinite(timestamp) ? timestamp : Date.now(),
+    contentBlocks: [{ type: "text", text: content }],
+  };
+}
+
+function isNotificationMessage(message: any): boolean {
+  return typeof message?.id === "string" && message.id.startsWith("notification-");
+}
+
+function appendUniqueNotificationMessages(messages: any[], notifications: any[]): any[] {
+  if (notifications.length === 0) return messages;
+  const seen = new Set(messages.map((m) => m.id));
+  const unique = notifications.filter((m) => !seen.has(m.id));
+  return unique.length > 0 ? [...messages, ...unique] : messages;
 }
 
 /** Reconstruct ChatMessage[] from an `agent_end` event's `messages`
@@ -333,7 +418,7 @@ function apply(sid: string, payload: AgentInnerEvent): void {
  *
  *  Mirrors the logic in `parsePipeNdjsonToMessages` so live and
  *  post-hoc views render the same shape. */
-function reconstructFromAgentEnd(agentMessages: any[]): any[] {
+function reconstructFromAgentEnd(agentMessages: any[], pipeName: string): any[] {
   const out: any[] = [];
   for (let i = 0; i < agentMessages.length; i++) {
     const m = agentMessages[i];
@@ -358,15 +443,34 @@ function reconstructFromAgentEnd(agentMessages: any[]): any[] {
     // Skip empty-and-blockless messages — usually pipe scaffolding.
     if (!text.trim() && blocks.length === 0) continue;
 
+    // Every user message in a pipe session is the system-injected
+    // prompt. Show a clean label; full prompt available via dropdown.
+    const displayContent = m.role === "user"
+      ? pipePromptLabel(pipeName, text)
+      : undefined;
+
     out.push({
       id: typeof m.id === "string" ? m.id : `pipe-agent-${i}`,
       role: m.role,
       content: text,
       timestamp: Date.now(),
+      ...(displayContent ? { displayContent } : {}),
       ...(blocks.length ? { contentBlocks: blocks } : {}),
     });
   }
   return out;
+}
+
+/** Build a clean display label for pipe prompt user messages. */
+function pipePromptLabel(pipeName: string, text: string): string {
+  const match = text.match(/Time range: (\S+) to (\S+)/);
+  if (match) {
+    const start = new Date(match[1]);
+    const end = new Date(match[2]);
+    const fmt = (d: Date) => d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+    return `pipe executed: ${pipeName} (${fmt(start)} – ${fmt(end)})`;
+  }
+  return `pipe executed: ${pipeName}`;
 }
 
 function extractText(content: any): string {

@@ -18,6 +18,18 @@ export interface SourceCitation {
   title: string;
   subtitle?: string;
   href?: string;
+  // ISO timestamp of the captured moment this source points at. When set on a
+  // local (screenpipe) citation, the footer makes the row jump into the
+  // timeline at this moment instead of rendering as dead text.
+  timestamp?: string;
+  // The search term behind this source. When set, the footer opens it in the
+  // search window (thumbnail grid of every matching capture) rather than
+  // jumping to a single timeline moment.
+  query?: string;
+  // Absolute path of a local file this source points at. When set, the footer
+  // opens the file in the in-chat preview sidebar (rendered markdown / code)
+  // instead of rendering as dead text. Only present for real, openable files.
+  path?: string;
 }
 
 interface ToolCallLike {
@@ -40,6 +52,84 @@ export function sourceCitationsFromMessage(message: MessageLike): SourceCitation
   const explicit = normalizeExplicitCitations(message.sourceCitations);
   if (explicit.length > 0) return explicit;
   return sourceCitationsFromContentBlocks(message.contentBlocks);
+}
+
+// Aggregate citations across a sequence of messages, deduped. Used for
+// pipe-run chats where the whole transcript is one agentic loop and showing
+// per-message footers spams the same file across every step.
+export function aggregateSourceCitations(messages: readonly MessageLike[]): SourceCitation[] {
+  const all: SourceCitation[] = [];
+  for (const message of messages) {
+    all.push(...sourceCitationsFromMessage(message));
+  }
+  return dedupeCitations(all);
+}
+
+export interface ChatCitationPlan {
+  // Messages whose own per-message footer should be hidden because their
+  // citations have been folded into a turn-level aggregate below.
+  deferredMessageIds: Set<string>;
+  // After this message renders, render an aggregated footer with these
+  // citations. Keyed by message id (the last assistant of the turn group).
+  aggregatedAfter: Map<string, SourceCitation[]>;
+}
+
+interface PlanMessageLike extends MessageLike {
+  id?: unknown;
+  role?: unknown;
+}
+
+interface ChatCitationPlanOptions {
+  // Always aggregate even if a turn has only one citation-bearing assistant
+  // message. Used for pipe sessions where the visual treatment should be
+  // consistent across every transcript.
+  forceAggregate?: boolean;
+  // Aggregate when a turn group has ≥ this many assistant messages bearing
+  // citations. Defaults to 2 — leaves single-tool-call turns alone.
+  minAssistantsForAggregation?: number;
+}
+
+// Walk a message list and produce an aggregation plan. A "turn" is one user
+// message plus the assistant messages that follow until the next user
+// message (or end of chat). Within each turn, if multiple assistant messages
+// carry citations, fold them into a single footer rendered after the last
+// assistant of that turn — that's the agentic-loop pattern (Pi looping
+// debug→fix→re-run, pipe-runs, multi-step research).
+export function computeChatCitationPlan(
+  messages: readonly PlanMessageLike[],
+  options: ChatCitationPlanOptions = {},
+): ChatCitationPlan {
+  const minAssistants = options.minAssistantsForAggregation ?? 2;
+  const force = options.forceAggregate ?? false;
+  const deferredMessageIds = new Set<string>();
+  const aggregatedAfter = new Map<string, SourceCitation[]>();
+
+  let turn: PlanMessageLike[] = [];
+  const flush = () => {
+    if (turn.length === 0) return;
+    const assistantsWithCitations = turn.filter(
+      (m) => m.role === "assistant" && sourceCitationsFromMessage(m).length > 0,
+    );
+    const lastAssistant = [...turn].reverse().find((m) => m.role === "assistant");
+    const shouldAggregate = force
+      ? assistantsWithCitations.length >= 1
+      : assistantsWithCitations.length >= minAssistants;
+    if (shouldAggregate && lastAssistant && typeof lastAssistant.id === "string") {
+      for (const m of assistantsWithCitations) {
+        if (typeof m.id === "string") deferredMessageIds.add(m.id);
+      }
+      aggregatedAfter.set(lastAssistant.id, aggregateSourceCitations(turn));
+    }
+    turn = [];
+  };
+
+  for (const message of messages) {
+    if (message.role === "user") flush();
+    turn.push(message);
+  }
+  flush();
+
+  return { deferredMessageIds, aggregatedAfter };
 }
 
 export function sourceCitationsFromContentBlocks(contentBlocks: unknown): SourceCitation[] {
@@ -78,7 +168,10 @@ function sourceCitationsFromToolCall(toolCall: ToolCallLike | undefined): Source
   const args = isObject(toolCall.args) ? toolCall.args : {};
   const resultText = resultToText(toolCall.result);
 
-  if (toolName === "web_search") {
+  // "sp_web_search" is the current bundled tool; bare "web_search" still
+  // appears when replaying sessions recorded before the sp_ rename
+  // (https://github.com/screenpipe/screenpipe/issues/3812).
+  if (toolName === "sp_web_search" || toolName === "web_search") {
     return webSearchCitations(args, toolCall.result, resultText);
   }
 
@@ -149,8 +242,9 @@ function screenpipeToolCitation(args: Record<string, unknown>): SourceCitation {
   const contentType = stringArg(args, "content_type") ?? stringArg(args, "contentType");
   const appName = stringArg(args, "app_name") ?? stringArg(args, "appName");
   const query = stringArg(args, "q") ?? stringArg(args, "query");
+  const startTime = stringArg(args, "start_time") ?? stringArg(args, "startTime");
   const range = timeRange(
-    stringArg(args, "start_time") ?? stringArg(args, "startTime"),
+    startTime,
     stringArg(args, "end_time") ?? stringArg(args, "endTime")
   );
   const parts = [
@@ -165,6 +259,8 @@ function screenpipeToolCitation(args: Record<string, unknown>): SourceCitation {
     kind: "screenpipe",
     title: "Screenpipe search",
     subtitle: parts.join("; ") || undefined,
+    timestamp: navTimestamp(startTime),
+    query: query || undefined,
   };
 }
 
@@ -219,12 +315,19 @@ function screenpipeApiCitation(call: string): SourceCitation {
   const query = extractQuery(call);
   const title = screenpipeTitle(path);
   const kind = screenpipeKind(path);
+  // Only local screen captures map to a moment on the timeline. Memory/db/
+  // connector endpoints aren't time-anchored screen data, so leave them inert.
+  const params = queryParams(query);
+  const timestamp = kind === "screenpipe" ? navTimestamp(params.start_time) : undefined;
+  const searchText = path === "/search" ? params.q : undefined;
 
   return {
     id: stableId(["screenpipe", path, query]),
     kind,
     title,
     subtitle: screenpipeSubtitle(path, query),
+    timestamp,
+    query: searchText,
   };
 }
 
@@ -305,7 +408,21 @@ function fileCitation(path: string, verb: string): SourceCitation {
     kind,
     title: kind === "memory" ? baseName : `${verb}: ${baseName}`,
     subtitle: shortenPath(path),
+    // Keep the absolute path so the footer can open the file in the preview
+    // sidebar. `subtitle` is only the shortened display form.
+    path,
   };
+}
+
+// Tokens that look path-like by accident (basename of a bare word, JS keywords
+// leaking out of heredocs) but aren't real files. Guards against rendering
+// "Local file: null" / "Local file: undefined" footers.
+function isUsablePath(path: string): boolean {
+  const trimmed = path.trim();
+  if (!trimmed) return false;
+  const base = basename(trimmed);
+  if (!base) return false;
+  return base !== "null" && base !== "undefined" && base !== "true" && base !== "false";
 }
 
 function fileKind(path: string): SourceCitationKind {
@@ -331,12 +448,19 @@ function normalizeExplicitCitations(value: unknown): SourceCitation[] {
     if (!title) continue;
     const subtitle = typeof item.subtitle === "string" ? item.subtitle : undefined;
     const href = typeof item.href === "string" ? item.href : undefined;
+    const timestamp = typeof item.timestamp === "string" ? navTimestamp(item.timestamp) : undefined;
+    const query = typeof item.query === "string" && item.query.trim() ? item.query.trim() : undefined;
+    const path =
+      typeof item.path === "string" && item.path.trim() ? item.path : undefined;
     citations.push({
       id: typeof item.id === "string" && item.id ? item.id : stableId([kind, title, subtitle, href]),
       kind,
       title,
       subtitle,
       href,
+      timestamp,
+      query,
+      ...(path ? { path } : {}),
     });
   }
   return dedupeCitations(citations);
@@ -430,8 +554,9 @@ function dedupeLinks(links: Array<{ title?: string; url: string }>): Array<{ tit
 
 function extractFilePathsFromCommand(command: string): string[] {
   const paths = new Set<string>();
+  const stripped = stripHeredocs(command);
   const readCommand = /\b(cat|less|more|head|tail|sed|awk|jq|wc|stat)\b([^|;&`]*)/g;
-  for (const match of command.matchAll(readCommand)) {
+  for (const match of stripped.matchAll(readCommand)) {
     const tool = match[1] ?? "";
     const tokens = shellWords(match[2] ?? "");
     let sawOperand = false;
@@ -444,10 +569,41 @@ function extractFilePathsFromCommand(command: string): string[] {
       }
 
       sawOperand = true;
-      if (isPathLike(token)) paths.add(token);
+      if (isPathLike(token) && isUsablePath(token)) paths.add(token);
     }
   }
   return Array.from(paths).slice(0, 4);
+}
+
+// Remove heredoc bodies (`<< 'EOF' ... EOF`, `<<EOF ... EOF`, etc.) so the
+// embedded program source isn't tokenized as filesystem paths. Common pattern:
+// `cat > /tmp/x.ts << 'SCRIPT_EOF'\n...JS source...\nSCRIPT_EOF\nbun run /tmp/x.ts`
+// — without this, every quoted string literal inside the JS that contains a
+// "/" or ".ext" leaks into the source citation footer.
+function stripHeredocs(command: string): string {
+  const heredocStart = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/g;
+  let result = "";
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = heredocStart.exec(command)) !== null) {
+    const startIdx = match.index;
+    const tag = match[2];
+    if (!tag) continue;
+    const afterTag = heredocStart.lastIndex;
+    // Find the line where the body begins (skip to the end of the start line).
+    const bodyStart = command.indexOf("\n", afterTag);
+    if (bodyStart === -1) break;
+    const closeRegex = new RegExp(`\\n\\s*${tag}\\s*(?:\\n|$)`);
+    const tail = command.slice(bodyStart);
+    const closeMatch = closeRegex.exec(tail);
+    if (!closeMatch) break;
+    const endIdx = bodyStart + closeMatch.index + closeMatch[0].length;
+    result += command.slice(cursor, startIdx);
+    cursor = endIdx;
+    heredocStart.lastIndex = endIdx;
+  }
+  result += command.slice(cursor);
+  return result;
 }
 
 function shellWords(value: string): string[] {
@@ -504,6 +660,16 @@ function queryParams(query: string): Record<string, string> {
     if (value && !value.includes("${")) out[safeDecode(rawKey)] = value;
   }
   return out;
+}
+
+// Normalize a (possibly URL-encoded) start time into a timestamp the timeline
+// can navigate to. Returns undefined when the value isn't a parseable date, so
+// only real moments become clickable.
+function navTimestamp(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const decoded = safeDecode(value);
+  const date = new Date(decoded);
+  return Number.isNaN(date.getTime()) ? undefined : decoded;
 }
 
 function timeRange(start: string | undefined, end: string | undefined): string | undefined {

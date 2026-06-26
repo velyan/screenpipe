@@ -4,6 +4,12 @@
 "use client";
 
 import React, { useState, useEffect, useCallback, useRef } from "react";
+import type { SettingsField } from "./settings-search";
+
+/** Settings search index for this section. Co-located with the component so adding a field here means updating one file. See `SettingsField` in `./settings-search` for the schema. */
+export const searchIndex: SettingsField[] = [
+  { label: "Speakers", keywords: ["voice", "diarization", "identify"] },
+];
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -33,8 +39,7 @@ import {
   AlertCircle,
 } from "lucide-react";
 import { localFetch } from "@/lib/api";
-import { useQueryState } from "nuqs";
-import { emit } from "@tauri-apps/api/event";
+import { showChatWithPrefill } from "@/lib/chat-utils";
 
 interface AudioSample {
   path: string;
@@ -85,6 +90,10 @@ function getLatestSampleTime(speaker: Speaker): number {
   const samples = parseSamples(speaker.metadata);
   if (samples.length === 0) return 0;
   return Math.max(...samples.map((s) => s.timestamp || 0));
+}
+
+function buildOrganizeSpeakersDisplayLabel(): string {
+  return "Organize speakers";
 }
 
 function AudioClip({
@@ -835,7 +844,6 @@ export function SpeakersSection() {
   );
   const [clusters, setClusters] = useState<SpeakerCluster[]>([]);
   const [clusterLoading, setClusterLoading] = useState(false);
-  const [, setSection] = useQueryState("section");
   const { toast } = useToast();
 
   const fetchSpeakers = useCallback(async () => {
@@ -1176,20 +1184,15 @@ export function SpeakersSection() {
               })
               .join("\n");
 
-            const prefillData = {
+            await showChatWithPrefill({
               context: `here are my current speakers:\n${speakerSummary}\n\nYou have access to the screenpipe API to manage speakers:\n- POST /speakers/update {id, name} to rename\n- POST /speakers/merge {speaker_to_keep_id, speaker_to_merge_id} to merge duplicates\n- POST /speakers/delete {speaker_id} to delete\n- POST /speakers/hallucination {speaker_id} to mark false detections`,
               prompt:
                 "look at my speakers and help me organize them. find likely duplicates to merge, suggest better names for vague ones, and flag any that look like false detections. make the changes directly via the API.",
+              displayLabel: buildOrganizeSpeakersDisplayLabel(),
               autoSend: true,
               source: "speakers-organize",
-            };
-
-            sessionStorage.setItem(
-              "pendingChatPrefill",
-              JSON.stringify(prefillData)
-            );
-            await setSection("home");
-            setTimeout(() => emit("chat-prefill", prefillData), 300);
+              useHomeChat: true,
+            });
           }}
         >
           <Sparkles className="h-3 w-3" />

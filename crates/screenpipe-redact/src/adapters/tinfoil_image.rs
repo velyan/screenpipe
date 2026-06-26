@@ -80,21 +80,26 @@ pub struct TinfoilImageConfig {
     /// GitHub repo (`org/repo`) cross-checked via Sigstore. Falls back
     /// to `SCREENPIPE_PRIVACY_FILTER_REPO`, then [`DEFAULT_REPO`].
     pub repo: Option<String>,
-    /// Bearer token. Falls back to
-    /// `SCREENPIPE_PRIVACY_FILTER_API_KEY`, then `SCREENPIPE_API_AUTH_KEY`.
+    /// Bearer token. Falls back through `SCREENPIPE_PRIVACY_FILTER_API_KEY`,
+    /// `SCREENPIPE_LOCAL_API_KEY`, then `SCREENPIPE_API_AUTH_KEY` (deprecated alias).
     pub api_key: Option<String>,
     /// Per-request timeout. Default 30 s.
     pub timeout: Option<Duration>,
     /// Score floor sent to the server. Below this, the server drops
     /// detections before returning.
     pub threshold: f32,
+    /// Canonical [`crate::SpanLabel`] snake_case names the enclave
+    /// should return regions for (e.g. `["secret", "email"]`). The
+    /// detector finds every class but only the requested ones come
+    /// back. Empty = enclave default. Populated from the
+    /// `piiRedactionLabels` setting.
+    pub labels: Vec<String>,
 }
 
 /// See sibling `tinfoil::CachedClient` for the rationale on holding
 /// the verifier alongside the bare reqwest client.
 struct CachedClient {
-    #[allow(dead_code)]
-    inner: tinfoil::Client,
+    _inner: tinfoil::Client,
     http: reqwest::Client,
     created_at: Instant,
 }
@@ -105,6 +110,9 @@ pub struct TinfoilImageRedactor {
     bearer: Option<HeaderValue>,
     timeout: Duration,
     threshold: f32,
+    /// Server-side label allow-list forwarded on every request; empty =
+    /// enclave default.
+    labels: Vec<String>,
     client: RwLock<Option<CachedClient>>,
     has_auth: bool,
 }
@@ -137,6 +145,7 @@ impl TinfoilImageRedactor {
         let api_key = cfg.api_key.or_else(|| {
             std::env::var("SCREENPIPE_PRIVACY_FILTER_API_KEY")
                 .ok()
+                .or_else(|| std::env::var("SCREENPIPE_LOCAL_API_KEY").ok())
                 .or_else(|| std::env::var("SCREENPIPE_API_AUTH_KEY").ok())
         });
 
@@ -172,6 +181,7 @@ impl TinfoilImageRedactor {
             bearer,
             timeout: cfg.timeout.unwrap_or(DEFAULT_TIMEOUT),
             threshold,
+            labels: cfg.labels,
             client: RwLock::new(None),
             has_auth,
         }
@@ -215,7 +225,7 @@ impl TinfoilImageRedactor {
             .clone();
         let http_clone = http.clone();
         *g = Some(CachedClient {
-            inner,
+            _inner: inner,
             http,
             created_at: Instant::now(),
         });
@@ -234,15 +244,16 @@ impl TinfoilImageRedactor {
 struct DetectRequest<'a> {
     image_b64: &'a str,
     threshold: f32,
+    /// Server-side label allow-list. Older enclave builds ignore this
+    /// field (pydantic drops unknown keys); newer builds only return
+    /// regions for these classes. Sent only when non-empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    labels: &'a Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct DetectResponse {
     detections: Vec<RawDetection>,
-    #[allow(dead_code)]
-    latency_ms: Option<f32>,
-    #[allow(dead_code)]
-    model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -275,6 +286,7 @@ impl ImageRedactor for TinfoilImageRedactor {
             .json(&DetectRequest {
                 image_b64: &image_b64,
                 threshold: self.threshold,
+                labels: &self.labels,
             });
         if let Some(b) = &self.bearer {
             req = req.header(AUTHORIZATION, b.clone());
@@ -357,6 +369,7 @@ mod tests {
             api_key: None,
             timeout: None,
             threshold: 0.0,
+            labels: vec![],
         }
     }
 
@@ -373,6 +386,7 @@ mod tests {
     fn no_api_key_means_no_auth() {
         // Make sure no env var is leaking in.
         std::env::remove_var("SCREENPIPE_PRIVACY_FILTER_API_KEY");
+        std::env::remove_var("SCREENPIPE_LOCAL_API_KEY");
         std::env::remove_var("SCREENPIPE_API_AUTH_KEY");
         let r = TinfoilImageRedactor::new(cfg());
         assert!(!r.has_auth());

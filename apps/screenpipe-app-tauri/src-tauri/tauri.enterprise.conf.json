@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "screenpipe",
+  "productName": "screenpipe enterprise",
   "identifier": "screenpi.pe.enterprise",
   "build": {
     "beforeDevCommand": "bun run dev",
@@ -9,7 +9,7 @@
     "devUrl": "http://localhost:3000"
   },
   "bundle": {
-    "createUpdaterArtifacts": false,
+    "createUpdaterArtifacts": true,
     "active": true,
     "publisher": "Screenpipe Inc.",
     "category": "DeveloperTool",
@@ -39,7 +39,9 @@
       "icons/screenpipe-logo-tray-black.png"
     ],
     "resources": [
-      "assets/*"
+      "assets/*",
+      "mlx.metallib",
+      "PermissionFlow_PermissionFlow.bundle"
     ],
     "macOS": {
       "entitlements": "entitlements.plist"
@@ -60,54 +62,58 @@
   },
   "plugins": {
     "updater": {
-      "endpoints": [],
-      "pubkey": ""
+      "active": true,
+      "dialog": false,
+      "endpoints": [
+        "https://screenpipe.com/api/app-update/enterprise/{{target}}-{{arch}}/{{current_version}}"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDIyQjQ2RkQzMUNBOUFDMTcKUldRWHJLa2MwMiswSWl3RlBGUW5zYUE0Zm0vNFFRRTltNUZZTUVxR2FxUDNtSWdUSHgyL3JNcmcK"
     },
     "deep-link": {
       "desktop": {
         "schemes": [
-          "screenpipe"
+          "screenpipe-enterprise"
         ]
       },
       "mobile": [
         {
-          "host": "screenpi.pe",
+          "host": "screenpipe.com",
           "pathPrefix": [
             "/auth"
           ]
         },
         {
-          "host": "screenpi.pe",
+          "host": "screenpipe.com",
           "pathPrefix": [
             "/stripe-connect"
           ]
         },
         {
-          "host": "screenpi.pe",
+          "host": "screenpipe.com",
           "pathPrefix": [
             "/purchase-successful"
           ]
         },
         {
-          "host": "screenpi.pe",
+          "host": "screenpipe.com",
           "pathPrefix": [
             "/settings"
           ]
         },
         {
-          "host": "screenpi.pe",
+          "host": "screenpipe.com",
           "pathPrefix": [
             "/changelog"
           ]
         },
         {
-          "host": "screenpi.pe",
+          "host": "screenpipe.com",
           "pathPrefix": [
             "/onboarding"
           ]
         },
         {
-          "host": "screenpi.pe",
+          "host": "screenpipe.com",
           "pathPrefix": [
             "/status"
           ]

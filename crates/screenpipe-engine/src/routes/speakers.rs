@@ -27,6 +27,9 @@ pub struct UpdateSpeakerRequest {
 #[derive(OaSchema, Serialize, Deserialize, Debug)]
 pub struct SearchSpeakersRequest {
     pub name: Option<String>,
+    pub limit: Option<u32>,
+    pub offset: Option<u32>,
+    pub include_samples: Option<bool>,
 }
 
 #[derive(OaSchema, Serialize, Deserialize, Debug)]
@@ -182,9 +185,12 @@ pub(crate) async fn search_speakers_handler(
     Query(request): Query<SearchSpeakersRequest>,
 ) -> Result<JsonResponse<Vec<Speaker>>, (StatusCode, JsonResponse<Value>)> {
     let search_prefix = request.name.unwrap_or_default();
+    let limit = request.limit.unwrap_or(50).clamp(1, 100) as i64;
+    let offset = request.offset.unwrap_or(0) as i64;
+    let include_samples = request.include_samples.unwrap_or(true);
     let speakers = state
         .db
-        .search_speakers(&search_prefix)
+        .search_speakers_limited(&search_prefix, limit, offset, include_samples)
         .await
         .map_err(|e| {
             (
@@ -219,15 +225,18 @@ pub(crate) async fn delete_speaker_handler(
         )
     })?;
 
-    // delete all audio chunks from the file system
+    // delete all audio chunks from the file system (best-effort)
     for audio_chunk in audio_chunks {
         if audio_chunk.start_time.is_some() && audio_chunk.end_time.is_some() {
-            std::fs::remove_file(audio_chunk.file_path).map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    JsonResponse(json!({"error": e.to_string()})),
-                )
-            })?;
+            if let Err(e) = std::fs::remove_file(&audio_chunk.file_path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "failed to remove audio chunk file {}: {}",
+                        audio_chunk.file_path,
+                        e
+                    );
+                }
+            }
         }
     }
 

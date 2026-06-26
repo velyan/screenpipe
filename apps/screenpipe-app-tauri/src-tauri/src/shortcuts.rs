@@ -155,6 +155,20 @@ async fn apply_shortcuts(app: &AppHandle, config: &ShortcutConfig) -> Result<(),
         let app_for_closure = app.clone();
         let _ = app.run_on_main_thread(move || {
             let app = &app_for_closure;
+            // The "show" shortcut only opens the timeline/rewind overlay, so it
+            // must be a no-op when the timeline is disabled. Checked at press
+            // time (not registration): the Disable-Timeline toggle restarts only
+            // the recording engine, so these shortcuts stay registered until the
+            // next app restart.
+            if crate::store::SettingsStore::get(app)
+                .unwrap_or_default()
+                .unwrap_or_default()
+                .recording
+                .disable_timeline
+            {
+                info!("timeline disabled: ignoring show shortcut");
+                return;
+            }
             info!("show shortcut triggered - attempting to show/hide main overlay");
             let _ = app.emit("shortcut-show", ());
             {
@@ -193,6 +207,14 @@ async fn apply_shortcuts(app: &AppHandle, config: &ShortcutConfig) -> Result<(),
         config.is_disabled("start_recording"),
         |app| {
             let _ = app.emit("shortcut-start-recording", ());
+            // The frontend listener only shows an in-app toast, which is
+            // invisible when the main window is hidden — i.e. exactly when a
+            // global hotkey is used. Fire a notification panel so the user gets
+            // glance-level confirmation regardless of window visibility.
+            crate::notifications::client::send(
+                "recording started",
+                "screen recording has been initiated",
+            );
         },
     )
     .await?;
@@ -203,6 +225,10 @@ async fn apply_shortcuts(app: &AppHandle, config: &ShortcutConfig) -> Result<(),
         config.is_disabled("stop_recording"),
         |app| {
             let _ = app.emit("shortcut-stop-recording", ());
+            crate::notifications::client::send(
+                "recording paused",
+                "capture paused — pipes and search still available",
+            );
         },
     )
     .await?;

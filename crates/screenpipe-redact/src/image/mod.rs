@@ -153,4 +153,15 @@ impl ImageRedactionPolicy {
             min_score: 0.50,
         }
     }
+
+    /// Build a policy from user-configured label names (the
+    /// `piiRedactionLabels` setting), keeping the default `min_score`.
+    /// See [`crate::span::parse_allow_list`] — Secret is always
+    /// included.
+    pub fn from_labels(labels: &[String]) -> Self {
+        Self {
+            allow: crate::span::parse_allow_list(labels),
+            ..Default::default()
+        }
+    }
 }

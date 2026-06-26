@@ -357,7 +357,10 @@ mod tests {
         let meeting_start = Utc::now() - Duration::minutes(10);
         let before_live_at = meeting_start + Duration::seconds(20);
         let live_at = meeting_start + Duration::minutes(2);
-        let overlap_at = live_at + Duration::seconds(15);
+        // Well inside the ±15s live-coverage window — placing this on the exact
+        // boundary (live_at + 15s) flips behavior across platforms because
+        // julianday() float math rounds differently on macOS vs Linux.
+        let overlap_at = live_at + Duration::seconds(5);
         let after_live_at = live_at + Duration::minutes(3);
 
         let meeting_id = sqlx::query(
@@ -448,6 +451,12 @@ mod tests {
             .iter()
             .map(|row| row.transcript.as_str())
             .collect::<Vec<_>>();
+        // Background rows within ±15s of a live segment are dropped only when they
+        // share the live segment's DIRECTION (input vs output) — see #3776. The
+        // "duplicate near live" row is an OUTPUT capture while the live segment is
+        // INPUT, so it's a different participant and is correctly KEPT (not a
+        // duplicate of the user's own input). Same-direction near-live rows would be
+        // suppressed; background rows outside the window survive and cover the gaps.
         assert_eq!(
             transcripts,
             vec![
@@ -469,6 +478,8 @@ mod tests {
         assert_eq!(rows[1].audio_chunk_id, None);
         assert_eq!(rows[1].speaker_name.as_deref(), Some("Louis"));
 
+        // The opposite-direction overlap row is KEPT (different participant), so it
+        // sits between the live segment and the later background row.
         assert_eq!(rows[2].source, "background");
         assert_eq!(rows[2].audio_chunk_id, Some(overlap_chunk));
 

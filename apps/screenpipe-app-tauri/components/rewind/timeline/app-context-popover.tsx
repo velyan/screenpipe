@@ -24,17 +24,19 @@ function formatUiEvent(ev: UiEventSummary): { icon: string; label: string } | nu
 	const truncate = (s: string, max = 40) => s.length > max ? s.slice(0, max) + "\u2026" : s;
 	switch (ev.event_type) {
 		case "text":
-			return ev.text_content
-				? { icon: "\u2328", label: `typed "${truncate(ev.text_content)}"` }
-				: null;
+			return { icon: "\u2328", label: ev.text_content ? `typed "${truncate(ev.text_content)}"` : "typed" };
 		case "clipboard":
-			return ev.text_content
-				? { icon: "\ud83d\udccb", label: `copied "${truncate(ev.text_content)}"` }
-				: null;
+			return { icon: "\ud83d\udccb", label: ev.text_content ? `copied "${truncate(ev.text_content)}"` : "copied" };
 		case "click":
 			return { icon: "\ud83d\uddb1", label: `clicked "${truncate(ev.text_content || "element")}"` };
 		case "app_switch":
 			return { icon: "\u21d4", label: `switched to ${ev.app_name || "app"}` };
+		case "key":
+			return { icon: "\u2303", label: ev.text_content ? `pressed ${truncate(ev.text_content)}` : "key press" };
+		case "scroll":
+			return { icon: "\u21f3", label: `scrolled${ev.window_title ? ` in ${truncate(ev.window_title)}` : ""}` };
+		case "window_focus":
+			return { icon: "\ud83d\udd32", label: `focused ${ev.window_title ? truncate(ev.window_title) : ev.app_name || "window"}` };
 		default:
 			return null;
 	}
@@ -116,7 +118,7 @@ export function AppContextPopover({
 		const transcripts: { text: string; time: Date; speaker?: string }[] = [];
 		const seenChunks = new Set<number>();
 		for (const frame of frames) {
-			for (const device of frame.devices) {
+			for (const device of frame.devices ?? []) {
 				for (const audio of device.audio || []) {
 					if (!audio.transcription?.trim()) continue;
 					if (seenChunks.has(audio.audio_chunk_id)) continue;
@@ -203,7 +205,7 @@ export function AppContextPopover({
 			);
 		}
 
-		navigator.clipboard.writeText(lines.join("\n"));
+		commands.copyTextToClipboard(lines.join("\n"));
 		setCopied(true);
 		setTimeout(() => setCopied(false), 1500);
 	};
@@ -302,14 +304,19 @@ export function AppContextPopover({
 						<div className="pl-4 space-y-0.5">
 							{data.topUrls.map((u, i) => {
 								const domain = extractDomain(u.url);
+								// browser_url from screenpipe often lacks a protocol (e.g. "github.com/foo");
+								// openUrl rejects such inputs silently, so normalize before opening.
+								const openableUrl = u.url.includes("://") ? u.url : `https://${u.url}`;
 								return (
 									<button
 										key={i}
-										className="flex items-center gap-1 text-blue-400 hover:text-blue-300 truncate w-full text-left transition-colors"
-										title={u.url}
-										onClick={() => {
-											openUrl(u.url).catch(() => {});
-											commands.closeWindow("Main").catch(() => {});
+										className="flex items-center gap-1 text-blue-400 hover:text-blue-300 truncate w-full text-left transition-colors cursor-pointer"
+										title={openableUrl}
+										onClick={(e) => {
+											e.stopPropagation();
+											openUrl(openableUrl).catch((err) => {
+												console.error("failed to open url", openableUrl, err);
+											});
 										}}
 									>
 										{domain ? (

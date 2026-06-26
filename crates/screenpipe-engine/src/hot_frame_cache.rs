@@ -10,43 +10,52 @@
 
 use chrono::{DateTime, Datelike, Utc};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use tokio::sync::{broadcast, watch, RwLock};
 use tracing::{info, warn};
 
+use crate::routes::search::is_screenpipe_app;
 use crate::video_cache::{AudioEntry, DeviceFrame, FrameMetadata, TimeSeriesFrame};
 
-/// Cached frame from the capture pipeline (~650 bytes per entry).
-/// 2000 frames/day = ~1.3 MB. Negligible memory usage.
+/// Cached frame from the capture pipeline.
+///
+/// All string fields are `Arc<str>` so that `.clone()` is O(1) — one atomic
+/// reference-count increment per field instead of a heap allocation per field.
+/// `push_frame` clones this struct twice (BTreeMap insert + broadcast send),
+/// so the saving is 2 × 8 allocs = 16 heap allocs avoided per captured frame.
 #[derive(Debug, Clone)]
 pub struct HotFrame {
     pub frame_id: i64,
     pub timestamp: DateTime<Utc>,
-    pub device_name: String,
-    pub app_name: String,
-    pub window_name: String,
-    pub ocr_text_preview: String,
-    pub snapshot_path: String,
-    pub browser_url: Option<String>,
-    pub capture_trigger: String,
+    pub device_name: Arc<str>,
+    pub app_name: Arc<str>,
+    pub window_name: Arc<str>,
+    pub ocr_text_preview: Arc<str>,
+    pub snapshot_path: Arc<str>,
+    pub browser_url: Option<Arc<str>>,
+    pub capture_trigger: Arc<str>,
     pub offset_index: i64,
     pub fps: f64,
-    pub machine_id: Option<String>,
+    pub machine_id: Option<Arc<str>>,
 }
 
 /// Cached audio entry from audio transcription pipeline.
+///
+/// String fields are `Arc<str>` for the same reason as `HotFrame` — cheap clone
+/// on broadcast send and BTreeMap insert.
 #[derive(Debug, Clone)]
 pub struct HotAudio {
     pub audio_chunk_id: i64,
     pub timestamp: DateTime<Utc>,
-    pub transcription: String,
-    pub device_name: String,
+    pub transcription: Arc<str>,
+    pub device_name: Arc<str>,
     pub is_input: bool,
-    pub audio_file_path: String,
+    pub audio_file_path: Arc<str>,
     pub duration_secs: f64,
     pub start_time: Option<f64>,
     pub end_time: Option<f64>,
     pub speaker_id: Option<i64>,
-    pub speaker_name: Option<String>,
+    pub speaker_name: Option<Arc<str>>,
 }
 
 /// In-memory cache for today's frames and audio.
@@ -218,22 +227,27 @@ impl HotFrameCache {
                     // Convert FrameData to HotFrames
                     for ocr_entry in &frame_data.ocr_entries {
                         // Skip screenpipe's own frames
-                        if ocr_entry.app_name.to_lowercase().contains("screenpipe") {
+                        if is_screenpipe_app(&ocr_entry.app_name) {
                             continue;
                         }
                         let hot = HotFrame {
                             frame_id: frame_data.frame_id,
                             timestamp: frame_data.timestamp,
-                            device_name: ocr_entry.device_name.clone(),
-                            app_name: ocr_entry.app_name.clone(),
-                            window_name: ocr_entry.window_name.clone(),
-                            ocr_text_preview: ocr_entry.text.chars().take(200).collect(),
-                            snapshot_path: ocr_entry.video_file_path.clone(),
-                            browser_url: ocr_entry.browser_url.clone(),
-                            capture_trigger: String::new(),
+                            device_name: Arc::from(ocr_entry.device_name.as_str()),
+                            app_name: Arc::from(ocr_entry.app_name.as_str()),
+                            window_name: Arc::from(ocr_entry.window_name.as_str()),
+                            ocr_text_preview: ocr_entry
+                                .text
+                                .chars()
+                                .take(200)
+                                .collect::<String>()
+                                .into(),
+                            snapshot_path: Arc::from(ocr_entry.video_file_path.as_str()),
+                            browser_url: ocr_entry.browser_url.as_deref().map(Arc::from),
+                            capture_trigger: Arc::from(""),
                             offset_index: frame_data.offset_index,
                             fps: frame_data.fps,
-                            machine_id: frame_data.machine_id.clone(),
+                            machine_id: frame_data.machine_id.as_deref().map(Arc::from),
                         };
                         frames.insert((hot.timestamp, hot.frame_id), hot);
                         frame_count += 1;
@@ -246,15 +260,15 @@ impl HotFrameCache {
                             let hot_audio = HotAudio {
                                 audio_chunk_id: audio_entry.audio_chunk_id,
                                 timestamp: frame_data.timestamp,
-                                transcription: audio_entry.transcription.clone(),
-                                device_name: audio_entry.device_name.clone(),
+                                transcription: Arc::from(audio_entry.transcription.as_str()),
+                                device_name: Arc::from(audio_entry.device_name.as_str()),
                                 is_input: audio_entry.is_input,
-                                audio_file_path: audio_entry.audio_file_path.clone(),
+                                audio_file_path: Arc::from(audio_entry.audio_file_path.as_str()),
                                 duration_secs: audio_entry.duration_secs,
                                 start_time: audio_entry.start_time,
                                 end_time: audio_entry.end_time,
                                 speaker_id: audio_entry.speaker_id,
-                                speaker_name: audio_entry.speaker_name.clone(),
+                                speaker_name: audio_entry.speaker_name.as_deref().map(Arc::from),
                             };
                             audio_map
                                 .entry(hot_audio.timestamp)
@@ -335,7 +349,7 @@ impl HotFrameCache {
         }
         for (_, hot) in frames.iter_mut() {
             if let Some((mp4_path, offset, fps)) = updates.get(&hot.frame_id) {
-                hot.snapshot_path = mp4_path.to_string();
+                hot.snapshot_path = Arc::from(*mp4_path);
                 hot.offset_index = *offset;
                 hot.fps = *fps;
             }
@@ -359,14 +373,14 @@ fn find_audio_for_frame(
     for (_, audio_list) in audio_map.range(search_start..=search_end) {
         for a in audio_list {
             entries.push(AudioEntry {
-                transcription: a.transcription.clone(),
-                device_name: a.device_name.clone(),
+                transcription: a.transcription.to_string(),
+                device_name: a.device_name.to_string(),
                 is_input: a.is_input,
-                audio_file_path: a.audio_file_path.clone(),
+                audio_file_path: a.audio_file_path.to_string(),
                 duration_secs: a.duration_secs,
                 audio_chunk_id: a.audio_chunk_id,
                 speaker_id: a.speaker_id,
-                speaker_name: a.speaker_name.clone(),
+                speaker_name: a.speaker_name.as_deref().map(String::from),
                 start_time: a.start_time,
                 end_time: a.end_time,
             });
@@ -378,19 +392,19 @@ fn find_audio_for_frame(
 /// Convert a HotFrame + audio into the existing TimeSeriesFrame format.
 fn hot_frame_to_timeseries(hot: &HotFrame, audio_entries: Vec<AudioEntry>) -> TimeSeriesFrame {
     let device_frame = DeviceFrame {
-        device_id: hot.device_name.clone(),
+        device_id: hot.device_name.to_string(),
         frame_id: hot.frame_id,
         image_data: vec![],
         metadata: FrameMetadata {
-            file_path: hot.snapshot_path.clone(),
-            app_name: hot.app_name.clone(),
-            window_name: hot.window_name.clone(),
+            file_path: hot.snapshot_path.to_string(),
+            app_name: hot.app_name.to_string(),
+            window_name: hot.window_name.to_string(),
             transcription: String::new(),
-            ocr_text: hot.ocr_text_preview.clone(),
-            browser_url: hot.browser_url.clone(),
+            ocr_text: hot.ocr_text_preview.to_string(),
+            browser_url: hot.browser_url.as_deref().map(String::from),
         },
         audio_entries,
-        machine_id: hot.machine_id.clone(),
+        machine_id: hot.machine_id.as_deref().map(String::from),
     };
 
     TimeSeriesFrame {
@@ -414,13 +428,13 @@ mod tests {
         let frame = HotFrame {
             frame_id: 1,
             timestamp: now,
-            device_name: "monitor_0".to_string(),
-            app_name: "TestApp".to_string(),
-            window_name: "TestWindow".to_string(),
-            ocr_text_preview: "hello world".to_string(),
-            snapshot_path: "/tmp/test.jpg".to_string(),
+            device_name: "monitor_0".into(),
+            app_name: "TestApp".into(),
+            window_name: "TestWindow".into(),
+            ocr_text_preview: "hello world".into(),
+            snapshot_path: "/tmp/test.jpg".into(),
             browser_url: None,
-            capture_trigger: "click".to_string(),
+            capture_trigger: "click".into(),
             offset_index: 0,
             fps: 0.033,
             machine_id: None,
@@ -447,13 +461,13 @@ mod tests {
             .push_frame(HotFrame {
                 frame_id: 1,
                 timestamp: now,
-                device_name: "monitor_0".to_string(),
-                app_name: "App".to_string(),
-                window_name: "Win".to_string(),
-                ocr_text_preview: String::new(),
-                snapshot_path: "/tmp/test.jpg".to_string(),
+                device_name: "monitor_0".into(),
+                app_name: "App".into(),
+                window_name: "Win".into(),
+                ocr_text_preview: "".into(),
+                snapshot_path: "/tmp/test.jpg".into(),
                 browser_url: None,
-                capture_trigger: "idle".to_string(),
+                capture_trigger: "idle".into(),
                 offset_index: 0,
                 fps: 0.033,
                 machine_id: None,
@@ -465,10 +479,10 @@ mod tests {
             .push_audio(HotAudio {
                 audio_chunk_id: 10,
                 timestamp: now + chrono::Duration::seconds(5),
-                transcription: "hello".to_string(),
-                device_name: "mic_0".to_string(),
+                transcription: "hello".into(),
+                device_name: "mic_0".into(),
                 is_input: true,
-                audio_file_path: "/tmp/audio.mp4".to_string(),
+                audio_file_path: "/tmp/audio.mp4".into(),
                 duration_secs: 3.0,
                 start_time: None,
                 end_time: None,
@@ -497,13 +511,13 @@ mod tests {
         let frame = HotFrame {
             frame_id: 42,
             timestamp: Utc::now(),
-            device_name: "monitor_0".to_string(),
-            app_name: "App".to_string(),
-            window_name: "Win".to_string(),
-            ocr_text_preview: String::new(),
-            snapshot_path: "/tmp/test.jpg".to_string(),
+            device_name: "monitor_0".into(),
+            app_name: "App".into(),
+            window_name: "Win".into(),
+            ocr_text_preview: "".into(),
+            snapshot_path: "/tmp/test.jpg".into(),
             browser_url: None,
-            capture_trigger: "click".to_string(),
+            capture_trigger: "click".into(),
             offset_index: 0,
             fps: 0.033,
             machine_id: None,

@@ -48,6 +48,40 @@ export async function waitForAppReady(): Promise<void> {
   await browser.pause(t(3000));
 }
 
+/**
+ * Reload the current webview and wait for the Home page to re-render.
+ *
+ * Shared so the per-spec inline copies don't drift. The bare
+ * `window.location.reload()` + poll pattern was flaky in CI: while the document
+ * is being torn down, `browser.execute(...)` intermittently throws
+ * "WebDriverError: Session ... not found" / "execution context destroyed", and
+ * uncaught that rejects the `waitUntil` and reds the run as "home did not
+ * re-render after reload". Trapping those transient errors inside the poll
+ * (return false -> keep polling) makes the reload robust, matching the proven
+ * home-page wait in `finishOpenHomeWindow`.
+ */
+export async function reloadAndWaitForHome(timeoutMs = t(30000)): Promise<void> {
+  // The reload itself can race the execution-context teardown — ignore.
+  await browser.execute(() => window.location.reload()).catch(() => {});
+  await browser.waitUntil(
+    async () => {
+      try {
+        return (await browser.execute(
+          () => !!document.querySelector('[data-testid="home-page"]')
+        )) as boolean;
+      } catch {
+        // Transient during the reload (session/context not ready) — retry.
+        return false;
+      }
+    },
+    {
+      timeout: timeoutMs,
+      interval: 500,
+      timeoutMsg: 'home did not re-render after reload',
+    }
+  );
+}
+
 type ShowWindowPayload = { Home: { page: null } };
 
 async function finishOpenHomeWindow(): Promise<void> {
@@ -107,6 +141,27 @@ async function finishOpenHomeWindow(): Promise<void> {
     }
   );
   await browser.pause(t(1500));
+
+  // The Home window persists across specs and `sidebarCollapsed` is in-memory
+  // React state — a prior spec may have collapsed the sidebar (e.g. via the
+  // focused-meeting auto-collapse) without navigating away, so the force-/home
+  // reload above never fires and the collapsed state survives. Since #4017
+  // ("declutter sidebar corner") a collapsed sidebar is hidden entirely — the
+  // whole <AppSidebar> and every nav-* item vanish — so any spec that clicks
+  // nav-pipes / nav-timeline / nav-settings would fail with "element still not
+  // existing". Re-expand here so each spec starts from a known-expanded state.
+  // The toggle is the only chrome left when collapsed; aria-label flips to
+  // "expand sidebar" in that state, so its presence is the collapse signal.
+  try {
+    const expandBtn = await $('[aria-label="expand sidebar"]');
+    if (await expandBtn.isExisting()) {
+      await expandBtn.click();
+      await browser.pause(t(500));
+    }
+  } catch {
+    // Best-effort — if the toggle can't be found/clicked, the spec's own
+    // waitForExist on the nav item still reports the real failure.
+  }
 }
 
 /**

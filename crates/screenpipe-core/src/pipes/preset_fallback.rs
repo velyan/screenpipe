@@ -31,7 +31,7 @@ const NON_RETRYABLE_ERROR_TYPES: &[&str] = &[
 ];
 
 /// Maximum number of presets to try per request.
-const MAX_FALLBACK_DEPTH: usize = 4;
+pub const MAX_FALLBACK_DEPTH: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Circuit breaker state
@@ -200,23 +200,74 @@ impl PresetFallbackRegistry {
         }
     }
 
+    /// Persist state to disk, logging (rather than swallowing) any failure.
+    ///
+    /// A silently-dropped write here means tripped breakers, cooldown timers and
+    /// backoff counts never reach disk: on restart the registry reloads stale
+    /// state and may re-pick a preset that is rate-limited or out of credits, or
+    /// keep a recovered preset closed. We can't propagate from the call sites
+    /// (they're fire-and-forget), but a `warn!` makes the failure observable
+    /// instead of invisible — same lesson as the store.bin wipe fix.
     fn persist(&self, state: &PersistedState) {
-        // Atomic write: write to temp, rename
-        let tmp = self.persist_path.with_extension("json.tmp");
-        if let Ok(json) = serde_json::to_string_pretty(state) {
-            if std::fs::write(&tmp, &json).is_ok() {
-                let _ = std::fs::rename(&tmp, &self.persist_path);
-            }
+        if let Err(e) = self.try_persist(state) {
+            warn!(
+                "failed to persist preset fallback state to {:?}: {}",
+                self.persist_path, e
+            );
         }
+    }
+
+    /// Atomic write: serialize to a temp file, then rename over the target.
+    /// Every failure mode (serialize, write, rename) is surfaced as an error
+    /// rather than dropped. On a failed rename the temp file is removed so a
+    /// stale `.json.tmp` can't linger next to the real state.
+    fn try_persist(&self, state: &PersistedState) -> std::io::Result<()> {
+        let tmp = self.persist_path.with_extension("json.tmp");
+        let json = serde_json::to_string_pretty(state)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(&tmp, &json)?;
+        if let Err(e) = std::fs::rename(&tmp, &self.persist_path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Pick the best preset from the list, respecting circuit breakers.
     /// Returns the preset ID and its index in the list.
     pub fn pick_preset<'a>(&self, presets: &'a [String]) -> Option<(&'a str, usize)> {
+        self.pick_preset_with_floor(presets, 0)
+    }
+
+    /// Like [`pick_preset`], but only considers presets at or after `floor`.
+    ///
+    /// Drives in-run fallback: after the preset at index `floor - 1` failed this
+    /// run, selection starts at `floor` so the retry advances to the next preset
+    /// **regardless of whether the failed preset's circuit breaker tripped**.
+    /// Timeouts and process crashes never trip the breaker, so a breaker-gated
+    /// selector would re-pick the same failing preset forever (#3914). `floor`
+    /// is clamped to the last index, so callers can pass an ever-incrementing
+    /// retry depth safely.
+    pub fn pick_preset_with_floor<'a>(
+        &self,
+        presets: &'a [String],
+        floor: usize,
+    ) -> Option<(&'a str, usize)> {
+        if presets.is_empty() {
+            return None;
+        }
+        let floor = floor.min(presets.len() - 1);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let mut changed = false;
 
-        for (i, preset_id) in presets.iter().enumerate().take(MAX_FALLBACK_DEPTH) {
+        // `take` before `skip` keeps the "only the first MAX_FALLBACK_DEPTH
+        // presets are ever eligible" cap measured from the start of the list.
+        for (i, preset_id) in presets
+            .iter()
+            .enumerate()
+            .take(MAX_FALLBACK_DEPTH)
+            .skip(floor)
+        {
             let breaker = state.presets.entry(preset_id.clone()).or_default();
 
             // Check if cooldown expired → HALF_OPEN
@@ -236,8 +287,9 @@ impl PresetFallbackRegistry {
             self.persist(&state);
         }
 
-        // All presets are in cooldown — use the first one anyway (best effort)
-        presets.first().map(|id| (id.as_str(), 0))
+        // Everything from `floor` is in cooldown — use the floor preset anyway
+        // (best effort) so the run still attempts the next, untried slot.
+        presets.get(floor).map(|id| (id.as_str(), floor))
     }
 
     /// Record a successful execution for a preset.
@@ -384,10 +436,15 @@ fn now_epoch() -> u64 {
 /// ```
 pub fn parse_preset_list(value: &serde_json::Value) -> Vec<String> {
     match value {
-        serde_json::Value::String(s) if !s.is_empty() => vec![s.clone()],
+        serde_json::Value::String(s) => s
+            .trim()
+            .is_empty()
+            .then(Vec::new)
+            .unwrap_or_else(|| vec![s.trim().to_string()]),
         serde_json::Value::Array(arr) => arr
             .iter()
             .filter_map(|v| v.as_str())
+            .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
             .collect(),
@@ -421,6 +478,12 @@ mod tests {
     fn test_parse_preset_list_empty_string() {
         let v = serde_json::json!("");
         assert!(parse_preset_list(&v).is_empty());
+    }
+
+    #[test]
+    fn test_parse_preset_list_trims_whitespace() {
+        let v = serde_json::json!([" primary ", "   ", "fallback  "]);
+        assert_eq!(parse_preset_list(&v), vec!["primary", "fallback"]);
     }
 
     #[test]
@@ -479,5 +542,117 @@ mod tests {
     fn test_retryable_errors() {
         let registry = PresetFallbackRegistry::new(Path::new("/tmp"));
         assert!(registry.record_failure("test", Some("rate_limited")));
+    }
+
+    /// Hermetic registry in a unique temp dir so persisted state can't leak
+    /// between tests (or between repeated runs).
+    fn fresh_registry(tag: &str) -> PresetFallbackRegistry {
+        let dir = std::env::temp_dir().join(format!("sp_preset_fallback_{}", tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        PresetFallbackRegistry::new(&dir)
+    }
+
+    #[test]
+    fn test_pick_preset_with_floor_advances_without_breaker() {
+        // The core #3914 fix: with NO breaker tripped, raising the floor must
+        // still advance to the next preset (timeouts/crashes never trip it).
+        let registry = fresh_registry("advance");
+        let presets = vec![
+            "primary".to_string(),
+            "fallback".to_string(),
+            "third".to_string(),
+        ];
+
+        assert_eq!(
+            registry.pick_preset_with_floor(&presets, 0),
+            Some(("primary", 0))
+        );
+        assert_eq!(
+            registry.pick_preset_with_floor(&presets, 1),
+            Some(("fallback", 1))
+        );
+        assert_eq!(
+            registry.pick_preset_with_floor(&presets, 2),
+            Some(("third", 2))
+        );
+    }
+
+    #[test]
+    fn test_pick_preset_with_floor_clamps_past_end() {
+        let registry = fresh_registry("clamp");
+        let presets = vec!["primary".to_string(), "fallback".to_string()];
+        // Floor beyond the last index clamps to the last preset rather than
+        // returning None / panicking.
+        assert_eq!(
+            registry.pick_preset_with_floor(&presets, 9),
+            Some(("fallback", 1))
+        );
+    }
+
+    #[test]
+    fn test_pick_preset_with_floor_skips_open_breaker() {
+        let registry = fresh_registry("skip_open");
+        let presets = vec![
+            "primary".to_string(),
+            "fallback".to_string(),
+            "third".to_string(),
+        ];
+        // Trip the fallback's breaker; from floor 1 it should be skipped to
+        // "third", while floor 0 still returns the (closed) primary.
+        registry.record_failure("fallback", Some("rate_limited"));
+        assert_eq!(
+            registry.pick_preset_with_floor(&presets, 0),
+            Some(("primary", 0))
+        );
+        assert_eq!(
+            registry.pick_preset_with_floor(&presets, 1),
+            Some(("third", 2))
+        );
+    }
+
+    #[test]
+    fn test_pick_preset_with_floor_empty() {
+        let registry = fresh_registry("empty");
+        assert_eq!(registry.pick_preset_with_floor(&[], 0), None);
+    }
+
+    /// A tripped breaker must actually survive on disk: persist then reload via
+    /// a fresh registry and confirm the state came back. Guards against a
+    /// `persist` that silently writes nothing (the store.bin failure class).
+    #[test]
+    fn test_state_persists_across_reload() {
+        let dir = std::env::temp_dir().join("sp_preset_fallback_reload");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        {
+            let registry = PresetFallbackRegistry::new(&dir);
+            assert!(registry.record_failure("primary", Some("rate_limited")));
+        }
+
+        // A brand-new registry reads only what made it to disk.
+        let reloaded = PresetFallbackRegistry::new(&dir);
+        let state = reloaded.state.lock().unwrap_or_else(|e| e.into_inner());
+        let breaker = state.presets.get("primary").expect("breaker persisted");
+        assert_eq!(breaker.state, BreakerState::Open);
+        assert_eq!(breaker.failure_count, 1);
+    }
+
+    /// A write that cannot land (parent directory missing) must surface an
+    /// error from `try_persist` rather than being swallowed. Cross-platform:
+    /// writing into a non-existent directory fails on every OS.
+    #[test]
+    fn test_persist_reports_error_when_unwritable() {
+        let dir = std::env::temp_dir().join("sp_preset_fallback_missing_parent");
+        let _ = std::fs::remove_dir_all(&dir); // ensure the parent does not exist
+        let registry = PresetFallbackRegistry::new(&dir);
+
+        let err = registry
+            .try_persist(&PersistedState::default())
+            .expect_err("persist into a missing directory must error");
+        // And no stray temp file should be left behind.
+        assert!(!dir.join("ai_preset_fallback.json.tmp").exists());
+        drop(err);
     }
 }

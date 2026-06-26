@@ -15,26 +15,6 @@ fn generate_code() -> String {
         .collect()
 }
 
-/// Open a URL in the default browser.
-fn open_browser(url: &str) {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("open").arg(url).spawn();
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.args(["/C", "start", "", url]);
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        let _ = cmd.spawn();
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
-    }
-}
-
 /// Handle `screenpipe login` — opens browser, polls server for token.
 pub async fn handle_login_command() -> anyhow::Result<()> {
     // Check if already logged in
@@ -61,13 +41,16 @@ pub async fn handle_login_command() -> anyhow::Result<()> {
     println!("  your code: {}", code);
     println!();
 
-    open_browser(&login_url);
+    super::browser::open_browser(&login_url);
 
     // Poll the server for the auth result
     let client = reqwest::Client::new();
     let poll_url = format!("{}/api/cli-auth?code={}", base, code);
 
-    let timeout = std::time::Duration::from_secs(300); // 5 min timeout
+    // 15 min. Headless device-code approval (copy the URL to your phone/another
+    // machine, sign in, approve) routinely takes longer than 5 min — the old
+    // limit timed out before a real approval landed on a fresh VPS login.
+    let timeout = std::time::Duration::from_secs(900);
     let start = std::time::Instant::now();
 
     print!("  waiting for authentication...");

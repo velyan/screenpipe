@@ -1,19 +1,17 @@
-import { invoke } from '@tauri-apps/api/core';
+import { commands } from "@/lib/utils/tauri";
 
 export async function getMediaFile(
 	filePath: string,
 ): Promise<{ data: string; mimeType: string }> {
 	try {
-		const result = await invoke<{ data: string; mimeType: string }>('get_media_file', {
-			filePath: filePath,
-		});
-
-		return result;
+		const res = await commands.getMediaFile(filePath);
+		if (res.status === "error") throw new Error(res.error);
+		return res.data as { data: string; mimeType: string };
 	} catch (error) {
 		console.error("failed to read media file:", error);
+		const message = error instanceof Error ? error.message : String(error || "unknown error");
 		throw new Error(
-			`failed to read media file: ${error instanceof Error ? error.message : "unknown error"}`,
+			`failed to read media file: ${message}`,
 		);
 	}
 }
-

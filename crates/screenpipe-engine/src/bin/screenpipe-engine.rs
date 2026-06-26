@@ -17,8 +17,7 @@ use screenpipe_audio::core::device::{
     get_cpal_device_and_config, AudioDevice, DeviceType, MACOS_OUTPUT_AUDIO_DEVICE_NAME,
 };
 use screenpipe_audio::{
-    core::device::{default_input_device, default_output_device, parse_audio_device},
-    meeting_detector::MeetingDetector,
+    core::device::resolve_audio_devices_for_capture, meeting_detector::MeetingDetector,
 };
 use screenpipe_core::agents::AgentExecutor;
 use screenpipe_core::find_ffmpeg_path;
@@ -30,11 +29,16 @@ use screenpipe_engine::{
         audio::handle_audio_command,
         mcp::handle_mcp_command,
         pipe::handle_pipe_command,
+        profile::handle_profile_command,
+        search::handle_search_command,
         status::handle_status_command,
         sync::{handle_sync_command, start_sync_service},
+        team::handle_team_command,
         vision::handle_vision_command,
         Cli, Command, RecordArgSources,
     },
+    crash_log,
+    high_fps_controller::HighFpsController,
     hot_frame_cache::HotFrameCache,
     start_meeting_watcher, start_power_manager, start_sleep_monitor, start_speaker_identification,
     start_ui_recording,
@@ -60,62 +64,6 @@ use tracing_subscriber::{prelude::__tracing_subscriber_SubscriberExt, Layer};
 
 #[cfg(target_os = "macos")]
 use tracing_oslog::OsLogger;
-
-/// Set the file descriptor limit for the process.
-/// This helps prevent "Too many open files" errors during heavy WebSocket/video usage.
-#[cfg(unix)]
-fn set_fd_limit() {
-    use nix::libc;
-    use std::env;
-
-    // Check if a custom limit was set via environment variable
-    let desired_limit: u64 = env::var("SCREENPIPE_FD_LIMIT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(8192); // Default to 8192 if not set
-
-    // Get current limits
-    let mut rlim = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-
-    unsafe {
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) == 0 {
-            let current_soft = rlim.rlim_cur;
-            let current_hard = rlim.rlim_max;
-
-            // Only increase if current limit is lower than desired
-            if current_soft < desired_limit {
-                // Set new soft limit (capped by hard limit)
-                let new_soft = std::cmp::min(desired_limit, current_hard);
-                rlim.rlim_cur = new_soft;
-
-                if libc::setrlimit(libc::RLIMIT_NOFILE, &rlim) == 0 {
-                    eprintln!(
-                        "increased file descriptor limit from {} to {} (hard limit: {})",
-                        current_soft, new_soft, current_hard
-                    );
-                } else {
-                    eprintln!(
-                        "warning: failed to increase file descriptor limit (current: {}, requested: {})",
-                        current_soft, new_soft
-                    );
-                }
-            } else {
-                // already sufficient — no need to log
-            }
-        } else {
-            eprintln!("warning: failed to get current file descriptor limits");
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn set_fd_limit() {
-    // On Windows, file handle limits work differently and are generally not an issue
-    // No action needed
-}
 
 #[cfg(target_os = "macos")]
 async fn doctor_check_system_audio_capture() -> bool {
@@ -174,6 +122,7 @@ fn get_base_dir(custom_path: &Option<String>) -> anyhow::Result<PathBuf> {
     let data_dir = base_dir.join("data");
 
     fs::create_dir_all(&data_dir)?;
+    paths::ensure_spotlight_excluded(&base_dir);
     Ok(base_dir)
 }
 
@@ -210,7 +159,13 @@ fn setup_logging(
             // SCREENPIPE_LOG=ort=info.
             .add_directive("ort=warn".parse().unwrap());
 
-        #[cfg(target_os = "windows")]
+        // xcap probes stale monitor / window IDs on every refresh and emits
+        // ERROR-level lines for IDs that don't exist (e.g. ImplMonitor::new(8)
+        // failed after a display was unplugged). Hundreds per session, all
+        // benign, and they crowd out real errors in user feedback logs.
+        // Silence on every platform — was previously windows-only, but the
+        // same spam happens on macOS (Core Graphics display IDs persist after
+        // disconnect) and on Linux X11.
         let filter = filter
             .add_directive("xcap::platform::impl_window=off".parse().unwrap())
             .add_directive("xcap::platform::impl_monitor=off".parse().unwrap())
@@ -289,8 +244,9 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "heap-prof")]
     let _profiler = dhat::Profiler::new_heap();
 
-    // Set file descriptor limit early, before any resources are allocated
-    set_fd_limit();
+    // Set file descriptor limit early, before any resources are allocated.
+    // Single source of truth shared with the desktop app (see fd_limit module).
+    screenpipe_engine::fd_limit::set_fd_limit();
 
     debug!("starting screenpipe server");
     let matches = Cli::command().get_matches();
@@ -309,6 +265,18 @@ async fn main() -> anyhow::Result<()> {
             handle_status_command(json, data_dir, port).await?;
             return Ok(());
         }
+        Command::Profile { json, port } => {
+            handle_profile_command(json, port).await?;
+            return Ok(());
+        }
+        Command::Search(ref args) => {
+            handle_search_command(args).await?;
+            return Ok(());
+        }
+        Command::Team { ref subcommand } => {
+            handle_team_command(subcommand).await?;
+            return Ok(());
+        }
         Command::Pipe { ref subcommand } => {
             handle_pipe_command(subcommand).await?;
             return Ok(());
@@ -324,6 +292,14 @@ async fn main() -> anyhow::Result<()> {
         Command::Mcp { ref subcommand } => {
             let local_data_dir = get_base_dir(&None)?;
             handle_mcp_command(subcommand, &local_data_dir).await?;
+            return Ok(());
+        }
+        Command::Agent { ref subcommand } => {
+            screenpipe_engine::cli::agent::handle_agent_command(subcommand).await?;
+            return Ok(());
+        }
+        Command::Service { ref subcommand } => {
+            screenpipe_engine::cli::service::handle_service_command(subcommand).await?;
             return Ok(());
         }
         Command::Sync { ref subcommand } => {
@@ -357,6 +333,10 @@ async fn main() -> anyhow::Result<()> {
             screenpipe_engine::cli::login::handle_whoami_command().await?;
             return Ok(());
         }
+        Command::Survey => {
+            screenpipe_engine::cli::survey::handle_survey_command().await?;
+            return Ok(());
+        }
         Command::Auth { ref subcommand } => {
             screenpipe_engine::cli::auth::handle_auth_command(subcommand).await?;
             return Ok(());
@@ -370,6 +350,10 @@ async fn main() -> anyhow::Result<()> {
             ref data_dir,
         } => {
             screenpipe_engine::cli::backup::handle_backup_command(subcommand, data_dir).await?;
+            return Ok(());
+        }
+        Command::Export(ref args) => {
+            screenpipe_engine::cli::export::handle_export_command(args).await?;
             return Ok(());
         }
         Command::Doctor => {
@@ -420,10 +404,22 @@ async fn main() -> anyhow::Result<()> {
     let local_data_dir_clone = local_data_dir.clone();
 
     // Build unified RecordingConfig from shared app settings plus explicit CLI args.
-    let config = record_args
+    let mut config = record_args
         .clone()
         .into_recording_config(local_data_dir.clone(), &record_arg_sources)
         .await?;
+
+    // Force telemetry off in CI / automation (GitHub Actions, etc.) so test runs
+    // never reach Sentry/PostHog. Done here, before any telemetry is initialized,
+    // so the startup banner and the logging Sentry layer also reflect it.
+    if config.analytics_enabled && screenpipe_engine::analytics::telemetry_disabled_by_env() {
+        info!("telemetry force-disabled: detected CI / automation environment");
+        config.analytics_enabled = false;
+    }
+
+    // mDNS LAN discovery is opt-in (off by default) so we don't trigger the
+    // macOS "Local Network" permission prompt unless the user wants it.
+    screenpipe_connect::mdns::set_enabled(record_args.enable_mdns);
 
     // Store the guard in a variable that lives for the entire main function
     let _log_guard = Some(setup_logging(
@@ -432,9 +428,13 @@ async fn main() -> anyhow::Result<()> {
         !config.analytics_enabled,
     )?);
 
+    if let Err(e) = screenpipe_engine::power::set_keep_awake(config.keep_computer_awake) {
+        warn!("failed to apply keep-awake setting: {}", e);
+    }
+
     // Non-blocking update check — runs in background, prints banner if outdated
     tokio::spawn(async {
-        check_for_updates().await;
+        screenpipe_engine::cli_reminder::check_for_updates().await;
     });
 
     // Periodic terminal nudge to install the desktop app (CLI-only).
@@ -481,6 +481,9 @@ async fn main() -> anyhow::Result<()> {
                             r"no such table: main\.speaker_embeddings",
                             // Concurrent DB access / user ran CLI while app was running
                             r"database is locked",
+                            // Port conflict — another screenpipe instance is already bound
+                            // (CLI-2J: 659 events / 649 users — user environment, not a bug)
+                            r"you're likely already running screenpipe instance",
                             // Broken Homebrew install — external dylib missing
                             r"Library not loaded.*libx265\.",
                             // Linux system library missing — distro-local, not our bug
@@ -520,12 +523,24 @@ async fn main() -> anyhow::Result<()> {
 
         // Attach non-sensitive CLI settings to all future Sentry events
         sentry::configure_scope(|scope| {
-            // Set user.id to the same analytics ID used by PostHog
-            // This links Sentry errors to PostHog sessions and feedback reports
+            // Set user.id to the same analytics ID used by PostHog. Embedded
+            // customers can set SCREENPIPE_SUPPORT_ID to make standalone CLI
+            // events searchable by customer without using email.
             scope.set_user(Some(sentry::protocol::User {
                 id: Some(analytics::get_distinct_id().to_string()),
                 ..Default::default()
             }));
+            let telemetry_context =
+                screenpipe_engine::telemetry_context::TelemetryContext::from_env();
+            for (key, value) in telemetry_context.pairs() {
+                scope.set_tag(key, value);
+            }
+            if !telemetry_context.is_empty() {
+                scope.set_context(
+                    "screenpipe_support",
+                    sentry::protocol::Context::Other(telemetry_context.to_json_map()),
+                );
+            }
             scope.set_context(
                 "cli_settings",
                 sentry::protocol::Context::Other({
@@ -591,15 +606,127 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Replace the current conditional check with:
-    let ffmpeg_path = find_ffmpeg_path();
-    if ffmpeg_path.is_none() {
-        // Try one more time, which might trigger the installation
+    // Crash diagnostics. Integrators embed this binary as a child process
+    // inside their own wrapper (e.g. an Electron app) and, when it dies, see
+    // only the exit code — never *why*. Install a panic hook that writes the
+    // message + backtrace to last-panic.log so the parent (and we, via Sentry)
+    // can read the cause after the process exits. Installed only on the Record
+    // path (the long-running server; subcommands return earlier) and written
+    // regardless of telemetry, so analytics-disabled customers still get a
+    // local crash record. Mirrors the desktop app's hook in
+    // apps/screenpipe-app-tauri/src-tauri/src/main.rs.
+    {
+        // Write to the resolved data dir (honors --data-dir) so the crash log
+        // sits next to screenpipe.log, and an embedder running with its own
+        // --data-dir doesn't collide with the desktop app's
+        // ~/.screenpipe/last-panic.log (the app runs its engine in-process and
+        // owns that file).
+        let panic_dir = local_data_dir.clone();
+        // A relaunch right after a crash is the common case: rotate last run's
+        // log to .prev so we don't truncate the message we most need.
+        crash_log::rotate_panic_log(&panic_dir);
+
+        // Reuse the existing embedder attribution (SCREENPIPE_EMBEDDER /
+        // SCREENPIPE_CUSTOMER_ID / ...) so the local crash record is identifiable
+        // even when telemetry is off. When telemetry is on, the Sentry scope is
+        // already tagged with the same context above, so panic events inherit it
+        // and no per-event tagging is needed here.
+        let attribution = {
+            use screenpipe_engine::telemetry_context::TelemetryContext;
+            let joined = TelemetryContext::from_env()
+                .pairs()
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join(" ");
+            if joined.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}", joined)
+            }
+        };
+
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // stderr first — the embedding parent usually pipes the child's
+            // stderr, and unwinding into an extern "C" frame can turn into
+            // panic_cannot_unwind → abort() and drop everything after this.
+            eprintln!("PANIC: {}", info);
+
+            let thread = std::thread::current();
+            let thread_name = thread.name().unwrap_or("<unnamed>");
+            let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = info.payload().downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic payload".to_string()
+            };
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_default();
+
+            // Orderly-shutdown noise: a background task (redact workers, etc.)
+            // caught mid-poll while the tokio runtime tears down on quit. Not a
+            // crash — don't record it where it would skew crash dashboards or
+            // mislead the embedder into thinking the binary is unstable.
+            if payload.contains("Tokio 1.x context was found, but it is being shutdown") {
+                eprintln!(
+                    "(suppressed tokio shutdown-time panic on thread '{}' at {})",
+                    thread_name, location
+                );
+                return;
+            }
+
+            // force_capture ignores RUST_BACKTRACE — we always want the trace.
+            let backtrace = std::backtrace::Backtrace::force_capture();
+            let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+            let record = format!(
+                "[{}] PANIC on thread '{}' at {}: {}{}\n\nBacktrace:\n{}",
+                timestamp, thread_name, location, payload, attribution, backtrace
+            );
+
+            eprintln!("{}", record);
+            crash_log::write_panic_log(&panic_dir, &record);
+
+            // Best-effort Sentry report. No-op when telemetry is disabled; and
+            // the CLI sample_rate (0.1) applies here, so last-panic.log is the
+            // reliable record while Sentry is the convenience copy.
+            sentry::capture_message(
+                &format!(
+                    "panic on thread '{}' at {}: {}",
+                    thread_name, location, payload
+                ),
+                sentry::Level::Fatal,
+            );
+            // Flush so the event leaves before the process dies.
+            if let Some(client) = sentry::Hub::current().client() {
+                client.flush(Some(std::time::Duration::from_secs(2)));
+            }
+
+            // Default hook last (prints the standard panic output).
+            default_hook(info);
+        }));
+    }
+
+    // Only require ffmpeg when audio recording is enabled. Vision-only recording
+    // should not attempt network installs (important for offline / locked-down
+    // Windows environments).
+    if !config.disable_audio {
         let ffmpeg_path = find_ffmpeg_path();
         if ffmpeg_path.is_none() {
-            eprintln!("ffmpeg not found and installation failed. please install ffmpeg manually.");
-            std::process::exit(1);
+            // Try one more time, which might trigger the installation
+            let ffmpeg_path = find_ffmpeg_path();
+            if ffmpeg_path.is_none() {
+                eprintln!(
+                    "ffmpeg not found and installation failed. please install ffmpeg manually."
+                );
+                std::process::exit(1);
+            }
         }
+    } else {
+        debug!("audio disabled; skipping ffmpeg preflight");
     }
 
     // Pre-flight permission check (macOS: trigger native prompts + poll until granted)
@@ -718,33 +845,15 @@ async fn main() -> anyhow::Result<()> {
         list_monitors().await
     };
 
-    let mut audio_devices = Vec::new();
+    let audio_devices = if config.disable_audio {
+        Vec::new()
+    } else {
+        resolve_audio_devices_for_capture(&config.audio_devices, config.use_system_default_audio)
+            .await
+    };
 
-    if !config.disable_audio {
-        if config.audio_devices.is_empty()
-            || config.use_system_default_audio
-            || config.audio_devices == vec!["default".to_string()]
-        {
-            // Use default devices
-            if let Ok(input_device) = default_input_device() {
-                audio_devices.push(input_device.to_string());
-            }
-            if let Ok(output_device) = default_output_device().await {
-                audio_devices.push(output_device.to_string());
-            }
-        } else {
-            // Use specified devices
-            for d in &config.audio_devices {
-                match parse_audio_device(d) {
-                    Ok(device) => audio_devices.push(device.to_string()),
-                    Err(e) => warn!("skipping unparseable audio device '{}': {}", d, e),
-                }
-            }
-        }
-
-        if audio_devices.is_empty() {
-            warn!("no audio devices available.");
-        }
+    if !config.disable_audio && audio_devices.is_empty() {
+        warn!("no audio devices available.");
     }
 
     let audio_devices_clone = audio_devices.clone();
@@ -876,35 +985,38 @@ async fn main() -> anyhow::Result<()> {
     let audio_manager = match audio_manager_builder.build(db.clone()).await {
         Ok(mut manager) => {
             // Wire up audio → hot cache: push new transcriptions so the WS
-            // streaming handler can attach audio to live frames.
-            let cache = hot_frame_cache.clone();
-            let rt = tokio::runtime::Handle::current();
-            // Use the actual capture time (when audio was recorded), not Utc::now().
-            // In smart/batch mode, transcription can be deferred by minutes — using
-            // Utc::now() would place audio far from the frames it belongs to.
-            manager.set_on_transcription_insert(std::sync::Arc::new(move |info| {
-                let cache = cache.clone();
-                let ts = chrono::DateTime::from_timestamp(info.capture_timestamp as i64, 0)
-                    .unwrap_or_else(chrono::Utc::now);
-                rt.spawn(async move {
-                    use screenpipe_engine::hot_frame_cache::HotAudio;
-                    cache
-                        .push_audio(HotAudio {
-                            audio_chunk_id: info.audio_chunk_id,
-                            timestamp: ts,
-                            transcription: info.transcription,
-                            device_name: info.device_name,
-                            is_input: info.is_input,
-                            audio_file_path: info.audio_file_path,
-                            duration_secs: info.duration_secs,
-                            start_time: info.start_time,
-                            end_time: info.end_time,
-                            speaker_id: info.speaker_id,
-                            speaker_name: None,
-                        })
-                        .await;
-                });
-            }));
+            // streaming handler can attach audio to live frames. Skipped when the
+            // timeline is disabled (the cache is only read by the timeline).
+            if !config.disable_timeline {
+                let cache = hot_frame_cache.clone();
+                let rt = tokio::runtime::Handle::current();
+                // Use the actual capture time (when audio was recorded), not Utc::now().
+                // In smart/batch mode, transcription can be deferred by minutes — using
+                // Utc::now() would place audio far from the frames it belongs to.
+                manager.set_on_transcription_insert(std::sync::Arc::new(move |info| {
+                    let cache = cache.clone();
+                    let ts = chrono::DateTime::from_timestamp(info.capture_timestamp as i64, 0)
+                        .unwrap_or_else(chrono::Utc::now);
+                    rt.spawn(async move {
+                        use screenpipe_engine::hot_frame_cache::HotAudio;
+                        cache
+                            .push_audio(HotAudio {
+                                audio_chunk_id: info.audio_chunk_id,
+                                timestamp: ts,
+                                transcription: info.transcription.into(),
+                                device_name: info.device_name.into(),
+                                is_input: info.is_input,
+                                audio_file_path: info.audio_file_path.into(),
+                                duration_secs: info.duration_secs,
+                                start_time: info.start_time,
+                                end_time: info.end_time,
+                                speaker_id: info.speaker_id,
+                                speaker_name: None,
+                            })
+                            .await;
+                    });
+                }));
+            }
             Arc::new(manager)
         }
         Err(e) => {
@@ -934,20 +1046,112 @@ async fn main() -> anyhow::Result<()> {
         info!("snapshot compaction disabled via --disable-snapshot-compaction");
     }
 
+    // Build the shared high-FPS controller once. Same instance feeds the
+    // VisionManager (so each capture loop reacts on the next tick) and the
+    // SCServer (so HTTP toggles, the tray menu, and pipes can all hit it
+    // without an engine restart). Seed from the persisted RecordingSettings
+    // so a user who already toggled the auto-mode preference keeps it.
+    let high_fps_controller = Arc::new(HighFpsController::new(
+        meeting_detector.clone(),
+        config.hd_recording_default,
+        config.hd_recording_interval_ms,
+    ));
+
+    // Wire `meeting_ended` → controller.handle_meeting_ended so a
+    // meeting-bound session auto-stops when the call ends. Without this,
+    // the only safety net is the 4-hour hard cap.
+    {
+        let controller = high_fps_controller.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut sub =
+                screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_ended");
+            while let Some(event) = sub.next().await {
+                let meeting_id = event
+                    .data
+                    .get("meeting_id")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| event.data.get("id").and_then(|v| v.as_i64()));
+                if let Some(id) = meeting_id {
+                    controller.handle_meeting_ended(id);
+                }
+            }
+        });
+    }
+
+    // On every `meeting_started`:
+    //   1. Always upgrade any active PrewarmPending session to Meeting{id}
+    //      so the user gets full call coverage instead of the 1hr clip.
+    //      Safe regardless of default_mode — only PrewarmPending sessions
+    //      are upgraded; explicit timers and existing meeting bindings
+    //      are left alone.
+    //   2. If default_mode = Always AND no session is pending an upgrade,
+    //      auto-start a meeting-bound session.
+    //   Ask mode is handled by the desktop shell (it adds a "+ HD" action
+    //   to the existing notification).
+    {
+        let controller = high_fps_controller.clone();
+        tokio::spawn(async move {
+            use futures::StreamExt;
+            let mut sub =
+                screenpipe_events::subscribe_to_event::<serde_json::Value>("meeting_started");
+            while let Some(event) = sub.next().await {
+                let meeting_id = event
+                    .data
+                    .get("meeting_id")
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| event.data.get("id").and_then(|v| v.as_i64()));
+                let Some(id) = meeting_id else { continue };
+
+                // Step 1: prewarm-pending upgrade is universal.
+                controller.try_upgrade_pending_to_meeting(id);
+
+                // Step 2: auto-start only for Always mode AND only if the
+                // upgrade above didn't already bind a session.
+                let snap = controller.snapshot();
+                if !matches!(
+                    snap.default_mode,
+                    screenpipe_engine::high_fps_controller::DefaultMode::Always
+                ) {
+                    continue;
+                }
+                let already_bound = matches!(
+                    snap.kind,
+                    Some(screenpipe_engine::high_fps_controller::SessionKind::Meeting { .. })
+                );
+                if !already_bound {
+                    controller.start_meeting_session(id);
+                }
+            }
+        });
+    }
+
     // Create VisionManager for event-driven capture on all monitors
-    let (handle, capture_trigger_tx) = if !config.disable_vision {
+    let (handle, capture_trigger_tx, linker_tx) = if !config.disable_vision {
         let vision_config =
             config.to_vision_manager_config(output_path_clone.to_string(), vision_metrics.clone());
+        // Hot frame cache is only consumed by the timeline streaming endpoint;
+        // skip frame buffering when the timeline is disabled.
+        let hot_cache_for_capture = if config.disable_timeline {
+            None
+        } else {
+            Some(hot_frame_cache.clone())
+        };
         let vision_manager = Arc::new(
             VisionManager::new(vision_config, db_clone.clone(), vision_handle.clone())
-                .with_hot_frame_cache(hot_frame_cache.clone())
-                .with_power_profile(power_manager.subscribe()),
+                .with_hot_frame_cache(hot_cache_for_capture)
+                .with_power_profile(power_manager.subscribe())
+                .with_high_fps_controller(high_fps_controller.clone()),
         );
 
         // Get the broadcast trigger sender BEFORE moving the VisionManager into
         // the spawned task. This sender is passed to start_ui_recording so UI
         // events (clicks, app switches, clipboard) trigger captures.
         let trigger_tx = vision_manager.trigger_sender();
+        // Same idea for the frame-linker channel: shared between the
+        // recorder (sends EventPersisted after batch flush) and each
+        // capture loop (sends FrameCaptured after a successful capture).
+        let linker_tx = vision_manager.linker_sender();
 
         let vm_clone = vision_manager.clone();
         let audio_manager_for_drm = if !config.disable_audio {
@@ -960,10 +1164,21 @@ async fn main() -> anyhow::Result<()> {
         let h = runtime.spawn(async move {
             let mut shutdown_rx = shutdown_tx_clone2.subscribe();
 
-            // Start VisionManager
+            // Start VisionManager. A failure here must NOT abort this task.
+            // `VisionManager::start()` returns Err when zero monitors are
+            // enumerated at boot — lid closed at login, screen locked, or a
+            // transient TCC/ScreenCaptureKit race (list_monitors swallows
+            // those to an empty set). Returning here used to leave vision
+            // permanently dead for the whole process lifetime, because every
+            // retry/recovery path lives inside the monitor watcher spawned
+            // below (it re-calls VisionManager::start() whenever status !=
+            // Running — see monitor_watcher.rs). Log and fall through so the
+            // watcher gets a chance to recover once a display appears.
             if let Err(e) = vm_clone.start().await {
-                error!("Failed to start VisionManager: {:?}", e);
-                return;
+                error!(
+                    "Failed to start VisionManager (monitor watcher will retry): {:?}",
+                    e
+                );
             }
 
             // Start MonitorWatcher for dynamic detection (with audio DRM pause support)
@@ -981,11 +1196,11 @@ async fn main() -> anyhow::Result<()> {
                 error!("Error shutting down VisionManager: {:?}", e);
             }
         });
-        (h, Some(trigger_tx))
+        (h, Some(trigger_tx), Some(linker_tx))
     } else {
         // Vision disabled — spawn a pending task so `handle` never completes
         // (otherwise the no-op future wins the tokio::select! race and shuts down the server)
-        (tokio::spawn(std::future::pending::<()>()), None)
+        (tokio::spawn(std::future::pending::<()>()), None, None)
     };
 
     let local_data_dir_clone_2 = local_data_dir_clone.clone();
@@ -1010,6 +1225,16 @@ async fn main() -> anyhow::Result<()> {
         info!("API auth enabled — run `screenpipe auth token` to view your key");
     }
 
+    // Standalone CLI users miss out on the chat/timeline UI — point them at the
+    // desktop app. SCREENPIPE_ANALYTICS_ID is only set when the Tauri app spawns
+    // the engine, so its absence is a reliable "this is a bare CLI run" signal.
+    if std::env::var("SCREENPIPE_ANALYTICS_ID").is_err() {
+        eprintln!();
+        eprintln!("  tip: get the desktop app for chat, timeline, and search UI");
+        eprintln!("       → https://screenpi.pe/onboarding");
+        eprintln!();
+    }
+
     let mut server = SCServer::new(
         db_server,
         SocketAddr::new(IpAddr::V4(config.listen_address), config.port),
@@ -1023,6 +1248,7 @@ async fn main() -> anyhow::Result<()> {
     server.vision_metrics = vision_metrics;
     server.audio_metrics = audio_manager.metrics.clone();
     server.hot_frame_cache = Some(hot_frame_cache);
+    server.timeline_disabled = config.disable_timeline;
     server.power_manager = Some(power_manager);
     server.manual_meeting = Some(manual_meeting.clone());
     server.api_auth = config.api_auth;
@@ -1032,7 +1258,7 @@ async fn main() -> anyhow::Result<()> {
     // SCServer::cloud_token_handle after spawn.
     if let Ok(t) = std::env::var("SCREENPIPE_API_KEY") {
         if !t.is_empty() {
-            let _ = server.cloud_token.try_write().map(|mut g| *g = Some(t));
+            server.cloud_token.store(std::sync::Arc::new(Some(t)));
         }
     }
 
@@ -1118,9 +1344,10 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&pipes_dir).ok();
 
     let user_token = std::env::var("SCREENPIPE_API_KEY").ok();
-    let pi_executor = std::sync::Arc::new(screenpipe_core::agents::pi::PiExecutor::new(
-        user_token.clone(),
-    ));
+    let pi_executor = std::sync::Arc::new(
+        screenpipe_core::agents::pi::PiExecutor::new(user_token.clone())
+            .with_api_auth_key(config.api_auth_key.clone()),
+    );
 
     // Workflow event classifier — opt-in cloud feature. Polls recent activity
     // and emits `WorkflowEvent`s on the bus so pipes with `trigger.events`
@@ -1162,6 +1389,8 @@ async fn main() -> anyhow::Result<()> {
         pipe_store,
         config.port,
     );
+    let mcp_session_access = screenpipe_core::pipes::mcp_access::McpSessionAccessRegistry::new();
+    pipe_manager.set_mcp_session_access(mcp_session_access.clone());
     // Wire pipe permission token registry (bridges PipeManager ↔ server middleware)
     pipe_manager.set_token_registry(std::sync::Arc::new(
         screenpipe_engine::pipe_permissions_middleware::DashMapTokenRegistry::new(
@@ -1169,7 +1398,7 @@ async fn main() -> anyhow::Result<()> {
         ),
     ));
     pipe_manager.set_on_run_complete(std::sync::Arc::new(
-        |pipe_name, success, duration_secs, error_type| {
+        |pipe_name, _execution_id, success, duration_secs, error_type| {
             let mut props = serde_json::json!({
                 "pipe": pipe_name,
                 "success": success,
@@ -1191,21 +1420,7 @@ async fn main() -> anyhow::Result<()> {
             let ss = secret_store_for_check.clone();
             let dir = screenpipe_dir_for_check.clone();
             Box::pin(async move {
-                let mut missing = Vec::new();
-                for conn_id in required {
-                    let configured = screenpipe_connect::connections::load_connection(
-                        ss.as_deref(),
-                        &dir,
-                        &conn_id,
-                    )
-                    .await
-                    .map(|c| c.enabled && !c.credentials.is_empty())
-                    .unwrap_or(false);
-                    if !configured {
-                        missing.push(conn_id);
-                    }
-                }
-                missing
+                screenpipe_connect::missing_pipe_connections(ss.as_deref(), &dir, &required).await
             })
         }));
     }
@@ -1223,7 +1438,10 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("failed to start pipe scheduler: {}", e);
     }
     let shared_pipe_manager = std::sync::Arc::new(tokio::sync::Mutex::new(pipe_manager));
-    let server = server.with_pipe_manager(shared_pipe_manager.clone());
+    let server = server
+        .with_pipe_manager(shared_pipe_manager.clone())
+        .with_mcp_session_access(mcp_session_access)
+        .with_high_fps_controller(high_fps_controller.clone());
 
     // Install pi agent in background
     tokio::spawn(async move {
@@ -1348,6 +1566,9 @@ async fn main() -> anyhow::Result<()> {
             match record_args.retention_mode {
                 screenpipe_engine::retention::RetentionMode::Media => {
                     "media-only (keep transcripts)".to_string()
+                }
+                screenpipe_engine::retention::RetentionMode::Lean => {
+                    "lean (keep text+memories)".to_string()
                 }
                 screenpipe_engine::retention::RetentionMode::All => "all (full delete)".to_string(),
             }
@@ -1514,7 +1735,9 @@ async fn main() -> anyhow::Result<()> {
                 db.clone(),
                 ui_recorder_config,
                 capture_trigger_tx,
+                linker_tx,
                 config.ignored_windows.clone(),
+                true, // CLI: show native TCC dialogs for accessibility + input monitoring
             )
             .await
             {
@@ -1540,6 +1763,7 @@ async fn main() -> anyhow::Result<()> {
             shutdown_tx.subscribe(),
             Some(meeting_detector),
             true,
+            config.ignored_meeting_apps.clone(),
         ))
     } else {
         info!("meeting watcher skipped because audio capture is disabled");
@@ -1549,8 +1773,8 @@ async fn main() -> anyhow::Result<()> {
     // Start calendar-assisted speaker identification
     let _speaker_id_handle = start_speaker_identification(db.clone(), config.user_name.clone());
 
-    // Periodic WAL checkpoint to prevent unbounded WAL growth
-    db.start_wal_maintenance();
+    // WAL checkpoint maintenance now starts inside DatabaseManager::new(), so
+    // every caller (CLI + in-process desktop app) gets it — no explicit call here.
 
     let server_future = server.start();
     pin_mut!(server_future);
@@ -1611,12 +1835,13 @@ async fn main() -> anyhow::Result<()> {
     if config.async_pii_redaction {
         use screenpipe_redact::{
             adapters::{
+                onnx::{OnnxConfig, OnnxRedactor},
                 opf::{OpfAdapter, OpfConfig},
-                tinfoil::TinfoilRedactor,
+                tinfoil::{TinfoilConfig, TinfoilRedactor},
             },
             pipeline::{Pipeline, PipelineConfig},
-            worker::{Worker, WorkerConfig, ALL_TARGET_TABLES},
-            Redactor,
+            worker::{RedactColumns, Worker, WorkerConfig, ALL_TARGET_TABLES},
+            Pseudonymizer, Redactor, TextRedactionPolicy,
         };
         use std::sync::Arc;
 
@@ -1624,57 +1849,142 @@ async fn main() -> anyhow::Result<()> {
 
         // Pipeline: regex pre-pass + AI fallback. Regex catches
         // structural PII deterministically and on-device. AI step
-        // resolves to:
-        //   1. local opf-rs (candle, ~74 ms p50 on Mac CPU, 41 ms on
-        //      Metal). First run downloads ~2.8 GB from
-        //      huggingface.co/screenpipe/pii-text-redactor and verifies
-        //      SHA-256 before landing at ~/.screenpipe/models/opf-v6/.
-        //      Spawned off the boot path so a slow first-run pull
-        //      doesn't block the engine.
-        //   2. Tinfoil confidential-compute enclave when TINFOIL_*
-        //      env vars are set and local opf-rs is unavailable.
-        //   3. regex-only otherwise (still destructive — overwrites
+        // resolves to (preference order):
+        //   1. v45_phase3 ONNX (xlm-roberta-base fine-tune, INT8, ~278 MB,
+        //      9 ms p50 on CPU, CoreML on macOS / DirectML on Windows
+        //      via the redact-onnx-* CI feature). First run downloads
+        //      from huggingface.co/screenpipe/pii-redactor under
+        //      v45_phase3_onnx/. Same checkpoint the Tinfoil container
+        //      and the desktop app's own worker use, so outputs match
+        //      across surfaces.
+        //   2. Legacy opf-rs (candle, OPF v6, ~74 ms p50 on Mac CPU,
+        //      ~2.8 GB) if v45 ONNX isn't compiled in or the download
+        //      fails.
+        //   3. Tinfoil confidential-compute enclave when TINFOIL_*
+        //      env vars are set and both local adapters are unavailable.
+        //   4. Regex-only otherwise (still destructive — overwrites
         //      regex-redacted text into the source columns).
         let pool = db.pool.clone();
-        tokio::spawn(async move {
-            info!(
-                "fetching local OPF v6 checkpoint (~2.8 GB on first run, cached at \
-                 ~/.screenpipe/models/opf-v6/)"
-            );
-            let pipeline = match OpfAdapter::load_or_download(OpfConfig::default()).await {
-                Ok(adapter) => {
-                    info!(
-                        "text-PII AI step: local opf-rs (candle) — lazy load on first \
-                         batch, idle-unload after 60s of no work"
-                    );
-                    // Wrap in Arc first so we can spawn the idle
-                    // unloader (which needs `Arc<Self>`) and still
-                    // hand the same Arc to the Pipeline.
-                    let adapter = Arc::new(adapter);
-                    let _unloader = Arc::clone(&adapter).spawn_idle_unloader();
-                    let ai: Arc<dyn Redactor> = adapter;
-                    Pipeline::regex_then_ai(ai, PipelineConfig::default())
+        let labels = config.pii_redaction_labels.clone();
+        // Consistent-pseudonym tokens (issue #4206), opt-in. Loads (or
+        // creates on first run) the per-install key under the data dir;
+        // on any IO error we log and fall back to static `[LABEL]` tags
+        // rather than block the worker.
+        let pseudonymizer = if config.pii_redaction_pseudonyms {
+            match Pseudonymizer::load_or_create(&config.data_dir) {
+                Ok(p) => {
+                    info!("text-PII redaction: consistent pseudonyms ON (issue #4206)");
+                    Some(Arc::new(p))
                 }
                 Err(e) => {
-                    if std::env::var("TINFOIL_API_KEY").is_ok()
-                        || std::env::var("TINFOIL_BASE_URL").is_ok()
-                    {
-                        info!("text-PII AI step: tinfoil enclave (local opf-rs unavailable: {e})");
-                        let ai: Arc<dyn Redactor> = Arc::new(TinfoilRedactor::from_env());
-                        Pipeline::regex_then_ai(ai, PipelineConfig::default())
-                    } else {
-                        tracing::warn!(
-                            "text-PII AI step disabled — local opf-rs unavailable ({e}) and no \
-                             TINFOIL_* env vars set. Worker will run regex-only."
-                        );
-                        Pipeline::regex_only()
+                    tracing::warn!(
+                        "couldn't load pseudonym key ({e}); rendering static [LABEL] tags instead"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        tokio::spawn(async move {
+            // Per-label allow-list from the `piiRedactionLabels` setting
+            // (default ["secret"]). Local adapters filter client-side via
+            // this policy; the env-gated tinfoil fallback forwards the
+            // raw labels so the enclave filters server-side.
+            let policy = TextRedactionPolicy::from_labels(&labels);
+            info!(
+                "fetching v45 phase 3 ONNX text redactor (~278 MB INT8 on first run, \
+                 cached at ~/.screenpipe/models/v45_phase3_onnx/)"
+            );
+            let pipeline = match OnnxRedactor::load_or_download(OnnxConfig::default()).await {
+                Ok(adapter) => {
+                    info!(
+                        "text-PII AI step: local v45_phase3 ONNX — same checkpoint as the \
+                         desktop app + Tinfoil container, sub-10 ms p50 on CPU"
+                    );
+                    let ai: Arc<dyn Redactor> = Arc::new(adapter);
+                    Pipeline::regex_then_ai(
+                        ai,
+                        PipelineConfig {
+                            policy: policy.clone(),
+                            ..Default::default()
+                        },
+                    )
+                }
+                Err(onnx_err) => {
+                    tracing::warn!(
+                        "couldn't load v45 phase 3 ONNX redactor ({onnx_err}); falling back \
+                         to OPF v6 candle"
+                    );
+                    info!(
+                        "fetching local OPF v6 checkpoint (~2.8 GB on first run, cached at \
+                         ~/.screenpipe/models/opf-v6/)"
+                    );
+                    match OpfAdapter::load_or_download(OpfConfig::default()).await {
+                        Ok(adapter) => {
+                            info!(
+                                "text-PII AI step: local opf-rs (candle) fallback — lazy load \
+                                 on first batch, idle-unload after 60s of no work"
+                            );
+                            // Wrap in Arc first so we can spawn the idle
+                            // unloader (which needs `Arc<Self>`) and still
+                            // hand the same Arc to the Pipeline.
+                            let adapter = Arc::new(adapter);
+                            let _unloader = Arc::clone(&adapter).spawn_idle_unloader();
+                            let ai: Arc<dyn Redactor> = adapter;
+                            Pipeline::regex_then_ai(
+                                ai,
+                                PipelineConfig {
+                                    policy: policy.clone(),
+                                    ..Default::default()
+                                },
+                            )
+                        }
+                        Err(e) => {
+                            if std::env::var("TINFOIL_API_KEY").is_ok()
+                                || std::env::var("TINFOIL_BASE_URL").is_ok()
+                            {
+                                info!(
+                                    "text-PII AI step: tinfoil enclave (local adapters \
+                                     unavailable: opf-rs={e})"
+                                );
+                                let ai: Arc<dyn Redactor> =
+                                    Arc::new(TinfoilRedactor::new(TinfoilConfig {
+                                        labels: labels.clone(),
+                                        ..Default::default()
+                                    }));
+                                Pipeline::regex_then_ai(
+                                    ai,
+                                    PipelineConfig {
+                                        policy: policy.clone(),
+                                        ..Default::default()
+                                    },
+                                )
+                            } else {
+                                tracing::warn!(
+                                    "text-PII AI step disabled — both v45 ONNX and opf-rs \
+                                     unavailable ({e}), and no TINFOIL_* env vars set. Worker \
+                                     will run regex-only."
+                                );
+                                Pipeline::regex_only_with_policy(policy.clone())
+                            }
+                        }
                     }
                 }
             };
+            // Opt-in pseudonym tokens (no-op when `pseudonymizer` is None
+            // or the adapter is span-less, i.e. tinfoil).
+            let pipeline = pipeline.with_pseudonyms(pseudonymizer);
             let pipeline_arc = Arc::new(pipeline) as Arc<dyn Redactor>;
 
+            // WHICH columns to scrub, from the `piiRedactionColumns` setting
+            // (browser_url / ui element name+description / a11y url-field are
+            // off by default — opt-in). Orthogonal to the category policy above.
+            let columns = RedactColumns::from_keys(&config.pii_redaction_columns);
+            info!(?columns, "redaction column allow-list");
             let worker_cfg = WorkerConfig {
                 tables: ALL_TARGET_TABLES.to_vec(),
+                columns,
                 ..Default::default()
             };
             let _worker_handle = Worker::new(pool, pipeline_arc, worker_cfg).spawn();
@@ -1700,46 +2010,51 @@ async fn main() -> anyhow::Result<()> {
     if config.async_image_pii_redaction {
         use screenpipe_redact::adapters::rfdetr::{RfdetrConfig, RfdetrRedactor};
         use screenpipe_redact::image::worker::{ImageWorker, ImageWorkerConfig};
-        use screenpipe_redact::ImageRedactor;
+        use screenpipe_redact::{ImageRedactionPolicy, ImageRedactor};
         use std::sync::Arc;
 
-        // Prefer the MLX runtime on Mac when the safetensors weights
-        // are present (~6× faster than the CoreML EP path). Falls
-        // through to the ONNX adapter otherwise — load_or_download
-        // fetches rfdetr_v9.onnx from
-        // huggingface.co/screenpipe/pii-image-redactor on first run
-        // (~108 MB), verifies SHA-256, caches at
-        // ~/.screenpipe/models/. Subsequent starts are instant.
+        // The desktop app intentionally uses the ONNX image redactor for
+        // local mode. Keep the standalone CLI on that same stable path by
+        // default: the MLX RF-DETR port is still experimental and can crash
+        // the process while reconciling large frame backlogs. Developers can
+        // still opt in while iterating on that runtime.
         #[allow(unused_mut)]
         let mut detector_arc: Option<Arc<dyn ImageRedactor>> = None;
         #[cfg(all(feature = "rfdetr-mlx", target_os = "macos", target_arch = "aarch64"))]
         {
-            use screenpipe_redact::adapters::rfdetr_mlx::{RfdetrMlxConfig, RfdetrMlxRedactor};
-            let mlx_cfg = RfdetrMlxConfig::default();
-            // Mirrors the ONNX adapter: download once, verify SHA-256,
-            // cache at ~/.screenpipe/models/rfdetr_v9.safetensors.
-            if let Err(e) = mlx_cfg.ensure_model_present().await {
-                tracing::info!(
-                    "rfdetr-mlx safetensors download failed ({e}); falling back to ONNX adapter"
-                );
-            } else {
-                match RfdetrMlxRedactor::load(mlx_cfg) {
-                    Ok(d) => {
-                        info!("image-PII detector: rfdetr-mlx (Apple Silicon GPU)");
-                        // Lazy-load + 60 s idle-unload — frees the
-                        // ~150–200 MB MLX resident footprint when the
-                        // worker is paused or the reconciliation queue
-                        // has drained. Same pattern as OpfAdapter.
-                        let d = Arc::new(d);
-                        let _ = Arc::clone(&d).spawn_idle_unloader();
-                        detector_arc = Some(d as Arc<dyn ImageRedactor>);
-                    }
-                    Err(e) => {
-                        tracing::info!(
-                            "rfdetr-mlx load failed ({e}); falling back to ONNX adapter"
-                        );
+            if std::env::var_os("SCREENPIPE_ENABLE_EXPERIMENTAL_RFDETR_MLX").is_some() {
+                use screenpipe_redact::adapters::rfdetr_mlx::{RfdetrMlxConfig, RfdetrMlxRedactor};
+                let mlx_cfg = RfdetrMlxConfig::default();
+                // Mirrors the ONNX adapter: download once, verify SHA-256,
+                // cache at ~/.screenpipe/models/rfdetr_v9.safetensors.
+                if let Err(e) = mlx_cfg.ensure_model_present().await {
+                    tracing::info!(
+                        "rfdetr-mlx safetensors download failed ({e}); falling back to ONNX adapter"
+                    );
+                } else {
+                    match RfdetrMlxRedactor::load(mlx_cfg) {
+                        Ok(d) => {
+                            info!("image-PII detector: rfdetr-mlx (Apple Silicon GPU)");
+                            // Lazy-load + 60 s idle-unload — frees the
+                            // ~150–200 MB MLX resident footprint when the
+                            // worker is paused or the reconciliation queue
+                            // has drained. Same pattern as OpfAdapter.
+                            let d = Arc::new(d);
+                            let _ = Arc::clone(&d).spawn_idle_unloader();
+                            detector_arc = Some(d as Arc<dyn ImageRedactor>);
+                        }
+                        Err(e) => {
+                            tracing::info!(
+                                "rfdetr-mlx load failed ({e}); falling back to ONNX adapter"
+                            );
+                        }
                     }
                 }
+            } else {
+                tracing::info!(
+                    "rfdetr-mlx disabled by default for CLI stability; \
+                     set SCREENPIPE_ENABLE_EXPERIMENTAL_RFDETR_MLX=1 to opt in"
+                );
             }
         }
         if detector_arc.is_none() {
@@ -1765,7 +2080,10 @@ async fn main() -> anyhow::Result<()> {
             info!(
                 "starting async image-PII reconciliation worker (destructive overwrite of source JPGs)"
             );
-            let cfg = ImageWorkerConfig::default();
+            let cfg = ImageWorkerConfig {
+                policy: ImageRedactionPolicy::from_labels(&config.pii_redaction_labels),
+                ..Default::default()
+            };
             let _img_handle = ImageWorker::new(db.pool.clone(), detector, cfg).spawn();
         }
     }
@@ -1824,54 +2142,4 @@ async fn main() -> anyhow::Result<()> {
     info!("shutdown complete");
 
     Ok(())
-}
-
-/// Non-blocking update check. Fetches the latest version from npm registry
-/// and prints a one-line banner if the current version is outdated.
-async fn check_for_updates() {
-    // Skip if user opted out
-    if env::var("SCREENPIPE_NO_UPDATE_CHECK").is_ok() {
-        return;
-    }
-
-    let current = env!("CARGO_PKG_VERSION");
-
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-
-    let resp = match client
-        .get("https://registry.npmjs.org/screenpipe/latest")
-        .header("Accept", "application/json")
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => r,
-        _ => return,
-    };
-
-    let json: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-
-    let latest = match json.get("version").and_then(|v| v.as_str()) {
-        Some(v) => v,
-        None => return,
-    };
-
-    if latest != current {
-        eprintln!(
-            "\n  {} screenpipe {} available (you have {})",
-            "update:".yellow().bold(),
-            latest.green(),
-            current,
-        );
-        eprintln!("  run: {}", "npx screenpipe@latest record".cyan());
-        eprintln!();
-    }
 }

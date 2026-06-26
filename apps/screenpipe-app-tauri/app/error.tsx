@@ -5,6 +5,8 @@
 "use client";
 
 import { useEffect } from "react";
+import { writeBrowserLogNow } from "@/lib/logging/browser-log";
+import { useFeedbackStore } from "@/lib/stores/feedback-store";
 
 export default function GlobalError({
   error,
@@ -13,6 +15,8 @@ export default function GlobalError({
   error: Error & { digest?: string };
   reset: () => void;
 }) {
+  const openFeedback = useFeedbackStore((s) => s.openFeedback);
+
   useEffect(() => {
     // Explicitly extract Error fields — JSON.stringify(error) returns `{}` because
     // `message`, `stack`, `name` are non-enumerable, so the Tauri log bridge
@@ -24,6 +28,9 @@ export default function GlobalError({
       stack: error?.stack,
     };
     console.error("global error boundary caught:", serialized);
+    writeBrowserLogNow("error", `error boundary: ${JSON.stringify(serialized)}`, {
+      stack: error?.stack,
+    });
   }, [error]);
 
   return (
@@ -46,6 +53,12 @@ export default function GlobalError({
             className="px-4 py-2 bg-neutral-800 text-white rounded-md text-sm font-medium hover:bg-neutral-700 transition-colors"
           >
             reload
+          </button>
+          <button
+            onClick={() => openFeedback(`App crashed: ${error.message || "unknown error"}`)}
+            className="px-4 py-2 bg-neutral-800 text-white rounded-md text-sm font-medium hover:bg-neutral-700 transition-colors"
+          >
+            report crash
           </button>
         </div>
       </div>

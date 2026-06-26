@@ -7,6 +7,7 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import {
@@ -20,8 +21,10 @@ import {
   Check,
   Download,
   ExternalLink,
+  Brain,
 } from "lucide-react";
-import { invoke } from "@tauri-apps/api/core";
+import { localFetch } from "@/lib/api";
+import { commands } from "@/lib/utils/tauri";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { writeTextFile, BaseDirectory } from "@tauri-apps/plugin-fs";
 import { downloadDir, join } from "@tauri-apps/api/path";
@@ -31,61 +34,140 @@ import posthog from "posthog-js";
 import { useSettings } from "@/lib/hooks/use-settings";
 
 // ---------------------------------------------------------------------------
-// Canonical screenpipe SKILL.md — kept in sync with docs.screenpi.pe/openclaw
+// Canonical screenpipe SKILL.md content. Re-exported from a generated module so
+// the "copy / save SKILL.md" text the cards serve is always the source of truth
+// from the repo: .claude/skills/{screenpipe-api,screenpipe-cli}/SKILL.md
+// (the same folders the `... skills install github:...` one-liners install from).
+// Regenerated on prebuild by scripts/gen-skill-content.js. Do not hand-edit copies.
 // ---------------------------------------------------------------------------
 
-export const SCREENPIPE_SKILL_MD = `---
-name: screenpipe
-description: Search screen recordings and audio transcriptions from the user's computer
-tools:
-  - Bash
----
-# screenpipe skill
+export {
+  SCREENPIPE_API_SKILL_MD,
+  SCREENPIPE_CLI_SKILL_MD,
+} from "@/lib/generated/screenpipe-skills";
 
-Query the user's screen history via the local API at http://localhost:3030.
+// ---------------------------------------------------------------------------
+// Second-brain prompt — paste-once automation that turns the agent into a
+// digital clone of the user's working context: it segments workflows,
+// summarizes processes, and maintains a durable memory in the background.
+// Kept in sync with docs.screenpi.pe/second-brain (docs/.../second-brain.mdx).
+// ---------------------------------------------------------------------------
 
-## search content
-\`\`\`bash
-curl -s "http://localhost:3030/search?q=QUERY&limit=20"
-\`\`\`
+export const SECOND_BRAIN_PROMPT = `you have access to screenpipe, a local tool that records everything i see, say, and
+hear on my computer and makes it searchable. i want you to build and maintain a
+"second brain" about me — a living memory of who i am, what i'm working on, and how
+i work — by watching my activity through screenpipe in the background, so i never
+have to re-explain my context. think of it as a digital clone of my working context.
 
-## get recent activity
-\`\`\`bash
-curl -s "http://localhost:3030/search?limit=10&content_type=ocr"
-\`\`\`
+## how to read my activity
 
-## activity summary
-\`\`\`bash
-curl -s "http://localhost:3030/activity-summary?start_time=2024-01-15T10:00:00Z&end_time=2024-01-15T18:00:00Z"
-\`\`\`
+if you have the screenpipe MCP tools (search-content, activity-summary, list-meetings,
+update-memory), use them. otherwise query the local REST API at http://localhost:3030
+(or http://SCREENPIPE_IP:3030 if i run screenpipe on another machine):
 
-## list meetings
-\`\`\`bash
-curl -s "http://localhost:3030/meetings?limit=20"
-\`\`\`
+- recent activity:    curl "http://localhost:3030/search?content_type=all&start_time=START&end_time=END&limit=100"
+- light summary:      curl "http://localhost:3030/activity-summary?start_time=START&end_time=END"
+- meetings:           curl "http://localhost:3030/meetings?limit=20"
+
+START / END are ISO 8601 UTC timestamps. start with a small window (the last 1-2 hours)
+so you don't pull too much. if screenpipe skills are available, load them first.
+
+## what to do each run (about once an hour, or when i ask)
+
+1. SEGMENT — pull my activity since you last ran and split it into distinct work
+   sessions. a session is a coherent block of related activity (e.g. "45 min in cursor
+   refactoring auth", "30 min in gmail answering investor emails", "1h call about X").
+   note the app(s), the time range, what i was actually trying to do, and the goal.
+
+2. SUMMARIZE — for each session write a short summary of the *process*: the steps i
+   took, the tools/inputs/outputs, the decisions i made, and whether it's repeatable.
+   if it looks repeatable, capture it as a numbered SOP i could hand off or automate.
+
+3. REMEMBER — update my second brain with anything durable and reusable:
+   - who i am: role, goals, preferences, recurring tools
+   - people i interact with and about what       (tag person:NAME)
+   - projects in flight, their status, open loops (tag project:NAME)
+   - workflows / SOPs i repeat                    (tag topic:NAME)
+   store only stable, reusable facts. never store secrets — passwords, API keys, tokens,
+   financial or health data, or anything clearly private. skip one-off noise.
+
+## where to store the second brain
+
+- if you have the screenpipe update-memory tool: write each durable fact as a memory
+  with namespaced tags (person:, project:, topic:) and importance 0-1. retrieve later
+  with search-content content_type='memory'. this is the same memory the screenpipe
+  digital-clone pipe builds, so it stays queryable from any agent.
+- also (or instead, if you lack that tool) keep markdown files i can read:
+    second-brain/profile.md          - who i am, goals, preferences
+    second-brain/people/NAME.md      - one file per person
+    second-brain/projects/NAME.md    - one file per project, with open loops
+    second-brain/workflows/NAME.md   - repeatable SOPs
+    second-brain/log/DATE.md         - the hourly session summaries (append-only)
+    second-brain/now.md              - what i'm doing right now and over the last
+                                       ~30/120 min, refreshed every run
+
+always APPEND and DEDUPE: update existing entries instead of duplicating them, and
+link related notes together.
+
+## run on a schedule
+
+set this to run automatically about once an hour using whatever scheduling you have
+(claude tasks, codex automations, openclaw/hermes automations, or a system cron job).
+between runs, when i ask you anything, read now.md and the relevant project/person
+files first so you already know what i was doing.
+
+start now: do one pass over my last 2 hours, then tell me what you learned about me
+and propose the schedule.
 `;
 
 // ---------------------------------------------------------------------------
 // Shared types
 // ---------------------------------------------------------------------------
 
+export type ConnectField = {
+  key: string;
+  label: string;
+  secret: boolean;
+  placeholder: string;
+  helpUrl?: string;
+};
+
+/** One installable screenpipe skill (e.g. the API skill or the CLI skill). */
+export type SkillVariant = {
+  /** Stable id — sub-tab value + posthog suffix. */
+  id: string;
+  /** Short tab label, e.g. "API" or "CLI". */
+  label: string;
+  /** One-line summary of what this skill lets the agent do. */
+  blurb: string;
+  /** SKILL.md contents served by copy / save-to-downloads. */
+  md: string;
+  /** Filename used when saving to Downloads (must be unique per variant). */
+  downloadName: string;
+  /** Where to drop SKILL.md on the agent's machine. */
+  localPath: string;
+  /** Optional one-liner that installs the real skill from a remote source. */
+  cliInstall?: string;
+};
+
 export type AgentCardProps = {
   name: string;
   iconSrc: string;
   description: string;
   homepage?: string;
-  mcp: { format: "json" | "yaml"; configPath: string; snippet: string };
-  skill: {
-    /** Where to drop SKILL.md on the local machine. */
-    localPath: string;
-    /** Optional CLI command that installs from a remote source. */
-    cliInstall?: string;
-  };
+  mcp: { format: "json" | "yaml" | "toml"; configPath: string; snippet: string };
+  /** One or more installable screenpipe skills (e.g. API + CLI). First is shown by default. */
+  skills: SkillVariant[];
   sync: {
     /** Default remote path on the VPS where ~/.screenpipe gets pushed. */
     defaultRemotePath: string;
     /** Prefix used for localStorage keys + posthog event names. */
     storageKeyPrefix: string;
+  };
+  /** If set, renders a "Connect" tab for entering credentials that screenpipe pipes use to call this agent. */
+  connect?: {
+    integrationId: string;
+    fields: ConnectField[];
   };
 };
 
@@ -97,7 +179,7 @@ function McpSection({ name, mcp }: { name: string; mcp: AgentCardProps["mcp"] })
   const [copied, setCopied] = useState(false);
   const handleCopy = useCallback(async () => {
     try {
-      await navigator.clipboard.writeText(mcp.snippet);
+      await commands.copyTextToClipboard(mcp.snippet);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {}
@@ -140,7 +222,42 @@ function McpSection({ name, mcp }: { name: string; mcp: AgentCardProps["mcp"] })
 // Skill section — install screenpipe SKILL.md into the agent's skills dir
 // ---------------------------------------------------------------------------
 
-function SkillSection({ name, skill }: { name: string; skill: AgentCardProps["skill"] }) {
+function SkillSection({ name, skills }: { name: string; skills: SkillVariant[] }) {
+  const [activeId, setActiveId] = useState(skills[0]?.id ?? "");
+  const active = skills.find((s) => s.id === activeId) ?? skills[0];
+  if (!active) return null;
+
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-muted-foreground leading-relaxed">
+        Drop a screenpipe SKILL.md into {name}&apos;s skills directory and {name} loads it
+        as a new skill. {skills.length > 1 ? "Install either — or both." : ""}
+      </p>
+
+      {skills.length > 1 && (
+        <div className="flex gap-1.5">
+          {skills.map((s) => (
+            <button
+              key={s.id}
+              onClick={() => setActiveId(s.id)}
+              className={`px-2.5 py-1 text-xs rounded-md border transition-colors ${
+                s.id === active.id
+                  ? "bg-foreground text-background border-foreground"
+                  : "border-border text-muted-foreground hover:bg-muted"
+              }`}
+            >
+              {s.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <SkillVariantBody key={active.id} name={name} variant={active} />
+    </div>
+  );
+}
+
+function SkillVariantBody({ name, variant }: { name: string; variant: SkillVariant }) {
   const [copied, setCopied] = useState(false);
   const [savedPath, setSavedPath] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -149,37 +266,37 @@ function SkillSection({ name, skill }: { name: string; skill: AgentCardProps["sk
 
   const copyMd = useCallback(async () => {
     try {
-      await navigator.clipboard.writeText(SCREENPIPE_SKILL_MD);
+      await commands.copyTextToClipboard(variant.md);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
       toast({ title: "copied SKILL.md to clipboard" });
     } catch (e) {
       toast({ title: "copy failed", description: String(e), variant: "destructive" });
     }
-  }, []);
+  }, [variant.md]);
 
   const copyCmd = useCallback(async () => {
-    if (!skill.cliInstall) return;
+    if (!variant.cliInstall) return;
     try {
-      await navigator.clipboard.writeText(skill.cliInstall);
+      await commands.copyTextToClipboard(variant.cliInstall);
       setCmdCopied(true);
       setTimeout(() => setCmdCopied(false), 2000);
       toast({ title: "copied install command" });
     } catch (e) {
       toast({ title: "copy failed", description: String(e), variant: "destructive" });
     }
-  }, [skill.cliInstall]);
+  }, [variant.cliInstall]);
 
   const saveToDownloads = useCallback(async () => {
     setSaveError(null);
     setSavedPath(null);
     setIsSaving(true);
     try {
-      await writeTextFile("screenpipe-SKILL.md", SCREENPIPE_SKILL_MD, {
+      await writeTextFile(variant.downloadName, variant.md, {
         baseDir: BaseDirectory.Download,
       });
       const dir = await downloadDir();
-      const filePath = await join(dir, "screenpipe-SKILL.md");
+      const filePath = await join(dir, variant.downloadName);
       setSavedPath(filePath);
       toast({ title: "saved to Downloads", description: filePath });
     } catch (e) {
@@ -190,7 +307,7 @@ function SkillSection({ name, skill }: { name: string; skill: AgentCardProps["sk
     } finally {
       setIsSaving(false);
     }
-  }, []);
+  }, [variant.downloadName, variant.md]);
 
   const revealSaved = useCallback(async () => {
     if (!savedPath) return;
@@ -203,10 +320,7 @@ function SkillSection({ name, skill }: { name: string; skill: AgentCardProps["sk
 
   return (
     <div className="space-y-3">
-      <p className="text-xs text-muted-foreground leading-relaxed">
-        Drop screenpipe&apos;s SKILL.md into {name}&apos;s skills directory. {name} will
-        load it as a new tool/skill that queries screenpipe&apos;s local API.
-      </p>
+      <p className="text-xs text-muted-foreground leading-relaxed">{variant.blurb}</p>
 
       {/* Path 1: agent on same machine — install via CLI or save to Downloads + manual move */}
       <div className="space-y-2">
@@ -214,14 +328,14 @@ function SkillSection({ name, skill }: { name: string; skill: AgentCardProps["sk
           if {name} runs on this machine
         </p>
 
-        {skill.cliInstall && (
+        {variant.cliInstall && (
           <div className="space-y-1.5">
             <p className="text-xs text-muted-foreground">
               One-liner install:
             </p>
             <div className="relative group">
               <pre className="bg-muted border border-border rounded-lg p-3 pr-10 text-xs font-mono text-foreground overflow-x-auto whitespace-pre-wrap">
-                {skill.cliInstall}
+                {variant.cliInstall}
               </pre>
               <Button
                 variant="ghost"
@@ -268,7 +382,7 @@ function SkillSection({ name, skill }: { name: string; skill: AgentCardProps["sk
         {savedPath && (
           <p className="text-xs text-muted-foreground">
             saved to <code className="bg-muted px-1 rounded">{savedPath}</code> — move to{" "}
-            <code className="bg-muted px-1 rounded">{skill.localPath}</code> and restart {name}.
+            <code className="bg-muted px-1 rounded">{variant.localPath}</code> and restart {name}.
           </p>
         )}
         {saveError && <p className="text-xs text-destructive">{saveError}</p>}
@@ -280,11 +394,11 @@ function SkillSection({ name, skill }: { name: string; skill: AgentCardProps["sk
           if {name} runs on a remote machine
         </p>
         <p className="text-xs text-muted-foreground leading-relaxed">
-          Copy the SKILL.md contents above, paste them into{" "}
-          <code className="bg-muted px-1 rounded">{skill.localPath}</code> on the remote
-          host, and either point the skill at this machine&apos;s screenpipe
-          (replace <code>localhost:3030</code> with your IP/Tailscale name) or use the{" "}
-          <strong>Sync (remote)</strong> tab to push your screenpipe data to that host.
+          Copy the SKILL.md contents above and paste them into{" "}
+          <code className="bg-muted px-1 rounded">{variant.localPath}</code> on the remote
+          host. To let {name} reach the screenpipe data on <em>this</em> machine, use the{" "}
+          <strong>Sync (remote)</strong> tab to push it over, or point any{" "}
+          <code>localhost:3030</code> calls at this machine&apos;s IP/Tailscale name.
         </p>
       </div>
     </div>
@@ -392,7 +506,9 @@ function RemoteSyncSection({
 
   const pollSchedulerStatus = useCallback(async () => {
     try {
-      const status = await invoke<SchedulerStatus>("remote_sync_scheduler_status");
+      const res = await commands.remoteSyncSchedulerStatus();
+      if (res.status === "error") throw new Error(res.error);
+      const status = res.data;
       if (status.last_sync) {
         setLastSync(status.last_sync);
         try { localStorage?.setItem(lastSyncKey, status.last_sync); } catch {}
@@ -408,8 +524,12 @@ function RemoteSyncSection({
       const ts = localStorage?.getItem(lastSyncKey);
       if (ts) setLastSync(ts);
     } catch {}
-    invoke<DiscoveredHost[]>("remote_sync_discover_hosts")
-      .then(setDiscoveredHosts)
+    commands.remoteSyncDiscoverHosts()
+      .then((res) => {
+        if (res.status === "ok") {
+          setDiscoveredHosts(res.data);
+        }
+      })
       .catch(() => {});
     pollSchedulerStatus();
     return () => {
@@ -435,7 +555,8 @@ function RemoteSyncSection({
     setIsTesting(true);
     setTestResult(null);
     try {
-      await invoke("remote_sync_test", { config: toRustConfig(config) });
+      const res = await commands.remoteSyncTest(toRustConfig(config));
+      if (res.status === "error") throw new Error(res.error);
       setTestResult({ ok: true });
       posthog.capture(`${eventPrefix}_ssh_test`, { success: true });
     } catch (e) {
@@ -452,10 +573,9 @@ function RemoteSyncSection({
     setSyncError(null);
     try {
       const dataDir = await getDataDir();
-      const result = await invoke<SyncResult>("remote_sync_now", {
-        config: toRustConfig(config),
-        dataDir,
-      });
+      const res = await commands.remoteSyncNow(toRustConfig(config), dataDir);
+      if (res.status === "error") throw new Error(res.error);
+      const result = res.data;
       if (syncCancelledRef.current) return;
       if (result.ok) {
         const now = new Date().toLocaleString();
@@ -485,10 +605,8 @@ function RemoteSyncSection({
       if (config.enabled && config.host && config.user) {
         try {
           const dataDir = await getDataDir();
-          await invoke("remote_sync_start_scheduler", {
-            config: toRustConfig(config),
-            dataDir,
-          });
+          const res = await commands.remoteSyncStartScheduler(toRustConfig(config), dataDir);
+          if (res.status === "error") throw new Error(res.error);
           posthog.capture(`${eventPrefix}_sync_enabled`, { interval: config.intervalMinutes });
           if (statusPollRef.current) clearInterval(statusPollRef.current);
           statusPollRef.current = setInterval(pollSchedulerStatus, 30_000);
@@ -496,7 +614,10 @@ function RemoteSyncSection({
           setSyncError(String(e));
         }
       } else {
-        try { await invoke("remote_sync_stop_scheduler"); } catch {}
+        try {
+          const res = await commands.remoteSyncStopScheduler();
+          if (res.status === "error") throw new Error(res.error);
+        } catch {}
         if (statusPollRef.current) {
           clearInterval(statusPollRef.current);
           statusPollRef.current = null;
@@ -569,7 +690,11 @@ function RemoteSyncSection({
           )}
           <Input
             placeholder="user@host"
-            value={config.user && config.host ? `${config.user}@${config.host}` : ""}
+            value={
+              config.user || config.host
+                ? `${config.user ? `${config.user}@` : ""}${config.host ?? ""}`
+                : ""
+            }
             onChange={(e) => {
               const val = e.target.value;
               const at = val.indexOf("@");
@@ -728,6 +853,209 @@ function RemoteSyncSection({
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// ConnectSection — credential form for screenpipe pipes calling back to the agent
+// ---------------------------------------------------------------------------
+
+function ConnectSection({ integrationId, fields }: { integrationId: string; fields: ConnectField[] }) {
+  const [creds, setCreds] = useState<Record<string, string>>({});
+  const [visible, setVisible] = useState<Record<string, boolean>>({});
+  const [status, setStatus] = useState<"idle" | "connecting" | "error" | "saved">("idle");
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    localFetch(`/connections/${integrationId}`)
+      .then(r => r.json())
+      .then(data => {
+        if (data.credentials) {
+          const loaded: Record<string, string> = {};
+          for (const [k, v] of Object.entries(data.credentials)) {
+            if (typeof v === "string") loaded[k] = v;
+          }
+          setCreds(loaded);
+          setStatus("saved");
+        }
+      })
+      .catch(() => {});
+  }, [integrationId]);
+
+  const hasCredentials = Object.values(creds).some(v => !!v);
+
+  const handleConnect = async () => {
+    setStatus("connecting");
+    setError(null);
+    try {
+      const testRes = await localFetch(`/connections/${integrationId}/test`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ credentials: creds }),
+      });
+      if (!testRes.ok) {
+        const err = await testRes.json().catch(() => ({}));
+        throw new Error(err.error || `test failed (${testRes.status})`);
+      }
+      await localFetch(`/connections/${integrationId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ credentials: creds }),
+      });
+      setStatus("saved");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setStatus("error");
+    }
+  };
+
+  const handleDisconnect = async () => {
+    await localFetch(`/connections/${integrationId}`, { method: "DELETE" }).catch(() => {});
+    setCreds({});
+    setStatus("idle");
+  };
+
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-muted-foreground leading-relaxed">
+        Let screenpipe pipes call back to this agent. Enter the gateway credentials so pipes can send events and messages directly to it.
+      </p>
+      {fields.map((field) => (
+        <div key={field.key} className="space-y-1">
+          <Label className="text-xs">{field.label}</Label>
+          <div className="relative">
+            <Input
+              type={field.secret && !visible[field.key] ? "password" : "text"}
+              placeholder={field.placeholder}
+              value={creds[field.key] || ""}
+              onChange={(e) => { setCreds(prev => ({ ...prev, [field.key]: e.target.value })); if (status === "saved") setStatus("idle"); }}
+              className="h-8 text-xs pr-8"
+              readOnly={status === "saved"}
+            />
+            {field.secret && (
+              <button
+                type="button"
+                onClick={() => setVisible(prev => ({ ...prev, [field.key]: !prev[field.key] }))}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+              >
+                {visible[field.key] ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+              </button>
+            )}
+          </div>
+        </div>
+      ))}
+      {error && <p className="text-xs text-destructive">{error}</p>}
+      <div className="flex gap-2">
+        {status !== "saved" && (
+          <Button
+            onClick={handleConnect}
+            disabled={!hasCredentials || status === "connecting"}
+            size="sm"
+            variant={status === "error" ? "outline" : "default"}
+            className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal"
+          >
+            {status === "connecting" ? (
+              <><Loader2 className="h-3 w-3 animate-spin" />connecting…</>
+            ) : (
+              <><Check className="h-3 w-3" />connect</>
+            )}
+          </Button>
+        )}
+        {status === "saved" && (
+          <Button
+            onClick={handleDisconnect}
+            variant="ghost"
+            size="sm"
+            className="gap-1.5 h-7 text-xs normal-case font-sans tracking-normal text-destructive"
+          >
+            <X className="h-3 w-3" />disconnect
+          </Button>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Second-brain callout — the headline action on every agent card: copy a
+// single prompt that makes the agent build a digital-clone-style memory of you.
+// ---------------------------------------------------------------------------
+
+function SecondBrainCallout({ name }: { name: string }) {
+  const [copied, setCopied] = useState(false);
+  const [savedPath, setSavedPath] = useState<string | null>(null);
+  const [isSaving, setIsSaving] = useState(false);
+
+  const copyPrompt = useCallback(async () => {
+    try {
+      await commands.copyTextToClipboard(SECOND_BRAIN_PROMPT);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+      toast({ title: "copied second-brain prompt", description: `paste it into ${name}` });
+      posthog.capture("second_brain_prompt_copied", { agent: name });
+    } catch (e) {
+      toast({ title: "copy failed", description: String(e), variant: "destructive" });
+    }
+  }, [name]);
+
+  const saveMd = useCallback(async () => {
+    setIsSaving(true);
+    try {
+      await writeTextFile("screenpipe-second-brain.md", SECOND_BRAIN_PROMPT, {
+        baseDir: BaseDirectory.Download,
+      });
+      const dir = await downloadDir();
+      setSavedPath(await join(dir, "screenpipe-second-brain.md"));
+      toast({ title: "saved to Downloads", description: "screenpipe-second-brain.md" });
+      posthog.capture("second_brain_prompt_saved", { agent: name });
+    } catch (e) {
+      toast({ title: "save failed", description: String(e), variant: "destructive" });
+    } finally {
+      setIsSaving(false);
+    }
+  }, [name]);
+
+  return (
+    <div className="rounded-lg border border-border bg-muted/40 p-3 space-y-2">
+      <div className="flex items-center gap-1.5">
+        <Brain className="h-3.5 w-3.5 text-foreground/70" />
+        <p className="text-xs font-semibold text-foreground">build a second brain</p>
+      </div>
+      <p className="text-xs text-muted-foreground leading-relaxed">
+        Paste one prompt into {name} and it keeps working in the background — segmenting your
+        workflows, summarizing your processes, and building a durable memory of you. Like the
+        digital clone pipe, but inside {name}.
+      </p>
+      <div className="flex items-center gap-2 flex-wrap">
+        <Button size="sm" onClick={copyPrompt} className="h-7 text-xs">
+          {copied ? <Check className="h-3 w-3 mr-1.5" /> : <Copy className="h-3 w-3 mr-1.5" />}
+          {copied ? "copied" : "copy prompt"}
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={saveMd}
+          disabled={isSaving}
+          className="h-7 text-xs"
+        >
+          {isSaving ? (
+            <Loader2 className="h-3 w-3 mr-1.5 animate-spin" />
+          ) : savedPath ? (
+            <Check className="h-3 w-3 mr-1.5" />
+          ) : (
+            <Download className="h-3 w-3 mr-1.5" />
+          )}
+          {savedPath ? "saved" : "save .md"}
+        </Button>
+        <a
+          href="#"
+          onClick={(e) => { e.preventDefault(); openUrl("https://docs.screenpi.pe/second-brain"); }}
+          className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground ml-auto"
+        >
+          <ExternalLink className="h-3 w-3" /> learn more
+        </a>
+      </div>
+    </div>
+  );
+}
+
 // AgentCard — wraps the three sections behind a tab switcher
 // ---------------------------------------------------------------------------
 
@@ -737,8 +1065,9 @@ export function AgentCard({
   description,
   homepage,
   mcp,
-  skill,
+  skills,
   sync,
+  connect,
 }: AgentCardProps) {
   return (
     <Card className="border-border bg-card overflow-hidden">
@@ -765,22 +1094,39 @@ export function AgentCard({
           </div>
         </div>
 
+        <div className="px-4 pb-3">
+          <SecondBrainCallout name={name} />
+        </div>
+
         <div className="px-4 pb-4">
           <Tabs defaultValue="mcp" className="w-full">
-            <TabsList className="grid w-full grid-cols-3 h-8">
+            <TabsList
+              className="grid w-full h-8"
+              style={{
+                gridTemplateColumns: `repeat(${2 + (skills.length > 0 ? 1 : 0) + (connect ? 1 : 0)}, minmax(0, 1fr))`,
+              }}
+            >
               <TabsTrigger value="mcp" className="text-xs">MCP</TabsTrigger>
-              <TabsTrigger value="skill" className="text-xs">Skill</TabsTrigger>
+              {skills.length > 0 && <TabsTrigger value="skill" className="text-xs">Skill</TabsTrigger>}
               <TabsTrigger value="sync" className="text-xs">Sync (remote)</TabsTrigger>
+              {connect && <TabsTrigger value="connect" className="text-xs">Connect</TabsTrigger>}
             </TabsList>
             <TabsContent value="mcp" className="mt-3">
               <McpSection name={name} mcp={mcp} />
             </TabsContent>
-            <TabsContent value="skill" className="mt-3">
-              <SkillSection name={name} skill={skill} />
-            </TabsContent>
+            {skills.length > 0 && (
+              <TabsContent value="skill" className="mt-3">
+                <SkillSection name={name} skills={skills} />
+              </TabsContent>
+            )}
             <TabsContent value="sync" className="mt-3">
               <RemoteSyncSection agentName={name} sync={sync} />
             </TabsContent>
+            {connect && (
+              <TabsContent value="connect" className="mt-3">
+                <ConnectSection integrationId={connect.integrationId} fields={connect.fields} />
+              </TabsContent>
+            )}
           </Tabs>
         </div>
       </CardContent>

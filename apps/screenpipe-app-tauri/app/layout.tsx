@@ -8,25 +8,69 @@ import { Inter } from "next/font/google";
 import "./globals.css";
 import { Providers } from "./providers";
 import { Toaster } from "@/components/ui/toaster";
-import { useEffect } from "react";
-import { DeeplinkHandler } from "@/components/deeplink-handler";
+import { Suspense, useEffect } from "react";
 import { ShortcutTracker } from "@/components/shortcut-reminder";
 import { PipeInstallDialog } from "@/components/pipe-install-dialog";
 import { BrowserPairingDialog } from "@/components/browser-pairing-dialog";
+import { RecentChatSwitcherController } from "@/components/chat/recent-chat-switcher-controller";
+import { FeedbackDialog } from "@/components/feedback-dialog";
+import { AnnouncementHost } from "@/components/announcement-host";
+import { AdvisoryOverlay } from "@/components/advisory-overlay";
+import { PipeAdvisoryWatcher } from "@/components/pipe-advisory-watcher";
 // TODO: vault lock UI disabled for now — vault is CLI-only until app UX is polished
 // import { VaultLockDialog } from "@/components/vault-lock-dialog";
-import { usePathname } from "next/navigation";
+import { usePathname, useSearchParams } from "next/navigation";
+import { commands } from "@/lib/utils/tauri";
+import {
+  installBrowserLogBridge,
+  writeBrowserLogNow,
+} from "@/lib/logging/browser-log";
+import {
+  clearSearchOpenedFromChatSurface,
+  markSearchOpenedFromChatSurface,
+  openChatConversationInCurrentChatSurface,
+} from "@/lib/chat-utils";
 
 const inter = Inter({ subsets: ["latin"] });
 
-// Debounced localStorage writer
-const createDebouncer = (wait: number) => {
-  let timeout: NodeJS.Timeout;
-  return (fn: Function) => {
-    clearTimeout(timeout);
-    timeout = setTimeout(() => fn(), wait);
-  };
-};
+function isChatFocusedRecentSwitcherRoute(
+  pathname: string | null,
+  section: string | null,
+): boolean {
+  if (pathname === "/chat") return true;
+  if (pathname !== "/home") return false;
+  return !section || section === "home";
+}
+
+function RecentChatSwitcherMount() {
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const isRecentChatSwitcherEnabled = isChatFocusedRecentSwitcherRoute(
+    pathname,
+    searchParams.get("section"),
+  );
+
+  useEffect(() => {
+    // /search runs in its own window. Preserve the marker so that search can
+    // yield Ctrl+Tab back to the chat surface that opened it.
+    if (pathname === "/search") return;
+    if (!isRecentChatSwitcherEnabled) {
+      clearSearchOpenedFromChatSurface();
+      return;
+    }
+    markSearchOpenedFromChatSurface(pathname === "/chat" ? "chat" : "home");
+  }, [isRecentChatSwitcherEnabled, pathname]);
+
+  if (!isRecentChatSwitcherEnabled) return null;
+
+  return (
+    <RecentChatSwitcherController
+      onActivateConversation={(id) => {
+        void openChatConversationInCurrentChatSurface(id);
+      }}
+    />
+  );
+}
 
 export default function RootLayout({
   children,
@@ -39,6 +83,8 @@ export default function RootLayout({
 
   useEffect(() => {
     if (typeof window === "undefined") return;
+
+    const uninstallBrowserLogBridge = installBrowserLogBridge();
 
     // Patch Tauri event listener race condition (APP-2/5/9/W, 69 users)
     // Tauri's unregisterListener doesn't null-check listeners[eventId]
@@ -64,7 +110,7 @@ export default function RootLayout({
       // Call the Rust-side ensure_webview_focus to re-assert WKWebView
       // as first responder via makeFirstResponder + dispatch_async
       try {
-        (window as any).__TAURI_INTERNALS__?.invoke("ensure_webview_focus").catch(() => {});
+        commands.ensureWebviewFocus().catch(() => {});
       } catch {}
     };
 
@@ -116,6 +162,23 @@ export default function RootLayout({
       }
     }, 2_000);
 
+    // Top-level error capture for crashes that happen before React's error
+    // boundaries mount (or while they're tearing down their parent tree).
+    // Write immediately so the stack lands in ~/.screenpipe/screenpipe-app.
+    const handleWindowError = (e: ErrorEvent) => {
+      writeBrowserLogNow("error", `window.onerror: ${e.message} @ ${e.filename}:${e.lineno}:${e.colno}`, {
+        stack: e.error?.stack ?? "(no stack)",
+      });
+    };
+    const handleUnhandled = (e: PromiseRejectionEvent) => {
+      const reason: any = e.reason;
+      writeBrowserLogNow("error", `unhandledrejection: ${reason?.message ?? String(reason)}`, {
+        stack: reason?.stack ?? "(no stack)",
+      });
+    };
+    window.addEventListener("error", handleWindowError);
+    window.addEventListener("unhandledrejection", handleUnhandled);
+
     // Auto-reload on IndexedDB disconnect (APP-2E, 27 users on v2.0.379)
     // WKWebView's IndexedDB server can crash; the page becomes unusable.
     // PostHog JS SDK uses IndexedDB for session replay — this is a known WebKit bug.
@@ -134,97 +197,42 @@ export default function RootLayout({
     };
     window.addEventListener("unhandledrejection", handleUnhandledRejection);
 
-    const logs: string[] = [];
-    const MAX_LOGS = 1000;
-    const originalConsole = { ...console };
-    const debouncedWrite = createDebouncer(1000);
-
-    // Belt-and-suspenders: scrub well-known secret-bearing keys before they
-    // hit localStorage. Any `console.log(settings)` (recording page, agents,
-    // OAuth flows) used to leak deepgramApiKey, aiPresets[].apiKey,
-    // openaiCompatibleApiKey, and the user's Clerk JWT into feedback bundles.
-    // Scrubbing here means future debug logs can't reintroduce the leak even
-    // if someone forgets and dumps an object containing these keys.
-    const SECRET_KEYS = new Set([
-      "apiKey",
-      "deepgramApiKey",
-      "openaiCompatibleApiKey",
-      "openrouterApiKey",
-      "anthropicApiKey",
-      "openaiApiKey",
-      "geminiApiKey",
-      "groqApiKey",
-      "elevenLabsApiKey",
-      "token",
-      "accessToken",
-      "refreshToken",
-      "idToken",
-      "secret",
-      "clientSecret",
-      "password",
-      "authorization",
-    ]);
-    const stringifyRedacted = (arg: unknown): string => {
-      if (typeof arg !== "object" || arg === null) {
-        return String(arg);
-      }
-      try {
-        return JSON.stringify(arg, (key, value) => {
-          if (
-            SECRET_KEYS.has(key) &&
-            typeof value === "string" &&
-            value.length > 0
-          ) {
-            return "[redacted]";
-          }
-          return value;
-        });
-      } catch {
-        return "[unserializable]";
-      }
-    };
-
-    ["log", "error", "warn", "info"].forEach((level) => {
-      (console[level as keyof Console] as any) = (...args: any[]) => {
-        // Call original first for performance
-        (originalConsole[level as keyof Console] as Function)(...args);
-
-        // Add to memory buffer (with secret keys scrubbed)
-        logs.push(
-          `[${level.toUpperCase()}] ${args.map(stringifyRedacted).join(" ")}`
-        );
-
-        // Trim buffer if needed
-        if (logs.length > MAX_LOGS) {
-          logs.splice(0, logs.length - MAX_LOGS);
-        }
-
-        // Debounced write to localStorage
-        debouncedWrite(() => {
-          try {
-            // localStorage can be null in Tauri WKWebView during navigation
-            if (!localStorage) return;
-            localStorage.setItem("console_logs", logs.join("\n"));
-          } catch (e) {
-            try {
-              // If localStorage is full, clear half the logs
-              logs.splice(0, logs.length / 2);
-              if (localStorage) localStorage.setItem("console_logs", logs.join("\n"));
-            } catch {
-              // localStorage unavailable, skip silently
-            }
-          }
-        });
-      };
-    });
-
     return () => {
+      uninstallBrowserLogBridge();
       window.removeEventListener("focus", handleWindowFocus);
       window.removeEventListener("mousedown", handlePointerRecovery, true);
       window.removeEventListener("keydown", markKeyActivity, true);
       window.removeEventListener("unhandledrejection", handleUnhandledRejection);
+      window.removeEventListener("error", handleWindowError);
+      window.removeEventListener("unhandledrejection", handleUnhandled);
       clearInterval(focusWatchdog);
     };
+  }, []);
+
+  // Suppress stray text-selection in non-content areas. The app globally sets
+  // `user-select: none` (app/globals.css) so the desktop UI feels native, and
+  // re-enables selection only for real content — chat-message prose, the OCR
+  // `.selectable-text-layer`, and form inputs. But WKWebView still paints an
+  // empty selection highlight when you click-drag across blank layout space
+  // (e.g. the empty area of the chat welcome screen): it looks like you're
+  // "selecting text" where there is none, and copying yields nothing. CSS
+  // `user-select: none` blocks the copyable text and is honored by keyboard
+  // select-all, but not the drag-highlight on real pointer input. Cancel the
+  // selection at its source unless the drag begins inside a selectable surface.
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const SELECTABLE =
+      '.prose, .selectable-text-layer, input, textarea, [contenteditable="true"], [contenteditable=""]';
+    const onSelectStart = (e: Event) => {
+      // e.target may be a Text node (when clicking mid-text), which lacks
+      // .closest(). Walk up to the nearest Element so the check works.
+      const node = e.target as Node | null;
+      const el = node instanceof Element ? node : node?.parentElement;
+      if (el?.closest?.(SELECTABLE)) return; // allow selecting real content
+      e.preventDefault();
+    };
+    document.addEventListener("selectstart", onSelectStart);
+    return () => document.removeEventListener("selectstart", onSelectStart);
   }, []);
 
   return (
@@ -249,6 +257,13 @@ export default function RootLayout({
                   document.documentElement.classList.add(systemTheme);
                 }
 
+                try {
+                  var savedFs = localStorage.getItem('screenpipe-font-size');
+                  if (savedFs) {
+                    document.documentElement.style.setProperty('--font-size-base', savedFs);
+                  }
+                } catch (e) {}
+
                 // Crash recovery: if React fails to render, the page stays blank.
                 // After 8s, if <body> has no visible children, reload once.
                 var RELOAD_KEY = '__sp_crash_reload';
@@ -268,18 +283,34 @@ export default function RootLayout({
           }}
         />
       </head>
-      <Providers>
-        <body className={`${inter.className} scrollbar-hide ${isSearch ? "bg-transparent" : ""}`}>
-          {!isOverlay && <DeeplinkHandler />}
+      <body className={`${inter.className} scrollbar-hide ${isSearch ? "bg-transparent" : ""}`}>
+        {/* Providers sits INSIDE <body> so the body element is present in
+            both the static export and the first client render. With Providers
+            wrapping <body>, gating Providers' children on a post-mount flag
+            (see app/providers.tsx) would also blank the body — the resulting
+            shape mismatch with the prerendered HTML is exactly what triggered
+            React #419 (hydration recovery) → #185 (infinite loop during
+            recovery render) on every first launch after auto-update. */}
+        <Providers>
+          {/* DeeplinkHandler is mounted in Providers (outside the entitlement
+              gate) so the screenpipe:// login callback is always caught, even
+              while the "sign in required" screen is showing. */}
           {!isOverlay && <ShortcutTracker />}
           {!isOverlay && <PipeInstallDialog />}
           {!isOverlay && <BrowserPairingDialog />}
+          <Suspense fallback={null}>
+            <RecentChatSwitcherMount />
+          </Suspense>
           {/* TODO: vault lock UI disabled — CLI-only for now */}
           {/* {!isOverlay && <VaultLockDialog />} */}
           {children}
           {!isOverlay && <Toaster />}
-        </body>
-      </Providers>
+          {!isOverlay && <AdvisoryOverlay />}
+          {!isOverlay && <PipeAdvisoryWatcher />}
+          {!isOverlay && <FeedbackDialog />}
+          {!isOverlay && <AnnouncementHost />}
+        </Providers>
+      </body>
     </html>
   );
 }

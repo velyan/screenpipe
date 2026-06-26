@@ -29,7 +29,9 @@ pub mod enhanced_mode_cache;
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use screenpipe_core::window_pattern::WindowPattern;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
@@ -460,7 +462,7 @@ pub fn hamming_distance(a: u64, b: u64) -> u32 {
 pub struct TreeWalkerConfig {
     /// How often to walk the tree (default: 3s).
     pub walk_interval: Duration,
-    /// Maximum recursion depth (default: 30).
+    /// Maximum recursion depth (default: 35).
     pub max_depth: usize,
     /// Maximum number of AX elements to visit per walk (default: 5000).
     pub max_nodes: usize,
@@ -478,6 +480,13 @@ pub struct TreeWalkerConfig {
     pub blocked_apps: Vec<String>,
     /// Window-title substrings that should be blocked by accessibility capture.
     pub blocked_title_keywords: Vec<String>,
+    /// Cached parse of `ignored_windows`, populated by `compile_patterns()`.
+    pub ignored_window_patterns: Vec<WindowPattern>,
+    /// Cached parse of `included_windows`, populated by `compile_patterns()`.
+    pub included_window_patterns: Vec<WindowPattern>,
+    /// User-configured URLs to ignore (domain-level match on the focused
+    /// browser tab's URL — see [`crate::url_filter::is_url_blocked`]).
+    pub ignored_urls: Vec<String>,
     /// Monitor origin X in screen points (virtual desktop coordinate space).
     /// Used to normalize element bounds to monitor-relative 0-1 coords.
     pub monitor_x: f64,
@@ -517,7 +526,7 @@ impl Default for TreeWalkerConfig {
     fn default() -> Self {
         Self {
             walk_interval: Duration::from_secs(3),
-            max_depth: 30,
+            max_depth: 35,
             max_nodes: 5000,
             walk_timeout: Duration::from_millis(250),
             max_text_length: 50_000,
@@ -526,6 +535,9 @@ impl Default for TreeWalkerConfig {
             included_windows: Vec::new(),
             blocked_apps: default_blocked_apps(),
             blocked_title_keywords: default_blocked_title_keywords(),
+            ignored_window_patterns: Vec::new(),
+            included_window_patterns: Vec::new(),
+            ignored_urls: Vec::new(),
             monitor_x: 0.0,
             monitor_y: 0.0,
             monitor_width: 0.0,
@@ -543,6 +555,30 @@ impl Default for TreeWalkerConfig {
 }
 
 impl TreeWalkerConfig {
+    /// Compile window filters once before the walker enters its hot path.
+    pub fn compile_patterns(&mut self) {
+        self.ignored_window_patterns = WindowPattern::parse_list(&self.ignored_windows);
+        self.included_window_patterns = WindowPattern::parse_list(&self.included_windows);
+    }
+
+    /// Lazily resolve parsed ignore patterns for defensive direct construction.
+    pub(crate) fn resolved_ignored(&self) -> Cow<'_, [WindowPattern]> {
+        if self.ignored_window_patterns.is_empty() && !self.ignored_windows.is_empty() {
+            Cow::Owned(WindowPattern::parse_list(&self.ignored_windows))
+        } else {
+            Cow::Borrowed(&self.ignored_window_patterns)
+        }
+    }
+
+    /// Lazily resolve parsed include patterns for defensive direct construction.
+    pub(crate) fn resolved_included(&self) -> Cow<'_, [WindowPattern]> {
+        if self.included_window_patterns.is_empty() && !self.included_windows.is_empty() {
+            Cow::Owned(WindowPattern::parse_list(&self.included_windows))
+        } else {
+            Cow::Borrowed(&self.included_window_patterns)
+        }
+    }
+
     /// Return the effective max_nodes (override if set, else default).
     pub fn effective_max_nodes(&self) -> usize {
         self.max_nodes_override.unwrap_or(self.max_nodes)
@@ -577,6 +613,8 @@ pub enum SkipReason {
     UserIgnored,
     /// User-configured included window whitelist didn't match.
     NotInIncludeList,
+    /// Focused browser tab's URL matched a user-configured ignored URL.
+    BlockedUrl,
 }
 
 impl std::fmt::Display for SkipReason {
@@ -586,6 +624,7 @@ impl std::fmt::Display for SkipReason {
             SkipReason::ExcludedApp => write!(f, "excluded app"),
             SkipReason::UserIgnored => write!(f, "user-configured ignored window"),
             SkipReason::NotInIncludeList => write!(f, "not in included windows list"),
+            SkipReason::BlockedUrl => write!(f, "user-configured ignored URL"),
         }
     }
 }
@@ -598,21 +637,63 @@ pub trait TreeWalkerPlatform: Send {
 
 /// Create a platform-appropriate tree walker.
 pub fn create_tree_walker(config: TreeWalkerConfig) -> Box<dyn TreeWalkerPlatform> {
-    #[cfg(target_os = "macos")]
-    {
-        Box::new(macos::MacosTreeWalker::new(config))
+    let ignored_urls = config.ignored_urls.clone();
+    let walker: Box<dyn TreeWalkerPlatform> = {
+        #[cfg(target_os = "macos")]
+        {
+            Box::new(macos::MacosTreeWalker::new(config))
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Box::new(windows::WindowsTreeWalker::new(config))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Box::new(linux::LinuxTreeWalker::new(config))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+        {
+            Box::new(StubTreeWalker)
+        }
+    };
+    if ignored_urls.is_empty() {
+        walker
+    } else {
+        Box::new(UrlFilteredWalker::new(walker, ignored_urls))
     }
-    #[cfg(target_os = "windows")]
-    {
-        Box::new(windows::WindowsTreeWalker::new(config))
+}
+
+/// Decorator that drops snapshots whose `browser_url` matches a
+/// user-configured ignored URL. Wrapping here (rather than inside each
+/// platform walker) applies the filter uniformly across macOS/Windows/Linux.
+struct UrlFilteredWalker {
+    inner: Box<dyn TreeWalkerPlatform>,
+    ignored_url_patterns: Vec<String>,
+}
+
+impl UrlFilteredWalker {
+    fn new(inner: Box<dyn TreeWalkerPlatform>, ignored_urls: Vec<String>) -> Self {
+        Self {
+            inner,
+            ignored_url_patterns: crate::url_filter::normalize_blocked_patterns(&ignored_urls),
+        }
     }
-    #[cfg(target_os = "linux")]
-    {
-        Box::new(linux::LinuxTreeWalker::new(config))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-    {
-        Box::new(StubTreeWalker)
+}
+
+impl TreeWalkerPlatform for UrlFilteredWalker {
+    fn walk_focused_window(&self) -> Result<TreeWalkResult> {
+        let result = self.inner.walk_focused_window()?;
+        if let TreeWalkResult::Found(ref snapshot) = result {
+            if let Some(ref url) = snapshot.browser_url {
+                if crate::url_filter::is_url_blocked_by_normalized_patterns(
+                    url,
+                    &self.ignored_url_patterns,
+                ) {
+                    return Ok(TreeWalkResult::Skipped(SkipReason::BlockedUrl));
+                }
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -630,6 +711,65 @@ impl TreeWalkerPlatform for StubTreeWalker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot_with_url(url: Option<&str>) -> TreeSnapshot {
+        TreeSnapshot {
+            app_name: "Safari".into(),
+            window_name: "Test".into(),
+            text_content: "hello".into(),
+            nodes: Vec::new(),
+            browser_url: url.map(|u| u.to_string()),
+            document_path: None,
+            timestamp: Utc::now(),
+            node_count: 1,
+            walk_duration: Duration::from_millis(1),
+            content_hash: 0,
+            simhash: 0,
+            truncated: false,
+            truncation_reason: TruncationReason::None,
+            max_depth_reached: 1,
+        }
+    }
+
+    struct FakeWalker(Option<String>);
+    impl TreeWalkerPlatform for FakeWalker {
+        fn walk_focused_window(&self) -> Result<TreeWalkResult> {
+            Ok(TreeWalkResult::Found(snapshot_with_url(self.0.as_deref())))
+        }
+    }
+
+    #[test]
+    fn test_url_filtered_walker_blocks_matching_url() {
+        let walker = UrlFilteredWalker::new(
+            Box::new(FakeWalker(Some("https://www.chase.com/login".into()))),
+            vec!["chase.com".into()],
+        );
+        assert!(matches!(
+            walker.walk_focused_window().unwrap(),
+            TreeWalkResult::Skipped(SkipReason::BlockedUrl)
+        ));
+    }
+
+    #[test]
+    fn test_url_filtered_walker_passes_other_urls() {
+        let walker = UrlFilteredWalker::new(
+            Box::new(FakeWalker(Some("https://example.com".into()))),
+            vec!["chase.com".into()],
+        );
+        assert!(matches!(
+            walker.walk_focused_window().unwrap(),
+            TreeWalkResult::Found(_)
+        ));
+    }
+
+    #[test]
+    fn test_url_filtered_walker_passes_non_browser_windows() {
+        let walker = UrlFilteredWalker::new(Box::new(FakeWalker(None)), vec!["chase.com".into()]);
+        assert!(matches!(
+            walker.walk_focused_window().unwrap(),
+            TreeWalkResult::Found(_)
+        ));
+    }
 
     #[test]
     fn test_content_hash_deterministic() {
@@ -649,7 +789,7 @@ mod tests {
     fn test_default_config() {
         let config = TreeWalkerConfig::default();
         assert_eq!(config.walk_interval, Duration::from_secs(3));
-        assert_eq!(config.max_depth, 30);
+        assert_eq!(config.max_depth, 35);
         assert_eq!(config.max_nodes, 5000);
         assert_eq!(config.walk_timeout, Duration::from_millis(250));
         assert_eq!(config.max_text_length, 50_000);

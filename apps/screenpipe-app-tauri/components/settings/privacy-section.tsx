@@ -4,14 +4,22 @@
 "use client";
 
 import React, { useState, useCallback, useEffect, useMemo, useRef } from "react";
+import type { SettingsField } from "./settings-search";
+
+/** Settings search index for this section. Co-located with the component so adding a field here means updating one file. See `SettingsField` in `./settings-search` for the schema. */
+export const searchIndex: SettingsField[] = [
+  { label: "Blocklist", keywords: ["ignore", "exclude", "block"] },
+  { label: "PII masking", keywords: ["mask", "redact", "columns", "url", "fields"] },
+  { label: "Telemetry" },
+];
 import { LockedSetting, ManagedSwitch } from "@/components/enterprise-locked-setting";
+import { useEnterprisePolicy } from "@/lib/hooks/use-enterprise-policy";
 import {
   Eye,
   EyeOff,
   Globe,
   Shield,
   Monitor,
-  Users,
   Loader2,
   AlertCircle,
   RefreshCw,
@@ -20,20 +28,29 @@ import {
   Lock,
   Copy,
   ClipboardX,
+  Keyboard,
+  MousePointerClick,
+  FolderTree,
+  ChevronRight,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
-import { Badge } from "@/components/ui/badge";
 import { HelpTooltip } from "@/components/ui/help-tooltip";
 import { MultiSelect } from "@/components/ui/multi-select";
+import { WindowPicker } from "./window-picker";
+import { InputMonitoringPanel } from "./input-monitoring-card";
+import { ApplyRestartBar } from "./apply-restart-bar";
 import { useSettings, Settings } from "@/lib/hooks/use-settings";
 import { ScheduleSettings } from "./schedule-settings";
-import { useTeam } from "@/lib/hooks/use-team";
+import { useIsEnterpriseBuild } from "@/lib/hooks/use-is-enterprise-build";
+import { open as openUrl } from "@tauri-apps/plugin-shell";
+import { platform } from "@tauri-apps/plugin-os";
 import { useToast } from "@/components/ui/use-toast";
 import { useSqlAutocomplete } from "@/lib/hooks/use-sql-autocomplete";
+import { useInstalledApps } from "@/lib/hooks/use-installed-apps";
 import { commands } from "@/lib/utils/tauri";
 import posthog from "posthog-js";
 import * as Sentry from "@sentry/react";
@@ -56,33 +73,93 @@ const getAppIconUrl = (appName: string): string => {
 
 const createWindowOptions = (
   windowItems: { name: string; count: number; app_name?: string }[],
-  existingPatterns: string[]
+  existingPatterns: string[],
+  installedApps: string[] = []
 ) => {
-  const windowOptions = [...windowItems]
-    .sort((a, b) => b.count - a.count)
-    .map((item) => ({
-      value: item.name,
-      label: item.name,
+  // For each observed window, surface BOTH the bare title (matches anywhere)
+  // and a scoped `App::Title` variant (matches that one window of that one
+  // app). Users can pick whichever matches their intent.
+  const seen = new Set<string>();
+  const windowOptions: ReturnType<typeof toOption>[] = [];
+  const sorted = [...windowItems].sort((a, b) => b.count - a.count);
+
+  function toOption(args: {
+    value: string;
+    label: string;
+    iconHint?: string;
+    description: string;
+  }) {
+    return {
+      value: args.value,
+      label: args.label,
       icon: AppWindowMac,
-      iconUrl: getAppIconUrl(item.app_name || item.name),
-      description: [
-        item.app_name && item.app_name !== item.name ? item.app_name : null,
-        `${formatCount(item.count)} captures`,
-      ]
-        .filter(Boolean)
-        .join(" · "),
-    }));
+      iconUrl: getAppIconUrl(args.iconHint || args.value),
+      description: args.description,
+    };
+  }
+
+  for (const item of sorted) {
+    if (!seen.has(item.name)) {
+      seen.add(item.name);
+      windowOptions.push(
+        toOption({
+          value: item.name,
+          label: item.name,
+          iconHint: item.app_name || item.name,
+          description: [
+            item.app_name && item.app_name !== item.name
+              ? item.app_name
+              : null,
+            `${formatCount(item.count)} captures`,
+          ]
+            .filter(Boolean)
+            .join(" · "),
+        })
+      );
+    }
+    if (item.app_name && item.app_name !== item.name) {
+      const scoped = `${item.app_name}::${item.name}`;
+      if (!seen.has(scoped)) {
+        seen.add(scoped);
+        windowOptions.push(
+          toOption({
+            value: scoped,
+            label: scoped,
+            iconHint: item.app_name,
+            description: `scoped: only this window of ${item.app_name}`,
+          })
+        );
+      }
+    }
+  }
+
+  const seenLower = new Set(Array.from(seen, (s) => s.toLowerCase()));
+
+  // Installed apps that have no captures yet. Lets users add an ignore/include
+  // rule for an app before it's ever recorded; the icon still resolves by name
+  // so these render with their real app icon despite zero captures.
+  const installedOptions = installedApps
+    .filter((app) => app && !seenLower.has(app.toLowerCase()))
+    .map((app) => {
+      seenLower.add(app.toLowerCase());
+      return toOption({
+        value: app,
+        label: app,
+        iconHint: app,
+        description: "installed · not captured yet",
+      });
+    });
 
   const customOptions = existingPatterns
-    .filter((pattern) => !windowItems.some((item) => item.name === pattern))
+    .filter((pattern) => !seenLower.has(pattern.toLowerCase()))
     .map((pattern) => ({
       value: pattern,
       label: pattern,
       icon: AppWindowMac,
-      iconUrl: getAppIconUrl(pattern),
+      iconUrl: getAppIconUrl(pattern.includes("::") ? pattern.split("::")[0] : pattern),
     }));
 
-  return [...windowOptions, ...customOptions];
+  return [...windowOptions, ...installedOptions, ...customOptions];
 };
 
 const getFaviconUrl = (domain: string): string => {
@@ -205,17 +282,222 @@ function EncryptDataCard({
   );
 }
 
+// Live, on-device-only illustration of what the current "what to hide"
+// selection masks. Pure example text — never real captured data. Each token
+// maps to a SpanLabel; it renders as the redaction placeholder when its
+// category is selected (secret is always on), otherwise as the raw value.
+// Makes the abstract category checkboxes concrete without a real frame.
+const REDACTION_PREVIEW_PARTS: (
+  | { text: string }
+  | { cat: string; value: string; ph: string }
+)[] = [
+  { text: "hi, i'm " },
+  { cat: "person", value: "Jordan Lee", ph: "[PERSON]" },
+  { text: " — email " },
+  { cat: "email", value: "jordan@example.com", ph: "[EMAIL]" },
+  { text: ", cell " },
+  { cat: "phone", value: "(555) 010-2983", ph: "[PHONE]" },
+  { text: ", ssn " },
+  { cat: "id", value: "412-09-1764", ph: "[ID]" },
+  { text: ", key " },
+  { cat: "secret", value: "AKIA…X7Q", ph: "[SECRET]" },
+  { text: "." },
+];
+
+function RedactionExamplePreview({ labels }: { labels: string[] }) {
+  const isOn = (cat: string) => cat === "secret" || labels.includes(cat);
+  return (
+    <div className="rounded-md border border-border bg-muted/40 px-2.5 py-2">
+      <p className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1">
+        Preview
+      </p>
+      <p className="text-xs leading-relaxed text-foreground">
+        {REDACTION_PREVIEW_PARTS.map((part, i) =>
+          "text" in part ? (
+            <span key={i} className="text-muted-foreground">
+              {part.text}
+            </span>
+          ) : isOn(part.cat) ? (
+            <span
+              key={i}
+              className="rounded-[3px] bg-foreground px-1 py-0.5 font-mono text-[10px] text-background align-baseline"
+            >
+              {part.ph}
+            </span>
+          ) : (
+            <span key={i} className="font-medium">
+              {part.value}
+            </span>
+          ),
+        )}
+      </p>
+    </div>
+  );
+}
+
+// Hover-to-highlight preview for the "where we look" (surfaces) axis: a tiny
+// mock app window whose regions light up when you hover the matching row and
+// get a redaction bar when that surface is on. Pure illustration — fabricated
+// content, never real captured data. Grayscale per DESIGN.md.
+function RedactionWherePreview({
+  options,
+  selected,
+  onToggle,
+}: {
+  options: {
+    value: string;
+    label: string;
+    desc: string;
+    recommended?: boolean;
+  }[];
+  selected: string[];
+  onToggle: (value: string, checked: boolean) => void;
+}) {
+  const [hovered, setHovered] = useState<string | null>(null);
+  const on = (v: string) => selected.includes(v);
+
+  // A redactable region of the mock screen, tagged with the surface it maps
+  // to. Outlines on hover of that row; covered by a bar when the surface is
+  // on. Helper (not a nested component) so it keeps the parent's hover state.
+  const region = (r: string, content: React.ReactNode, mono?: boolean) => (
+    <span
+      className={cn(
+        "relative inline-block rounded-[3px] align-baseline",
+        hovered === r &&
+          "outline outline-2 outline-foreground outline-offset-2",
+      )}
+    >
+      <span className={cn(mono && "font-mono", on(r) && "invisible")}>
+        {content}
+      </span>
+      {on(r) && (
+        <span className="absolute inset-0 rounded-[3px] bg-foreground" />
+      )}
+    </span>
+  );
+
+  return (
+    <div className="mt-1">
+      <div className="space-y-1.5">
+        {options.map((opt) => (
+          <label
+            key={opt.value}
+            className="flex items-start gap-2 text-xs cursor-pointer"
+            onMouseEnter={() => setHovered(opt.value)}
+            onMouseLeave={() => setHovered(null)}
+          >
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={on(opt.value)}
+              onChange={(e) => onToggle(opt.value, e.target.checked)}
+            />
+            <span>
+              <span className="font-medium text-foreground">{opt.label}</span>
+              {opt.recommended && (
+                <span className="text-muted-foreground"> (recommended)</span>
+              )}
+              <span className="text-muted-foreground"> — {opt.desc}</span>
+            </span>
+          </label>
+        ))}
+      </div>
+
+      {/* Mock app window — hover a row above to see the matching area. */}
+      <div className="mt-2.5 overflow-hidden rounded-md border border-border bg-card">
+        <div className="flex items-center gap-1.5 border-b border-border px-2 py-1.5">
+          <span className="h-2 w-2 rounded-full bg-border" />
+          <span className="h-2 w-2 rounded-full bg-border" />
+          <span className="h-2 w-2 rounded-full bg-border" />
+          <span className="ml-1 min-w-0 flex-1 text-[10px]">
+            {region(
+              "browser_url",
+              <span className="block truncate rounded-full bg-muted px-2 py-0.5 text-muted-foreground">
+                app.example.com/account
+              </span>,
+              true,
+            )}
+          </span>
+        </div>
+        <div className="space-y-2 px-3 py-2.5 text-xs">
+          <div className="flex gap-3">
+            {region(
+              "ui_element_name",
+              <span className="font-medium text-foreground">dashboard</span>,
+            )}
+            {region(
+              "ui_element_name",
+              <span className="text-muted-foreground">settings</span>,
+            )}
+          </div>
+
+          <div>
+            <div className="mb-0.5 text-[10px] text-muted-foreground">email</div>
+            <div className="rounded border border-border px-1.5 py-1">
+              {region("element_properties", "jordan@example.com")}
+            </div>
+            <div className="mt-0.5 text-[10px]">
+              {region(
+                "ui_element_description",
+                <span className="text-muted-foreground">
+                  we&apos;ll never share your email
+                </span>,
+              )}
+            </div>
+          </div>
+
+          <div>
+            <div className="mb-0.5 text-[10px] text-muted-foreground">
+              password
+            </div>
+            <div className="rounded border border-border px-1.5 py-1 font-mono">
+              {region("element_properties", "hunter2-s3cret", true)}
+            </div>
+          </div>
+
+          <div className="text-[10px]">
+            {region(
+              "a11y_url_field",
+              <span className="text-foreground underline">reset password</span>,
+            )}
+          </div>
+
+          <div className="space-y-1 pt-0.5">
+            <div className="h-1.5 w-full rounded bg-foreground" />
+            <div className="h-1.5 w-4/5 rounded bg-foreground" />
+            <div className="text-[9px] text-muted-foreground">
+              typed text, transcripts &amp; on-screen text — always hidden
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function PrivacySection() {
   const { settings, updateSettings } = useSettings();
-  const team = useTeam();
-  const isTeamAdmin = !!team.team && team.role === "admin";
+  const isEnterprise = useIsEnterpriseBuild();
+  // Input Monitoring is a macOS-only TCC permission; the grant card only
+  // renders there (alongside the keyboard/click capture toggles it gates).
+  const isMacOS = typeof window !== "undefined" && platform() === "macos";
   const { toast } = useToast();
+  // when the admin forces the PII backend (local/cloud) we lock the radios so
+  // the employee can't override it (the value itself is applied to settings by
+  // useEnterprisePolicy.applyPiiPolicy on every policy poll).
+  const { getManagedValue } = useEnterprisePolicy();
+  const managedPiiBackend = getManagedValue("piiBackend");
+  // Same idea for input capture: the admin can force keyboard/click rows on
+  // or off org-wide (applied by useEnterprisePolicy.applyInputCapturePolicy).
+  // These settings are inverted ("disable…"), so ManagedSwitch — which assumes
+  // checked == managed value — doesn't fit; lock the switches manually.
+  const managedKeyboardCapture = getManagedValue("disableKeyboardCapture");
+  const managedClickCapture = getManagedValue("disableClickCapture");
 
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
-  const [filterView, setFilterView] = useState<"all" | "personal" | "team">("all");
-  const [pushingFilter, setPushingFilter] = useState<string | null>(null);
+  const [picker, setPicker] = useState<"ignored" | "included" | null>(null);
 
   const [liveApiKey, setLiveApiKey] = useState<string | null>(null);
   const [revealApiKey, setRevealApiKey] = useState(false);
@@ -228,9 +510,8 @@ export function PrivacySection() {
 
   const loadLiveApiKey = useCallback(async () => {
     try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      const config = await invoke<{ key: string | null }>("get_local_api_config");
-      setLiveApiKey(config.key ?? null);
+      const res = await (commands.getLocalApiConfig() as Promise<{ key: string | null }>);
+      setLiveApiKey(res.key ?? null);
     } catch {
       setLiveApiKey(null);
     }
@@ -244,6 +525,9 @@ export function PrivacySection() {
     useSqlAutocomplete("window");
   const { items: urlItems, isLoading: isUrlItemsLoading } =
     useSqlAutocomplete("url");
+  // Installed apps with no captures yet — merged into the app filters so users
+  // can block/allow an app before it's ever recorded.
+  const { apps: installedApps } = useInstalledApps();
 
   const handleSettingsChange = useCallback(
     (newSettings: Partial<Settings>, restart: boolean = true) => {
@@ -293,8 +577,8 @@ export function PrivacySection() {
       pendingSettingsRef.current = {};
 
       if (pendingApiKey) {
-        const { invoke } = await import("@tauri-apps/api/core");
-        await invoke("set_api_auth_key", { key: pendingApiKey });
+        const res = await commands.setApiAuthKey(pendingApiKey);
+        if (res.status === "error") throw new Error(res.error);
         setPendingApiKey(null);
       }
 
@@ -336,82 +620,216 @@ export function PrivacySection() {
     }
   };
 
-  const handlePiiRemovalChange = (checked: boolean) => {
-    handleSettingsChange({ usePiiRemoval: checked }, true);
-  };
+  // ── PII removal: one user-facing toggle, three internal flags ─────
+  //
+  // The UI exposes a single "PII Removal" section with two modes —
+  // Basic (regex on the hot path) and Smart (regex + AI background
+  // worker, also covers images). Underneath we still drive the three
+  // historically-independent backend flags:
+  //
+  //   usePiiRemoval            → hot-path regex (screenpipe-core)
+  //   asyncPiiRedaction        → text reconciliation worker (screenpipe-redact)
+  //   asyncImagePiiRedaction   → image redactor worker (rfdetr_v8)
+  //
+  // Smart implies Basic — there's no reason to disable the cheap
+  // deterministic safety net while running the expensive ML pass, and
+  // keeping them coupled means a single source of truth for "is the
+  // user opted into PII removal at all?" downstream.
+  type PiiMode = "off" | "basic" | "smart";
+  const piiMode: PiiMode = (() => {
+    const aiOn =
+      Boolean(settings.asyncPiiRedaction ?? false) ||
+      Boolean(settings.asyncImagePiiRedaction ?? false);
+    if (aiOn) return "smart";
+    if (settings.usePiiRemoval) return "basic";
+    return "off";
+  })();
 
-  // Cloud media analysis (Gemma 4 E4B inside our Tinfoil enclave) —
-  // toggling this also rewrites the screenpipe-api skill markdown so
-  // agents see the capability iff the toggle is on. Defaults to true.
-  const cloudMediaAnalysisEnabled =
-    settings.cloudMediaAnalysisEnabled ?? true;
-
-  const handleCloudMediaAnalysisChange = useCallback(
-    async (checked: boolean) => {
-      handleSettingsChange({ cloudMediaAnalysisEnabled: checked }, true);
-      try {
-        const { invoke } = await import("@tauri-apps/api/core");
-        await invoke("set_cloud_media_analysis_skill", { enabled: checked });
-      } catch (e) {
-        console.error("failed to sync cloud media analysis skill:", e);
-        // Don't block on the file mutation — setting still persisted in
-        // the UI store. Worst case Pi sees a stale block until next
-        // toggle or app restart.
-      }
-    },
-    [handleSettingsChange],
-  );
-
-  // On first hydrate sync the skill file with the (default-true) setting.
-  // Cheap idempotent file write; ensures fresh installs land with the
-  // block present, and that flipping settings.json from outside the app
-  // (e.g. importing a config) keeps the skill in sync.
-  useEffect(() => {
-    if (!settings) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const { invoke } = await import("@tauri-apps/api/core");
-        if (!cancelled) {
-          await invoke("set_cloud_media_analysis_skill", {
-            enabled: cloudMediaAnalysisEnabled,
-          });
-        }
-      } catch (e) {
-        console.error("cloud media analysis skill sync on hydrate failed:", e);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // Intentionally NOT depending on cloudMediaAnalysisEnabled — we want
-    // this to fire once on mount; subsequent changes flow through
-    // handleCloudMediaAnalysisChange which calls invoke directly.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // "AI PII removal" — single user-facing toggle that flips both the
-  // text reconciliation worker AND the image redactor (rfdetr_v8) on
-  // or off together. The technical knobs (destructive vs sibling,
-  // text-only vs image-only) stay CLI-only so the UI stays simple.
-  const aiPiiRemovalEnabled =
-    Boolean(settings.asyncPiiRedaction ?? false) ||
-    Boolean(settings.asyncImagePiiRedaction ?? false);
-
-  const handleAiPiiRemovalChange = (checked: boolean) => {
+  const handlePiiModeChange = (next: PiiMode) => {
     handleSettingsChange(
       {
-        asyncPiiRedaction: checked,
-        asyncImagePiiRedaction: checked,
+        usePiiRemoval: next !== "off",
+        asyncPiiRedaction: next === "smart",
+        asyncImagePiiRedaction: next === "smart",
       },
       true,
     );
   };
 
+  // Kept for the ManagedSwitch path (enterprise lock on usePiiRemoval).
+  // Falls back to a Basic-mode flip; enterprise admins who pinned the
+  // legacy flag still get exactly what they pinned.
+  const handlePiiRemovalChange = (checked: boolean) => {
+    handlePiiModeChange(checked ? "basic" : "off");
+  };
+
+  // Smart mode runs two independent AI workers — text (DB columns) and
+  // image (screenshot pixels). They're separate flags, so let the user
+  // pick either or both. Switching to Smart turns both on; unchecking the
+  // last one degrades cleanly to Basic (keep the regex safety net).
+  const textRedactionOn = Boolean(settings.asyncPiiRedaction ?? false);
+  const imageRedactionOn = Boolean(settings.asyncImagePiiRedaction ?? false);
+  const handleModalityToggle = (which: "text" | "image", checked: boolean) => {
+    const text = which === "text" ? checked : textRedactionOn;
+    const image = which === "image" ? checked : imageRedactionOn;
+    if (!text && !image) {
+      handlePiiModeChange("basic");
+      return;
+    }
+    handleSettingsChange(
+      {
+        usePiiRemoval: true,
+        asyncPiiRedaction: text,
+        asyncImagePiiRedaction: image,
+      },
+      true,
+    );
+  };
+
+  const aiPiiRemovalEnabled = piiMode === "smart";
+
   // Where the AI workers run — one switch covers both modalities.
   const piiBackend = (settings.piiBackend as "local" | "tinfoil" | undefined) ?? "local";
   const handlePiiBackendChange = (next: "local" | "tinfoil") => {
     handleSettingsChange({ piiBackend: next } as any, true);
+  };
+
+  // Which PII classes the AI workers actually remove. Secret is the
+  // always-on baseline (the backend forces it in too — see
+  // screenpipe_redact::parse_allow_list); the rest are opt-in. Stored
+  // as canonical snake_case SpanLabel names in `piiRedactionLabels`.
+  // The model detects every class, but only the selected ones get
+  // redacted — everything else stays as searchable timeline value.
+  const PII_FIELD_OPTIONS: {
+    value: string;
+    label: string;
+    desc: string;
+    always?: boolean;
+  }[] = [
+    { value: "secret", label: "Passwords & keys", desc: "passwords, API keys, tokens", always: true },
+    { value: "id", label: "ID numbers", desc: "SSNs, credit cards, account & license numbers" },
+    { value: "person", label: "Names", desc: "people's names" },
+    { value: "email", label: "Email addresses", desc: "email addresses" },
+    { value: "phone", label: "Phone numbers", desc: "phone numbers" },
+    { value: "address", label: "Mailing addresses", desc: "postal addresses" },
+    { value: "url", label: "Links with tokens", desc: "links carrying tokens or session IDs" },
+    { value: "date", label: "Dates", desc: "dates of birth, timestamps" },
+    { value: "sensitive", label: "Health & financial details", desc: "health, financial, identity context" },
+  ];
+
+  const piiRedactionLabels = useMemo<string[]>(() => {
+    const raw = (settings.piiRedactionLabels as string[] | undefined) ?? ["secret"];
+    // Secret is always implied, regardless of what's persisted.
+    return raw.includes("secret") ? raw : ["secret", ...raw];
+  }, [settings.piiRedactionLabels]);
+
+  const handlePiiLabelToggle = (value: string, checked: boolean) => {
+    if (value === "secret") return; // always-on baseline; can't be unchecked
+    const next = new Set(piiRedactionLabels);
+    if (checked) next.add(value);
+    else next.delete(value);
+    next.add("secret"); // never drop the baseline
+    // Persist in the canonical option order so diffs stay stable.
+    const ordered = PII_FIELD_OPTIONS.map((o) => o.value).filter((v) => next.has(v));
+    handleSettingsChange({ piiRedactionLabels: ordered } as Partial<Settings>, true);
+  };
+
+  // Consistent pseudonyms (issue #4206): render redacted values as
+  // stable tokens (e.g. [PERSON_1a2b3c4d]) instead of generic tags, so
+  // the same value stays correlatable across the timeline without being
+  // exposed. One-way + local; opt-in, default off.
+  const piiRedactionPseudonyms = Boolean(
+    settings.piiRedactionPseudonyms ?? false,
+  );
+  const handlePseudonymsToggle = (checked: boolean) => {
+    handleSettingsChange(
+      { piiRedactionPseudonyms: checked } as Partial<Settings>,
+      true,
+    );
+  };
+
+  // WHICH captured columns get scrubbed (orthogonal to the categories
+  // above). Typed text / clipboard / transcripts / window titles /
+  // on-screen text are always redacted; these extra surfaces are opt-in.
+  // Stored as the full list of stable column keys in `piiRedactionColumns`
+  // (see `RedactColumns` in screenpipe-redact). The core keys are always
+  // persisted so this UI only toggles the extras.
+  const CORE_REDACTION_COLUMNS = [
+    "accessibility_text",
+    "accessibility_tree",
+    "window_name",
+    "audio_transcription",
+    "ui_text_content",
+    "ui_element_value",
+    "ui_window_title",
+    "element_text",
+  ];
+  // Form-field values default ON: it's the surface where real PII (typed
+  // passwords / field values a11y exposes that OCR never sees) actually
+  // lives. Kept OUT of CORE so the user can still uncheck it — it only
+  // seeds the default. Keep in sync with the Rust defaults
+  // (`RedactColumns::default` / `default_pii_redaction_columns`).
+  const DEFAULT_OPTIONAL_COLUMNS = ["element_properties"];
+  const PII_COLUMN_OPTIONS: {
+    value: string;
+    label: string;
+    desc: string;
+    recommended?: boolean;
+  }[] = [
+    {
+      value: "element_properties",
+      label: "Form field values",
+      desc: "what you type into forms — catches passwords and field contents that on-screen text misses",
+      recommended: true,
+    },
+    {
+      value: "browser_url",
+      label: "Web addresses",
+      desc: "the address bar — usually not private, and hiding them breaks links",
+    },
+    {
+      value: "ui_element_name",
+      label: "Button & menu labels",
+      desc: "names like “Submit” or “Search” — rarely private",
+    },
+    {
+      value: "ui_element_description",
+      label: "Help text on controls",
+      desc: "the longer description some buttons and menus expose",
+    },
+    {
+      value: "a11y_url_field",
+      label: "Links inside app data",
+      desc: "URLs embedded in an app’s underlying structure",
+    },
+  ];
+
+  const piiRedactionColumns = useMemo<string[]>(() => {
+    return (
+      (settings.piiRedactionColumns as string[] | undefined) ?? [
+        ...CORE_REDACTION_COLUMNS,
+        ...DEFAULT_OPTIONAL_COLUMNS,
+      ]
+    );
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settings.piiRedactionColumns]);
+
+  const handlePiiColumnToggle = (value: string, checked: boolean) => {
+    const next = new Set(piiRedactionColumns);
+    if (checked) next.add(value);
+    else next.delete(value);
+    // Core surfaces are always redacted — never drop them.
+    CORE_REDACTION_COLUMNS.forEach((c) => next.add(c));
+    // Persist in canonical order (core first, then extras) for stable diffs.
+    const order = [
+      ...CORE_REDACTION_COLUMNS,
+      ...PII_COLUMN_OPTIONS.map((o) => o.value),
+    ];
+    const ordered = order.filter((v) => next.has(v));
+    handleSettingsChange(
+      { piiRedactionColumns: ordered } as Partial<Settings>,
+      true,
+    );
   };
 
   const handleIncognitoToggle = (checked: boolean) => {
@@ -428,6 +846,18 @@ export function PrivacySection() {
     handleSettingsChange({ disableClipboardCapture: !checked }, true);
   };
 
+  const handleKeyboardCaptureToggle = (checked: boolean) => {
+    // UI is "Capture keyboard" on/off. Settings store inverts to match
+    // the CLI flag name (--disable-keyboard-capture).
+    handleSettingsChange({ disableKeyboardCapture: !checked }, true);
+  };
+
+  const handleClickCaptureToggle = (checked: boolean) => {
+    // UI is "Capture clicks" on/off. Settings store inverts to match
+    // the CLI flag name (--disable-click-capture).
+    handleSettingsChange({ disableClickCapture: !checked }, true);
+  };
+
   const handleRecordWhileLockedToggle = (checked: boolean) => {
     handleSettingsChange({ recordWhileLocked: checked }, true);
   };
@@ -436,47 +866,18 @@ export function PrivacySection() {
     handleSettingsChange({ analyticsEnabled: checked }, true);
   };
 
-  const handlePushFilterToTeam = async (
-    configType: string,
-    key: string,
-    filters: string[]
-  ) => {
-    setPushingFilter(key);
-    try {
-      await team.pushConfig(configType, key, { filters });
-      toast({ title: "pushed to team" });
-    } catch (err: any) {
-      toast({
-        title: "failed to push to team",
-        description: err.message,
-        variant: "destructive",
-      });
-    } finally {
-      setPushingFilter(null);
-    }
+  // Add one pattern from the WindowPicker. Reuses the MultiSelect change
+  // handler so the mutual-exclusion logic (a pattern in ignore is removed
+  // from include and vice versa) stays in one place.
+  const addIgnoredPattern = (pattern: string) => {
+    const lower = pattern.toLowerCase();
+    if (settings.ignoredWindows.some((w) => w.toLowerCase() === lower)) return;
+    handleIgnoredWindowsChange([...settings.ignoredWindows, pattern]);
   };
-
-  const handleRemoveTeamFilter = async (
-    configType: string,
-    key: string,
-    filterToRemove: string
-  ) => {
-    const config = team.configs?.find(
-      (c) => c.config_type === configType && c.key === key && c.scope === "team"
-    );
-    if (!config) return;
-    const currentFilters: string[] = (config.value as any)?.filters ?? [];
-    const newFilters = currentFilters.filter((f) => f !== filterToRemove);
-    try {
-      await team.pushConfig(configType, key, { filters: newFilters });
-      toast({ title: "team filter removed" });
-    } catch (err: any) {
-      toast({
-        title: "failed to remove team filter",
-        description: err.message,
-        variant: "destructive",
-      });
-    }
+  const addIncludedPattern = (pattern: string) => {
+    const lower = pattern.toLowerCase();
+    if (settings.includedWindows.some((w) => w.toLowerCase() === lower)) return;
+    handleIncludedWindowsChange([...settings.includedWindows, pattern]);
   };
 
   const handleIgnoredWindowsChange = (values: string[]) => {
@@ -692,18 +1093,15 @@ export function PrivacySection() {
                   onClick={async () => {
                     if (!liveApiKey) return;
                     try {
-                      await navigator.clipboard.writeText(liveApiKey);
-                    } catch {
-                      const el = document.createElement("textarea");
-                      el.value = liveApiKey;
-                      el.style.position = "fixed";
-                      el.style.opacity = "0";
-                      document.body.appendChild(el);
-                      el.select();
-                      document.execCommand("copy");
-                      document.body.removeChild(el);
+                      await commands.copyTextToClipboard(liveApiKey);
+                      toast({ title: "API key copied to clipboard" });
+                    } catch (error) {
+                      toast({
+                        title: "couldn't copy API key",
+                        description: error instanceof Error ? error.message : String(error),
+                        variant: "destructive",
+                      });
                     }
-                    toast({ title: "API key copied to clipboard" });
                   }}
                 >
                   <Copy className="h-3.5 w-3.5" />
@@ -724,8 +1122,9 @@ export function PrivacySection() {
                     if (!confirmed) return;
                     setRegeneratingKey(true);
                     try {
-                      const { invoke } = await import("@tauri-apps/api/core");
-                      const newKey = await invoke<string>("regenerate_api_auth_key");
+                      const res = await commands.regenerateApiAuthKey();
+                      if (res.status === "error") throw new Error(res.error);
+                      const newKey = res.data;
                       setLiveApiKey(newKey);
                       setRevealApiKey(true);
                       setHasUnsavedChanges(true);
@@ -752,6 +1151,8 @@ export function PrivacySection() {
           </CardContent>
         </Card>
         </LockedSetting>
+
+        {isEnterprise && <AdminTeamTokenCard />}
 
         {/* LAN access — off by default. Toggling on force-enables api_auth
             (the backend mirrors this guard in RecordingConfig::from_settings
@@ -792,7 +1193,7 @@ export function PrivacySection() {
         </LockedSetting>
 
         <EncryptDataCard
-          encryptStore={settings.encryptStore ?? false}
+          encryptStore={settings.encryptStore ?? true}
           onEncryptStoreChange={(checked) => {
             handleSettingsChange({ encryptStore: checked });
           }}
@@ -875,12 +1276,96 @@ export function PrivacySection() {
             </div>
             <Switch
               id="captureClipboard"
-              checked={!(settings.disableClipboardCapture ?? false)}
+              checked={!(settings.disableClipboardCapture ?? true)}
               onCheckedChange={handleClipboardCaptureToggle}
             />
           </div>
         </CardContent>
       </Card>
+
+      {/* Keyboard capture toggle */}
+      <Card>
+        <CardContent className="px-3 py-2.5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-2.5">
+              <Keyboard className="h-4 w-4 text-muted-foreground shrink-0" />
+              <div>
+                <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                  Capture keyboard
+                  <HelpTooltip text="when on, screenpipe records what you type (your keystrokes). off by default. the accessibility tree and OCR still capture on-screen text either way, so Rewind and Ask keep working — this only controls the raw keystroke stream, where passwords, API keys, and secrets you type would otherwise be logged." />
+                </h3>
+                <p className="text-xs text-muted-foreground">
+                  {managedKeyboardCapture !== undefined
+                    ? "Managed by your organization."
+                    : "Off by default. Records the raw keystroke stream (secrets often get typed). On-screen text is still captured."}
+                </p>
+              </div>
+            </div>
+            <Switch
+              id="captureKeyboard"
+              checked={
+                managedKeyboardCapture !== undefined
+                  ? managedKeyboardCapture === "false"
+                  : !(settings.disableKeyboardCapture ?? true)
+              }
+              disabled={managedKeyboardCapture !== undefined}
+              onCheckedChange={handleKeyboardCaptureToggle}
+            />
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Click capture toggle */}
+      <Card>
+        <CardContent className="px-3 py-2.5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-2.5">
+              <MousePointerClick className="h-4 w-4 text-muted-foreground shrink-0" />
+              <div>
+                <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                  Capture clicks
+                  <HelpTooltip text="when on, screenpipe records mouse click events (where and what you clicked). on by default — clicks carry no text payload and power workflow analysis and task mining. turning this off only skips the click rows; clicks still trigger screen captures." />
+                </h3>
+                <p className="text-xs text-muted-foreground">
+                  {managedClickCapture !== undefined
+                    ? "Managed by your organization."
+                    : "On by default. Click events power workflow analysis; no text is recorded."}
+                </p>
+              </div>
+            </div>
+            <Switch
+              id="captureClicks"
+              checked={
+                managedClickCapture !== undefined
+                  ? managedClickCapture === "false"
+                  : !(settings.disableClickCapture ?? false)
+              }
+              disabled={managedClickCapture !== undefined}
+              onCheckedChange={handleClickCaptureToggle}
+            />
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Input Monitoring permission (macOS) — the OS-level TCC grant that
+          lets the keyboard/click capture toggles above actually record.
+          Lives here, next to those toggles, instead of under Connections. */}
+      {isMacOS && (
+        <Card>
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center space-x-2.5">
+              <Keyboard className="h-4 w-4 text-muted-foreground shrink-0" />
+              <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                Input Monitoring permission
+                <HelpTooltip text="macOS permission that lets screenpipe capture keystrokes and mouse clicks. without it, capture runs in reduced mode — clipboard and app/window switches still work, but keyboard and click recording is dropped." />
+              </h3>
+            </div>
+            <div className="mt-2 ml-[26px]">
+              <InputMonitoringPanel />
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Record While Locked */}
       <Card>
@@ -923,6 +1408,11 @@ export function PrivacySection() {
         <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">
           Data protection
         </h2>
+        {/* One PII Removal section with two modes — Basic (regex on the
+            hot path) and Smart (regex + AI background worker, also
+            covers images). Smart progressively discloses backend +
+            field selection. See piiMode comment above for the
+            three-flag mapping. */}
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5">
             <div className="flex items-center justify-between">
@@ -931,111 +1421,252 @@ export function PrivacySection() {
                 <div>
                   <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
                     PII Removal
-                    <HelpTooltip text="Automatically redacts personally identifiable information (emails, phone numbers, etc.) from captured text before storing." />
+                    <HelpTooltip text="Redacts emails, phones, secrets, and more from captures. Smart mode adds names, addresses, and image redaction." />
                   </h3>
                   <p className="text-xs text-muted-foreground">
-                    Redact emails, phones, SSNs, credit cards
+                    {piiMode === "off"
+                      ? "Off — captures store raw text and pixels."
+                      : piiMode === "basic"
+                      ? "Basic — regex on capture. Emails, phones, SSNs, cards, API keys."
+                      : "Smart — AI background worker. Adds names, addresses, image redaction."}
                   </p>
                 </div>
               </div>
               <ManagedSwitch
                 settingKey="usePiiRemoval"
                 id="usePiiRemoval"
-                checked={settings.usePiiRemoval}
-                onCheckedChange={handlePiiRemovalChange}
+                checked={piiMode !== "off"}
+                onCheckedChange={(checked) =>
+                  handlePiiModeChange(checked ? "basic" : "off")
+                }
               />
             </div>
-          </CardContent>
-        </Card>
-
-        {/* AI PII removal — covers text + images via the async worker */}
-        <Card className="border-border bg-card">
-          <CardContent className="px-3 py-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-2.5">
-                <Shield className="h-4 w-4 text-muted-foreground shrink-0" />
-                <div>
-                  <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                    AI PII removal
-                    <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
-                      Experimental
+            {piiMode !== "off" && (
+              <div className="mt-3 ml-6 space-y-3 border-l-2 border-border pl-3">
+                <div className="space-y-2">
+                  <p className="text-xs font-medium text-foreground">Mode</p>
+                  <label className="flex cursor-pointer items-start gap-2 text-xs">
+                    <input
+                      type="radio"
+                      name="piiMode"
+                      className="mt-0.5"
+                      checked={piiMode === "basic"}
+                      onChange={() => handlePiiModeChange("basic")}
+                    />
+                    <span>
+                      <span className="font-medium text-foreground">Basic</span>
+                      <span className="text-muted-foreground">
+                        {" "}— regex on capture. Free, instant, deterministic.
+                        Catches emails, phones, SSNs, cards, JWTs, API keys,
+                        private keys, connection strings.
+                      </span>
                     </span>
-                    <HelpTooltip text="Uses an on-device AI model to detect and remove PII from both screen frames and captured text (names, emails, addresses, secrets, URLs). Downloads a ~100 MB model on first run and uses extra CPU/GPU while it processes captures in the background." />
-                  </h3>
-                  <p className="text-xs text-muted-foreground">
-                    Removes PII from text and images. Uses extra resources.
-                  </p>
+                  </label>
+                  <label className="flex cursor-pointer items-start gap-2 text-xs">
+                    <input
+                      type="radio"
+                      name="piiMode"
+                      className="mt-0.5"
+                      checked={piiMode === "smart"}
+                      onChange={() => handlePiiModeChange("smart")}
+                    />
+                    <span>
+                      <span className="font-medium text-foreground">Smart</span>
+                      <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground bg-muted px-1.5 py-0.5 rounded ml-1">
+                        Experimental
+                      </span>
+                      <span className="text-muted-foreground">
+                        {" "}— includes Basic, plus an AI background worker
+                        for semantic PII (names, addresses, sensitive context)
+                        and image redaction on screen frames. Downloads a
+                        ~100 MB model on first run.
+                      </span>
+                    </span>
+                  </label>
+
+                  {piiMode === "smart" && (
+                    <div className="ml-6 space-y-1.5 pt-1">
+                      <p className="text-xs font-medium text-foreground">
+                        Apply to
+                      </p>
+                      <label className="flex items-start gap-2 text-xs cursor-pointer">
+                        <input
+                          type="checkbox"
+                          className="mt-0.5"
+                          checked={textRedactionOn}
+                          onChange={(e) =>
+                            handleModalityToggle("text", e.target.checked)
+                          }
+                        />
+                        <span>
+                          <span className="font-medium text-foreground">
+                            Text
+                          </span>
+                          <span className="text-muted-foreground">
+                            {" "}— scrub captured text (OCR, accessibility,
+                            transcripts, typed &amp; clipboard input)
+                          </span>
+                        </span>
+                      </label>
+                      <label className="flex items-start gap-2 text-xs cursor-pointer">
+                        <input
+                          type="checkbox"
+                          className="mt-0.5"
+                          checked={imageRedactionOn}
+                          onChange={(e) =>
+                            handleModalityToggle("image", e.target.checked)
+                          }
+                        />
+                        <span>
+                          <span className="font-medium text-foreground">
+                            Images
+                          </span>
+                          <span className="text-muted-foreground">
+                            {" "}— black out PII in screenshot frames (on-device
+                            vision model)
+                          </span>
+                        </span>
+                      </label>
+                    </div>
+                  )}
                 </div>
               </div>
-              <Switch
-                id="aiPiiRemoval"
-                checked={aiPiiRemovalEnabled}
-                onCheckedChange={handleAiPiiRemovalChange}
-              />
-            </div>
+            )}
             {aiPiiRemovalEnabled && (
               <div className="mt-3 ml-6 space-y-2 border-l-2 border-border pl-3">
-                <p className="text-xs font-medium text-foreground">Where it runs</p>
-                <label className="flex cursor-pointer items-start gap-2 text-xs">
+                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+                  <span className="font-medium text-foreground">Where it runs</span>
+                  <label className={`flex items-center gap-1.5 ${managedPiiBackend ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}>
+                    <input
+                      type="radio"
+                      name="piiBackend"
+                      checked={piiBackend === "local"}
+                      disabled={!!managedPiiBackend}
+                      onChange={() => handlePiiBackendChange("local")}
+                    />
+                    <span className="text-foreground">Local</span>
+                  </label>
+                  <label className={`flex items-center gap-1.5 ${managedPiiBackend ? "cursor-not-allowed opacity-60" : "cursor-pointer"}`}>
+                    <input
+                      type="radio"
+                      name="piiBackend"
+                      checked={piiBackend === "tinfoil"}
+                      disabled={!!managedPiiBackend}
+                      onChange={() => handlePiiBackendChange("tinfoil")}
+                    />
+                    <span className="text-foreground">Cloud (enclave)</span>
+                  </label>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  Local stays on-device — strongest privacy, slower on weak
+                  hardware. Cloud uses screenpipe&apos;s attested
+                  confidential-compute enclave — fast everywhere; your device
+                  verifies the open-source build before sending anything.
+                </p>
+
+                {/* Axis 1 — WHAT to hide (PII categories). The primary knob:
+                    content-type, applies wherever it's found. */}
+                <p className="text-xs font-medium text-foreground pt-2">
+                  What to hide
+                </p>
+                {PII_FIELD_OPTIONS.map((opt) => {
+                  const checked =
+                    opt.always || piiRedactionLabels.includes(opt.value);
+                  return (
+                    <label
+                      key={opt.value}
+                      className={cn(
+                        "flex items-start gap-2 text-xs",
+                        opt.always ? "cursor-default" : "cursor-pointer",
+                      )}
+                    >
+                      <input
+                        type="checkbox"
+                        className="mt-0.5"
+                        checked={checked}
+                        disabled={opt.always}
+                        onChange={(e) =>
+                          handlePiiLabelToggle(opt.value, e.target.checked)
+                        }
+                      />
+                      <span>
+                        <span className="font-medium text-foreground">
+                          {opt.label}
+                        </span>
+                        {opt.always && (
+                          <span className="text-muted-foreground">
+                            {" "}(always on)
+                          </span>
+                        )}
+                        <span className="text-muted-foreground">
+                          {" "}— {opt.desc}
+                        </span>
+                      </span>
+                    </label>
+                  );
+                })}
+                {textRedactionOn && (
+                  <RedactionExamplePreview labels={piiRedactionLabels} />
+                )}
+                <p className="text-[11px] text-muted-foreground pt-0.5">
+                  Unselected types stay visible so your timeline remains
+                  searchable. Secrets are always removed in both modes.
+                </p>
+
+                {/* Axis 2 — WHERE to look (captured surfaces). Advanced and
+                    orthogonal to the categories above; collapsed by default so
+                    most users only deal with "What to hide". Text-only, so
+                    hide it entirely when text redaction is off (Images-only
+                    Smart mode). */}
+                {textRedactionOn && (
+                  <details className="group pt-3 mt-1.5 border-t border-border">
+                    <summary className="flex cursor-pointer select-none items-center gap-1.5 text-xs font-medium text-foreground list-none [&::-webkit-details-marker]:hidden">
+                      <ChevronRight className="h-3 w-3 shrink-0 transition-transform group-open:rotate-90" />
+                      Where we look
+                      <span className="font-normal text-muted-foreground">
+                        — advanced
+                      </span>
+                    </summary>
+                    <div className="mt-2 space-y-1.5">
+                      <p className="text-[11px] text-muted-foreground">
+                        We always scan what you type, your clipboard,
+                        transcripts, window titles, and on-screen text. Turn on
+                        any of these extra places the same info can hide —
+                        hover a row to see what it covers.
+                      </p>
+                      <RedactionWherePreview
+                        options={PII_COLUMN_OPTIONS}
+                        selected={piiRedactionColumns}
+                        onToggle={handlePiiColumnToggle}
+                      />
+                    </div>
+                  </details>
+                )}
+
+                <label className="flex items-start gap-2 text-xs cursor-pointer pt-2 mt-1.5 border-t border-border">
                   <input
-                    type="radio"
-                    name="piiBackend"
+                    type="checkbox"
                     className="mt-0.5"
-                    checked={piiBackend === "local"}
-                    onChange={() => handlePiiBackendChange("local")}
+                    checked={piiRedactionPseudonyms}
+                    onChange={(e) => handlePseudonymsToggle(e.target.checked)}
                   />
                   <span>
-                    <span className="font-medium text-foreground">Local</span>
-                    <span className="text-muted-foreground">
-                      {" "}— on your device. Strongest privacy. Slower on weak hardware.
+                    <span className="font-medium text-foreground">
+                      Consistent pseudonyms
                     </span>
-                  </span>
-                </label>
-                <label className="flex cursor-pointer items-start gap-2 text-xs">
-                  <input
-                    type="radio"
-                    name="piiBackend"
-                    className="mt-0.5"
-                    checked={piiBackend === "tinfoil"}
-                    onChange={() => handlePiiBackendChange("tinfoil")}
-                  />
-                  <span>
-                    <span className="font-medium text-foreground">Cloud (enclave)</span>
                     <span className="text-muted-foreground">
-                      {" "}— screenpipe&apos;s confidential-compute enclave. Fast everywhere; your device cryptographically verifies the enclave is running the open-source build before sending anything.
+                      {" "}— replace each value with a stable token like{" "}
+                      <code>[PERSON_1a2b3c4d5e6f]</code> instead of a generic{" "}
+                      <code>[PERSON]</code>, so the same person or value stays
+                      linkable across your timeline without being exposed.
+                      One-way and on-device — the original can&apos;t be
+                      recovered. Applies to newly-recorded activity going
+                      forward.
                     </span>
                   </span>
                 </label>
               </div>
             )}
-          </CardContent>
-        </Card>
-
-        {/* Cloud media analysis — audio / video / image via Gemma 4 E4B
-            inside the same Tinfoil enclave. Toggle adds/removes the
-            section from ~/.claude/skills/screenpipe-api/SKILL.md so
-            agents literally don't see the capability when it's off. */}
-        <Card className="border-border bg-card">
-          <CardContent className="px-3 py-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-2.5">
-                <Lock className="h-4 w-4 text-muted-foreground shrink-0" />
-                <div>
-                  <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                    AI audio &amp; video analysis
-                    <HelpTooltip text="Lets Pi and Claude Code call screenpipe's confidential enclave (Gemma 4 E4B inside a Tinfoil-attested AMD SEV-SNP container, encrypted in flight + at rest, no plaintext at the provider) to transcribe meetings, describe video clips, and analyze image frames from your screenpipe data. When off, the capability is stripped from the agent skill markdown so Pi won't try to use it." />
-                  </h3>
-                  <p className="text-xs text-muted-foreground">
-                    Confidential enclave for transcription, video, and image understanding.
-                  </p>
-                </div>
-              </div>
-              <Switch
-                id="cloudMediaAnalysisEnabled"
-                checked={cloudMediaAnalysisEnabled}
-                onCheckedChange={handleCloudMediaAnalysisChange}
-              />
-            </div>
           </CardContent>
         </Card>
       </div>
@@ -1046,528 +1677,114 @@ export function PrivacySection() {
           Content filters
         </h2>
 
-        {/* All | Personal | Shared with team tabs */}
-        {team.team &&
-          (() => {
-            const teamIgnored = new Set(
-              settings.teamFilters?.ignoredWindows ?? []
-            );
-            const teamIncluded = new Set(
-              settings.teamFilters?.includedWindows ?? []
-            );
-            const teamUrls = new Set(
-              settings.teamFilters?.ignoredUrls ?? []
-            );
-            const personalOnlyCount =
-              settings.ignoredWindows.filter((w) => !teamIgnored.has(w))
-                .length +
-              settings.includedWindows.filter((w) => !teamIncluded.has(w))
-                .length +
-              (settings.ignoredUrls || []).filter((u) => !teamUrls.has(u))
-                .length;
-            const teamOnlyCount =
-              teamIgnored.size + teamIncluded.size + teamUrls.size;
-            const allCount = personalOnlyCount + teamOnlyCount;
-            return (
-              <div className="flex items-center gap-4 border-b border-border">
-                {(["all", "personal", "team"] as const).map((tab) => {
-                  const count =
-                    tab === "all"
-                      ? allCount
-                      : tab === "personal"
-                        ? personalOnlyCount
-                        : teamOnlyCount;
-                  const label =
-                    tab === "all"
-                      ? "All"
-                      : tab === "personal"
-                        ? "Personal"
-                        : "Shared with team";
-                  return (
-                    <button
-                      key={tab}
-                      onClick={() => setFilterView(tab)}
-                      className={cn(
-                        "pb-2 text-sm transition-colors duration-150 border-b-2 -mb-px",
-                        filterView === tab
-                          ? "border-foreground text-foreground font-medium"
-                          : "border-transparent text-muted-foreground hover:text-foreground"
-                      )}
-                    >
-                      {label} ({count})
-                    </button>
-                  );
-                })}
-              </div>
-            );
-          })()}
-
-        {/* Personal filters (shown in "all" and "personal" views) */}
-        {filterView !== "team" && (
-          <>
-            <Card className="border-border bg-card">
-              <CardContent className="px-3 py-2.5">
-                <div className="flex items-center space-x-2.5 mb-2">
-                  <EyeOff className="h-4 w-4 text-muted-foreground shrink-0" />
-                  <div className="flex items-center gap-1.5 flex-1 min-w-0">
-                    <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                      Ignored Apps
-                      <HelpTooltip text="Apps matching these patterns will not be captured. Matches against window titles — e.g. add 'Password Manager' to skip sensitive apps." />
-                    </h3>
-                    {isTeamAdmin && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="h-6 text-[10px] ml-auto cursor-pointer"
-                        disabled={pushingFilter === "ignored_windows"}
-                        onClick={() =>
-                          handlePushFilterToTeam(
-                            "window_filter",
-                            "ignored_windows",
-                            settings.ignoredWindows
-                          )
-                        }
-                      >
-                        {pushingFilter === "ignored_windows" ? (
-                          <Loader2 className="h-3 w-3 mr-1 animate-spin" />
-                        ) : (
-                          <Users className="h-3 w-3 mr-1" />
-                        )}
-                        push to team
-                      </Button>
-                    )}
-                  </div>
-                </div>
-                <div className="ml-[26px]">
-                  <MultiSelect
-                    options={createWindowOptions(
-                      windowItems || [],
-                      settings.ignoredWindows
-                    )}
-                    defaultValue={settings.ignoredWindows}
-                    value={settings.ignoredWindows}
-                    onValueChange={handleIgnoredWindowsChange}
-                    placeholder="Select apps to ignore..."
-                    allowCustomValues
-                  />
-                  {filterView === "all" &&
-                    (settings.teamFilters?.ignoredWindows?.length ?? 0) > 0 && (
-                      <div className="flex flex-wrap gap-1 mt-1">
-                        {settings.teamFilters!.ignoredWindows.map((w) => (
-                          <Badge
-                            key={w}
-                            variant="outline"
-                            className="text-[10px] h-5 gap-0.5"
-                          >
-                            <Users className="h-2.5 w-2.5 mr-0.5" />
-                            {w}
-                            {isTeamAdmin && (
-                              <button
-                                onClick={() =>
-                                  handleRemoveTeamFilter(
-                                    "window_filter",
-                                    "ignored_windows",
-                                    w
-                                  )
-                                }
-                                className="ml-0.5 hover:text-destructive"
-                              >
-                                <svg
-                                  xmlns="http://www.w3.org/2000/svg"
-                                  width="10"
-                                  height="10"
-                                  viewBox="0 0 24 24"
-                                  fill="none"
-                                  stroke="currentColor"
-                                  strokeWidth="2"
-                                  strokeLinecap="round"
-                                  strokeLinejoin="round"
-                                >
-                                  <path d="M18 6 6 18" />
-                                  <path d="m6 6 12 12" />
-                                </svg>
-                              </button>
-                            )}
-                          </Badge>
-                        ))}
-                      </div>
-                    )}
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card className="border-border bg-card">
-              <CardContent className="px-3 py-2.5">
-                <div className="flex items-center space-x-2.5 mb-2">
-                  <Eye className="h-4 w-4 text-muted-foreground shrink-0" />
-                  <div className="flex items-center gap-1.5 flex-1 min-w-0">
-                    <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                      Included Apps
-                      <HelpTooltip text="When set, ONLY apps matching these patterns will be captured. Everything else is ignored. Leave empty to capture all apps (except ignored ones)." />
-                    </h3>
-                    {isTeamAdmin && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="h-6 text-[10px] ml-auto cursor-pointer"
-                        disabled={pushingFilter === "included_windows"}
-                        onClick={() =>
-                          handlePushFilterToTeam(
-                            "window_filter",
-                            "included_windows",
-                            settings.includedWindows
-                          )
-                        }
-                      >
-                        {pushingFilter === "included_windows" ? (
-                          <Loader2 className="h-3 w-3 mr-1 animate-spin" />
-                        ) : (
-                          <Users className="h-3 w-3 mr-1" />
-                        )}
-                        push to team
-                      </Button>
-                    )}
-                  </div>
-                </div>
-                <div className="ml-[26px]">
-                  <MultiSelect
-                    options={createWindowOptions(
-                      windowItems || [],
-                      settings.includedWindows
-                    )}
-                    defaultValue={settings.includedWindows}
-                    value={settings.includedWindows}
-                    onValueChange={handleIncludedWindowsChange}
-                    placeholder="Only capture these apps (optional)..."
-                    allowCustomValues
-                  />
-                  {filterView === "all" &&
-                    (settings.teamFilters?.includedWindows?.length ?? 0) >
-                      0 && (
-                      <div className="flex flex-wrap gap-1 mt-1">
-                        {settings.teamFilters!.includedWindows.map((w) => (
-                          <Badge
-                            key={w}
-                            variant="outline"
-                            className="text-[10px] h-5 gap-0.5"
-                          >
-                            <Users className="h-2.5 w-2.5 mr-0.5" />
-                            {w}
-                            {isTeamAdmin && (
-                              <button
-                                onClick={() =>
-                                  handleRemoveTeamFilter(
-                                    "window_filter",
-                                    "included_windows",
-                                    w
-                                  )
-                                }
-                                className="ml-0.5 hover:text-destructive"
-                              >
-                                <svg
-                                  xmlns="http://www.w3.org/2000/svg"
-                                  width="10"
-                                  height="10"
-                                  viewBox="0 0 24 24"
-                                  fill="none"
-                                  stroke="currentColor"
-                                  strokeWidth="2"
-                                  strokeLinecap="round"
-                                  strokeLinejoin="round"
-                                >
-                                  <path d="M18 6 6 18" />
-                                  <path d="m6 6 12 12" />
-                                </svg>
-                              </button>
-                            )}
-                          </Badge>
-                        ))}
-                      </div>
-                    )}
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card className="border-border bg-card">
-              <CardContent className="px-3 py-2.5">
-                <div className="flex items-center space-x-2.5 mb-2">
-                  <Globe className="h-4 w-4 text-muted-foreground shrink-0" />
-                  <div className="flex items-center gap-1.5 flex-1 min-w-0">
-                    <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                      Ignored URLs
-                      <HelpTooltip text="Browser URLs matching these patterns will not be captured. Use for privacy — e.g. add 'bank.com' to skip banking sites." />
-                    </h3>
-                    {isTeamAdmin && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="h-6 text-[10px] ml-auto cursor-pointer"
-                        disabled={pushingFilter === "ignored_urls"}
-                        onClick={() =>
-                          handlePushFilterToTeam(
-                            "url_filter",
-                            "ignored_urls",
-                            settings.ignoredUrls || []
-                          )
-                        }
-                      >
-                        {pushingFilter === "ignored_urls" ? (
-                          <Loader2 className="h-3 w-3 mr-1 animate-spin" />
-                        ) : (
-                          <Users className="h-3 w-3 mr-1" />
-                        )}
-                        push to team
-                      </Button>
-                    )}
-                  </div>
-                </div>
-                <div className="ml-[26px]">
-                  <MultiSelect
-                    options={createUrlOptions(
-                      urlItems || [],
-                      settings.ignoredUrls || []
-                    )}
-                    defaultValue={settings.ignoredUrls || []}
-                    value={settings.ignoredUrls || []}
-                    onValueChange={handleIgnoredUrlsChange}
-                    placeholder="e.g. wellsfargo.com, chase.com..."
-                    allowCustomValues={true}
-                  />
-                  {(settings.ignoredUrls || []).some(
-                    (url) =>
-                      url.length < 5 ||
-                      ["bank", "pay", "money", "finance"].includes(
-                        url.toLowerCase()
-                      )
-                  ) && (
-                    <p className="text-xs text-yellow-600 dark:text-yellow-500 flex items-center gap-1 mt-1">
-                      <AlertCircle className="h-3 w-3" />
-                      Short patterns may over-match. Use specific domains.
-                    </p>
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center space-x-2.5 mb-2">
+              <EyeOff className="h-4 w-4 text-muted-foreground shrink-0" />
+              <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                Ignored Apps
+                <HelpTooltip text="Skip captures for these patterns. Plain text (e.g. '1Password') matches the app or any window title that contains it. Use 'App::Title' to scope to one window of an app (e.g. 'Slack::#hr' blocks only #hr in Slack)." />
+              </h3>
+            </div>
+            <div className="ml-[26px]">
+              <div data-testid="privacy-ignored-apps-select">
+                <MultiSelect
+                  options={createWindowOptions(
+                    windowItems || [],
+                    settings.ignoredWindows,
+                    installedApps
                   )}
-                  {filterView === "all" &&
-                    (settings.teamFilters?.ignoredUrls?.length ?? 0) > 0 && (
-                      <div className="flex flex-wrap gap-1 mt-1">
-                        {settings.teamFilters!.ignoredUrls.map((u) => (
-                          <Badge
-                            key={u}
-                            variant="outline"
-                            className="text-[10px] h-5 gap-0.5"
-                          >
-                            <Users className="h-2.5 w-2.5 mr-0.5" />
-                            {u}
-                            {isTeamAdmin && (
-                              <button
-                                onClick={() =>
-                                  handleRemoveTeamFilter(
-                                    "url_filter",
-                                    "ignored_urls",
-                                    u
-                                  )
-                                }
-                                className="ml-0.5 hover:text-destructive"
-                              >
-                                <svg
-                                  xmlns="http://www.w3.org/2000/svg"
-                                  width="10"
-                                  height="10"
-                                  viewBox="0 0 24 24"
-                                  fill="none"
-                                  stroke="currentColor"
-                                  strokeWidth="2"
-                                  strokeLinecap="round"
-                                  strokeLinejoin="round"
-                                >
-                                  <path d="M18 6 6 18" />
-                                  <path d="m6 6 12 12" />
-                                </svg>
-                              </button>
-                            )}
-                          </Badge>
-                        ))}
-                      </div>
-                    )}
-                </div>
-              </CardContent>
-            </Card>
-          </>
-        )}
+                  defaultValue={settings.ignoredWindows}
+                  value={settings.ignoredWindows}
+                  onValueChange={handleIgnoredWindowsChange}
+                  placeholder="Select apps to ignore..."
+                  allowCustomValues
+                />
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-[11px] mt-1.5 gap-1.5"
+                onClick={() => setPicker("ignored")}
+              >
+                <FolderTree className="h-3 w-3" /> browse apps & windows
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
 
-        {/* Team-only view */}
-        {filterView === "team" && (
-          <>
-            {(settings.teamFilters?.ignoredWindows?.length ?? 0) > 0 && (
-              <Card className="border-border bg-card">
-                <CardContent className="px-3 py-2.5">
-                  <div className="flex items-center space-x-2.5 mb-2">
-                    <EyeOff className="h-4 w-4 text-muted-foreground shrink-0" />
-                    <h3 className="text-sm font-medium text-foreground">
-                      Ignored Apps
-                    </h3>
-                  </div>
-                  <div className="flex flex-wrap gap-1 ml-[26px]">
-                    {settings.teamFilters!.ignoredWindows.map((w) => (
-                      <Badge
-                        key={w}
-                        variant="outline"
-                        className="text-[10px] h-5 gap-0.5"
-                      >
-                        <Users className="h-2.5 w-2.5 mr-0.5" />
-                        {w}
-                        {isTeamAdmin && (
-                          <button
-                            onClick={() =>
-                              handleRemoveTeamFilter(
-                                "window_filter",
-                                "ignored_windows",
-                                w
-                              )
-                            }
-                            className="ml-0.5 hover:text-destructive"
-                          >
-                            <svg
-                              xmlns="http://www.w3.org/2000/svg"
-                              width="10"
-                              height="10"
-                              viewBox="0 0 24 24"
-                              fill="none"
-                              stroke="currentColor"
-                              strokeWidth="2"
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                            >
-                              <path d="M18 6 6 18" />
-                              <path d="m6 6 12 12" />
-                            </svg>
-                          </button>
-                        )}
-                      </Badge>
-                    ))}
-                  </div>
-                </CardContent>
-              </Card>
-            )}
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center space-x-2.5 mb-2">
+              <Eye className="h-4 w-4 text-muted-foreground shrink-0" />
+              <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                Included Apps
+                <HelpTooltip text="When set, only matching windows are captured. Plain text is a global include (e.g. 'Slack' = only Slack). 'App::Title' creates a per-app whitelist (e.g. 'Slack::#engineering' keeps only that channel in Slack; other apps stay unaffected)." />
+              </h3>
+            </div>
+            <div className="ml-[26px]">
+              <div data-testid="privacy-included-apps-select">
+                <MultiSelect
+                  options={createWindowOptions(
+                    windowItems || [],
+                    settings.includedWindows,
+                    installedApps
+                  )}
+                  defaultValue={settings.includedWindows}
+                  value={settings.includedWindows}
+                  onValueChange={handleIncludedWindowsChange}
+                  placeholder="Only capture these apps (optional)..."
+                  allowCustomValues
+                />
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-[11px] mt-1.5 gap-1.5"
+                onClick={() => setPicker("included")}
+              >
+                <FolderTree className="h-3 w-3" /> browse apps & windows
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
 
-            {(settings.teamFilters?.includedWindows?.length ?? 0) > 0 && (
-              <Card className="border-border bg-card">
-                <CardContent className="px-3 py-2.5">
-                  <div className="flex items-center space-x-2.5 mb-2">
-                    <Eye className="h-4 w-4 text-muted-foreground shrink-0" />
-                    <h3 className="text-sm font-medium text-foreground">
-                      Included Apps
-                    </h3>
-                  </div>
-                  <div className="flex flex-wrap gap-1 ml-[26px]">
-                    {settings.teamFilters!.includedWindows.map((w) => (
-                      <Badge
-                        key={w}
-                        variant="outline"
-                        className="text-[10px] h-5 gap-0.5"
-                      >
-                        <Users className="h-2.5 w-2.5 mr-0.5" />
-                        {w}
-                        {isTeamAdmin && (
-                          <button
-                            onClick={() =>
-                              handleRemoveTeamFilter(
-                                "window_filter",
-                                "included_windows",
-                                w
-                              )
-                            }
-                            className="ml-0.5 hover:text-destructive"
-                          >
-                            <svg
-                              xmlns="http://www.w3.org/2000/svg"
-                              width="10"
-                              height="10"
-                              viewBox="0 0 24 24"
-                              fill="none"
-                              stroke="currentColor"
-                              strokeWidth="2"
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                            >
-                              <path d="M18 6 6 18" />
-                              <path d="m6 6 12 12" />
-                            </svg>
-                          </button>
-                        )}
-                      </Badge>
-                    ))}
-                  </div>
-                </CardContent>
-              </Card>
-            )}
-
-            {(settings.teamFilters?.ignoredUrls?.length ?? 0) > 0 && (
-              <Card className="border-border bg-card">
-                <CardContent className="px-3 py-2.5">
-                  <div className="flex items-center space-x-2.5 mb-2">
-                    <Globe className="h-4 w-4 text-muted-foreground shrink-0" />
-                    <h3 className="text-sm font-medium text-foreground">
-                      Ignored URLs
-                    </h3>
-                  </div>
-                  <div className="flex flex-wrap gap-1 ml-[26px]">
-                    {settings.teamFilters!.ignoredUrls.map((u) => (
-                      <Badge
-                        key={u}
-                        variant="outline"
-                        className="text-[10px] h-5 gap-0.5"
-                      >
-                        <Users className="h-2.5 w-2.5 mr-0.5" />
-                        {u}
-                        {isTeamAdmin && (
-                          <button
-                            onClick={() =>
-                              handleRemoveTeamFilter(
-                                "url_filter",
-                                "ignored_urls",
-                                u
-                              )
-                            }
-                            className="ml-0.5 hover:text-destructive"
-                          >
-                            <svg
-                              xmlns="http://www.w3.org/2000/svg"
-                              width="10"
-                              height="10"
-                              viewBox="0 0 24 24"
-                              fill="none"
-                              stroke="currentColor"
-                              strokeWidth="2"
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                            >
-                              <path d="M18 6 6 18" />
-                              <path d="m6 6 12 12" />
-                            </svg>
-                          </button>
-                        )}
-                      </Badge>
-                    ))}
-                  </div>
-                </CardContent>
-              </Card>
-            )}
-
-            {(settings.teamFilters?.ignoredWindows?.length ?? 0) === 0 &&
-              (settings.teamFilters?.includedWindows?.length ?? 0) === 0 &&
-              (settings.teamFilters?.ignoredUrls?.length ?? 0) === 0 && (
-                <Card className="border-border bg-card">
-                  <CardContent className="py-8 text-center text-muted-foreground">
-                    <p>no team filters shared yet</p>
-                    {isTeamAdmin && (
-                      <p className="text-sm mt-2">
-                        use &quot;push to team&quot; to share your filters
-                      </p>
-                    )}
-                  </CardContent>
-                </Card>
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center space-x-2.5 mb-2">
+              <Globe className="h-4 w-4 text-muted-foreground shrink-0" />
+              <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                Ignored URLs
+                <HelpTooltip text="Browser URLs matching these patterns will not be captured. Use for privacy — e.g. add 'bank.com' to skip banking sites." />
+              </h3>
+            </div>
+            <div className="ml-[26px]">
+              <MultiSelect
+                options={createUrlOptions(
+                  urlItems || [],
+                  settings.ignoredUrls || []
+                )}
+                defaultValue={settings.ignoredUrls || []}
+                value={settings.ignoredUrls || []}
+                onValueChange={handleIgnoredUrlsChange}
+                placeholder="e.g. wellsfargo.com, chase.com..."
+                allowCustomValues={true}
+              />
+              {(settings.ignoredUrls || []).some(
+                (url) =>
+                  url.length < 5 ||
+                  ["bank", "pay", "money", "finance"].includes(
+                    url.toLowerCase()
+                  )
+              ) && (
+                <p className="text-xs text-yellow-600 dark:text-yellow-500 flex items-center gap-1 mt-1">
+                  <AlertCircle className="h-3 w-3" />
+                  Short patterns may over-match. Use specific domains.
+                </p>
               )}
-          </>
-        )}
+            </div>
+          </CardContent>
+        </Card>
       </div>
 
       {/* Telemetry */}
@@ -1602,25 +1819,245 @@ export function PrivacySection() {
         </LockedSetting>
       </div>
 
-      {/* Floating apply & restart button */}
-      {hasUnsavedChanges && (
-        <div className="sticky bottom-4 flex justify-end pointer-events-none z-50">
-          <Button
-            onClick={handleUpdate}
-            disabled={isUpdating || Object.keys(validationErrors).length > 0}
-            size="sm"
-            data-testid="privacy-apply-restart"
-            className="pointer-events-auto flex items-center gap-1.5 h-9 px-4 text-sm bg-foreground text-background hover:bg-background hover:text-foreground transition-colors duration-150 shadow-lg"
-          >
-            {isUpdating ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <RefreshCw className="h-3.5 w-3.5" />
-            )}
-            Apply & Restart
-          </Button>
-        </div>
-      )}
+      {/* Floating apply & restart bar */}
+      <ApplyRestartBar
+        visible={hasUnsavedChanges}
+        onApply={handleUpdate}
+        isUpdating={isUpdating}
+        disabled={Object.keys(validationErrors).length > 0}
+        message="unsaved privacy changes. restart to apply."
+        testId="privacy-apply-restart"
+      />
+      <WindowPicker
+        open={picker !== null}
+        onOpenChange={(o) => {
+          if (!o) setPicker(null);
+        }}
+        selected={
+          picker === "included" ? settings.includedWindows : settings.ignoredWindows
+        }
+        installedApps={installedApps}
+        onAdd={(p) => {
+          if (picker === "included") addIncludedPattern(p);
+          else addIgnoredPattern(p);
+        }}
+        action={picker === "included" ? "include" : "ignore"}
+      />
     </div>
+  );
+}
+
+/**
+ * Admin team API token — enterprise builds only.
+ *
+ * Org-wide team-query auth has two intentionally separate pieces:
+ * `license_key` is org-level (every employee's machine, deployed by IT);
+ * `team_api_token` is per-admin and grants the `read:devices` /
+ * `read:search` / `read:records` scopes that the `screenpipe-team` pi
+ * skill calls v1 endpoints with. An admin mints one at
+ * https://screenpipe.com/enterprise?tab=tokens, pastes it here, and the
+ * desktop persists it to ~/.screenpipe/enterprise.json. Every new pi
+ * chat reads that file at boot and (un)installs the skill accordingly —
+ * no app restart needed, just open a new chat. Revoke from the same
+ * dashboard page to kill team access immediately.
+ *
+ * UX mirrors the local API key card above (Input + Eye reveal + Copy).
+ */
+function AdminTeamTokenCard() {
+  const { toast } = useToast();
+  const [liveToken, setLiveToken] = useState<string | null>(null);
+  const [revealToken, setRevealToken] = useState(false);
+  const [pendingToken, setPendingToken] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const reload = useCallback(async () => {
+    try {
+      const cur = await commands.getEnterpriseTeamApiToken();
+      setLiveToken(cur ?? null);
+    } catch {
+      setLiveToken(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  const handleSave = useCallback(async () => {
+    const trimmed = (pendingToken ?? "").trim();
+    if (!trimmed) {
+      toast({ title: "paste a token first" });
+      return;
+    }
+    if (!trimmed.startsWith("sk_ent_")) {
+      toast({
+        title: "that doesn't look like an admin token",
+        description: "expected format: sk_ent_…",
+      });
+      return;
+    }
+    setSaving(true);
+    try {
+      const res = await commands.saveEnterpriseTeamConfig(null, null, trimmed);
+      if (res.status === "error") throw new Error(res.error);
+      setLiveToken(trimmed);
+      setPendingToken(null);
+      toast({
+        title: "admin token saved",
+        description: "open a new pi chat to use it — no app restart needed",
+      });
+    } catch (e) {
+      toast({
+        title: "failed to save",
+        description: e instanceof Error ? e.message : String(e),
+        variant: "destructive",
+      });
+    } finally {
+      setSaving(false);
+    }
+  }, [pendingToken, toast]);
+
+  const handleClear = useCallback(async () => {
+    setSaving(true);
+    try {
+      const res = await commands.saveEnterpriseTeamConfig(null, null, "");
+      if (res.status === "error") throw new Error(res.error);
+      setLiveToken(null);
+      setPendingToken(null);
+      setRevealToken(false);
+      toast({ title: "admin token cleared" });
+    } catch (e) {
+      toast({
+        title: "failed to clear",
+        description: e instanceof Error ? e.message : String(e),
+        variant: "destructive",
+      });
+    } finally {
+      setSaving(false);
+    }
+  }, [toast]);
+
+  const displayValue =
+    pendingToken !== null
+      ? pendingToken
+      : liveToken
+      ? revealToken
+        ? liveToken
+        : "•".repeat(Math.min(liveToken.length, 32))
+      : "";
+  const hasPending = pendingToken !== null && pendingToken !== (liveToken ?? "");
+
+  return (
+    <Card className="border-border bg-card">
+      <CardContent className="px-3 py-2.5">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center space-x-2.5">
+            <Shield className="h-4 w-4 text-muted-foreground shrink-0" />
+            <div>
+              <h3 className="text-sm font-medium text-foreground">
+                Admin Team API Token
+              </h3>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Lets the pi agent query org-wide team data (devices, search,
+                records). Mint at{" "}
+                <button
+                  className="underline text-foreground hover:text-foreground/80"
+                  onClick={() =>
+                    openUrl("https://screenpipe.com/enterprise?tab=tokens")
+                  }
+                >
+                  screenpipe.com/enterprise → api tokens
+                </button>
+                .
+              </p>
+            </div>
+          </div>
+        </div>
+        <div className="mt-2.5 flex items-center space-x-2.5 pl-6.5">
+          <Input
+            type="text"
+            // First-time users have no `liveToken` yet — they must always be able
+            // to type a fresh token in. Only lock the input when we're displaying
+            // an EXISTING token in masked form; clicking the eye unlocks edit mode.
+            readOnly={Boolean(liveToken) && !revealToken && pendingToken === null}
+            placeholder="sk_ent_…"
+            data-testid="privacy-admin-token-input"
+            value={displayValue}
+            onChange={(e) => {
+              setPendingToken(e.target.value);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && hasPending) {
+                void handleSave();
+              }
+            }}
+            onClick={(e) => (e.target as HTMLInputElement).select()}
+            className="h-8 text-xs font-mono cursor-text select-all"
+          />
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8 px-2 shrink-0"
+            title={revealToken ? "Hide token" : "Reveal token"}
+            onClick={() => {
+              setRevealToken((v) => !v);
+              if (pendingToken === null && liveToken) setPendingToken(liveToken);
+            }}
+            // Eye only makes sense when there's a saved token to unmask. Fresh
+            // users typing a new token don't need it.
+            disabled={!liveToken}
+            data-testid="privacy-admin-token-reveal"
+          >
+            {revealToken ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-8 px-2 shrink-0"
+            title="Copy token"
+            disabled={!liveToken}
+            data-testid="privacy-admin-token-copy"
+            onClick={async () => {
+              if (!liveToken) return;
+              try {
+                await commands.copyTextToClipboard(liveToken);
+                toast({ title: "admin token copied to clipboard" });
+              } catch (error) {
+                toast({
+                  title: "couldn't copy admin token",
+                  description: error instanceof Error ? error.message : String(error),
+                  variant: "destructive",
+                });
+              }
+            }}
+          >
+            <Copy className="h-3.5 w-3.5" />
+          </Button>
+          {hasPending && (
+            <Button
+              size="sm"
+              className="h-8 text-xs"
+              disabled={saving}
+              onClick={handleSave}
+              data-testid="privacy-admin-token-save"
+            >
+              save
+            </Button>
+          )}
+          {!hasPending && liveToken && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8 text-xs"
+              disabled={saving}
+              onClick={handleClear}
+              data-testid="privacy-admin-token-clear"
+            >
+              clear
+            </Button>
+          )}
+        </div>
+      </CardContent>
+    </Card>
   );
 }

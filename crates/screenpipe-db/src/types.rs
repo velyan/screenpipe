@@ -115,6 +115,10 @@ pub struct OCRResultRaw {
     pub browser_url: Option<String>,
     pub focused: Option<bool>,
     pub device_name: String,
+    /// Origin of the row's text: `"accessibility"` (OS-native tree, primary)
+    /// or `"ocr"` (fallback for terminals, canvas-rendered apps, weak a11y).
+    /// `None` for legacy rows captured before text_source was tracked.
+    pub text_source: Option<String>,
 }
 
 #[derive(OaSchema, Debug, Serialize, Deserialize)]
@@ -133,6 +137,10 @@ pub struct OCRResult {
     pub browser_url: Option<String>,
     pub focused: Option<bool>,
     pub device_name: String,
+    /// Origin of `ocr_text`: `"accessibility"` (OS-native tree, primary) or
+    /// `"ocr"` (fallback). `None` for legacy rows. Despite the field name
+    /// `ocr_text`, the content is accessibility-derived for most captures.
+    pub text_source: Option<String>,
 }
 
 /// Content type for search queries.
@@ -189,6 +197,15 @@ pub struct Speaker {
     pub metadata: String,
 }
 
+#[derive(OaSchema, Debug, Serialize, Deserialize, FromRow, Clone)]
+pub struct TagAutocompleteItem {
+    pub name: String,
+    pub count: i64,
+    pub frame_count: i64,
+    pub audio_count: i64,
+    pub memory_count: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct NewDiarizationSegment {
     pub provider_speaker_label: String,
@@ -209,6 +226,75 @@ pub struct ReplacementAudioTranscription {
     pub end_time: f64,
 }
 
+/// Outcome of processing an audio chunk through the transcription pipeline.
+///
+/// The whole point of this enum is to separate "did we consider this chunk?"
+/// from "did the chunk produce indexable text?". Before this existed, the
+/// reconciliation sweep inferred processing state from the presence of an
+/// `audio_transcriptions` row — which conflated silent/duplicate/transcribed
+/// and caused infinite re-pick loops when STT returned empty.
+///
+/// `record_chunk_outcome` translates one of these variants into an atomic
+/// status update on `audio_chunks` (plus optional row writes / FK cascades)
+/// inside a single TX.
+#[derive(Debug, Clone)]
+pub enum ChunkOutcome {
+    /// STT produced text. The segments are written and chunk is marked done.
+    /// Multiple segments with identical trimmed text collide on the UNIQUE
+    /// `idx_audio_transcription_chunk_text` index — the writer uses
+    /// INSERT OR IGNORE so duplicates are dropped silently (their
+    /// per-speaker timing/identity stays in `diarization_segments`).
+    Transcribed {
+        segments: Vec<ReplacementAudioTranscription>,
+        engine: String,
+        device: String,
+        is_input_device: bool,
+        /// Capture timestamp of the chunk — used for the row's `timestamp`
+        /// column so search/timeline ordering matches the audio, not the
+        /// (possibly much later) reconciliation moment.
+        timestamp: DateTime<Utc>,
+    },
+
+    /// STT returned no text (silent audio, VAD rejected everything, or
+    /// post-dedup empty result). Chunk is marked `silent` so the
+    /// reconciliation sweep doesn't keep re-picking it.
+    Silent,
+
+    /// The transcription was a cross-device duplicate of another recent
+    /// device's transcript and was intentionally not recorded (the
+    /// `has_similar_recent_transcription` check fired). We still mark the
+    /// chunk as processed — semantically "we don't need to retry" — to
+    /// avoid the same loop the Silent variant prevents.
+    Duplicate,
+
+    /// Transient failure (engine crashed, model timeout, etc.). Bumps the
+    /// attempts counter; once attempts reach the cap, the chunk transitions
+    /// to `failed` and stops being picked.
+    Failed { reason: String },
+
+    /// Permanent failure (corrupt audio, decode error). Chunk is marked
+    /// `failed` immediately without attempts retries; downstream cleanup
+    /// can delete the file.
+    FailedPermanent { reason: String },
+}
+
+/// Maximum number of times reconciliation will retry a `Failed` outcome
+/// before giving up and marking the chunk `failed`. Tuned to absorb a
+/// transient engine restart without giving up on real audio.
+pub const MAX_TRANSCRIPTION_ATTEMPTS: i64 = 5;
+
+/// Processing-state counts across a recent window of audio chunks. Powers
+/// the new health diagnostic — direct measurement of a pipeline stall
+/// (pending older than threshold) instead of guessing from pool idleness.
+#[derive(Debug, Clone)]
+pub struct AudioChunkProcessingSnapshot {
+    pub pending: i64,
+    pub transcribed: i64,
+    pub silent: i64,
+    pub failed: i64,
+    pub oldest_pending: Option<DateTime<Utc>>,
+}
+
 /// A persistent memory: fact, preference, decision, or insight.
 #[derive(OaSchema, Debug, Serialize, Deserialize, FromRow, Clone)]
 pub struct MemoryRecord {
@@ -219,6 +305,32 @@ pub struct MemoryRecord {
     pub tags: Option<String>,
     pub importance: f64,
     pub frame_id: Option<i64>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A registered output file: produced by a pipe, chat, or agent.
+#[derive(OaSchema, Debug, Serialize, Deserialize, FromRow, Clone)]
+pub struct OutputRecord {
+    pub id: i64,
+    pub source: String,
+    pub source_type: String,
+    pub title: String,
+    pub kind: String,
+    pub original_path: Option<String>,
+    pub output_path: String,
+    pub size_bytes: i64,
+    pub preview: Option<String>,
+    pub metadata: Option<String>,
+    /// SAF envelope `kind` (e.g. "sop") when this output is a validated
+    /// SAF artifact; NULL for plain file outputs.
+    pub saf_kind: Option<String>,
+    /// SAF stable artifact id — survives across re-emits/versions.
+    pub artifact_id: Option<String>,
+    /// SAF artifact `version` number (monotonic per artifact_id). The column
+    /// name is prefixed to avoid clashing with the envelope's `saf_version`
+    /// format marker, which is always 1 and not stored.
+    pub saf_version: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -455,6 +567,8 @@ pub struct SearchMatch {
     // pub context: Option<String>,
     pub text: String,
     pub url: String,
+    /// Origin of `text`: `"accessibility"` or `"ocr"`. `None` for legacy rows.
+    pub text_source: Option<String>,
 }
 
 #[derive(OaSchema, Serialize)]
@@ -477,6 +591,8 @@ pub struct FrameRow {
     pub text_json: String,
     /// Accessibility tree JSON — used as fallback for bounding boxes when OCR text_json is empty
     pub accessibility_tree_json: Option<String>,
+    /// Origin of `ocr_text`: `"accessibility"` or `"ocr"`. `None` for legacy rows.
+    pub text_source: Option<String>,
 }
 
 /// Lightweight frame row for grouped search — skips text/text_json columns.
@@ -800,6 +916,12 @@ pub struct Element {
     /// implicitly true/false. See issue #2436.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_screen: Option<bool>,
+    /// Raw JSON of the element's automation properties (`is_enabled`,
+    /// `is_focused`, `is_selected`, `is_expanded`, `value`, `placeholder`, …)
+    /// serialized at capture. `None` for OCR rows and legacy accessibility
+    /// rows. Parsed into compact state by the API layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties: Option<String>,
 }
 
 /// Flat row for bulk insert (parent_id assigned after insert)
@@ -835,6 +957,9 @@ pub struct ElementRow {
     /// (legacy rows pre-issue-#2436 fix); search treats unknown as
     /// neither on- nor off-screen.
     pub on_screen: Option<bool>,
+    /// Raw JSON automation properties (see [`Element::properties`]). NULL for
+    /// OCR / legacy rows.
+    pub properties: Option<String>,
 }
 
 impl From<ElementRow> for Element {
@@ -865,6 +990,7 @@ impl From<ElementRow> for Element {
             confidence: row.confidence,
             sort_order: row.sort_order,
             on_screen: row.on_screen,
+            properties: row.properties,
         }
     }
 }

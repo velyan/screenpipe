@@ -16,6 +16,7 @@ use crate::platform::windows_uia::UiaContext;
 
 use anyhow::Result;
 use chrono::Utc;
+use screenpipe_core::window_pattern::{self, WindowPattern};
 use std::cell::UnsafeCell;
 use std::time::Instant;
 use tracing::debug;
@@ -101,7 +102,8 @@ pub struct WindowsTreeWalker {
 unsafe impl Send for WindowsTreeWalker {}
 
 impl WindowsTreeWalker {
-    pub fn new(config: TreeWalkerConfig) -> Self {
+    pub fn new(mut config: TreeWalkerConfig) -> Self {
+        config.compile_patterns();
         Self {
             config,
             state: UnsafeCell::new(WalkerState {
@@ -193,11 +195,19 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
             return Ok(TreeWalkResult::NotFound);
         }
 
+        // Skip transient shell-internal windows (MSCTFIME UI, Shell_TrayWnd, CiceroUIWndFrame).
+        // On Windows 11 24H2+ a TSF/IME regression causes these explorer.exe-owned windows to
+        // steal foreground focus for ~10-50ms on every mouse click, producing spurious frames.
+        if crate::platform::windows::is_transient_shell_window(hwnd) {
+            debug!("a11y: skipped transient shell window class");
+            return Ok(TreeWalkResult::Skipped(SkipReason::ExcludedApp));
+        }
+
         // Get process info
         let mut pid: u32 = 0;
         unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-        let app_name = crate::platform::windows::get_process_name(pid)
-            .unwrap_or_else(|| "Unknown".to_string());
+        // Resolve logical app name — handles WebView2 and shell-hosted Edge.
+        let app_name = crate::platform::windows::get_effective_app_name(hwnd, pid);
 
         // Skip excluded apps
         let app_lower = app_name.to_lowercase();
@@ -208,6 +218,7 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
                 .iter()
                 .any(|pattern| app_lower.contains(&pattern.to_lowercase()))
         {
+            debug!(app = %app_name, pid, "a11y: skipped — hardcoded excluded app");
             return Ok(TreeWalkResult::Skipped(SkipReason::ExcludedApp));
         }
 
@@ -218,13 +229,22 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
             String::from_utf16_lossy(&buf[..len as usize])
         };
 
+        debug!(
+            app = %app_name,
+            pid,
+            title = %window_name,
+            "a11y: walk_focused_window — evaluating window"
+        );
+
         // Skip incognito / private browsing windows (localized title check)
         if self.config.ignore_incognito_windows && crate::incognito::is_title_private(&window_name)
         {
+            debug!(app = %app_name, title = %window_name, "a11y: skipped — incognito/private window");
             return Ok(TreeWalkResult::Skipped(SkipReason::Incognito));
         }
 
-        // Apply user-configured ignored windows (check app name and window title)
+        // Apply user-configured ignored windows. Supports both legacy
+        // unscoped patterns ("Slack") and scoped `App::Title` patterns.
         let window_lower = window_name.to_lowercase();
         if self
             .config
@@ -235,23 +255,31 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
             return Ok(TreeWalkResult::Skipped(SkipReason::ExcludedApp));
         }
 
-        if self.config.ignored_windows.iter().any(|pattern| {
-            let p = pattern.to_lowercase();
-            app_lower.contains(&p) || window_lower.contains(&p)
-        }) {
+        let ignored_patterns = self.config.resolved_ignored();
+        let included_patterns = self.config.resolved_included();
+        if window_pattern::matches_any(ignored_patterns.as_ref(), &app_lower, &window_lower) {
+            debug!(
+                app = %app_name,
+                title = %window_name,
+                ignored_patterns = ?self.config.ignored_windows,
+                "a11y: skipped — matched user ignored pattern"
+            );
             return Ok(TreeWalkResult::Skipped(SkipReason::UserIgnored));
         }
 
-        // Apply user-configured included windows (whitelist mode)
-        if !self.config.included_windows.is_empty() {
-            let matches = self.config.included_windows.iter().any(|pattern| {
-                let p = pattern.to_lowercase();
-                app_lower.contains(&p) || window_lower.contains(&p)
-            });
-            if !matches {
-                return Ok(TreeWalkResult::Skipped(SkipReason::NotInIncludeList));
-            }
+        // Scoped includes act as per-app whitelists; other apps fall back to
+        // global semantics — see `window_pattern::passes_includes`.
+        if !window_pattern::passes_includes(included_patterns.as_ref(), &app_lower, &window_lower) {
+            debug!(
+                app = %app_name,
+                title = %window_name,
+                included_patterns = ?self.config.included_windows,
+                "a11y: skipped — not in include list"
+            );
+            return Ok(TreeWalkResult::Skipped(SkipReason::NotInIncludeList));
         }
+
+        debug!(app = %app_name, pid, title = %window_name, "a11y: capturing window tree");
 
         // Use adaptive budget overrides when set
         let effective_timeout = self.config.effective_walk_timeout();
@@ -279,12 +307,6 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
         let mut text_buffer = String::with_capacity(4096);
         let mut nodes = Vec::with_capacity(256);
         let mut browser_url: Option<String> = None;
-        let ignored_lower: Vec<String> = self
-            .config
-            .ignored_windows
-            .iter()
-            .map(|s| s.to_lowercase())
-            .collect();
         let mut hit_ignored_extension = false;
         extract_text_from_tree(
             &root,
@@ -295,7 +317,8 @@ impl TreeWalkerPlatform for WindowsTreeWalker {
             &mut browser_url,
             &monitor_rect,
             &window_rect,
-            &ignored_lower,
+            ignored_patterns.as_ref(),
+            &app_lower,
             &mut hit_ignored_extension,
         );
 
@@ -525,7 +548,8 @@ fn extract_text_from_tree(
     browser_url: &mut Option<String>,
     monitor_rect: &Option<MonitorRect>,
     window_rect: &Option<WindowRect>,
-    ignored_windows_lower: &[String],
+    ignored_patterns: &[WindowPattern],
+    focused_app_lower: &str,
     hit_ignored_extension: &mut bool,
 ) {
     if depth > max_depth {
@@ -586,12 +610,10 @@ fn extract_text_from_tree(
             // Browser extension popup detection: Document nodes for Chrome extensions
             // carry the extension name in `name` and a chrome-extension:// URL in `value`.
             // If either matches an ignored-window pattern, skip the entire subtree.
-            if !ignored_windows_lower.is_empty() {
+            if !ignored_patterns.is_empty() {
                 let matches = |val: &str| {
                     let lower = val.to_lowercase();
-                    ignored_windows_lower
-                        .iter()
-                        .any(|ig| lower.contains(ig.as_str()))
+                    window_pattern::matches_any(ignored_patterns, focused_app_lower, &lower)
                 };
                 if node.name.as_deref().is_some_and(|n| matches(n))
                     || node.value.as_deref().is_some_and(|v| matches(v))
@@ -611,7 +633,7 @@ fn extract_text_from_tree(
                         || v.starts_with("ms-browser-extension://")
                 });
                 if is_extension_popup
-                    && extension_subtree_matches_ignored(node, ignored_windows_lower)
+                    && extension_subtree_matches_ignored(node, ignored_patterns, focused_app_lower)
                 {
                     *hit_ignored_extension = true;
                     return;
@@ -703,7 +725,8 @@ fn extract_text_from_tree(
             browser_url,
             monitor_rect,
             window_rect,
-            ignored_windows_lower,
+            ignored_patterns,
+            focused_app_lower,
             hit_ignored_extension,
         );
     }
@@ -717,10 +740,14 @@ fn extract_text_from_tree(
 /// route).  In that case the top-level Document name check misses it, but the
 /// extension's own UI text always contains the brand name ("Bitwarden",
 /// "1Password", etc.) a few levels in.
-fn extension_subtree_matches_ignored(node: &AccessibilityNode, ignored_lower: &[String]) -> bool {
+fn extension_subtree_matches_ignored(
+    node: &AccessibilityNode,
+    ignored_patterns: &[WindowPattern],
+    focused_app_lower: &str,
+) -> bool {
     let matches = |val: &str| {
         let lower = val.to_lowercase();
-        ignored_lower.iter().any(|ig| lower.contains(ig.as_str()))
+        window_pattern::matches_any(ignored_patterns, focused_app_lower, &lower)
     };
 
     for child in &node.children {
@@ -828,6 +855,7 @@ mod tests {
             &None, // monitor_rect
             &None, // window_rect
             &[],
+            "",
             &mut false,
         );
 
@@ -898,6 +926,7 @@ mod tests {
             &None, // monitor_rect
             &None, // window_rect
             &[],
+            "",
             &mut false,
         );
 
@@ -973,7 +1002,8 @@ mod tests {
             ..Default::default()
         };
 
-        let ignored = vec!["bit".to_string()];
+        let ignored_raw = vec!["bit".to_string()];
+        let ignored = WindowPattern::parse_list(&ignored_raw);
         let mut buf = String::new();
         let mut nodes = Vec::new();
         let mut url = None;
@@ -989,6 +1019,7 @@ mod tests {
             &None, // monitor_rect
             &None, // window_rect
             &ignored,
+            "",
             &mut hit,
         );
 

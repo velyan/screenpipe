@@ -4,15 +4,23 @@
 
 import { homeDir } from "@tauri-apps/api/path";
 import { getVersion } from "@tauri-apps/api/app";
-import { invoke } from "@tauri-apps/api/core";
+import { commands } from "@/lib/utils/tauri";
 import { platform } from "@tauri-apps/plugin-os";
 import { Store } from "@tauri-apps/plugin-store";
+import { emit, listen } from "@tauri-apps/api/event";
 import React, { createContext, useContext, useEffect, useRef, useState } from "react";
 import posthog from "posthog-js";
 import { User } from "../utils/tauri";
 import { SettingsStore } from "../utils/tauri";
 import { installAuthInterceptor } from "../auth-guard";
+import { hasAppEntitlement, normalizeAppUser } from "@/lib/app-entitlement";
+import { screenpipeWebUrl } from "@/lib/web-url";
 import type { SourceCitation } from "@/lib/source-citations";
+import type {
+	EnterpriseAppUpdatePolicy,
+	EnterpriseInstallMetadata,
+} from "@ee/lib/app-update-policy";
+import { type FontSize, applyFontSize } from "@/lib/utils/font-size";
 export type VadSensitivity = "low" | "medium" | "high";
 
 export type AIProviderType =
@@ -79,6 +87,8 @@ export interface ChatMessage {
 	id: string;
 	role: "user" | "assistant";
 	content: string;
+	intent?: "steer";
+	turnIntentId?: string;
 	timestamp: number;
 	contentBlocks?: any[];
 	sourceCitations?: SourceCitation[];
@@ -90,6 +100,23 @@ export interface ChatMessage {
 	 *  or what's sent to the model. */
 	displayContent?: string;
 	images?: any[];
+	/** Non-image attachments (PDF/DOCX/XLSX/text) extracted to text. Only
+	 *  metadata is stored here — the actual extracted text already lives
+	 *  inside `content` (folded in at send time so the model sees it).
+	 *  The renderer reads this to draw attachment cards above the bubble. */
+	attachments?: Array<{
+		name: string;
+		ext: string;
+		charCount: number;
+		truncated: boolean;
+	}>;
+	interruptedBySteer?: boolean;
+	steeredResponse?: boolean;
+	/** Wall-clock work duration for coalesced assistant messages (pipe
+	 *  runs). Used by the chat renderer as a fallback when no thinking
+	 *  blocks contributed a duration, so the work-group can still show
+	 *  "Worked for X min" even when the agent emitted no thinking. */
+	workDurationMs?: number;
 }
 
 /** What kind of session a conversation represents.
@@ -132,12 +159,21 @@ export interface ChatConversation {
 	 *  sidebar sort order. Persisted so that order survives app restart;
 	 *  derived from messages on first hydration if not set on disk yet. */
 	lastUserMessageAt?: number;
+	/** ms since epoch of the most recent actual message append (user or
+	 *  assistant). Drives unread detection — immune to non-content writes. */
+	lastContentAt?: number;
+	/** ms since epoch of the most recent time this chat was actually opened.
+	 *  A value of `0` means "never viewed" for persisted unread restore. */
+	lastViewedAt?: number;
 	/** Conversation type — defaults to "chat" when missing (back-compat
 	 *  with older on-disk files). See `ConversationKind`. */
 	kind?: ConversationKind;
 	/** Pipe metadata for `pipe-watch` / `pipe-run` conversations.
 	 *  Undefined for plain chats. */
 	pipeContext?: PipeContext;
+	/** Optional user-assigned sidebar group label (lowercase, trimmed).
+	 *  Drives the manual-grouping sections in the chat sidebar. */
+	sidebarGroup?: string;
 	/** Last URL the agent navigated the embedded browser sidebar to.
 	 *  Drives the right-side `<BrowserSidebar />` panel: when the user
 	 *  re-opens this conversation the panel restores to this URL.
@@ -152,6 +188,13 @@ export interface ChatConversation {
 		 *  "re-open" button is shown in the chat header). */
 		collapsed?: boolean;
 	};
+	/** Title source priority: user > ai > fallback. Used to prevent
+	 *  lower-priority titles from overwriting higher-priority ones. */
+	titleSource?: "user" | "ai" | "fallback";
+	/** The AI preset ID last used in this conversation. Used to restore
+	 *  the model selection when switching between chats. Persisted to disk
+	 *  so the selection survives app restart. */
+	presetId?: string;
 }
 
 export interface ChatHistoryStore {
@@ -174,14 +217,14 @@ export type Settings = SettingsStore & {
 	enableWorkflowEvents?: boolean;
 	/** Audio transcription scheduling: "realtime" (default) or "batch" (longer chunks for quality) */
 	transcriptionMode?: "realtime" | "smart" | "batch";
-	/** Meeting-only live notes. Separate from background 24/7 transcription. */
+	/** Live notes for manually-started meetings. Separate from background 24/7 transcription. */
 	meetingLiveTranscriptionEnabled?: boolean;
-	/** Provider for meeting-only live notes. Defaults to the selected transcription engine. */
-	meetingLiveTranscriptionProvider?: "selected-engine" | "screenpipe-cloud" | "disabled" | "openai-realtime" | "deepgram-live";
+	/** Provider for manually-started live notes. Defaults to the selected transcription engine. */
+	meetingLiveTranscriptionProvider?: "selected-engine" | "screenpipe-cloud" | "disabled" | "deepgram-live";
+	/** When true, the user's typed text (and edited files) captured during a meeting is auto-appended to the meeting note when the meeting stops. Default true. */
+	appendTypedTextToMeetingNote?: boolean;
 	/** User's name for speaker identification — input device audio will be labeled with this name */
 	userName?: string;
-	/** When true, screen capture continues but OCR text extraction is skipped (saves CPU) */
-	disableOcr?: boolean;
 	/** Filters pushed from team — merged with local filters for recording */
 	teamFilters?: {
 		ignoredWindows: string[];
@@ -205,6 +248,13 @@ export type Settings = SettingsStore & {
 	 * Independent of pipeSyncEnabled — a user might want their memories on
 	 * every device but keep pipes device-local, or vice versa. Pro-gated. */
 	memoriesSyncEnabled?: boolean;
+	/** Sync connected-account credentials (OAuth tokens + manual API keys)
+	 * across devices. Off by default and kept separate from pipes/memories on
+	 * purpose: it syncs secrets, so enabling it is a distinct informed choice.
+	 * Credentials are end-to-end encrypted in the sync blob. Pro-gated. */
+	connectionsSyncEnabled?: boolean;
+	/** Font size for the entire app UI */
+	fontSize?: FontSize;
 	/** OpenAI-compatible transcription endpoint URL */
 	openaiCompatibleEndpoint?: string;
 	/** OpenAI-compatible transcription API key */
@@ -226,9 +276,6 @@ export type Settings = SettingsStore & {
 	filterMusic?: boolean;
 	/** Maximum batch transcription duration in seconds (0 = engine default: Deepgram 5000s, OpenAI 3000s, Whisper 600s) */
 	batchMaxDurationSecs?: number;
-	/** Redact PII from screenpipe API responses before they reach the LLM.
-	 *  Pro-only; enforced client-side (UI hides the toggle for non-pro). */
-	piPrivacyFilter?: boolean;
 	/** Show periodic notifications suggesting pipe ideas based on user's data (default: true) */
 	pipeSuggestionsEnabled?: boolean;
 	/** Hours between pipe suggestion notifications (default: 24) */
@@ -239,43 +286,91 @@ export type Settings = SettingsStore & {
 	showRestartNotifications?: boolean;
 	/** Pause all screen capture when a DRM-protected streaming app (Netflix, Disney+, etc.) or a remote-desktop client (Omnissa/VMware Horizon) is focused — they blank their windows during screen recording */
 	pauseOnDrmContent?: boolean;
-	/** Skip clipboard capture in the UI recorder (events + content). Recommended when piping ~/.screenpipe to a remote LLM since passwords / API keys often pass through the clipboard. */
+	/** Skip clipboard capture in the UI recorder (events + content). Defaults to true (clipboard capture OFF) — passwords / API keys often pass through the clipboard, so it's opt-in. */
 	disableClipboardCapture?: boolean;
+	/** Skip keyboard / typed-text capture in the UI recorder. Defaults to true (keyboard capture OFF) — the a11y tree + OCR still capture on-screen text, this only drops the raw keystroke stream where secrets get typed. */
+	disableKeyboardCapture?: boolean;
+	/** Skip mouse-click rows in the UI recorder. Defaults to false (click capture ON) — clicks carry no text payload and drive workflow/task mining. Clicks still wake event-driven capture when disabled. */
+	disableClickCapture?: boolean;
 	/** Experimental: capture System Audio via CoreAudio Process Tap (macOS 14.4+) instead of ScreenCaptureKit.
 	 *  Off by default. Ignored on macOS <14.4 and non-macOS — falls back to SCK. */
 	experimentalCoreaudioSystemAudio?: boolean;
 	/** Experimental: request Windows WASAPI microphone AEC when supported. */
 	windowsInputAecEnabled?: boolean;
+	/** Experimental: request Apple VoiceProcessingIO AEC on the default macOS microphone. */
+	macosInputVpioEnabled?: boolean;
 	/** Continue recording audio when the screen is locked (default: false) */
 	recordWhileLocked?: boolean;
 	/** Auto-delete local data older than retention days (free alternative to cloud archive) */
 	localRetentionEnabled?: boolean;
 	/** Days to keep data locally before auto-deleting (default: 14) */
 	localRetentionDays?: number;
-	/** What gets deleted past the cutoff: "media" keeps DB rows (search/timeline still
-	 * work), only reclaims mp4/wav/jpeg files. "all" wipes everything. Default: "media". */
-	localRetentionMode?: "media" | "all";
+	/** What gets deleted past the cutoff:
+	 * - "media" (default): keep all DB rows (search/timeline still work), only
+	 *   reclaim mp4/wav/jpeg files on disk.
+	 * - "lean": also strip the heavy accessibility/OCR element tree, the raw AX
+	 *   tree JSON, and the ui_events stream — shrinks the database itself while
+	 *   keeping text, transcripts, and memories searchable.
+	 * - "all": wipe everything past the cutoff. */
+	localRetentionMode?: "media" | "lean" | "all";
 	/** Apply macOS vibrancy effect to sidebar for a translucent glass look */
 	translucentSidebar?: boolean;
 	/** Hide model "thinking" reasoning blocks in chat (default: true) */
 	hideThinkingBlocks?: boolean;
-	/** Notification preferences — which notification sources are enabled */
+	/** Show the chat suggestion chips above the input — the "follow up"
+	 *  questions and the connection-aware suggested prompts. The single inline
+	 *  X on the chips flips this to false; re-enable from Settings → Display.
+	 *  Default true. */
+	showChatSuggestions?: boolean;
+	/** Auto-generate chat titles with the LLM after the first message.
+	 *  Costs one extra inference per new chat. Disable to save tokens —
+	 *  chats fall back to a title derived from the first message (default: true) */
+	autoGenerateChatTitles?: boolean;
+	/** Notification preferences — which notification sources are enabled.
+	 *  The set of per-category keys is declared in
+	 *  `components/settings/notification-registry.ts` (single source of truth);
+	 *  this type lists the stable ones the Rust side reads by name. */
 	notificationPrefs?: {
+		/** Master switch. When false the `/notify` handler drops every panel
+		 *  (pipe, system, power, transcript-stall, …). Default true. */
+		notificationsEnabled?: boolean;
+		/** Snooze expiry as epoch ms. While `> Date.now()` all non-critical
+		 *  notifications are paused. 0 / unset = not snoozed. */
+		snoozeUntil?: number;
+		/** Recurring daily quiet window (local wall-clock). When `enabled`,
+		 *  non-critical notifications are paused inside the window. */
+		quietHours?: { enabled: boolean; start: string; end: string };
+		/** Pipe names that still notify while snoozed / in quiet hours (Slack-VIP
+		 *  pattern). A hard master-off still silences them. */
+		allowDuringPause?: string[];
 		captureStalls: boolean;
 		appUpdates: boolean;
 		pipeSuggestions: boolean;
 		pipeNotifications: boolean;
 		/** Toast when a monitor is plugged, unplugged, or switched (clamshell, dock). Default true. */
 		displayChanges?: boolean;
+		/** Live-note prompt when a meeting is detected. Default true. */
+		meetingLiveNotes?: boolean;
+		/** OS notification when a meeting starts but no audio frames arrive within 60s. Default true. */
+		audioCaptureStalled?: boolean;
+		/** In-app /notify when audio is captured but no live transcript arrives within 60s. Default true. */
+		liveTranscriptStalled?: boolean;
+		/** Toast on informational power-profile transitions (Balanced / Saver), e.g. when unplugging AC.
+		 *  Critical AudioPaused/FullPause alerts always fire regardless. Default true. */
+		powerModeChanges?: boolean;
 		mutedPipes: string[];
 	};
 	/** Remote devices to monitor pipes on (LAN addresses) */
-	monitorDevices?: Array<{
-		address: string;
-		label?: string;
-	}>;
-	/** Enable recording schedule — when on, recording only runs during defined time ranges */
-	scheduleEnabled?: boolean;
+		monitorDevices?: Array<{
+			address: string;
+			label?: string;
+		}>;
+		/** Enterprise app-update policy fetched from the admin dashboard. */
+		enterpriseAppUpdatePolicy?: EnterpriseAppUpdatePolicy;
+		/** Local install/update-manager detection for enterprise fleet reporting. */
+		enterpriseInstallMetadata?: EnterpriseInstallMetadata;
+		/** Enable recording schedule — when on, recording only runs during defined time ranges */
+		scheduleEnabled?: boolean;
 	/** Per-day-of-week time ranges defining when recording is active */
 	scheduleRules?: Array<{
 		dayOfWeek: number;
@@ -285,6 +380,19 @@ export type Settings = SettingsStore & {
 	}>;
 	apiAuth?: boolean;
 	apiKey?: string;
+	/** Default behavior when a meeting is detected.
+	 * - `"ask"` (default): the existing meeting-start notification grows
+	 *   a "+ HD" action. Click → starts a meeting-bound session that
+	 *   auto-stops when the call ends.
+	 * - `"always"`: every detected meeting auto-starts a session.
+	 * - `"never"`: no auto-action; only the manual tray timer can start
+	 *   one.
+	 * Indefinite manual mode does not exist — every session is bound to
+	 * either a meeting or a timer, both with hard-cap safety nets. */
+	hdRecordingDefault?: "ask" | "always" | "never";
+	/** Capture debounce (ms) installed while an HD session is active.
+	 * Default 100 ≈ 10 fps. Clamped to >= 33 ms (30 fps ceiling). */
+	hdRecordingIntervalMs?: number;
 	/**
 	 * When true the backend binds the HTTP API to 0.0.0.0 instead of 127.0.0.1
 	 * so other devices on the LAN can reach it. api_auth is force-enabled
@@ -294,6 +402,20 @@ export type Settings = SettingsStore & {
 	 */
 	listenOnLan?: boolean;
 	encryptStore?: boolean;
+	/** Global blanket permission: allow screenpipe to copy browser cookies
+	 *  into the owned browser so the agent can browse sites the user is
+	 *  logged into. Revocable from the owned-browser cookie menu.
+	 *  Undefined = not decided yet, false = disabled, true = enabled. */
+	browserCookieAccessGranted?: boolean;
+	/** Windows-only: when true, closing the Home window hides it to the system
+	 * tray (and removes it from the taskbar) instead of minimizing. The Rust
+	 * close handler in src-tauri/src/main.rs reads this directly. Default off. */
+	minimizeToTrayOnClose?: boolean;
+	/** macOS-only: when true, run as a menu-bar-only "agent" app with no Dock
+	 * icon (NSApplication Accessory activation policy). The tray icon stays
+	 * visible. Read by reset_to_regular_and_refresh_tray in
+	 * src-tauri/src/window/panel.rs at startup and on window events. Default off. */
+	hideDockIcon?: boolean;
 }
 
 export function getEffectiveFilters(settings: Settings) {
@@ -306,7 +428,8 @@ export function getEffectiveFilters(settings: Settings) {
 }
 
 export const DEFAULT_PROMPT = `Rules:
-- Media: use standard markdown ![description](/path/to/file.mp4) for videos and ![description](/path/to/image.jpg) for images
+- Media: use standard markdown with angle-bracket local paths, like ![description](</path/to/file.mp4>) for videos and ![description](</path/to/image.jpg>) for images
+- Always wrap local file paths in angle brackets because screenpipe paths often contain spaces or parentheses
 - Diagrams: use \`\`\`mermaid blocks for visual summaries (flowchart, gantt, mindmap, graph)
 - Activity summaries: gantt charts with apps/duration
 - Workflows: flowcharts showing steps taken
@@ -348,17 +471,15 @@ const DEFAULT_IGNORED_WINDOWS_PER_OS: Record<string, string[]> = {
 	linux: ["Info center", "Discover", "Parted"],
 };
 
-// Two default screenpipe-cloud presets on first install:
-// - "Chat":  Claude Opus 4.7 if the user is pro, Claude Sonnet 4.5 otherwise.
-//           Opus is gated in the ai-gateway (subscribed tier), so pushing
-//           it to non-pro users would 403 their first message.
-// - "Pipes": Claude Haiku 4.5 — cheap/fast for recurring pipe runs.
-//           Pipes default to this preset; users can override per-pipe.
+// Default screenpipe-cloud presets on first install — every seed runs on
+// "auto": the ai-gateway routes to the best model the user's tier allows, so
+// nobody starts pinned to a specific (possibly tier-gated) Claude model.
+// - "Chat":  default preset, used by interactive chat.
+// - "Pipes": same routing, separate id so recurring pipe runs can be
+//           customized independently; users can override per-pipe.
 const CHAT_PRESET_ID = "chat";
 const PIPES_PRESET_ID = "pipes";
 
-// Pro users get the chat / pipes pair (opus for interactive chat, auto for
-// pipe runs that pick the cheapest model that fits the task).
 // Non-pro users get a single "screenpipe" preset on auto — auto handles
 // model routing without needing the user to know what to pick.
 const SCREENPIPE_PRESET_ID = "screenpipe";
@@ -370,7 +491,7 @@ export function makeDefaultPresets(isPro: boolean): AIPreset[] {
 				id: CHAT_PRESET_ID,
 				provider: "screenpipe-cloud",
 				url: "",
-				model: "claude-opus-4-7",
+				model: "auto",
 				maxContextChars: 200000,
 				defaultPreset: true,
 				prompt: "",
@@ -403,6 +524,45 @@ export function makeDefaultPresets(isPro: boolean): AIPreset[] {
 // ensureDefaultPreset() re-seeds with pro status once settings.user is loaded.
 const DEFAULT_CLOUD_PRESET: AIPreset = makeDefaultPresets(false)[0];
 
+const DEFAULT_AUDIO_ENGINE = "whisper-large-v3-turbo-quantized";
+
+// "Paid" = any active app entitlement (Basic / Business / Enterprise / Lifetime)
+// OR the legacy cloud-sync subscription. Broadened from `cloud_subscribed`-only so
+// every paying user — not just Cloud Sync subscribers — gets Screenpipe Cloud
+// transcription on by default. Still requires a token/id so the cloud engine can
+// authenticate against api.screenpipe.com.
+const isLoggedInProUser = (user: User | null | undefined) =>
+	hasAppEntitlement(user as any) && Boolean(user?.token || user?.id);
+
+const applyProCloudAudioDefaults = (settings: Settings): Settings => {
+	if (!isLoggedInProUser(settings.user)) return settings;
+	if ((settings as any)._proCloudAudioDefaultsAppliedV2) return settings;
+
+	// If the user picked a non-default, non-cloud engine, they've configured audio
+	// themselves — don't flip live-meeting on or rewrite the provider behind their back.
+	// V2 marker is intentionally left unset so a later switch back to default re-evaluates.
+	// Both platform defaults count as "untouched": macOS seeds whisper-turbo, while
+	// Windows/Linux seed parakeet — without the latter, paid users on those platforms
+	// would never be auto-switched to cloud.
+	const isPlatformDefaultEngine =
+		settings.audioTranscriptionEngine === DEFAULT_AUDIO_ENGINE ||
+		settings.audioTranscriptionEngine === "parakeet";
+	const userChoseCustomEngine =
+		!isPlatformDefaultEngine &&
+		settings.audioTranscriptionEngine !== "screenpipe-cloud";
+	if (userChoseCustomEngine) return settings;
+
+	const oldCloudEngineMigrationAlreadyRan = (settings as any)._cloudEngineApplied === true;
+	if (!oldCloudEngineMigrationAlreadyRan) {
+		settings.audioTranscriptionEngine = "screenpipe-cloud";
+	}
+	settings.meetingLiveTranscriptionEnabled = true;
+	settings.meetingLiveTranscriptionProvider = "screenpipe-cloud";
+	(settings as any)._proCloudAudioDefaultsAppliedV2 = true;
+
+	return settings;
+};
+
 let DEFAULT_SETTINGS: Settings = {
 			aiPresets: makeDefaultPresets(false) as any,
 			deviceId: crypto.randomUUID(),
@@ -414,18 +574,30 @@ let DEFAULT_SETTINGS: Settings = {
 			audioTranscriptionEngine: "whisper-large-v3-turbo-quantized",
 			meetingLiveTranscriptionEnabled: true,
 			meetingLiveTranscriptionProvider: "selected-engine",
+			appendTypedTextToMeetingNote: true,
 			ocrEngine: "default",
 			monitorIds: ["default"],
 			audioDevices: ["default"],
 			useSystemDefaultAudio: true,
-			usePiiRemoval: false,
+			// Default ON (#3819): this is the lightweight hot-path regex redaction
+			// in screenpipe-core (emails, phone numbers, SSNs, card numbers, API
+			// keys, etc.) — NOT the heavy async AI model (asyncPiiRedaction stays
+			// off, so no ~2.8GB model download). Privacy-by-default for new installs;
+			// existing users keep whatever they already chose.
+			usePiiRemoval: true,
 			port: 3030,
 			dataDir: "default",
 			disableAudio: false,
+			// New installs capture audio only during detected meetings (saves cloud
+			// transcription cost, disk, and CPU). Existing installs are NOT backfilled
+			// — they have no stored value, so the serde/UI "always" fallback keeps them
+			// on continuous capture without rewriting their settings.
+			audioCaptureMode: "meetings-only",
 			ignoredWindows: [
 			],
 			includedWindows: [],
 			ignoredUrls: [],
+			ignoredMeetingApps: [],
 			teamFilters: { ignoredWindows: [], includedWindows: [], ignoredUrls: [] },
 
 			analyticsEnabled: true,
@@ -438,6 +610,8 @@ let DEFAULT_SETTINGS: Settings = {
 				port: 11434,
 			},
 		updateChannel: "stable",
+			autoUpdate: false,
+			autoUpdatePipes: true,
 			autoStartEnabled: true,
 			platform: "unknown",
 			disabledShortcuts: [],
@@ -457,7 +631,10 @@ let DEFAULT_SETTINGS: Settings = {
 				website: null,
 				contact: null,
 				cloud_subscribed: null,
-				credits_balance: null
+				credits_balance: null,
+				app_entitled: null,
+				subscription_plan: null,
+				entitlement: null
 			},
 			showScreenpipeShortcut: "Control+Super+S",
 			startRecordingShortcut: "Super+Alt+U",
@@ -468,7 +645,6 @@ let DEFAULT_SETTINGS: Settings = {
 			searchShortcut: "Control+Super+K",
 			lockVaultShortcut: "Super+Shift+L",
 			disableVision: false,
-			disableOcr: false,
 			useAllMonitors: true,
 			showShortcutOverlay: true,
 			chatHistory: {
@@ -478,6 +654,7 @@ let DEFAULT_SETTINGS: Settings = {
 			},
 			overlayMode: "fullscreen",
 			showOverlayInScreenRecording: false,
+			disableTimeline: false,
 			videoQuality: "balanced",
 			transcriptionMode: "batch",
 			cloudArchiveEnabled: false,
@@ -486,13 +663,21 @@ let DEFAULT_SETTINGS: Settings = {
 			filterMusic: false,
 			ignoreIncognitoWindows: true,
 			pauseOnDrmContent: false,
-			disableClipboardCapture: false,
+			disableClipboardCapture: true,
+			disableKeyboardCapture: true,
+			disableClickCapture: false,
+			keepComputerAwake: false,
 			experimentalCoreaudioSystemAudio: false,
 			windowsInputAecEnabled: false,
+			macosInputVpioEnabled: false,
 			recordWhileLocked: false,
 			localRetentionEnabled: false,
 			localRetentionDays: 14,
 			localRetentionMode: "media",
+			encryptStore: true,
+			hdRecordingDefault: "ask",
+			hdRecordingIntervalMs: 100,
+			fontSize: "16px",
 		};
 
 export function createDefaultSettingsObject(): Settings {
@@ -510,7 +695,6 @@ export function createDefaultSettingsObject(): Settings {
 		DEFAULT_SETTINGS.lockVaultShortcut = p === "windows" ? "Ctrl+Shift+L" : "Super+Shift+L";
 
 		if (p === "windows") {
-			DEFAULT_SETTINGS.disableOcr = true;
 			DEFAULT_SETTINGS.overlayMode = "window";
 		}
 
@@ -543,8 +727,67 @@ export const getStore = async () => {
 /** Save the store and re-encrypt store.bin on disk (keychain encryption). */
 export const saveAndEncrypt = async (store: Store) => {
 	await store.save();
-	await invoke("reencrypt_store").catch(() => {});
+	await commands.reencryptStore().catch(() => {});
 };
+
+/**
+ * #3943: persist settings WITHOUT the cloud auth token in plaintext.
+ *
+ * The Clerk JWT must never land in store.bin (or its .last-good snapshot). When
+ * the settings being saved carry a token, mirror it to the authoritative
+ * encrypted secret store FIRST (so it's never lost), then write a stripped copy
+ * to disk. A token-less save never clears the secret store — only explicit
+ * logout (`setCloudToken(null)`) does — so a save during a transient
+ * pre-hydration state can't sign the user out.
+ */
+async function setSettingsStripped(store: Store, settings: Settings) {
+	const token = settings?.user?.token;
+	// Default to "safe to write as-is" when there's no token to protect.
+	let persisted = !token;
+	if (token) {
+		try {
+			const res = await commands.setCloudToken(token);
+			if (res.status === "ok") {
+				persisted = true;
+			} else {
+				console.warn("cloud token not persisted to secret store:", res.error);
+			}
+		} catch (e) {
+			console.warn("failed to mirror cloud token to secret store:", e);
+		}
+	}
+	// Only strip the plaintext token from store.bin once it's safely in the
+	// encrypted secret store. If persistence failed, keep it on disk so the user
+	// isn't silently signed out on the next restart (#3943).
+	const toPersist =
+		token && persisted
+			? { ...settings, user: { ...settings.user, token: undefined } }
+			: settings;
+	await store.set("settings", toPersist);
+}
+
+/**
+ * #3943: the cloud auth token no longer lives in store.bin (it's in the
+ * encrypted secret store). Neither `store.get("settings")` nor the cross-window
+ * `onKeyChange` broadcast carries it, so hydrate it back into the in-memory
+ * settings here. Every reader of `settings.user.token` (the account "logged in"
+ * indicator, the auth auto-refresh effect, the engine Bearer path) then keeps
+ * working unchanged across windows. Without this on the broadcast path, a login
+ * in one window ships a token-stripped user to every window (including the one
+ * that just logged in), so they all render "not logged in". Mutates in place and
+ * returns the same object for convenience.
+ */
+async function hydrateCloudToken(settings: Settings): Promise<Settings> {
+	if (settings.user && !settings.user.token) {
+		try {
+			const token = await commands.getCloudToken();
+			if (token) settings.user.token = token;
+		} catch (e) {
+			console.warn("failed to hydrate cloud token from secret store:", e);
+		}
+	}
+	return settings;
+}
 
 // Store utilities similar to Cap's implementation
 function createSettingsStore() {
@@ -554,6 +797,9 @@ function createSettingsStore() {
 		if (!settings) {
 			return createDefaultSettingsObject();
 		}
+
+		// #3943: re-hydrate the cloud token that no longer persists in store.bin.
+		await hydrateCloudToken(settings);
 
 		// Migration: Ensure existing users have deviceId for free tier tracking
 		let needsUpdate = false;
@@ -579,8 +825,8 @@ function createSettingsStore() {
 		// cancellation — so the tap silently captured zeroed buffers on every
 		// meeting. Users who explicitly want the tap (e.g. to dodge SCK's
 		// sleep/wake display-enumeration bug) can re-enable it in Settings.
-		// Reported by Ruark Ferreira on 2026-04-24 after his v2.4.46 calls
-		// kept dropping other participants.
+		// Reported on 2026-04-24 after v2.4.46 calls kept dropping
+		// other participants.
 		if (!(settings as any).coreaudioTapMigrationV2) {
 			settings.experimentalCoreaudioSystemAudio = false;
 			(settings as any).coreaudioTapMigrationV2 = true;
@@ -595,6 +841,17 @@ function createSettingsStore() {
 			settings.meetingLiveTranscriptionProvider = "selected-engine";
 			needsUpdate = true;
 		}
+		if (settings.appendTypedTextToMeetingNote === undefined) {
+			settings.appendTypedTextToMeetingNote = true;
+			needsUpdate = true;
+		}
+
+		// NOTE: audioCaptureMode is intentionally NOT backfilled for existing
+		// installs. Their stored settings have no value for it, so the engine's
+		// serde default ("always") and the UI's `?? "always"` fallback keep them on
+		// continuous capture — without writing anything to their store. Only brand-new
+		// installs default to "meetings-only" (via createDefaultSettingsObject, which
+		// get() returns directly when there are no stored settings).
 
 		// Migration: Add default presets if user has none
 		if (!settings.aiPresets || settings.aiPresets.length === 0) {
@@ -717,16 +974,11 @@ function createSettingsStore() {
 			needsUpdate = true;
 		}
 
-		// Post-migration: if user is a paid subscriber but still on a local engine
-		// (because migration ran before login), switch to cloud once.
-		// _cloudEngineApplied prevents overriding if user manually switches back later.
-		if (
-			settings.user?.cloud_subscribed &&
-			settings.audioTranscriptionEngine !== "screenpipe-cloud" &&
-			!(settings as any)._cloudEngineApplied
-		) {
-			settings.audioTranscriptionEngine = "screenpipe-cloud";
-			(settings as any)._cloudEngineApplied = true;
+		// Post-migration: when a logged-in Pro user is first confirmed, default
+		// both background and live transcription to Screenpipe Cloud. The marker
+		// prevents future user refreshes from overriding a manual engine choice.
+		if (isLoggedInProUser(settings.user) && !(settings as any)._proCloudAudioDefaultsAppliedV2) {
+			applyProCloudAudioDefaults(settings);
 			needsUpdate = true;
 		}
 
@@ -751,7 +1003,7 @@ function createSettingsStore() {
 					p?.model === "claude-sonnet-4-5"
 				) {
 					upgraded = true;
-					return { ...p, model: "claude-opus-4-7" };
+					return { ...p, model: "claude-opus-4-8" };
 				}
 				return p;
 			});
@@ -763,7 +1015,7 @@ function createSettingsStore() {
 
 		// Save migrations if needed
 		if (needsUpdate) {
-			await store.set("settings", settings);
+			await setSettingsStripped(store, settings);
 			await saveAndEncrypt(store);
 		}
 
@@ -773,8 +1025,16 @@ function createSettingsStore() {
 	const set = async (value: Partial<Settings>) => {
 		const store = await getStore();
 		const current = await get();
-		const newSettings = { ...current, ...value };
-		await store.set("settings", newSettings);
+		let newSettings = { ...current, ...value } as Settings;
+		if ("user" in value) {
+			// On logout / Pro→non-Pro transition, clear the V2 marker so a future
+			// Pro login re-evaluates cloud defaults (handles account switching).
+			if (!isLoggedInProUser(newSettings.user)) {
+				delete (newSettings as any)._proCloudAudioDefaultsAppliedV2;
+			}
+			newSettings = applyProCloudAudioDefaults(newSettings);
+		}
+		await setSettingsStripped(store, newSettings);
 		await saveAndEncrypt(store);
 	};
 
@@ -792,8 +1052,15 @@ function createSettingsStore() {
 
 	const listen = (callback: (settings: Settings) => void) => {
 		return getStore().then((store) => {
-			return store.onKeyChange("settings", (newValue: Settings | null | undefined) => {
-				callback(newValue || createDefaultSettingsObject());
+			// #3943: the broadcast value is token-stripped (see setSettingsStripped),
+			// so hydrate the cloud token before handing settings to React, mirroring
+			// get(). A monotonic seq drops a slow hydration that a newer broadcast
+			// (e.g. a logout fired right after a login) has already superseded.
+			let seq = 0;
+			return store.onKeyChange("settings", async (newValue: Settings | null | undefined) => {
+				const mySeq = ++seq;
+				const next = await hydrateCloudToken(newValue || createDefaultSettingsObject());
+				if (mySeq === seq) callback(next);
 			});
 		});
 	};
@@ -816,7 +1083,7 @@ interface SettingsContextType {
 	resetSettings: () => Promise<void>;
 	resetSetting: <K extends keyof Settings>(key: K) => Promise<void>;
 	reloadStore: () => Promise<void>;
-	loadUser: (token: string) => Promise<void>;
+	loadUser: (token: string, verify?: boolean) => Promise<void>;
 	getDataDir: () => Promise<string>;
 	isSettingsLoaded: boolean;
 	loadingError: string | null;
@@ -852,6 +1119,15 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 					port: loadedSettings.port ?? 3030,
 					authEnabled: loadedSettings.apiAuth ?? true,
 				});
+
+				// Hydrate Rust's owned-browser runtime cache from persisted settings.
+				// This prevents the cookie-access prompt from reappearing after restart.
+				await commands
+					.setBrowserCookieAccessState(
+						loadedSettings.browserCookieAccessGranted === true,
+						loadedSettings.browserCookieAccessGranted === false,
+					)
+					.catch(() => {});
 			} catch (error) {
 				console.error("Failed to load settings:", error);
 				setLoadingError(error instanceof Error ? error.message : "Unknown error");
@@ -871,17 +1147,47 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		};
 	}, []);
 
-	// Install global fetch interceptor to catch 401s from screenpi.pe
+	// Install global fetch interceptor to catch 401s from screenpipe.com
 	const settingsRef = useRef(settings);
 	settingsRef.current = settings;
+
+	// Monotonic auth generation, bumped on every explicit sign-out. A
+	// loadUser() call snapshots this at entry; if a sign-out bumps it while the
+	// network request is still in flight, loadUser refuses to write the user
+	// back. Without this, a slow refresh that started before the user clicked
+	// "logout" resurrects the just-cleared session — the user had to click
+	// logout twice. Regression test: e2e/specs/zz-logout-resurrect.spec.ts.
+	const authGenerationRef = useRef(0);
+
 	useEffect(() => {
 		installAuthInterceptor(
 			() => settingsRef.current.user?.token ?? undefined,
 			async () => {
 				await updateSettings({ user: null as any });
+				// Mirror the sign-out into the sidecar so the pi-agent and
+				// cloud_proxy.rs stop sending the now-revoked token on the
+				// next pipe run.
+				try {
+					await commands.setCloudToken(null);
+				} catch (e) {
+					console.warn("failed to clear cloud token in sidecar:", e);
+				}
 			}
 		);
 	}, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+	// Cross-window sign-out: when any window broadcasts a sign-out (logout
+	// button or 401 interceptor), bump THIS window's auth generation so an
+	// in-flight loadUser here also aborts instead of writing the user back
+	// into the shared store. Pairs with the emit() in updateSettings.
+	useEffect(() => {
+		const unlistenPromise = listen("screenpipe-auth-signout", () => {
+			authGenerationRef.current += 1;
+		});
+		return () => {
+			unlistenPromise.then((un) => un()).catch(() => {});
+		};
+	}, []);
 
 	// Auto-refresh user data from API when app starts with a stored token.
 	// This ensures subscription status (cloud_subscribed) stays current —
@@ -951,6 +1257,8 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 			website: settings.user?.website,
 			contact: settings.user?.contact,
 			cloud_subscribed: !!settings.user?.cloud_subscribed,
+			app_entitled: !!(settings.user as any)?.app_entitled,
+			subscription_plan: (settings.user as any)?.subscription_plan,
 			machine_analytics_id: settings.analyticsId,
 		};
 
@@ -962,7 +1270,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 				posthog.identify(distinctId, baseProps);
 			});
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [settings.analyticsId, settings.user?.id, settings.user?.clerk_id, settings.user?.cloud_subscribed]);
+	}, [settings.analyticsId, settings.user?.id, settings.user?.clerk_id, settings.user?.cloud_subscribed, (settings.user as any)?.app_entitled, (settings.user as any)?.subscription_plan]);
 
 	// When user becomes a Pro subscriber, default to cloud transcription (one-time)
 	useEffect(() => {
@@ -1000,7 +1308,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		}
 
 		const nextPresets = settings.aiPresets.map((p: any, i: number) =>
-			i === idx ? { ...p, model: "claude-opus-4-7" } : p
+			i === idx ? { ...p, model: "claude-opus-4-8" } : p
 		);
 		settingsStore.set({
 			aiPresets: nextPresets,
@@ -1009,7 +1317,25 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [settings.user?.cloud_subscribed, isSettingsLoaded]);
 
+	useEffect(() => {
+		applyFontSize(settings.fontSize);
+	}, [settings.fontSize]);
+
 	const updateSettings = async (updates: Partial<Settings>) => {
+		// Sign-out (user → null) must invalidate any loadUser() request that is
+		// currently in flight so the cleared session can't be resurrected when a
+		// slow refresh resolves afterwards. Bump synchronously — before the first
+		// await — so even the logout button's fire-and-forget call wins the race.
+		if ("user" in updates && !updates.user) {
+			authGenerationRef.current += 1;
+			// Broadcast to the other windows. Each non-overlay window has its own
+			// SettingsProvider + DeeplinkHandler, so a login's deep-link fires a
+			// loadUser in EVERY window. Without this, a logout in this window
+			// wouldn't invalidate an in-flight loadUser in another window, which
+			// would write the user back into the shared store and resurrect the
+			// session. Fire-and-forget; the listener above bumps each window's ref.
+			emit("screenpipe-auth-signout").catch(() => {});
+		}
 		await settingsStore.set(updates);
 		// Settings will be updated via the listener
 
@@ -1054,14 +1380,22 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		return `${homeDirPath}/.screenpipe`;
 	};
 
-	const loadUser = async (token: string) => {
+	const loadUser = async (token: string, verify = false) => {
+		// Snapshot the auth generation at the start of the request. If the user
+		// signs out while this fetch is in flight, the generation changes and we
+		// abort the write below instead of resurrecting the cleared session.
+		const generation = authGenerationRef.current;
+		const startingToken = settingsRef.current.user?.token ?? null;
 		try {
-			const response = await fetch(`https://screenpi.pe/api/user`, {
+			const response = await fetch(screenpipeWebUrl("/api/user", "https://screenpipe.com"), {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
 				},
-				body: JSON.stringify({ token }),
+				// verify=true asks the server to consult Stripe directly (used by the
+				// entitlement gate right after purchase); normal polls omit it to keep
+				// the hot path off Stripe.
+				body: JSON.stringify({ token, ...(verify ? { verify: true } : {}) }),
 			});
 
 			if (!response.ok) {
@@ -1070,10 +1404,18 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 			}
 
 			const data = await response.json();
-			const userData = {
-				...data.user,
-				token
-			} as User;
+			const userData = normalizeAppUser(data.user, token) as User;
+
+			// The user signed out while this request was in flight — writing
+			// userData now would resurrect the cleared session (the "logout needs
+			// two clicks" bug). Abort silently; the sign-out already won.
+			if (
+				authGenerationRef.current !== generation ||
+				(startingToken !== null && settingsRef.current.user?.token !== token)
+			) {
+				console.log("loadUser: sign-out during fetch — not restoring session");
+				return;
+			}
 
 			// if user was not logged in, send posthog event and bridge identity
 			if (!settings.user?.id) {
@@ -1094,6 +1436,19 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 			}
 
 			await updateSettings({ user: userData });
+
+			// Push the fresh token into the running sidecar so the
+			// `Server.cloud_token` (used by /v1/chat/completions proxy) and
+			// the `PiExecutor.user_token` (used by pi-agent's models.json
+			// apiKey) both pick up the new value on the next pipe run.
+			// Without this, sign-in only updates the webview's settings —
+			// the engine keeps whatever token it captured at boot (often
+			// `null`), and every Sonnet/Opus pipe 403s on tier=anonymous.
+			try {
+				await commands.setCloudToken(token);
+			} catch (e) {
+				console.warn("failed to push cloud token to sidecar:", e);
+			}
 		} catch (err) {
 			console.error("failed to load user:", err instanceof Error ? err.message : err);
 			throw err;

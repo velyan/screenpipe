@@ -20,12 +20,19 @@ import {
   isEnterpriseManagedPreset,
   normalizeEnterpriseAiPresetPolicy,
 } from "@/lib/enterprise-ai-preset-policy";
+import {
+  DEFAULT_ENTERPRISE_APP_UPDATE_POLICY,
+  EnterpriseAppUpdatePolicy,
+  EnterpriseInstallMetadata,
+  normalizeEnterpriseAppUpdatePolicy,
+} from "@ee/lib/app-update-policy";
 
 interface EnterprisePolicy {
   hiddenSections: string[];
   lockedSettings: Record<string, unknown>;
   managedAiPreset: EnterpriseManagedAiPreset | null;
   aiPresetPolicy: EnterpriseAiPresetPolicy;
+  appUpdatePolicy: EnterpriseAppUpdatePolicy;
   managedPipes: ManagedPipe[];
   orgName: string;
 }
@@ -35,12 +42,19 @@ const EMPTY_POLICY: EnterprisePolicy = {
   lockedSettings: {},
   managedAiPreset: null,
   aiPresetPolicy: DEFAULT_ENTERPRISE_AI_PRESET_POLICY,
+  appUpdatePolicy: DEFAULT_ENTERPRISE_APP_UPDATE_POLICY,
   managedPipes: [],
   orgName: "",
 };
 
-// Sections always hidden in enterprise builds (regardless of policy)
-const ENTERPRISE_DEFAULT_HIDDEN = ["account", "referral"];
+// Sections always hidden in enterprise builds (regardless of policy).
+// "account" is deliberately NOT here: its visibility is admin-controlled via
+// the workspace policy's UI-visibility toggle (hidden_sections), because the
+// Account section carries the sign-in button — and team pipe sharing + role
+// detection need sign-in. Hardcoding it hidden made signing in impossible on
+// enterprise devices. "referral" stays hardcoded (consumer growth surface,
+// meaningless in a managed org).
+const ENTERPRISE_DEFAULT_HIDDEN = ["referral"];
 
 // Re-fetch policy every 5 minutes so admin changes propagate without app restart
 const POLL_INTERVAL_MS = 5 * 60 * 1000;
@@ -121,6 +135,136 @@ async function applyAiPresetPolicy(policy: EnterpriseAiPresetPolicy): Promise<vo
   await store.save();
 }
 
+async function getEnterpriseInstallMetadata(): Promise<EnterpriseInstallMetadata> {
+  try {
+    return await commands.getEnterpriseInstallMetadata();
+  } catch {
+    return {
+      install_source: "unknown",
+      update_manager: "unknown",
+      managed: false,
+      detected_by: [],
+    };
+  }
+}
+
+async function applyAppUpdatePolicy(policy: EnterpriseAppUpdatePolicy): Promise<EnterpriseInstallMetadata> {
+  const store = await getStore();
+  const settings = (await store.get<Record<string, unknown>>("settings")) || {};
+  const metadata = await getEnterpriseInstallMetadata();
+  await store.set("settings", {
+    ...settings,
+    enterpriseAppUpdatePolicy: policy,
+    enterpriseInstallMetadata: metadata,
+    autoUpdate: policy.allow_employee_override
+      ? settings.autoUpdate ?? policy.default_auto_update
+      : policy.default_auto_update,
+  });
+  await store.save();
+  return metadata;
+}
+
+/**
+ * Apply enterprise-forced PII redaction settings to the local settings store so
+ * the recording engine honors them. The admin sets these in the workspace
+ * policy (lockedSettings.usePiiRemoval / piiBackend / piiRedactionLabels); we
+ * write them into `settings` the same way the AI-preset + app-update policies
+ * do, so the on-device ONNX + Tinfoil PII workers pick them up. The matching UI
+ * controls are disabled separately so the employee can't override a forced
+ * value. Keys map 1:1 to the engine's RecordingSettings fields
+ * (use_pii_removal, pii_backend, pii_redaction_labels).
+ */
+async function applyPiiPolicy(lockedSettings: Record<string, unknown>): Promise<void> {
+  const updates: Record<string, unknown> = {};
+
+  const master = lockedSettings.usePiiRemoval;
+  if (master === "true" || master === "false") {
+    updates.usePiiRemoval = master === "true";
+  }
+
+  const backend = lockedSettings.piiBackend;
+  if (backend === "local" || backend === "tinfoil") {
+    updates.piiBackend = backend;
+  }
+
+  const labels = lockedSettings.piiRedactionLabels;
+  if (Array.isArray(labels)) {
+    // canonical SpanLabel snake_case names; `secret` is always redacted
+    const clean = Array.from(new Set(labels.filter((l): l is string => typeof l === "string")));
+    if (!clean.includes("secret")) clean.push("secret");
+    updates.piiRedactionLabels = clean;
+  }
+
+  if (Object.keys(updates).length === 0) return;
+
+  const store = await getStore();
+  const settings = (await store.get<Record<string, unknown>>("settings")) || {};
+  await store.set("settings", { ...settings, ...updates });
+  await store.save();
+}
+
+/**
+ * Apply enterprise-forced input-capture settings (keyboard / click rows) to
+ * the local settings store so the recording engine honors them. The admin
+ * sets these in the workspace policy's Managed settings
+ * (lockedSettings.disableKeyboardCapture / disableClickCapture — "true" |
+ * "false" strings like every managed value). Unlike the PII policy, the
+ * engine only reads these at spawn, so when a forced value actually changes
+ * the device's effective setting we restart the engine once. The matching
+ * privacy-section toggles are disabled separately so the employee can't
+ * override a forced value.
+ */
+let inputCaptureRestartInFlight = false;
+
+async function applyInputCapturePolicy(lockedSettings: Record<string, unknown>): Promise<void> {
+  const updates: Record<string, boolean> = {};
+
+  const keyboard = lockedSettings.disableKeyboardCapture;
+  if (keyboard === "true" || keyboard === "false") {
+    updates.disableKeyboardCapture = keyboard === "true";
+  }
+
+  const clicks = lockedSettings.disableClickCapture;
+  if (clicks === "true" || clicks === "false") {
+    updates.disableClickCapture = clicks === "true";
+  }
+
+  if (Object.keys(updates).length === 0) return;
+
+  const store = await getStore();
+  const settings = (await store.get<Record<string, unknown>>("settings")) || {};
+  // Defaults when the key was never persisted mirror the app defaults:
+  // keyboard rows off, click rows on.
+  const current: Record<string, boolean> = {
+    disableKeyboardCapture: (settings.disableKeyboardCapture as boolean | undefined) ?? true,
+    disableClickCapture: (settings.disableClickCapture as boolean | undefined) ?? false,
+  };
+  const changed = Object.entries(updates).some(([key, value]) => current[key] !== value);
+  if (!changed) return;
+
+  await store.set("settings", { ...settings, ...updates });
+  await store.save();
+  console.log(
+    `[enterprise] input capture policy changed settings: ${Object.entries(updates)
+      .map(([k, v]) => `${k}=${v}`)
+      .join(", ")} — restarting engine`
+  );
+
+  // Restart so the forced values take effect without waiting for the
+  // employee to restart manually. Guarded so overlapping policy polls in
+  // this window don't stack restarts; steady-state polls are no-ops because
+  // the store already matches the policy.
+  if (inputCaptureRestartInFlight) return;
+  inputCaptureRestartInFlight = true;
+  try {
+    await commands.stopScreenpipe();
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    await commands.spawnScreenpipe(null);
+  } finally {
+    inputCaptureRestartInFlight = false;
+  }
+}
+
 /**
  * Fire-and-forget heartbeat to report device status to the enterprise API.
  * Called after a successful policy fetch. Never throws, never blocks.
@@ -132,6 +276,10 @@ async function sendHeartbeat(licenseKey: string): Promise<void> {
     const deviceId = (settings.deviceId as string) || "unknown";
     const appVersion = await getVersion().catch(() => "unknown");
     const devicePlatform = getPlatform();
+    const appUpdatePolicy = normalizeEnterpriseAppUpdatePolicy(
+      settings.enterpriseAppUpdatePolicy
+    );
+    const installMetadata = await getEnterpriseInstallMetadata();
 
     let frameStatus = "unknown";
     let audioStatus = "unknown";
@@ -154,7 +302,7 @@ async function sendHeartbeat(licenseKey: string): Promise<void> {
       pipeStatuses = await gatherPipeStatuses();
     } catch {}
 
-    await tauriFetch("https://screenpi.pe/api/enterprise/heartbeat", {
+    await tauriFetch("https://screenpipe.com/api/enterprise/heartbeat", {
       method: "POST",
       headers: {
         "X-License-Key": licenseKey,
@@ -166,6 +314,16 @@ async function sendHeartbeat(licenseKey: string): Promise<void> {
         platform: devicePlatform,
         app_version: appVersion,
         recording_status: { frame_status: frameStatus, audio_status: audioStatus },
+        update_manager: installMetadata.update_manager,
+        management_detected: installMetadata.managed,
+        install_source: installMetadata.install_source,
+        management_detected_by: installMetadata.detected_by,
+        update_status: {
+          policy_mode: appUpdatePolicy.mode,
+          default_auto_update: appUpdatePolicy.default_auto_update,
+          allow_employee_override: appUpdatePolicy.allow_employee_override,
+          channel: appUpdatePolicy.channel,
+        },
         pipe_statuses: pipeStatuses,
       }),
     });
@@ -181,7 +339,14 @@ function cachePolicy(policy: EnterprisePolicy) {
 function loadCachedPolicy(): EnterprisePolicy | null {
   try {
     const raw = localStorage.getItem(CACHE_KEY);
-    if (raw) return JSON.parse(raw);
+    if (raw) {
+      const policy = JSON.parse(raw);
+      return {
+        ...EMPTY_POLICY,
+        ...policy,
+        appUpdatePolicy: normalizeEnterpriseAppUpdatePolicy(policy.appUpdatePolicy),
+      };
+    }
   } catch {}
   return null;
 }
@@ -215,17 +380,48 @@ export function useEnterprisePolicy() {
 
   const fetchPolicy = useCallback(async (licenseKey: string): Promise<FetchResult> => {
     try {
-      // Include device ID for pipe targeting
+      // Include device ID for pipe targeting + cloud session JWT so the
+      // server can tell us whether the signed-in user is an admin of this
+      // license. The admin bit gates installation of the screenpipe-team
+      // skill in the desktop pi-agent — see `Pi::is_enterprise_admin`.
       let deviceId = "unknown";
+      let cloudToken: string | null = null;
       try {
         const store = await getStore();
         const settings = (await store.get<Record<string, unknown>>("settings")) || {};
         deviceId = (settings.deviceId as string) || "unknown";
+        const user = settings.user as Record<string, unknown> | undefined;
+        const token = user?.token;
+        if (typeof token === "string" && token.length > 0) {
+          cloudToken = token;
+        }
       } catch {}
 
-      const res = await tauriFetch("https://screenpi.pe/api/enterprise/policy", {
+      // Fallback: read directly from ~/.screenpipe/auth.json when the
+      // in-memory store hasn't been hydrated yet (dev launches before
+      // sign-in completes, or store resets). auth.json is the durable
+      // on-disk copy maintained by the pi-agent configuration flow.
+      if (!cloudToken) {
+        try {
+          const fallback = await commands.getCloudToken();
+          if (typeof fallback === "string" && fallback.length > 0) {
+            cloudToken = fallback;
+          }
+        } catch (e) {
+          console.warn("[enterprise] get_cloud_token failed:", e);
+        }
+      }
+
+      const headers: Record<string, string> = {
+        "X-License-Key": licenseKey,
+        "X-Device-Id": deviceId,
+      };
+      if (cloudToken) {
+        headers["Authorization"] = `Bearer ${cloudToken}`;
+      }
+      const res = await tauriFetch("https://screenpipe.com/api/enterprise/policy", {
         method: "GET",
-        headers: { "X-License-Key": licenseKey, "X-Device-Id": deviceId },
+        headers,
       });
       if (res.status === 401 || res.status === 402) {
         console.error(`[enterprise] policy fetch: key rejected (${res.status})`);
@@ -239,6 +435,9 @@ export function useEnterprisePolicy() {
       const aiPresetPolicy = normalizeEnterpriseAiPresetPolicy(
         data.aiPresetPolicy ?? data.managedAiPreset ?? null
       );
+      const appUpdatePolicy = normalizeEnterpriseAppUpdatePolicy(
+        data.appUpdatePolicy ?? data.lockedSettings?.app_update_policy
+      );
       const lockedKeys = Object.keys(data.lockedSettings || {});
       const allHidden = [
         ...ENTERPRISE_DEFAULT_HIDDEN,
@@ -250,6 +449,7 @@ export function useEnterprisePolicy() {
         lockedSettings: data.lockedSettings || {},
         managedAiPreset: data.managedAiPreset || null,
         aiPresetPolicy,
+        appUpdatePolicy,
         managedPipes: data.managedPipes || [],
         orgName: data.orgName || "",
       };
@@ -257,9 +457,6 @@ export function useEnterprisePolicy() {
         `[enterprise] policy loaded: org=${result.orgName}, hidden=[${result.hiddenSections.join(",")}], locked=[${lockedKeys.join(",")}]`
       );
       cachePolicy(result);
-
-      // Fire-and-forget heartbeat
-      sendHeartbeat(licenseKey);
 
       // Apply enterprise AI preset policy to settings store.
       if (result.aiPresetPolicy) {
@@ -273,18 +470,113 @@ export function useEnterprisePolicy() {
         }
       }
 
-      // Sync managed pipes to local filesystem
-      if (result.managedPipes.length > 0) {
-        syncManagedPipes(result.managedPipes).catch((e) =>
-          console.warn("[enterprise] failed to sync managed pipes:", e)
+      try {
+        const metadata = await applyAppUpdatePolicy(result.appUpdatePolicy);
+        console.log(
+          `[enterprise] applied app update policy: mode=${result.appUpdatePolicy.mode}, manager=${metadata.update_manager}, managed=${metadata.managed}`
         );
+      } catch (e) {
+        console.warn("[enterprise] failed to apply app update policy:", e);
       }
+
+      // Apply enterprise-forced PII redaction (master / local-vs-cloud backend /
+      // categories) to the settings store so the recording engine honors them.
+      try {
+        await applyPiiPolicy(result.lockedSettings);
+        console.log(
+          `[enterprise] applied PII policy: locked=[${["usePiiRemoval", "piiBackend", "piiRedactionLabels"].filter((k) => k in result.lockedSettings).join(",")}]`
+        );
+      } catch (e) {
+        console.warn("[enterprise] failed to apply PII policy:", e);
+      }
+
+      // Apply enterprise-forced input capture (keyboard / click rows).
+      // Restarts the engine when a forced value actually changed.
+      try {
+        await applyInputCapturePolicy(result.lockedSettings);
+      } catch (e) {
+        console.warn("[enterprise] failed to apply input capture policy:", e);
+      }
+
+      // Fire-and-forget heartbeat
+      sendHeartbeat(licenseKey);
+
+      // Sync managed pipes to local filesystem. Always runs (even with an
+      // empty list) so pipes removed from the policy get disabled on devices.
+      // Pruning is only allowed when the server actually returned the
+      // managedPipes field — an older backend that omits it must not
+      // mass-disable the fleet.
+      syncManagedPipes(result.managedPipes, {
+        pruneUnlisted: Array.isArray(data.managedPipes),
+      }).catch((e) =>
+        console.warn("[enterprise] failed to sync managed pipes:", e)
+      );
 
       // Push hidden sections to Rust so tray menu can use them
       try {
         await commands.setEnterprisePolicy(result.hiddenSections);
+        // Reconcile the live app with the policy we just pushed: if it turns on
+        // hidden-UI mode, retract any windows already on screen and drop the
+        // dock icon now (set_enterprise_policy only updates state — it doesn't
+        // hide what's already visible). Also persists the decision so the next
+        // launch starts hidden before any window renders. No-op when not hidden.
+        await commands.applyEnterpriseUiVisibility();
       } catch (e) {
         console.warn("[enterprise] failed to push policy to Rust:", e);
+      }
+
+      // Push per-stream sync toggles to Rust so the enterprise sync task
+      // gates each upload kind. Defaults to all-true server-side, so an
+      // older server that doesn't return syncStreams ends up here as
+      // undefined → all true (no behavior change).
+      try {
+        const streams = (data.syncStreams ?? {}) as Record<string, unknown>;
+        const pickBool = (key: string): boolean =>
+          typeof streams[key] === "boolean" ? (streams[key] as boolean) : true;
+        // frame_images is a NEW data class (screen pixels leave the device on
+        // request) — a 3-way MODE ("off" | "cited" | "all"), the org's explicit
+        // dashboard choice. Legacy boolean policies map true → "cited".
+        // Anything unrecognized is "off" — fail-closed.
+        const rawMode = streams.frame_images as unknown;
+        const frameImages =
+          rawMode === "off" || rawMode === "cited" || rawMode === "all"
+            ? rawMode
+            : rawMode === true
+            ? "cited"
+            : "off";
+        await commands.setSyncStreams(
+          pickBool("frames"),
+          pickBool("audio"),
+          pickBool("ui_events"),
+          pickBool("memories"),
+          pickBool("snapshots"),
+          frameImages,
+        );
+      } catch (e) {
+        console.warn("[enterprise] failed to push sync streams to Rust:", e);
+      }
+
+      // Persist admin status into ~/.screenpipe/enterprise.json so the
+      // pi-agent can decide whether to install the screenpipe-team skill
+      // on its next boot. Only meaningful when we sent a cloud token in
+      // the request — without one, the server has no way to identify the
+      // user, so `data.isAdmin` is always false (don't accidentally wipe
+      // an existing admin marker just because the user was signed-out at
+      // policy-fetch time).
+      if (cloudToken) {
+        try {
+          const adminFlag = Boolean(data.isAdmin);
+          console.log(
+            `[enterprise] persisting team config: is_admin=${adminFlag} (raw response.isAdmin=${data.isAdmin})`
+          );
+          await commands.saveEnterpriseTeamConfig(adminFlag, true, null);
+        } catch (e) {
+          console.warn("[enterprise] failed to persist team config:", e);
+        }
+      } else {
+        console.warn(
+          "[enterprise] no cloud token available — skipping team-config persist (sign in to screenpipe cloud to enable team queries)"
+        );
       }
       return { ok: true, policy: result };
     } catch (e) {

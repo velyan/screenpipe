@@ -4,43 +4,40 @@ version = { workspace = true }
 authors = { workspace = true }
 description = { workspace = true }
 repository = { workspace = true }
-license = { workspace = true }
+license-file = { workspace = true }
 edition = { workspace = true }
 
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [build-dependencies]
-which = "7.0.0"
+which = { workspace = true }
 
 [dependencies]
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { workspace = true }
+serde_json = { workspace = true }
 oasgen = { workspace = true }
 
-# Cross-platform audio capture.
-# Use the divanshu-go Windows AEC fork so Windows microphone AEC can be
-# wired through screenpipe's capture path. Cargo.lock pins the resolved
-# commit; update the cpal guard in .github/workflows/ci.yml whenever this
-# dependency is intentionally advanced.
-cpal = { git = "https://github.com/divanshu-go/cpal.git", branch = "windows-aec" }
+# Cross-platform audio capture. Tracks screenpipe/cpal main, which carries
+# the Windows WASAPI AEC and macOS VoiceProcessingIO patches.
+cpal = { git = "https://github.com/screenpipe/cpal.git", rev = "c7a610aee5c6037c9c69dc5bf7f2a850da8d8b12" }
 
 # Wav encoding
-hound = "3.5"
+hound = { workspace = true }
 
 # MP3 encoding for compressed cloud uploads
 mp3lame-encoder = "0.2.2"
 
 # Cli ! shouldn't be required if using as lib
-clap = { version = "4.3", features = ["derive"] }
+clap = { workspace = true }
 
 # Dates
-chrono = { version = "0.4.31", features = ["serde"] }
+chrono = { workspace = true }
 
 # Local Embeddings + STT
 # Using fork of vad-rs with Silero VAD v5/v6 support
 # v5/v6: 3x faster, 6000+ languages, better accuracy
-vad-rs = { git = "https://github.com/divanshu-go/vad-rs-1.git", branch="main", default-features = false }
-anyhow = "1.0.86"
+vad-rs = { git = "https://github.com/screenpipe/vad-rs-1.git", rev = "260252c122c752c8c2da7e86caff7e706aace025", default-features = false }
+anyhow = { workspace = true }
 hf-hub = { workspace = true }
 # https://github.com/pdeljanov/Symphonia/tree/master?tab=readme-ov-file#optimizations
 symphonia = { version = "0.5.4", features = ["aac", "isomp4", "opt-simd"] }
@@ -50,7 +47,7 @@ whisper-rs = { git = "https://github.com/screenpipe/whisper-rs.git", rev = "97e4
 # Log
 log = { workspace = true }
 tracing = { workspace = true }
-env_logger = "0.10"
+env_logger = { workspace = true }
 
 # Bytes
 bytemuck = "1.16.1"
@@ -74,71 +71,91 @@ crossbeam = { workspace = true }
 dashmap = { workspace = true }
 
 # Directories
-dirs = "5.0.1"
+dirs = { workspace = true }
 
-sysinfo = "0.29.0"
-lazy_static = { version = "1.4.0" }
+sysinfo = { workspace = true }
+lazy_static = { workspace = true }
 realfft = "3.4.0"
-ndarray = "0.16"
+ndarray = { workspace = true }
 # Base ort dep — each platform overrides with specific features below
-ort = { version = "=2.0.0-rc.10", default-features = false, features = ["ndarray", "half"] }
-ort-sys = { version = "=2.0.0-rc.10", default-features = false }
+ort = { workspace = true, default-features = false, features = ["ndarray", "half"] }
+ort-sys = { workspace = true }
 knf-rs = "0.3.2"
-futures = "0.3.31"
-audiopipe = { git = "https://github.com/divanshu-go/audiopipe.git", branch = "main", default-features = false, features = ["qwen3-asr-antirez-blas", "parakeet"], optional = true }
-mlx-rs = { version = "0.25", optional = true }
-bytes = { version = "1.9.0", features = ["serde"] }
-rand = "0.9.0"
-base64 = "0.22"
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
-url = "2"
+futures = { workspace = true }
+audiopipe = { workspace = true, features = ["qwen3-asr-antirez-blas", "parakeet"], optional = true }
+mlx-rs = { workspace = true, optional = true }
+bytes = { workspace = true, features = ["serde"] }
+rand = { workspace = true }
+tokio-tungstenite = { workspace = true, features = ["native-tls"] }
+url = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libpulse-binding = { version = "2.28", optional = true }
 libpulse-simple-binding = { version = "2.28", optional = true }
 # Bundle ONNX Runtime on Linux (same as macOS). load-dynamic was tried but
 # broke systems without a system-installed libonnxruntime.so (see #2506).
-ort = { version = "=2.0.0-rc.10", features = ["download-binaries"] }
+ort = { workspace = true, features = ["download-binaries", "tls-native"] }
 
 # Windows COM API for querying the "Default Communications Device" role.
 # MS Teams/Zoom route audio to the eCommunications endpoint, which may
 # differ from the multimedia/console default that cpal returns.
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.58", features = [
+windows = { workspace = true, features = [
     "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
     "Win32_System_Com",
+    "Win32_System_Threading",
     "Win32_Devices_FunctionDiscovery",
     "Win32_UI_Shell_PropertiesSystem",
 ] }
 
+# Bundle ONNX Runtime at build time on Windows x86_64 (same as Linux/macOS-arm64).
+# `load-dynamic` (runtime LoadLibrary of onnxruntime.dll) was tried but HANGS on
+# some hosts: ort rc.12's first call deadlocks inside `libloading::Library::new`
+# at 0% CPU, before `CreateEnv`, so the audio engine never finishes the
+# `building_audio` boot phase and the app looks dead (recording, VAD, diarization
+# all broken). Load-time linking of the *same* onnxruntime.dll initializes in
+# ~30ms. See PR #4171.
 [target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
-ort = { version = "=2.0.0-rc.10", features = [
-  "download-binaries",
-  "copy-dylibs",
-] }
-samplerate = { version = "0.2.4" }
-libsamplerate-sys = "0.1.10"
+ort = { workspace = true, features = ["download-binaries", "tls-native"] }
+samplerate = { workspace = true }
+libsamplerate-sys = { workspace = true }
 
-# Windows ARM64: use our own ONNX Runtime DLL at runtime (load-dynamic); no compile-time link, no ort.pyke.io cache
+# Windows ARM64: do NOT use `load-dynamic` — its runtime LoadLibrary of
+# onnxruntime.dll hangs with ort rc.12 the same way it did on x86_64 (see #4173).
+# ort links at build time instead; CI sets ORT_STRATEGY=system + ORT_LIB_LOCATION
+# to the bundled MS onnxruntime-win-arm64 (pyke ships no arm64-windows prebuilt,
+# so the `download-binaries` strategy that comes in transitively is overridden by
+# ORT_STRATEGY=system).
 [target.'cfg(all(target_os = "windows", target_arch = "aarch64"))'.dependencies]
-ort = { version = "=2.0.0-rc.10", default-features = false, features = ["load-dynamic"] }
-ort-sys = { version = "=2.0.0-rc.10", default-features = false }
-samplerate = { version = "0.2.4" }
-libsamplerate-sys = "0.1.10"
+ort = { workspace = true, default-features = false, features = ["api-24", "tracing"] }
+ort-sys = { workspace = true }
+samplerate = { workspace = true }
+libsamplerate-sys = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-cidre = { git = "https://github.com/yury/cidre.git" }
-once_cell = "1.17.1"
-objc = "0.2.7"
-ort = { version = "=2.0.0-rc.10", features = ["download-binaries"] }
+cidre = { git = "https://github.com/yury/cidre.git", rev = "8481f3f0dc7dd39bb5be80d9424bfac0cad3801a" }
+once_cell = { workspace = true }
+objc = { workspace = true }
+
+# Apple Silicon: bundle ONNX Runtime via the pyke prebuilt (arm64 xcframework).
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+ort = { workspace = true, features = ["download-binaries", "tls-native"] }
+
+# Intel mac: ort rc.12 ships no x86_64 prebuilt (pyke + upstream ONNX Runtime
+# are arm64-only since ~1.20). load-dynamic links against headers only and
+# loads the dylib at runtime if present. The ONNX ASR paths (parakeet/qwen3)
+# are not enabled on Intel, so no dylib is required for a working build.
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
+ort = { workspace = true, default-features = false, features = ["load-dynamic", "api-24"] }
 
 [dev-dependencies]
-tempfile = "3.3.0"
+tempfile = { workspace = true }
 infer = "0.15"
 criterion = { workspace = true }
-strsim = "0.10.0"
-futures = "0.3.31"
-tracing-subscriber = "0.3.16"
+strsim = { workspace = true }
+futures = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 
 [features]
@@ -155,6 +172,42 @@ parakeet-mlx = ["dep:audiopipe", "audiopipe?/parakeet-mlx", "dep:mlx-rs"]
 [[example]]
 name = "screenpipe-audio"
 path = "examples/screenpipe-audio.rs"
+
+# These benchmark/eval examples use the optional `audiopipe` crate (linked only
+# by the `parakeet` / `qwen3-asr` features). Without a `required-features` guard,
+# `cargo {build,clippy} --all-targets` on default features tries to compile them,
+# fails to resolve the unlinked `audiopipe` crate (E0433), and breaks the
+# lefthook clippy hook for ANY change in this crate. Gating each on `parakeet`
+# (which pulls in `audiopipe`) makes --all-targets skip them unless it's enabled.
+[[example]]
+name = "bench_quality"
+path = "examples/bench_quality.rs"
+required-features = ["parakeet"]
+
+[[example]]
+name = "bench_quality2"
+path = "examples/bench_quality2.rs"
+required-features = ["parakeet"]
+
+[[example]]
+name = "bench_parakeet"
+path = "examples/bench_parakeet.rs"
+required-features = ["parakeet"]
+
+[[example]]
+name = "bench_engines"
+path = "examples/bench_engines.rs"
+required-features = ["parakeet"]
+
+[[example]]
+name = "parakeet_bench"
+path = "examples/parakeet_bench.rs"
+required-features = ["parakeet"]
+
+[[example]]
+name = "wer_battle_test"
+path = "examples/wer_battle_test.rs"
+required-features = ["parakeet"]
 
 [[test]]
 name = "audio_pipeline_benchmark"

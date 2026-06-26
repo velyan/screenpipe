@@ -59,9 +59,22 @@ import {
   loadConversationFile,
   saveConversationFile,
 } from "@/lib/chat-storage";
+import {
+  getCachedBrowserStateEntry,
+  resolveNewestBrowserState,
+} from "@/lib/browser-state-cache";
 import type { ChatConversation } from "@/lib/hooks/use-settings";
 import {
+  extractConversationHistorySyncUserText,
+  isInjectedTitleSourcePrompt,
+} from "@/lib/chat-utils";
+import { deriveFallbackConversationTitle } from "@/lib/utils/chat-title";
+import { isInternalTitleSession } from "@/lib/utils/internal-session";
+import {
+  getPersistedViewedAt,
   useChatStore,
+  isSessionForeground,
+  sessionRecordFromMeta,
   type SessionStatus,
   type SessionRecord,
 } from "@/lib/stores/chat-store";
@@ -163,6 +176,8 @@ export async function handlePiEvent(envelope: AgentEventEnvelope) {
   const sid = envelope.sessionId;
   const inner = envelope.event;
   if (!sid || !inner) return; // events without a session id or body can't be routed
+  // Internal Pi sessions (title generation, etc.) — never routed to chat store
+  if (isInternalTitleSession(sid)) return;
   // Pipe sessions are only routed when chat-store already has a record
   // for them — i.e. the user clicked into a pipe-watch view, which
   // upserted the session. Unwatched pipes go to the pipe-run-recorder
@@ -203,20 +218,21 @@ export async function handlePiEvent(envelope: AgentEventEnvelope) {
   // Handles the case where Pi was started outside the chat-storage flow
   // (e.g. resumed from disk before we hydrated).
   if (!existing) {
+    const now = Date.now();
     store.actions.upsert({
       id: sid,
-      title: "new chat",
+      title: "untitled",
       preview: snippet ?? "",
       status: nextStatus ?? "streaming",
       lastError: err ?? undefined,
       messageCount: 0,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
+      createdAt: now,
+      updatedAt: now,
       pinned: false,
-      // First-touch session is unread unless the user is already viewing
-      // it (this is also how external triggers — chat-prefill, pipe
-      // events — surface in the sidebar).
-      unread: store.currentId !== sid,
+      unread: false,
+      // Set lastContentAt on first touch only when there's actual content.
+      // isUnread() in the store will compute the correct unread boolean.
+      ...(snippet ? { lastContentAt: now } : {}),
     });
     if (snippet) previewLastEmittedAt.set(sid, Date.now());
     return;
@@ -237,6 +253,9 @@ export async function handlePiEvent(envelope: AgentEventEnvelope) {
   const patch: Partial<SessionRecord> = { updatedAt: Date.now() };
   if (nextStatus) patch.status = nextStatus;
   if (writePreview) patch.preview = snippet!;
+  // Background assistant text should mark the session as having new
+  // unseen content once the user has switched away.
+  if (snippet && !isSessionForeground(store, sid)) patch.lastContentAt = Date.now();
   if (nextStatus === "error" && err) patch.lastError = err;
   if (nextStatus && nextStatus !== "error") patch.lastError = undefined;
 
@@ -256,12 +275,6 @@ export async function handlePiEvent(envelope: AgentEventEnvelope) {
   }
 
   store.actions.patch(sid, patch);
-
-  // Mark as unread if real assistant content arrived for a session that
-  // is NOT the currently-viewed one. The store's markUnread is a no-op
-  // when sid === currentId, so this is safe to call unconditionally on
-  // any event that produced a snippet.
-  if (snippet) store.actions.markUnread(sid);
 }
 
 function handleSessionEvicted(payload: AgentSessionEvictedPayload) {
@@ -313,22 +326,7 @@ async function hydrate() {
       limit: CHAT_HISTORY_INITIAL_LIMIT,
       includeHidden: false,
     });
-    const records: SessionRecord[] = metas
-      .map((m) => ({
-        id: m.id,
-        title: m.title || "untitled",
-        preview: "",
-        status: "idle" as const,
-        messageCount: m.messageCount,
-        createdAt: m.createdAt,
-        updatedAt: m.updatedAt,
-        pinned: m.pinned,
-        // History reload doesn't count as new activity — start clean.
-        unread: false,
-        lastUserMessageAt: m.lastUserMessageAt,
-        kind: m.kind,
-        pipeContext: m.pipeContext,
-      }));
+    const records: SessionRecord[] = metas.map(sessionRecordFromMeta);
     useChatStore.getState().actions.hydrateFromDisk(records);
   } catch {
     // Storage may not be ready yet on first launch — non-fatal.
@@ -440,29 +438,114 @@ interface MutableMessage {
   [k: string]: unknown;
 }
 
+function textFromPiMessageContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part): part is { type?: unknown; text?: unknown } =>
+      !!part && typeof part === "object",
+    )
+    .filter((part) => part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text)
+    .join("");
+}
+
+function imageDataUrlsFromPiContent(content: unknown): string[] {
+  if (!Array.isArray(content)) return [];
+  const images: string[] = [];
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+    const item = part as {
+      type?: unknown;
+      mimeType?: unknown;
+      mime_type?: unknown;
+      data?: unknown;
+    };
+    if (item.type !== "image" || typeof item.data !== "string") continue;
+    if (item.data.startsWith("data:image/")) {
+      images.push(item.data);
+      continue;
+    }
+    const mime =
+      typeof item.mimeType === "string"
+        ? item.mimeType
+        : typeof item.mime_type === "string"
+          ? item.mime_type
+          : "image/png";
+    images.push(`data:${mime};base64,${item.data}`);
+  }
+  return images;
+}
+
 function applyEventToSessionContent(sid: string, payload: PiInnerEvent) {
   const store = useChatStore.getState();
   const existing = store.sessions[sid];
   if (!existing) return; // upsert will fire on the next call
 
-  // CRITICAL: skip content writes for the session the panel is actively
-  // rendering. The chat panel's own pi_event handler in standalone-chat
-  // owns the message lifecycle for the current session (it creates the
-  // assistant placeholder, appends deltas, handles agent_end, persists
-  // to disk). If both this router AND the local handler write messages
-  // for the same session, you get DOUBLE messages — one from each
-  // writer — and the panel renders the same assistant reply twice.
-  // The router's job is exclusively to keep BACKGROUND sessions in
-  // sync; the panel handles foreground. On switch, loadConversation
-  // snapshots the panel's state to the store before the router takes
-  // over for what's now a background session.
-  if (store.currentId === sid) return;
+  // The agent-event bus already enforces exclusive delivery: a session's
+  // foreground handler receives its events OR the default router does, never
+  // both at once. So we intentionally do not guard on `currentId === sid`
+  // here. That old belt-and-suspenders check created a switch-back gap where
+  // loadConversation flipped `currentId` before the new foreground handler was
+  // attached; any events in that window were dropped by both writers.
 
   const t = payload.type;
 
-  // Assistant message starts — create a new in-flight message shell
-  // and remember its id as the streaming target.
+  // Queued follow-ups begin with `message_start(role=user)`. When the user has
+  // switched away, the foreground panel does not see that event, so the
+  // background router must materialize the user bubble and the assistant
+  // placeholder itself. Without this, completed background queues persist only
+  // assistant replies and the user turns appear to vanish from history.
+  if (t === "message_start" && payload.message?.role === "user") {
+    const rawText = textFromPiMessageContent(payload.message?.content);
+    const text = extractConversationHistorySyncUserText(rawText) ?? rawText;
+    const images = imageDataUrlsFromPiContent(payload.message?.content);
+    if (!text && images.length === 0) return;
+
+    const userId = `pi-user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const assistantId = `pi-assistant-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const userMsg: MutableMessage = {
+      id: userId,
+      role: "user",
+      content: text,
+      ...(images.length ? { images } : {}),
+      timestamp: Date.now(),
+    };
+    const assistantShell: MutableMessage = {
+      id: assistantId,
+      role: "assistant",
+      content: "",
+      contentBlocks: [],
+      timestamp: Date.now(),
+    };
+
+    store.actions.appendMessage(sid, userMsg);
+    store.actions.appendMessage(sid, assistantShell);
+    store.actions.setStreaming(sid, {
+      streamingMessageId: assistantId,
+      streamingText: "",
+      contentBlocks: [],
+      isStreaming: true,
+      isLoading: true,
+    });
+    // Clear the draft flag so the chat appears in the sidebar.
+    // This is needed when a queued follow-up starts while the user
+    // has navigated away from the chat.
+    store.actions.patch(sid, { draft: false });
+    return;
+  }
+
+  // Assistant message starts. When a session moves to the background in the
+  // middle of a tool-using reply, Pi may emit another assistant
+  // `message_start` after an internal `turn_end`. Foreground chat keeps that
+  // work inside the SAME visible assistant bubble, so background routing must
+  // reuse the existing streaming target instead of creating a second message.
+  //
+  // Only create a fresh assistant shell when we truly have no in-flight
+  // assistant message for this session.
   if (t === "message_start" && payload.message?.role === "assistant") {
+    const cur = store.sessions[sid];
+    if (cur?.streamingMessageId) return;
     const newId = `pi-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const newMsg: MutableMessage = {
       id: newId,
@@ -571,20 +654,12 @@ function applyEventToSessionContent(sid: string, payload: PiInnerEvent) {
   }
 
   // turn_end fires between LLM turns within a single agent run (typically
-  // across a tool-call boundary). The agent is still streaming — only the
-  // current message's accumulator should be cleared so the next
-  // message_start gets a fresh slate. Calling endTurn here would briefly
-  // flip isStreaming/isLoading false and falsely settle the session
-  // mid-run.
+  // across a tool-call boundary). Foreground chat does NOT split the visible
+  // assistant reply here; it keeps appending follow-up tool work and prose to
+  // the same assistant bubble until the full run reaches agent_end. The
+  // background router must mirror that shape or switching away mid-response
+  // will fragment one reply into several tiny assistant messages.
   if (t === "turn_end") {
-    const cur = store.sessions[sid];
-    if (cur?.streamingMessageId) {
-      store.actions.setStreaming(sid, {
-        streamingMessageId: null,
-        streamingText: "",
-        contentBlocks: [],
-      });
-    }
     return;
   }
 
@@ -611,16 +686,17 @@ const saveQueue = new Map<string, Promise<void>>();
  *  saveQueue tail for each id so already-running saves finish before
  *  the window closes. Used by the close-on-quit hook in
  *  `mountPiEventRouter`. */
-async function flushPendingSaves(): Promise<void> {
+export async function flushPendingSaves(): Promise<void> {
   const sessions = useChatStore.getState().sessions;
   const ids = Object.keys(sessions).filter((id) => {
     const s = sessions[id];
     return !!s.messages && s.messages.length > 0;
   });
   await Promise.all(ids.map((id) => persistBackgroundSession(id)));
-  // Await the entire saveQueue tail so any in-flight save (queued
-  // before flush) also completes. persistBackgroundSession returns the
-  // promise it just appended, so the previous await covers the tail.
+  // Also await any queue tails that were already in-flight before this
+  // flush started, even if their sessions no longer appear in the
+  // current store snapshot.
+  await Promise.all([...saveQueue.values()]);
 }
 
 /**
@@ -663,21 +739,51 @@ async function persistBackgroundSession(sid: string): Promise<void> {
       }
 
       const existing = await loadConversationFile(sid);
-      const firstUserMsg = messages.find((m: any) => m.role === "user") as any;
-      const derivedTitle: string =
-        firstUserMsg?.content?.slice(0, 50) || "New Chat";
-      // Prefer a previously-persisted title (user may have renamed it),
-      // but only if that title isn't itself a stale derivation.
+      const browserState = resolveNewestBrowserState(
+        existing?.browserState,
+        getCachedBrowserStateEntry(sid),
+      );
+
+      const firstUserMsg = messages.find(
+        (m: any) => m.role === "user" && !isInjectedTitleSourcePrompt(m.content)
+      ) as any;
+      const derivedTitle: string = deriveFallbackConversationTitle(firstUserMsg);
+
+      // Background saves use fallback titles; AI titles generated in foreground
       const title = existing?.title || derivedTitle;
 
+      const storeSession = useChatStore.getState().sessions[sid];
+      let computedLastUserMessageAt: number | undefined;
+      for (const message of messages as any[]) {
+        if (message?.role !== "user" || typeof message.timestamp !== "number") continue;
+        if (computedLastUserMessageAt == null || message.timestamp > computedLastUserMessageAt) {
+          computedLastUserMessageAt = message.timestamp;
+        }
+      }
+
       const lastUserMessageAt =
-        useChatStore.getState().sessions[sid]?.lastUserMessageAt ??
+        computedLastUserMessageAt ??
+        storeSession?.lastUserMessageAt ??
         existing?.lastUserMessageAt;
+
+      const lastContentAt =
+        storeSession?.lastContentAt ??
+        existing?.lastContentAt;
+      const lastViewedAt =
+        getPersistedViewedAt(storeSession) ??
+        (typeof existing?.lastViewedAt === "number"
+          ? existing.lastViewedAt
+          : lastContentAt
+            ? 0
+            : undefined);
 
       const conv: ChatConversation = {
         id: sid,
         title,
+        ...(existing?.titleSource ? { titleSource: existing.titleSource } : {}),
         ...(lastUserMessageAt ? { lastUserMessageAt } : {}),
+        ...(lastContentAt ? { lastContentAt } : {}),
+        ...(typeof lastViewedAt === "number" ? { lastViewedAt } : {}),
         // Full transcript — see comment in use-chat-conversations.ts
         // saveConversation. The slice(-100) here was silently truncating
         // long backgrounded chats on every agent_end save.
@@ -711,11 +817,16 @@ async function persistBackgroundSession(sid: string): Promise<void> {
             id: m.id,
             role: m.role,
             content,
+            ...(m.intent ? { intent: m.intent } : {}),
+            ...(m.turnIntentId ? { turnIntentId: m.turnIntentId } : {}),
             timestamp: m.timestamp,
+            ...(m.displayContent ? { displayContent: m.displayContent } : {}),
             ...(blocks?.length ? { contentBlocks: blocks } : {}),
             ...(m.images?.length ? { images: m.images } : {}),
             ...(m.model ? { model: m.model } : {}),
             ...(m.provider ? { provider: m.provider } : {}),
+            ...(m.interruptedBySteer ? { interruptedBySteer: true } : {}),
+            ...(m.steeredResponse ? { steeredResponse: true } : {}),
           };
         }),
         createdAt: existing?.createdAt ?? Date.now(),
@@ -728,6 +839,8 @@ async function persistBackgroundSession(sid: string): Promise<void> {
         // (back-compat).
         ...(session.kind ? { kind: session.kind } : existing?.kind ? { kind: existing.kind } : {}),
         ...(session.pipeContext ? { pipeContext: session.pipeContext } : existing?.pipeContext ? { pipeContext: existing.pipeContext } : {}),
+        ...(existing?.sidebarGroup ? { sidebarGroup: existing.sidebarGroup } : {}),
+        ...(browserState ? { browserState } : {}),
       };
 
       try {

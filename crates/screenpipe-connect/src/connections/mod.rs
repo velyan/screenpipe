@@ -15,7 +15,9 @@ pub mod brex;
 pub mod browser;
 pub mod calcom;
 pub mod calendly;
+pub mod claude_code;
 pub mod clickup;
+pub mod codex;
 pub mod confluence;
 pub mod discord;
 pub mod email;
@@ -28,6 +30,7 @@ pub mod google_calendar;
 pub mod google_docs;
 pub mod google_sheets;
 pub mod granola;
+pub mod hermes;
 pub mod hubspot;
 pub mod intercom;
 pub mod jira;
@@ -38,18 +41,24 @@ pub mod logseq;
 pub mod loops;
 pub mod make;
 pub mod microsoft365;
+pub mod mochi;
 pub mod monday;
 pub mod n8n;
 pub mod notion;
 pub mod ntfy;
 pub mod obsidian;
+pub mod obsidian_memories;
+pub mod odoo;
+pub mod openclaw;
 pub mod otter;
+pub mod outlook_email;
 pub mod perplexity;
 pub mod pipedrive;
 pub mod pocket;
 pub mod posthog;
 pub mod pushover;
 pub mod quickbooks;
+pub mod readwise;
 pub mod resend;
 pub mod salesforce;
 pub mod sentry;
@@ -63,6 +72,7 @@ pub mod toggl;
 pub mod trello;
 pub mod vercel;
 pub mod whatsapp;
+pub mod workflowy;
 pub mod zapier;
 pub mod zendesk;
 pub mod zoom;
@@ -70,6 +80,7 @@ pub mod zoom;
 use crate::oauth;
 use anyhow::Result;
 use async_trait::async_trait;
+use screenpipe_core::connections::sync as core_connections_sync;
 use screenpipe_secrets::SecretStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -128,6 +139,8 @@ pub struct ProxyConfig {
 pub enum ProxyAuth {
     /// Send as `Authorization: Bearer <token>`. Token comes from OAuth or credential field.
     Bearer { credential_key: &'static str },
+    /// Send as `Authorization: Token <token>`.
+    Token { credential_key: &'static str },
     /// Send as a custom header (e.g. `X-API-Key: <value>`).
     Header {
         name: &'static str,
@@ -140,6 +153,24 @@ pub enum ProxyAuth {
     },
     /// No auth needed (e.g. webhook-based integrations where the URL is the secret).
     None,
+}
+
+/// How the background OAuth refresher should treat this integration.
+///
+/// Most providers issue long-lived refresh tokens (Google: ~6mo, Microsoft:
+/// 90d) — for those, leaning on natural access-token expiry is enough and
+/// [`RefreshPolicy::default`] returns `keep_alive: None`.
+///
+/// Providers that expire the *refresh* token on a sliding inactivity window
+/// need a `keep_alive` floor: the refresher will proactively call refresh
+/// whenever the last successful refresh is older than this duration, even
+/// if the access token is still valid. The value should leave headroom
+/// against the provider's published limit (e.g. Zoom's 15h ⇒ 12h floor).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RefreshPolicy {
+    /// Maximum gap between successful refreshes. `None` = no keep-alive
+    /// pressure beyond the access-token-expiry path.
+    pub keep_alive: Option<std::time::Duration>,
 }
 
 #[async_trait]
@@ -161,11 +192,43 @@ pub trait Integration: Send + Sync {
         None
     }
 
+    /// User-selectable access levels offered on the OAuth consent (e.g. Slack
+    /// send-only vs send+read). Default is empty — `extra_auth_params` is used
+    /// as-is and the UI shows no choice. The connect command resolves the
+    /// chosen variant's `params` by `id`; scope strings never come from the UI.
+    fn oauth_scope_variants(&self) -> &'static [oauth::ScopeVariant] {
+        &[]
+    }
+
+    /// Whether repeated OAuth connects can create distinct account/workspace
+    /// instances instead of overwriting the provider's default token slot.
+    fn supports_oauth_instances(&self) -> bool {
+        false
+    }
+
+    /// Background refresh policy. Defaults to "rely on access-token expiry".
+    /// Override when the provider expires the refresh token on inactivity.
+    fn refresh_policy(&self) -> RefreshPolicy {
+        RefreshPolicy::default()
+    }
+
     /// Return proxy config for credential-free API forwarding.
     /// When set, pipes can call `localhost:3030/connections/:id/proxy/*path`
     /// and the server injects auth automatically — no secrets in the LLM context.
     fn proxy_config(&self) -> Option<&'static ProxyConfig> {
         None
+    }
+
+    /// Path-prefix routing overrides for the credential proxy.
+    ///
+    /// Each entry is `(path_prefix, replacement_base_url)`. When the incoming
+    /// proxy path starts with `path_prefix`, the proxy strips that prefix and
+    /// forwards to `replacement_base_url/<rest>` instead of the `ProxyConfig`
+    /// base_url. Useful when a single OAuth credential covers APIs on multiple
+    /// subdomains (e.g. Google Docs at docs.googleapis.com vs Drive at
+    /// www.googleapis.com). Default: no overrides (everything goes to base_url).
+    fn path_routes(&self) -> &'static [(&'static str, &'static str)] {
+        &[]
     }
 
     /// Extra PEM-encoded root certificate to trust when calling this
@@ -219,6 +282,7 @@ pub fn all_integrations() -> Vec<Box<dyn Integration>> {
         Box::new(linear::Linear),
         Box::new(perplexity::Perplexity),
         Box::new(obsidian::Obsidian),
+        Box::new(obsidian_memories::ObsidianMemories),
         Box::new(n8n::N8n),
         Box::new(make::Make),
         Box::new(zapier::Zapier),
@@ -241,6 +305,7 @@ pub fn all_integrations() -> Vec<Box<dyn Integration>> {
         Box::new(confluence::Confluence),
         Box::new(salesforce::Salesforce),
         Box::new(microsoft365::Microsoft365),
+        Box::new(outlook_email::OutlookEmail),
         Box::new(trello::Trello),
         Box::new(zendesk::Zendesk),
         Box::new(stripe::Stripe),
@@ -251,6 +316,7 @@ pub fn all_integrations() -> Vec<Box<dyn Integration>> {
         Box::new(sentry::Sentry),
         Box::new(vercel::Vercel),
         Box::new(pipedrive::Pipedrive),
+        Box::new(odoo::Odoo),
         Box::new(intercom::Intercom),
         Box::new(monday::Monday),
         Box::new(asana::Asana),
@@ -262,10 +328,17 @@ pub fn all_integrations() -> Vec<Box<dyn Integration>> {
         Box::new(google_docs::GoogleDocs),
         Box::new(google_sheets::GoogleSheets),
         Box::new(quickbooks::QuickBooks),
+        Box::new(readwise::Readwise),
+        Box::new(mochi::Mochi),
         Box::new(loops::Loops),
         Box::new(resend::Resend),
         Box::new(supabase::Supabase),
         Box::new(zoom::Zoom),
+        Box::new(claude_code::ClaudeCode),
+        Box::new(codex::Codex),
+        Box::new(workflowy::Workflowy),
+        Box::new(openclaw::OpenClaw),
+        Box::new(hermes::Hermes),
     ]
 }
 
@@ -320,6 +393,37 @@ pub async fn load_connection(
     // Fall back to legacy file
     let file_store = load_store(screenpipe_dir);
     file_store.get(key).cloned()
+}
+
+/// Returns true when a connection id is configured and ready for pipes.
+/// OAuth integrations are checked via `oauth:<id>` tokens in SecretStore;
+/// credential-based integrations via `cred:<id>` / `connections.json`.
+pub async fn is_connection_configured(
+    secret_store: Option<&SecretStore>,
+    screenpipe_dir: &Path,
+    conn_id: &str,
+) -> bool {
+    let integration = all_integrations()
+        .into_iter()
+        .find(|i| i.def().id == conn_id);
+
+    let Some(integration) = integration else {
+        return false;
+    };
+
+    if integration.oauth_config().is_some() {
+        for inst in oauth::list_oauth_instances(secret_store, conn_id).await {
+            if oauth::is_oauth_instance_connected(secret_store, conn_id, inst.as_deref()).await {
+                return true;
+            }
+        }
+        false
+    } else {
+        load_connection(secret_store, screenpipe_dir, conn_id)
+            .await
+            .map(|c| c.enabled && !c.credentials.is_empty())
+            .unwrap_or(false)
+    }
 }
 
 /// Write a `SavedConnection` to SecretStore. Falls back to the legacy
@@ -391,17 +495,7 @@ impl ConnectionManager {
         for i in &self.integrations {
             let def = i.def();
             let is_oauth = i.oauth_config().is_some();
-            let connected = if is_oauth {
-                let instances = oauth::list_oauth_instances(ss, def.id).await;
-                let mut any_connected = false;
-                for inst in &instances {
-                    if oauth::is_oauth_instance_connected(ss, def.id, inst.as_deref()).await {
-                        any_connected = true;
-                        break;
-                    }
-                }
-                any_connected
-            } else {
+            let creds_connected = || async {
                 self.get_all_instances(def.id)
                     .await
                     .map(|instances| {
@@ -411,10 +505,32 @@ impl ConnectionManager {
                     })
                     .unwrap_or(false)
             };
+            let connected = if is_oauth {
+                let instances = oauth::list_oauth_instances(ss, def.id).await;
+                let mut any_connected = false;
+                for inst in &instances {
+                    if oauth::is_oauth_instance_connected(ss, def.id, inst.as_deref()).await {
+                        any_connected = true;
+                        break;
+                    }
+                }
+                // OAuth integrations can also carry manual fallback credentials
+                // (HubSpot Private App token, Teams webhook URL). Users connected
+                // that way — including everyone who connected before the
+                // integration gained OAuth — must not see the tile flip to off;
+                // the proxy and test() still honor those credentials.
+                if !any_connected && !def.fields.is_empty() {
+                    any_connected = creds_connected().await;
+                }
+                any_connected
+            } else {
+                creds_connected().await
+            };
             result.push(ConnectionInfo {
                 def,
                 connected,
                 is_oauth,
+                supports_oauth_instances: is_oauth && i.supports_oauth_instances(),
             });
         }
         result
@@ -426,13 +542,19 @@ impl ConnectionManager {
             enabled: true,
             credentials: creds,
         };
-        save_connection(
+        let result = save_connection(
             self.secret_store.as_deref(),
             &self.screenpipe_dir,
             id,
             &conn,
         )
-        .await
+        .await;
+
+        if result.is_ok() {
+            core_connections_sync::clear_connection_tombstone(&self.screenpipe_dir, id);
+        }
+
+        result
     }
 
     pub async fn get_credentials(&self, id: &str) -> Result<Option<Map<String, Value>>> {
@@ -461,6 +583,15 @@ impl ConnectionManager {
             .and_then(|i| i.proxy_config())
     }
 
+    /// Look up path-prefix routing overrides for a connection by ID.
+    pub fn find_path_routes(&self, id: &str) -> &'static [(&'static str, &'static str)] {
+        self.integrations
+            .iter()
+            .find(|i| i.def().id == id)
+            .map(|i| i.path_routes())
+            .unwrap_or(&[])
+    }
+
     /// Look up the integration definition by ID.
     pub fn find_def(&self, id: &str) -> Option<&'static IntegrationDef> {
         self.integrations
@@ -480,7 +611,12 @@ impl ConnectionManager {
     }
 
     pub async fn disconnect(&self, id: &str) -> Result<()> {
-        remove_connection(self.secret_store.as_deref(), &self.screenpipe_dir, id).await
+        let result =
+            remove_connection(self.secret_store.as_deref(), &self.screenpipe_dir, id).await;
+        if result.is_ok() {
+            core_connections_sync::record_connection_tombstone(&self.screenpipe_dir, id);
+        }
+        result
     }
 
     pub async fn test(&self, id: &str, creds: &Map<String, Value>) -> Result<String> {
@@ -503,13 +639,19 @@ impl ConnectionManager {
             enabled: true,
             credentials: creds,
         };
-        save_connection(
+        let result = save_connection(
             self.secret_store.as_deref(),
             &self.screenpipe_dir,
             &key,
             &conn,
         )
-        .await
+        .await;
+
+        if result.is_ok() {
+            core_connections_sync::clear_connection_tombstone(&self.screenpipe_dir, &key);
+        }
+
+        result
     }
 
     /// Return all saved instances for the given integration id.
@@ -528,7 +670,12 @@ impl ConnectionManager {
     /// Remove a specific instance (or the default) for the given integration.
     pub async fn disconnect_instance(&self, id: &str, instance: Option<&str>) -> Result<()> {
         let key = make_key(id, instance);
-        remove_connection(self.secret_store.as_deref(), &self.screenpipe_dir, &key).await
+        let result =
+            remove_connection(self.secret_store.as_deref(), &self.screenpipe_dir, &key).await;
+        if result.is_ok() {
+            core_connections_sync::record_connection_tombstone(&self.screenpipe_dir, &key);
+        }
+        result
     }
 
     fn find(&self, id: &str) -> Result<&dyn Integration> {
@@ -547,6 +694,8 @@ pub struct ConnectionInfo {
     pub connected: bool,
     /// True if this integration authenticates via OAuth (no manual fields).
     pub is_oauth: bool,
+    /// True if OAuth reconnects can be stored as separate named instances.
+    pub supports_oauth_instances: bool,
 }
 
 type CredentialConnection<'a> = (
@@ -592,7 +741,20 @@ pub async fn render_context(
         }
     }
 
-    if cred_connected.is_empty() && oauth_connected.is_empty() {
+    let ics_settings =
+        crate::ics_calendar::load_ics_calendar_settings_from_store(screenpipe_dir).ok();
+    let ics_enabled: Vec<_> = ics_settings
+        .as_ref()
+        .map(|settings| {
+            settings
+                .entries
+                .iter()
+                .filter(|entry| entry.enabled)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if cred_connected.is_empty() && oauth_connected.is_empty() && ics_enabled.is_empty() {
         return String::new();
     }
 
@@ -644,6 +806,25 @@ pub async fn render_context(
         } else {
             // OAuth without proxy — still don't expose the token
             out.push_str("  (connected via OAuth — use the endpoints listed above; no raw token is exposed)\n");
+        }
+    }
+
+    if !ics_enabled.is_empty() {
+        out.push_str("\n### ICS Calendar\n");
+        out.push_str(
+            "Read-only access to subscribed ICS/webcal calendar feeds. \
+             Use GET /connections/ics-calendar/events?hours_back=0&hours_ahead=72 \
+             to list upcoming events, and GET /connections/ics-calendar/status for feed status. \
+             Feed URLs are private and are not exposed.\n",
+        );
+        out.push_str(&format!("  connected feeds: {}\n", ics_enabled.len()));
+        let names = ics_enabled
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .filter(|name| !name.trim().is_empty())
+            .collect::<Vec<_>>();
+        if !names.is_empty() {
+            out.push_str(&format!("  feed names: {}\n", names.join(", ")));
         }
     }
 
@@ -785,6 +966,20 @@ mod tests {
         creds
     }
 
+    #[test]
+    fn agent_integrations_are_registered() {
+        let ids: Vec<&str> = all_integrations().iter().map(|i| i.def().id).collect();
+        // The two embeddable-agent gateways pipes can call back into.
+        assert!(
+            ids.contains(&"hermes"),
+            "hermes integration must be registered"
+        );
+        assert!(
+            ids.contains(&"openclaw"),
+            "openclaw integration must be registered"
+        );
+    }
+
     #[tokio::test]
     async fn named_manual_instances_count_as_connected() {
         let dir = temp_screenpipe_dir();
@@ -817,6 +1012,26 @@ mod tests {
         let context = render_context(&dir, 3030, None).await;
         assert!(context.contains("## Discord (discord, instance: work)"));
         assert!(context.contains("webhook_url: https://example.com/webhook"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn oauth_integration_counts_as_configured() {
+        use screenpipe_secrets::SecretStore;
+        use serde_json::json;
+        use sqlx::SqlitePool;
+
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        let store = SecretStore::new(pool, None).await.unwrap();
+        store
+            .set_json("oauth:github", &json!({"access_token": "gho_test"}))
+            .await
+            .unwrap();
+        let dir = temp_screenpipe_dir();
+
+        assert!(is_connection_configured(Some(&store), &dir, "github").await);
+        assert!(!is_connection_configured(Some(&store), &dir, "discord").await);
 
         let _ = std::fs::remove_dir_all(dir);
     }

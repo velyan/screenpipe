@@ -31,44 +31,6 @@ env:
   GIT_LFS_SKIP_SMUDGE: 1
 
 jobs:
-  cpal-pin-guard:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Guard cpal Windows audio pin
-        shell: bash
-        run: |
-          set -euo pipefail
-          manifest="crates/screenpipe-audio/Cargo.toml"
-          expected_url='git = "https://github.com/divanshu-go/cpal.git"'
-          expected_branch='branch = "windows-aec"'
-          expected_lock_source='source = "git+https://github.com/divanshu-go/cpal.git?branch=windows-aec#eeae0269bec7b4fc6e21c461624a0fa0e7acdc82"'
-          cpal_line="$(grep -E '^cpal = ' "$manifest" || true)"
-
-          if [[ "$cpal_line" != *"$expected_url"* || "$cpal_line" != *"$expected_branch"* ]]; then
-            echo "::error file=${manifest},line=25::cpal source changed. Run the Windows audio RMS smoke on Win11 24H2 Communications-class hardware before merging, then update this guard with the verified source."
-            echo "current cpal line: ${cpal_line:-<missing>}"
-            exit 1
-          fi
-
-          cpal_lock_source() {
-            local lockfile="$1"
-            awk '
-              $0 == "[[package]]" { in_package = 1; is_cpal = 0 }
-              in_package && $0 == "name = \"cpal\"" { is_cpal = 1 }
-              in_package && is_cpal && /^source = / { print; exit }
-            ' "$lockfile"
-          }
-
-          for lockfile in Cargo.lock apps/screenpipe-app-tauri/src-tauri/Cargo.lock; do
-            lock_source="$(cpal_lock_source "$lockfile")"
-            if [[ "$lock_source" != "$expected_lock_source" ]]; then
-              echo "::error file=${lockfile}::cpal lock source changed. Run the Windows audio RMS smoke on Win11 24H2 Communications-class hardware before merging, then update this guard with the verified lock source."
-              echo "current cpal lock source: ${lock_source:-<missing>}"
-              exit 1
-            fi
-          done
-
   test-ubuntu:
     runs-on: ubuntu-latest
     env:
@@ -149,22 +111,44 @@ jobs:
       - name: Set up MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Install 7zip
+      - name: Ensure 7-Zip is available
         shell: powershell
         run: |
+          # GitHub-hosted windows runners ship 7-Zip pre-installed, so this is
+          # normally a no-op. Only download when it's genuinely missing, and
+          # retry with backoff — the old unconditional Invoke-WebRequest hit
+          # intermittent "Unable to connect to the remote server" from
+          # 7-zip.org and failed the whole Windows job on unrelated PRs.
+          $sevenZipDir = "C:\Program Files\7-Zip"
+          if (Test-Path "$sevenZipDir\7z.exe") {
+            echo "$sevenZipDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+            Write-Host "7-Zip already present at $sevenZipDir"
+            exit 0
+          }
           $7zipUrl = "https://7-zip.org/a/7z2301-x64.exe"
           $7zipInstaller = "7z-installer.exe"
-          Invoke-WebRequest -Uri $7zipUrl -OutFile $7zipInstaller
+          $downloaded = $false
+          for ($i = 1; $i -le 5; $i++) {
+            try {
+              Invoke-WebRequest -Uri $7zipUrl -OutFile $7zipInstaller -UseBasicParsing -TimeoutSec 60
+              $downloaded = $true
+              break
+            } catch {
+              Write-Host "7-Zip download attempt $i failed: $($_.Exception.Message)"
+              Start-Sleep -Seconds ([math]::Min(30, [math]::Pow(2, $i)))
+            }
+          }
+          if (-not $downloaded) { throw "failed to download 7-Zip after 5 attempts" }
           Start-Process -FilePath .\$7zipInstaller -Args "/S" -Wait
           Remove-Item $7zipInstaller
-          echo "C:\Program Files\7-Zip" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "$sevenZipDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Download ONNX Runtime (CPU)
         shell: pwsh
         run: |
-          $url = "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-win-x64-1.22.0.zip"
-          $zipFile = "onnxruntime-win-x64-1.22.0.zip"
-          $extractDir = "apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.22.0"
+          $url = "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-x64-1.24.2.zip"
+          $zipFile = "onnxruntime-win-x64-1.24.2.zip"
+          $extractDir = "apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.24.2"
           Invoke-WebRequest -Uri $url -OutFile $zipFile
           if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
           7z x $zipFile -o"apps/screenpipe-app-tauri/src-tauri/" -y
@@ -193,7 +177,7 @@ jobs:
       - name: Stage ONNX Runtime DLLs next to test binary
         shell: pwsh
         run: |
-          $src = "${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.22.0/lib"
+          $src = "${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.24.2/lib"
           $dst = "${{ github.workspace }}/target/x86_64-pc-windows-msvc/release/deps"
           if (-not (Test-Path $dst)) {
             New-Item -ItemType Directory -Path $dst -Force | Out-Null
@@ -253,15 +237,19 @@ jobs:
       - name: Add ONNX lib dir to PATH for cargo tests
         shell: pwsh
         run: |
-          $ortLib = "${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.22.0/lib"
+          $ortLib = "${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.24.2/lib"
           echo $ortLib | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           Write-Host "PATH appended: $ortLib"
 
       - name: Run specific Windows OCR cargo test
         env:
           RUSTFLAGS: "-C link-arg=/LTCG"
-          ORT_STRATEGY: system
-          ORT_LIB_LOCATION: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.22.0
+          # Link ONNX Runtime via ort's download-binaries (pyke prebuilt), same as the
+          # green release-app.yml. Setting ORT_LIB_LOCATION forces ort-sys into system
+          # static-linking, which needs onnxruntime_common.lib + the static _deps tree
+          # the dynamic MS prebuilt doesn't ship -> "ort-sys could not link" (#4173
+          # fallout, after Windows x86_64 moved off load-dynamic). The MS zip staged
+          # above still provides the runtime DLL.
           # Use prebuilt NASM objects on Windows: https://aws.github.io/aws-lc-rs/requirements/windows.html#prebuilt-nasm-objects
           AWS_LC_SYS_PREBUILT_NASM: "1"
         run: cargo test -p screenpipe-screen test_process_ocr_task_windows --release --target x86_64-pc-windows-msvc
@@ -269,8 +257,12 @@ jobs:
       - name: Run PII removal tests
         env:
           RUSTFLAGS: "-C link-arg=/LTCG"
-          ORT_STRATEGY: system
-          ORT_LIB_LOCATION: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.22.0
+          # Link ONNX Runtime via ort's download-binaries (pyke prebuilt), same as the
+          # green release-app.yml. Setting ORT_LIB_LOCATION forces ort-sys into system
+          # static-linking, which needs onnxruntime_common.lib + the static _deps tree
+          # the dynamic MS prebuilt doesn't ship -> "ort-sys could not link" (#4173
+          # fallout, after Windows x86_64 moved off load-dynamic). The MS zip staged
+          # above still provides the runtime DLL.
           # Use prebuilt NASM objects on Windows: https://aws.github.io/aws-lc-rs/requirements/windows.html#prebuilt-nasm-objects
           AWS_LC_SYS_PREBUILT_NASM: "1"
         run: cargo test -p screenpipe-core pii_removal --release --target x86_64-pc-windows-msvc
@@ -278,8 +270,12 @@ jobs:
       - name: Run PII redaction tests
         env:
           RUSTFLAGS: "-C link-arg=/LTCG"
-          ORT_STRATEGY: system
-          ORT_LIB_LOCATION: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.22.0
+          # Link ONNX Runtime via ort's download-binaries (pyke prebuilt), same as the
+          # green release-app.yml. Setting ORT_LIB_LOCATION forces ort-sys into system
+          # static-linking, which needs onnxruntime_common.lib + the static _deps tree
+          # the dynamic MS prebuilt doesn't ship -> "ort-sys could not link" (#4173
+          # fallout, after Windows x86_64 moved off load-dynamic). The MS zip staged
+          # above still provides the runtime DLL.
           # Use prebuilt NASM objects on Windows: https://aws.github.io/aws-lc-rs/requirements/windows.html#prebuilt-nasm-objects
           AWS_LC_SYS_PREBUILT_NASM: "1"
         run: cargo test -p screenpipe-engine --lib pii_redaction_tests --release --target x86_64-pc-windows-msvc

@@ -119,9 +119,11 @@ bun x screenpipe@latest connection test telegram
 bun x screenpipe@latest connection list
 ```
 
-Connection IDs: `telegram`, `slack`, `discord`, `email`, `todoist`, `teams`, `google-calendar`, `apple-intelligence`, `openclaw`
+Connection IDs: `telegram`, `slack`, `discord`, `email`, `todoist`, `teams`, `google-calendar`, `openclaw`
 
 Credentials are stored locally at `~/.screenpipe/connections.json`.
+
+**Per-integration details**: don't guess API shapes from this skill. Run `connection list` or `connection get <id>` — each entry includes a self-describing `description` with credential fields, endpoints, and example bodies. Only fetch the integration you need.
 
 ## Publishing pipes to the store
 

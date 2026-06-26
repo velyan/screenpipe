@@ -51,7 +51,10 @@ jobs:
     - name: Install dependencies
       shell: pwsh
       run: |
-        choco install ffmpeg openssl
+        # openssl is preinstalled on the windows-2022 runner and already on PATH
+        # (e2e-test.yml mints the same Scream cert with no choco openssl). Installing
+        # it via choco breaks when slproweb.com 404s the latest OpenSSL installer.
+        choco install ffmpeg
         echo "C:\ProgramData\chocolatey\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
     - name: Install Scream on Windows
@@ -84,22 +87,44 @@ jobs:
           Write-Host "Audio service is already running"
         }
 
-    - name: Install 7zip
+    - name: Ensure 7-Zip is available
       shell: powershell
       run: |
+        # GitHub-hosted windows runners ship 7-Zip pre-installed, so this is
+        # normally a no-op. Only download when it's genuinely missing, and
+        # retry with backoff — the old unconditional Invoke-WebRequest hit
+        # intermittent "Unable to connect to the remote server" from
+        # 7-zip.org and failed the whole Windows job on unrelated PRs.
+        $sevenZipDir = "C:\Program Files\7-Zip"
+        if (Test-Path "$sevenZipDir\7z.exe") {
+          echo "$sevenZipDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "7-Zip already present at $sevenZipDir"
+          exit 0
+        }
         $7zipUrl = "https://7-zip.org/a/7z2301-x64.exe"
         $7zipInstaller = "7z-installer.exe"
-        Invoke-WebRequest -Uri $7zipUrl -OutFile $7zipInstaller
+        $downloaded = $false
+        for ($i = 1; $i -le 5; $i++) {
+          try {
+            Invoke-WebRequest -Uri $7zipUrl -OutFile $7zipInstaller -UseBasicParsing -TimeoutSec 60
+            $downloaded = $true
+            break
+          } catch {
+            Write-Host "7-Zip download attempt $i failed: $($_.Exception.Message)"
+            Start-Sleep -Seconds ([math]::Min(30, [math]::Pow(2, $i)))
+          }
+        }
+        if (-not $downloaded) { throw "failed to download 7-Zip after 5 attempts" }
         Start-Process -FilePath .\$7zipInstaller -Args "/S" -Wait
         Remove-Item $7zipInstaller
-        echo "C:\Program Files\7-Zip" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        echo "$sevenZipDir" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
     - name: Download ONNX Runtime (CPU)
       shell: pwsh
       run: |
-        $url = "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-win-x64-1.22.0.zip"
-        $zipFile = "onnxruntime-win-x64-1.22.0.zip"
-        $extractDir = "apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.22.0"
+        $url = "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-x64-1.24.2.zip"
+        $zipFile = "onnxruntime-win-x64-1.24.2.zip"
+        $extractDir = "apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.24.2"
         Invoke-WebRequest -Uri $url -OutFile $zipFile
         if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
         7z x $zipFile -o"apps/screenpipe-app-tauri/src-tauri/" -y
@@ -115,8 +140,12 @@ jobs:
     - name: Build CLI
       env:
         RUSTFLAGS: "-C link-arg=/LTCG"
-        ORT_STRATEGY: system
-        ORT_LIB_LOCATION: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.22.0
+        # Link ONNX Runtime via ort's download-binaries (pyke prebuilt), same as the
+        # green release-app.yml. Setting ORT_LIB_LOCATION forces ort-sys into system
+        # static-linking, which needs onnxruntime_common.lib + the static _deps tree
+        # the dynamic MS prebuilt doesn't ship -> "ort-sys could not link" (#4173
+        # fallout, after Windows x86_64 moved off load-dynamic). The MS zip staged
+        # above still provides the runtime DLL.
         OPENBLAS_PATH: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas
         # Use prebuilt NASM objects on Windows: https://aws.github.io/aws-lc-rs/requirements/windows.html#prebuilt-nasm-objects
         AWS_LC_SYS_PREBUILT_NASM: "1"
@@ -127,8 +156,12 @@ jobs:
       timeout-minutes: 10
       env:
         RUSTFLAGS: "-C link-arg=/LTCG"
-        ORT_STRATEGY: system
-        ORT_LIB_LOCATION: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.22.0
+        # Link ONNX Runtime via ort's download-binaries (pyke prebuilt), same as the
+        # green release-app.yml. Setting ORT_LIB_LOCATION forces ort-sys into system
+        # static-linking, which needs onnxruntime_common.lib + the static _deps tree
+        # the dynamic MS prebuilt doesn't ship -> "ort-sys could not link" (#4173
+        # fallout, after Windows x86_64 moved off load-dynamic). The MS zip staged
+        # above still provides the runtime DLL.
         OPENBLAS_PATH: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas
         AWS_LC_SYS_PREBUILT_NASM: "1"
       run: |
@@ -161,7 +194,7 @@ jobs:
         }
 
         # Copy runtime DLLs next to the binary unless the build already staged them.
-        $ortDll = "apps\screenpipe-app-tauri\src-tauri\onnxruntime-win-x64-1.22.0\lib\onnxruntime.dll"
+        $ortDll = "apps\screenpipe-app-tauri\src-tauri\onnxruntime-win-x64-1.24.2\lib\onnxruntime.dll"
         if (Test-Path $ortDll) {
           Copy-DllIfMissing $ortDll $binDir
         }

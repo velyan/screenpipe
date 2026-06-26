@@ -4,12 +4,13 @@
 
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
-import { Bell, ChevronRight, ChevronDown, MessageSquare, X } from "lucide-react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { Bell, Check, ChevronRight, ChevronDown, Copy, ExternalLink, MessageSquare, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
+import { notificationUrlTransform, openScreenpipeViewerLink } from "@/components/markdown";
 import remarkGfm from "remark-gfm";
 import posthog from "posthog-js";
-import { invoke } from "@tauri-apps/api/core";
+import { commands } from "@/lib/utils/tauri";
 import {
   Popover,
   PopoverContent,
@@ -17,6 +18,8 @@ import {
 } from "@/components/ui/popover";
 import { useRouter } from "next/navigation";
 import { showChatWithPrefill } from "@/lib/chat-utils";
+import { invoke } from "@tauri-apps/api/core";
+import { emit } from "@tauri-apps/api/event";
 
 interface NotificationEntry {
   id: string;
@@ -24,15 +27,39 @@ interface NotificationEntry {
   title: string;
   body: string;
   pipe_name?: string;
+  source_session_id?: string;
+  source_message_id?: string;
+  source_url?: string;
   timestamp: string;
   read: boolean;
 }
 
-const API_BASE = "http://localhost:11435";
+interface AppServerConfig {
+  port: number;
+}
+
+let appServerBaseUrl: Promise<string> | null = null;
+
+async function getAppServerBaseUrl(): Promise<string> {
+  appServerBaseUrl ??= invoke<AppServerConfig>("get_app_server_config")
+    .then((config) => `http://localhost:${config.port || 11435}`)
+    .catch(() => "http://localhost:11435");
+  return appServerBaseUrl;
+}
+
+async function notificationFetch(
+  path: string,
+  init?: RequestInit,
+): Promise<Response> {
+  const baseUrl = await getAppServerBaseUrl();
+  return fetch(`${baseUrl}${path.startsWith("/") ? path : `/${path}`}`, init);
+}
 
 async function openNotificationLink(href: string) {
   const raw = href.trim();
   if (!raw) return;
+
+  if (await openScreenpipeViewerLink(raw)) return;
 
   let localPath: string | null = null;
   if (raw.startsWith("~/")) {
@@ -49,7 +76,7 @@ async function openNotificationLink(href: string) {
   // Prefer opening markdown files in Obsidian if installed.
   if (localPath && localPath.toLowerCase().endsWith(".md")) {
     try {
-      await invoke("open_note_path", { path: localPath });
+      await commands.openNotePath(localPath);
       return;
     } catch {
       // Fallback to default system file opener below.
@@ -57,22 +84,51 @@ async function openNotificationLink(href: string) {
   }
 
   if (localPath) {
-    await invoke("open_note_path", { path: localPath });
+    await commands.openNotePath(localPath);
     return;
   }
 
   await open(raw);
 }
 
+async function openNotificationSource(url: string) {
+  if (!url.trim()) return;
+  if (url.startsWith("screenpipe://")) {
+    await emit("deep-link-received", url);
+    return;
+  }
+  const { open } = await import("@tauri-apps/plugin-shell");
+  await open(url);
+}
+
+function notificationClipboardText(entry: NotificationEntry): string {
+  return `${entry.title}\n\n${entry.body}`.trim();
+}
+
+function buildNotificationDisplayLabel(title: string): string {
+  const normalized = title.replace(/\s+/g, " ").trim();
+  if (!normalized) return "Ask AI about notification";
+  const compact = normalized.length > 60 ? `${normalized.slice(0, 57).trimEnd()}...` : normalized;
+  return `Ask AI about: ${compact}`;
+}
+
 export function NotificationBell() {
   const [history, setHistory] = useState<NotificationEntry[]>([]);
   const [open, setOpen] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const copiedResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const router = useRouter();
+
+  useEffect(() => {
+    return () => {
+      if (copiedResetRef.current) clearTimeout(copiedResetRef.current);
+    };
+  }, []);
 
   const loadHistory = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/notifications`);
+      const res = await notificationFetch("/notifications");
       if (res.ok) {
         const entries: NotificationEntry[] = await res.json();
         setHistory(entries);
@@ -93,7 +149,7 @@ export function NotificationBell() {
   const markAllRead = async () => {
     setHistory((prev) => prev.map((n) => ({ ...n, read: true })));
     try {
-      await fetch(`${API_BASE}/notifications`, { method: "POST" });
+      await notificationFetch("/notifications", { method: "POST" });
     } catch {}
   };
 
@@ -101,7 +157,7 @@ export function NotificationBell() {
     posthog.capture("notification_bell_clear_all", { count: history.length });
     setHistory([]);
     try {
-      await fetch(`${API_BASE}/notifications`, { method: "DELETE" });
+      await notificationFetch("/notifications", { method: "DELETE" });
     } catch {}
   };
 
@@ -114,7 +170,7 @@ export function NotificationBell() {
     setHistory((prev) => prev.filter((n) => n.id !== id));
     if (expandedId === id) setExpandedId(null);
     try {
-      await fetch(`${API_BASE}/notifications/${encodeURIComponent(id)}`, { method: "DELETE" });
+      await notificationFetch(`/notifications/${encodeURIComponent(id)}`, { method: "DELETE" });
     } catch {}
   };
 
@@ -134,6 +190,7 @@ export function NotificationBell() {
       onOpenChange={(o) => {
         setOpen(o);
         if (o) {
+          void loadHistory();
           posthog.capture("notification_bell_opened", {
             unread_count: unreadCount,
             total_count: history.length,
@@ -143,16 +200,24 @@ export function NotificationBell() {
       }}
     >
       <PopoverTrigger asChild>
-        <button className="relative p-1.5 rounded-md hover:bg-muted/60 transition-colors">
+        <button
+          aria-label={unreadCount > 0 ? `notifications, ${unreadCount} unread` : "notifications"}
+          data-testid="notification-bell-trigger"
+          className="relative p-1.5 rounded-md hover:bg-muted/60 transition-colors"
+        >
           <Bell className="h-3.5 w-3.5 text-muted-foreground" />
+          {/* Quiet unread marker — a dot, not a count. Chrome only
+              signals "something new"; detail lives in the popover. */}
           {unreadCount > 0 && (
-            <span className="absolute -top-0.5 -right-0.5 min-w-[14px] h-[14px] flex items-center justify-center rounded-full bg-foreground text-background text-[9px] font-medium px-1">
-              {unreadCount > 9 ? "9+" : unreadCount}
-            </span>
+            <span
+              data-testid="notification-bell-unread-dot"
+              className="absolute top-0.5 right-0.5 h-1.5 w-1.5 rounded-full bg-foreground"
+            />
           )}
         </button>
       </PopoverTrigger>
       <PopoverContent
+        data-testid="notification-bell-popover"
         className="w-[320px] p-0 border-border"
         align="end"
         sideOffset={4}
@@ -164,6 +229,7 @@ export function NotificationBell() {
           </span>
           {history.length > 0 && (
             <button
+              data-testid="notification-bell-clear-all"
               onClick={clearAll}
               className="text-[10px] text-muted-foreground hover:text-foreground transition-colors"
             >
@@ -175,7 +241,10 @@ export function NotificationBell() {
         {/* List */}
         <div className="max-h-[360px] overflow-y-auto">
           {history.length === 0 ? (
-            <div className="px-3 py-6 text-center text-xs text-muted-foreground">
+            <div
+              data-testid="notification-bell-empty"
+              className="px-3 py-6 text-center text-xs text-muted-foreground"
+            >
               no notifications yet
             </div>
           ) : (
@@ -184,9 +253,14 @@ export function NotificationBell() {
               return (
                 <div
                   key={entry.id}
+                  data-notification-id={entry.id}
                   className="border-b border-border/50 last:border-0"
                 >
                   <div
+                    data-testid={`notification-bell-item-${entry.id}`}
+                    role="button"
+                    tabIndex={0}
+                    aria-expanded={isExpanded}
                     className="group/notif px-3 py-2 hover:bg-muted/30 cursor-pointer"
                     onClick={() => {
                       const willExpand = !isExpanded;
@@ -198,6 +272,12 @@ export function NotificationBell() {
                           title: entry.title,
                         });
                       }
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key !== "Enter" && e.key !== " ") return;
+                      e.preventDefault();
+                      const willExpand = !isExpanded;
+                      setExpandedId(willExpand ? entry.id : null);
                     }}
                   >
                     <div className="flex items-start justify-between gap-2">
@@ -216,9 +296,10 @@ export function NotificationBell() {
                           </span>
                         </div>
                         {!isExpanded && entry.body && (
-                          <div className="text-[10px] text-muted-foreground mt-0.5 line-clamp-2 pl-4 [&_p]:inline [&_strong]:text-foreground [&_a]:underline">
+                          <div className="select-text text-[10px] text-muted-foreground mt-0.5 line-clamp-2 pl-4 [&_p]:inline [&_strong]:text-foreground [&_a]:underline">
                             <ReactMarkdown
                               remarkPlugins={[remarkGfm]}
+                              urlTransform={notificationUrlTransform}
                               components={{
                                 a: ({ href, children }) => (
                                   <a
@@ -250,11 +331,12 @@ export function NotificationBell() {
                           {formatTime(entry.timestamp)}
                         </span>
                         <button
+                          data-testid={`notification-bell-dismiss-${entry.id}`}
                           onClick={(e) => {
                             e.stopPropagation();
                             dismissOne(entry.id);
                           }}
-                          className="p-0.5 rounded hover:bg-muted/60 opacity-0 group-hover/notif:opacity-100 transition-opacity"
+                          className="p-0.5 rounded hover:bg-muted/60 opacity-0 group-hover/notif:opacity-100 group-focus/notif:opacity-100 group-focus-within/notif:opacity-100 focus:opacity-100 transition-opacity"
                           title="dismiss"
                         >
                           <X className="w-3 h-3 text-muted-foreground/50 hover:text-foreground" />
@@ -263,11 +345,15 @@ export function NotificationBell() {
                     </div>
                   </div>
                   {isExpanded && (
-                    <div className="px-3 pb-2 pl-7">
+                    <div
+                      data-testid={`notification-bell-expanded-${entry.id}`}
+                      className="px-3 pb-2 pl-7"
+                    >
                       {entry.body && (
-                        <div className="text-[10px] text-muted-foreground leading-relaxed mb-2 [&_p]:mb-1 [&_p:last-child]:mb-0 [&_strong]:text-foreground [&_code]:bg-muted [&_code]:px-1 [&_code]:text-[9px] [&_ul]:pl-4 [&_ul]:my-0.5 [&_li]:my-0">
+                        <div className="select-text text-[10px] text-muted-foreground leading-relaxed mb-2 [&_p]:mb-1 [&_p:last-child]:mb-0 [&_strong]:text-foreground [&_code]:bg-muted [&_code]:px-1 [&_code]:text-[9px] [&_ul]:pl-4 [&_ul]:my-0.5 [&_li]:my-0">
                           <ReactMarkdown
                             remarkPlugins={[remarkGfm]}
+                            urlTransform={notificationUrlTransform}
                             components={{
                               a: ({ href, children }) => (
                                 <a
@@ -296,27 +382,67 @@ export function NotificationBell() {
                           {entry.pipe_name}
                         </span>
                       )}
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          posthog.capture("notification_bell_ask_ai", {
-                            notification_type: entry.type,
-                            pipe_name: entry.pipe_name,
-                            title: entry.title,
-                          });
-                          setOpen(false);
-                          showChatWithPrefill({
-                            context: `notification from ${entry.pipe_name || "screenpipe"}:\n\n**${entry.title}**\n${entry.body}`,
-                            prompt: `tell me more about this: "${entry.title}"`,
-                            autoSend: true,
-                            source: `notification-bell-${entry.id}`,
-                          });
-                        }}
-                        className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors"
-                      >
-                        <MessageSquare className="w-3 h-3" />
-                        ask ai about this
-                      </button>
+                      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                        <button
+                          data-testid={`notification-bell-copy-${entry.id}`}
+                          onClick={async (e) => {
+                            e.stopPropagation();
+                            await commands.copyTextToClipboard(notificationClipboardText(entry));
+                            if (copiedResetRef.current) clearTimeout(copiedResetRef.current);
+                            setCopiedId(entry.id);
+                            copiedResetRef.current = setTimeout(() => setCopiedId(null), 1400);
+                            posthog.capture("notification_bell_copy", {
+                              notification_type: entry.type,
+                              pipe_name: entry.pipe_name,
+                            });
+                          }}
+                          className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors"
+                        >
+                          {copiedId === entry.id ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                          {copiedId === entry.id ? "copied" : "copy"}
+                        </button>
+                        {entry.source_url && (
+                          <button
+                            data-testid={`notification-bell-source-${entry.id}`}
+                            onClick={async (e) => {
+                              e.stopPropagation();
+                              setOpen(false);
+                              posthog.capture("notification_bell_open_source", {
+                                notification_type: entry.type,
+                                pipe_name: entry.pipe_name,
+                              });
+                              await openNotificationSource(entry.source_url!);
+                            }}
+                            className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors"
+                          >
+                            <ExternalLink className="w-3 h-3" />
+                            source
+                          </button>
+                        )}
+                        <button
+                          data-testid={`notification-bell-ask-ai-${entry.id}`}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            posthog.capture("notification_bell_ask_ai", {
+                              notification_type: entry.type,
+                              pipe_name: entry.pipe_name,
+                              title: entry.title,
+                            });
+                            setOpen(false);
+                            showChatWithPrefill({
+                              context: `notification from ${entry.pipe_name || "screenpipe"}:\n\n**${entry.title}**\n${entry.body}`,
+                              prompt: `tell me more about this: "${entry.title}"`,
+                              displayLabel: buildNotificationDisplayLabel(entry.title),
+                              autoSend: true,
+                              source: `notification-bell-${entry.id}`,
+                            });
+                          }}
+                          className="flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors"
+                        >
+                          <MessageSquare className="w-3 h-3" />
+                          ask ai
+                        </button>
+                      </div>
                     </div>
                   )}
                 </div>
@@ -328,6 +454,7 @@ export function NotificationBell() {
         {/* Footer */}
         <div className="px-3 py-1.5 border-t border-border">
           <button
+            data-testid="notification-bell-manage-settings"
             onClick={() => {
               setOpen(false);
               router.push("/settings?section=notifications");

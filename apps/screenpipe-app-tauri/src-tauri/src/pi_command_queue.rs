@@ -20,6 +20,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use specta::Type;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::process::ChildStdin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,15 +64,10 @@ pub struct PiCommand {
 /// How the queue waits after writing a command to stdin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitMode {
-    /// Write to stdin, reply Ok, advance immediately. Used for `prompt`
-    /// commands that include `streamingBehavior: "followUp"` — pi-mono owns
-    /// prompt serialization (its internal followUp queue handles back-to-back
-    /// prompts during streaming AND during auto-retry's mid-prompt agent_end
-    /// gap). The Rust queue must NOT block on `agent_end`, because pi-mono
-    /// fires that event mid-prompt during auto-retry and our drain loop would
-    /// race the still-running turn. The "queued" UI rail is cleared by the
-    /// stdout reader when pi-mono fires `message_start` for the user message.
-    WriteOnly,
+    /// Write a prompt, acknowledge the write, then wait for the agent to
+    /// become idle before the next queued prompt is written. This keeps
+    /// follow-ups in Rust's cancellable queue until their actual turn starts.
+    Prompt,
     /// Write to stdin, wait for `done`, then reply and dequeue. Used for `new_session`
     /// and `abort` where the caller must know the SDK is fully idle before proceeding.
     WaitDone,
@@ -81,6 +77,7 @@ pub enum WaitMode {
 #[derive(Clone)]
 pub struct PiQueueHandle {
     tx: mpsc::Sender<QueueMessage>,
+    stdin: Option<Arc<Mutex<ChildStdin>>>,
     /// Shared with the drain loop and the stdout reader. We keep a reference
     /// here so `send_prompt` can publish the new entry to subscribers BEFORE
     /// awaiting the drain loop, giving the UI an instant "queued" hint.
@@ -117,7 +114,11 @@ pub struct PiQueueState {
     /// pulled them. The mpsc channel is FIFO and not introspectable, so we
     /// can't pluck a specific entry out of it — instead the drain loop
     /// checks this set when popping and skips the write.
-    cancelled: std::sync::Mutex<std::collections::HashSet<String>>,
+    cancelled: std::sync::Mutex<HashSet<String>>,
+    /// Full queued command payloads by queue id. The UI only receives a small
+    /// preview, but backend actions like "Steer this queued row" need the
+    /// exact original prompt/images without trusting frontend shadow state.
+    queued_payloads: std::sync::Mutex<HashMap<String, Value>>,
     /// True between `agent_start` and `agent_end` — i.e. while the SDK is
     /// actively processing a `prompt`. Read by the stdout reader to suppress
     /// the `response → 500ms → signal_done` fallback on prompt ACKs (those
@@ -127,6 +128,16 @@ pub struct PiQueueState {
     /// authoritative done signal; the response-fallback only matters for
     /// new_session/abort, which never fire agent_start.
     agent_active: AtomicBool,
+    /// True while a steer command has been written to stdin via
+    /// `send_immediate` but the new turn's `agent_start` has not yet fired.
+    /// Prevents the drain loop from writing the next queued prompt during
+    /// the brief `agent_end` → `agent_start` transition.
+    steer_in_flight: AtomicBool,
+    /// Tool calls that have been requested by the assistant but have not yet
+    /// emitted their matching result. Pi can emit `agent_end` at tool-use
+    /// boundaries, so this keeps Rust from treating the turn as complete while
+    /// the shell/read/edit tool is still running.
+    active_tool_calls: std::sync::Mutex<HashSet<String>>,
 }
 
 impl PiQueueState {
@@ -138,14 +149,17 @@ impl PiQueueState {
             terminated_notify: Notify::new(),
             alive: alive_tx,
             queued: queued_tx,
-            cancelled: std::sync::Mutex::new(std::collections::HashSet::new()),
+            cancelled: std::sync::Mutex::new(HashSet::new()),
+            queued_payloads: std::sync::Mutex::new(HashMap::new()),
             agent_active: AtomicBool::new(false),
+            steer_in_flight: AtomicBool::new(false),
+            active_tool_calls: std::sync::Mutex::new(HashSet::new()),
         })
     }
 
     /// Called by the stdout reader when a `done` event is received.
     pub fn signal_done(&self) {
-        self.done_notify.notify_one();
+        self.done_notify.notify_waiters();
     }
 
     /// Called by the stdout reader on `agent_start` (a prompt has begun streaming).
@@ -164,6 +178,60 @@ impl PiQueueState {
         self.agent_active.load(Ordering::SeqCst)
     }
 
+    /// Mark that a steer command is in flight (written to stdin, awaiting
+    /// `agent_start`). The drain loop checks this alongside `agent_active`.
+    pub fn set_steer_in_flight(&self) {
+        self.steer_in_flight.store(true, Ordering::SeqCst);
+        self.done_notify.notify_waiters();
+    }
+
+    /// Clear the steer-in-flight guard. Called on `agent_start`, write
+    /// failure, process termination, and the bounded 30s timeout.
+    pub fn clear_steer_in_flight(&self) {
+        self.steer_in_flight.store(false, Ordering::SeqCst);
+        self.done_notify.notify_waiters();
+    }
+
+    /// Whether a steer command is awaiting its `agent_start`.
+    pub fn is_steer_in_flight(&self) -> bool {
+        self.steer_in_flight.load(Ordering::SeqCst)
+    }
+
+    pub fn mark_tool_active(&self, tool_call_id: impl Into<String>) {
+        if let Ok(mut active) = self.active_tool_calls.lock() {
+            active.insert(tool_call_id.into());
+        }
+        self.done_notify.notify_waiters();
+    }
+
+    pub fn mark_tool_idle(&self, tool_call_id: &str) {
+        if let Ok(mut active) = self.active_tool_calls.lock() {
+            active.remove(tool_call_id);
+        }
+        self.done_notify.notify_waiters();
+    }
+
+    pub fn has_active_tools(&self) -> bool {
+        self.active_tool_calls
+            .lock()
+            .map(|active| !active.is_empty())
+            .unwrap_or(true)
+    }
+
+    pub fn has_active_turn_work(&self) -> bool {
+        self.is_agent_active() || self.is_steer_in_flight() || self.has_active_tools()
+    }
+
+    pub fn is_busy(&self) -> bool {
+        self.has_active_turn_work() || !self.queued.borrow().is_empty()
+    }
+
+    pub fn signal_done_if_idle(&self) {
+        if !self.has_active_turn_work() {
+            self.signal_done();
+        }
+    }
+
     /// Called by the stdout reader when the process terminates (EOF).
     pub fn signal_terminated(&self) {
         let _ = self.alive.send(false);
@@ -172,9 +240,19 @@ impl PiQueueState {
         self.done_notify.notify_waiters();
         // Drop any queued prompts so subscribers stop showing them — Pi died.
         self.queued.send_modify(|v| v.clear());
+        if let Ok(mut payloads) = self.queued_payloads.lock() {
+            payloads.clear();
+        }
+        if let Ok(mut cancelled) = self.cancelled.lock() {
+            cancelled.clear();
+        }
+        if let Ok(mut active_tools) = self.active_tool_calls.lock() {
+            active_tools.clear();
+        }
         // Clear the agent-active flag so a future restart doesn't start out
         // in a stuck "active" state if the process died mid-stream.
         self.agent_active.store(false, Ordering::SeqCst);
+        self.clear_steer_in_flight();
     }
 
     /// Subscribe to queue-pending changes. Each receive yields the current
@@ -188,7 +266,10 @@ impl PiQueueState {
         self.queued.borrow().clone()
     }
 
-    fn enqueue_prompt(&self, prompt: PiQueuedPrompt) {
+    fn enqueue_prompt(&self, prompt: PiQueuedPrompt, payload: Value) {
+        if let Ok(mut payloads) = self.queued_payloads.lock() {
+            payloads.insert(prompt.id.clone(), payload);
+        }
         self.queued.send_modify(|v| v.push(prompt));
     }
 
@@ -198,30 +279,9 @@ impl PiQueueState {
                 v.remove(pos);
             }
         });
-    }
-
-    /// Remove the first queued entry whose preview matches the given user
-    /// message text. Called by the stdout reader when pi-mono fires
-    /// `message_start` with a user message — that's the moment a prompt
-    /// transitions from "waiting in pi-mono's followUp queue" to "in-flight",
-    /// and is the right moment to clear the UI rail entry. Returns whether a
-    /// match was found and removed.
-    ///
-    /// Matching is by preview text (truncated to 200 chars at enqueue time).
-    /// Pi-mono uses the same FIFO match-by-text strategy in its own queue, so
-    /// this stays consistent: if the user enqueues two identical prompts, the
-    /// first message_start dequeues the first entry, the second dequeues the
-    /// second.
-    pub fn dequeue_first_matching_text(&self, text: &str) -> bool {
-        let preview: String = text.chars().take(200).collect();
-        let mut removed = false;
-        self.queued.send_modify(|v| {
-            if let Some(pos) = v.iter().position(|p| p.preview == preview) {
-                v.remove(pos);
-                removed = true;
-            }
-        });
-        removed
+        if let Ok(mut payloads) = self.queued_payloads.lock() {
+            payloads.remove(id);
+        }
     }
 
     /// Mark a prompt id as cancelled so the drain loop drops it on dequeue
@@ -237,6 +297,27 @@ impl PiQueueState {
         }
         self.dequeue_prompt(id);
         was_present
+    }
+
+    fn take_queued_payload(&self, id: &str) -> Option<Value> {
+        let was_visible = self.queued.borrow().iter().any(|p| p.id == id);
+        if !was_visible {
+            return None;
+        }
+        let payload = self
+            .queued_payloads
+            .lock()
+            .ok()
+            .and_then(|mut payloads| payloads.remove(id));
+        if let Ok(mut set) = self.cancelled.lock() {
+            set.insert(id.to_string());
+        }
+        self.queued.send_modify(|v| {
+            if let Some(pos) = v.iter().position(|p| p.id == id) {
+                v.remove(pos);
+            }
+        });
+        payload
     }
 
     fn take_cancelled(&self, id: &str) -> bool {
@@ -278,6 +359,7 @@ impl PiQueueHandle {
         payload: Value,
         wait_mode: WaitMode,
         preview: String,
+        force_visible_queue: bool,
     ) -> Result<(String, oneshot::Receiver<Result<(), String>>), String> {
         let id = format!("q_{}", uuid::Uuid::new_v4().simple());
         let queued_at_ms = std::time::SystemTime::now()
@@ -294,26 +376,107 @@ impl PiQueueHandle {
         };
 
         let (tx, rx) = oneshot::channel();
-        self.tx
+        let should_show_in_queue = force_visible_queue || self.state.is_agent_active();
+        let tracked_payload = payload.clone();
+
+        if should_show_in_queue {
+            self.state.enqueue_prompt(meta.clone(), tracked_payload);
+        }
+
+        if self
+            .tx
             .send(QueueMessage::Command(PiCommand {
                 payload,
                 wait_mode,
                 reply: tx,
-                prompt_meta: Some(meta.clone()),
+                prompt_meta: Some(meta),
             }))
             .await
-            .map_err(|_| "Pi command queue closed".to_string())?;
-
-        // Only surface in the "queued · waiting for current reply" UI rail
-        // when the agent is actually mid-stream. For a first prompt to an
-        // idle agent, pi-mono fires `message_start` within milliseconds and
-        // showing it as "queued" briefly is confusing — skip the rail entry.
-        // The stdout reader's `message_start` handler is a no-op when the
-        // entry isn't present (it dequeues by text match).
-        if self.state.is_agent_active() {
-            self.state.enqueue_prompt(meta);
+            .is_err()
+        {
+            if should_show_in_queue {
+                self.state.dequeue_prompt(&id);
+            }
+            return Err("Pi command queue closed".to_string());
         }
         Ok((id, rx))
+    }
+
+    /// Remove a queued prompt and return its original command payload. Used
+    /// for queue-row steering: the selected follow-up leaves the queue and is
+    /// sent through Pi's native steer path instead of later running as a
+    /// normal follow-up.
+    pub async fn take_queued_payload(&self, prompt_id: String) -> Result<Option<Value>, String> {
+        Ok(self.state.take_queued_payload(&prompt_id))
+    }
+
+    /// Write a command straight to Pi stdin. This is intentionally reserved
+    /// for native steer, which must redirect the active turn immediately
+    /// instead of waiting behind normal queued follow-ups.
+    pub async fn send_immediate(&self, mut payload: Value) -> Result<(), String> {
+        let stdin = self
+            .stdin
+            .as_ref()
+            .ok_or("Pi stdin is not available".to_string())?;
+        let req_id = format!("req_{}", uuid::Uuid::new_v4().simple());
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("id".to_string(), json!(&req_id));
+        }
+        let cmd_type = payload
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let cmd_str = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+        // Set the guard *before* writing so the drain loop sees it even if
+        // agent_end (old turn) fires before agent_start (steer turn).
+        if cmd_type == "steer" {
+            self.state.set_steer_in_flight();
+        }
+        let mut stdin_guard = stdin.lock().await;
+        info!(
+            "pi_command_queue: writing immediate {} ({}), {} bytes",
+            cmd_type,
+            req_id,
+            cmd_str.len()
+        );
+        let write_result = writeln!(*stdin_guard, "{}", cmd_str)
+            .and_then(|_| stdin_guard.flush());
+        if write_result.is_err() {
+            if cmd_type == "steer" {
+                self.state.clear_steer_in_flight();
+            }
+        }
+        write_result.map_err(|e| format!("stdin write failed: {}", e))
+    }
+
+    /// Abort only the active Pi turn. Unlike `abort`, this does not drain or
+    /// clear queued follow-ups, so the queue can continue after the active
+    /// reply stops.
+    pub async fn abort_active_only(&self) -> Result<(), String> {
+        let stdin = self
+            .stdin
+            .as_ref()
+            .ok_or("Pi stdin is not available".to_string())?;
+        let mut alive_rx = self.state.alive.subscribe();
+        let req_id = format!("req_{}", uuid::Uuid::new_v4().simple());
+        let abort_cmd = json!({"type": "abort", "id": &req_id});
+        let cmd_str = serde_json::to_string(&abort_cmd).map_err(|e| e.to_string())?;
+
+        self.state.mark_agent_idle();
+        {
+            let mut stdin_guard = stdin.lock().await;
+            info!("pi_command_queue: writing active-only abort ({})", req_id);
+            writeln!(*stdin_guard, "{}", cmd_str)
+                .and_then(|_| stdin_guard.flush())
+                .map_err(|e| format!("abort write failed: {}", e))?;
+        }
+
+        if wait_for_done_or_terminated(&self.state, &mut alive_rx, "abort").await {
+            Ok(())
+        } else {
+            Err("Pi process died during abort".to_string())
+        }
     }
 
     /// Cancel a single queued prompt by its id. Returns `true` if the prompt
@@ -355,6 +518,7 @@ pub fn spawn_queue(
     let (tx, mut rx) = mpsc::channel::<QueueMessage>(32);
     let handle = PiQueueHandle {
         tx,
+        stdin: Some(stdin.clone()),
         state: state.clone(),
     };
 
@@ -384,6 +548,7 @@ pub fn spawn_queue(
             match msg {
                 QueueMessage::Command(cmd) => {
                     let prompt_id = cmd.prompt_meta.as_ref().map(|m| m.id.clone());
+                    let is_prompt = prompt_id.is_some();
 
                     // Tombstone check — if the user cancelled this prompt
                     // while it was sitting in the channel, drop it without
@@ -411,6 +576,73 @@ pub fn spawn_queue(
                         .unwrap_or("?")
                         .to_string();
 
+                    // Prompt commands must be serialized against the currently
+                    // active agent turn *and* any in-flight steer command.
+                    // We cannot rely on response ACK order: ACK can arrive
+                    // before pi-mono actually starts streaming.
+                    {
+                        let mut died_during_wait = false;
+                        while is_prompt && state.has_active_turn_work() {
+                            // When only steer_in_flight holds us (agent finished
+                            // but steer's agent_start hasn't arrived yet), use a
+                            // short 30s timeout. If agent_start never fires (Pi
+                            // rejected the steer silently), force-clear and let
+                            // the queue proceed.
+                            if state.is_steer_in_flight()
+                                && !state.is_agent_active()
+                                && !state.has_active_tools()
+                            {
+                                tokio::select! {
+                                    _ = state.done_notify.notified() => {}
+                                    _ = state.terminated_notify.notified() => {
+                                        died_during_wait = true;
+                                        break;
+                                    }
+                                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                                        warn!(
+                                            "pi_command_queue: steer_in_flight stuck 30s, force-clearing"
+                                        );
+                                        state.clear_steer_in_flight();
+                                    }
+                                }
+                            } else {
+                                let ok = wait_for_done_or_terminated(
+                                    &state,
+                                    &mut alive_rx,
+                                    &cmd_type,
+                                )
+                                .await;
+                                if !ok {
+                                    died_during_wait = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if died_during_wait {
+                            if let Some(pid) = &prompt_id {
+                                state.dequeue_prompt(pid);
+                            }
+                            let _ = cmd
+                                .reply
+                                .send(Err("Pi process died while processing".to_string()));
+                            continue;
+                        }
+                    }
+
+                    // The first queued prompt can already be popped from
+                    // the mpsc channel and parked here waiting for the
+                    // current turn to finish. If the user deletes it
+                    // during that wait, the original tombstone check above
+                    // is now stale. Re-check before writing so "Delete"
+                    // really prevents the prompt from ever reaching Pi.
+                    if let Some(pid) = &prompt_id {
+                        if state.take_cancelled(pid) {
+                            state.dequeue_prompt(pid);
+                            let _ = cmd.reply.send(Err("cancelled".to_string()));
+                            continue;
+                        }
+                    }
+
                     // Write to stdin
                     let write_result = {
                         let mut stdin_guard = stdin.lock().await;
@@ -436,21 +668,29 @@ pub fn spawn_queue(
                         continue;
                     }
 
+                    // `agent_start` can arrive a little later than the write.
+                    // Mark active optimistically for prompt commands so the
+                    // next queued prompt cannot slip through this tiny window.
+                    if is_prompt {
+                        state.mark_agent_active();
+                    }
+
                     match cmd.wait_mode {
-                        WaitMode::WriteOnly => {
-                            // Pi-mono owns serialization for prompts via its
-                            // internal followUp queue. We don't wait for done
-                            // and we don't dequeue from the UI rail here —
-                            // the entry stays visible until pi-mono fires
-                            // `message_start` for the user message, at which
-                            // point the stdout reader removes it.
+                        WaitMode::Prompt => {
+                            // The prompt has now left the waiting queue and
+                            // entered the transcript as the active turn.
+                            if let Some(pid) = &prompt_id {
+                                state.dequeue_prompt(pid);
+                            }
                             let _ = cmd.reply.send(Ok(()));
+                            let _ =
+                                wait_for_done_or_terminated(&state, &mut alive_rx, &cmd_type).await;
                         }
                         WaitMode::WaitDone => {
                             // Successful write — for blocking commands the
                             // entry should be removed from the queued rail
                             // immediately (it's now in-flight, not waiting).
-                            // Prompts use WriteOnly and skip this branch.
+                            // Prompts use Prompt mode and skip this branch.
                             if let Some(pid) = &prompt_id {
                                 state.dequeue_prompt(pid);
                             }
@@ -490,6 +730,12 @@ pub fn spawn_queue(
                     // queued-prompt list. The drain above should cover them
                     // but a paranoid clear is cheap and correct.
                     state.queued.send_modify(|v| v.clear());
+                    if let Ok(mut payloads) = state.queued_payloads.lock() {
+                        payloads.clear();
+                    }
+                    if let Ok(mut tombstones) = state.cancelled.lock() {
+                        tombstones.clear();
+                    }
                     // Abort halts the agent loop. Clear the active flag so
                     // the abort's `response` ACK is allowed to fire the
                     // done-fallback (otherwise the wait below hangs until
@@ -580,16 +826,6 @@ async fn wait_for_done_or_terminated(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    /// Create a pipe-based fake stdin for testing.
-    fn fake_stdin() -> (Arc<Mutex<ChildStdin>>, std::fs::File) {
-        // We can't easily create a ChildStdin directly, so we test
-        // the queue logic via the public API with a real subprocess.
-        // For unit tests, we verify the signal/wait logic instead.
-        unimplemented!("Integration tests use real Pi process")
-    }
 
     #[tokio::test]
     async fn test_queue_state_done_signal() {
@@ -629,12 +865,16 @@ mod tests {
         // Verify the handle API works without a real subprocess
         let (tx, mut rx) = mpsc::channel::<QueueMessage>(8);
         let state = PiQueueState::new();
-        let handle = PiQueueHandle { tx, state };
+        let handle = PiQueueHandle {
+            tx,
+            stdin: None,
+            state,
+        };
 
         // Send a command in the background
         let h = tokio::spawn(async move {
             let result = handle
-                .send(json!({"type": "prompt"}), WaitMode::WriteOnly)
+                .send(json!({"type": "prompt"}), WaitMode::Prompt)
                 .await;
             assert!(result.is_ok());
             // The receiver should work
@@ -644,7 +884,7 @@ mod tests {
 
         // Receive from the channel and complete it
         if let Some(QueueMessage::Command(cmd)) = rx.recv().await {
-            assert_eq!(cmd.wait_mode, WaitMode::WriteOnly);
+            assert_eq!(cmd.wait_mode, WaitMode::Prompt);
             let _ = cmd.reply.send(Ok(()));
         }
 
@@ -656,14 +896,16 @@ mod tests {
     async fn test_abort_cancels_pending() {
         let (tx, mut rx) = mpsc::channel::<QueueMessage>(8);
         let state = PiQueueState::new();
-        let handle = PiQueueHandle { tx, state };
+        let handle = PiQueueHandle {
+            tx,
+            stdin: None,
+            state,
+        };
 
         // Queue two commands
         let h1 = {
             let h = handle.clone();
-            tokio::spawn(
-                async move { h.send(json!({"type": "prompt"}), WaitMode::WriteOnly).await },
-            )
+            tokio::spawn(async move { h.send(json!({"type": "prompt"}), WaitMode::Prompt).await })
         };
         let h2 = {
             let h = handle.clone();
@@ -708,5 +950,254 @@ mod tests {
         let _ = h1.await;
         let _ = h2.await;
         let _ = abort_handle.await;
+    }
+
+    /// The real regression guard for native-steer queue serialization: drive
+    /// the actual `spawn_queue` drain loop and prove a queued follow-up stays
+    /// blocked while `steer_in_flight` is set, then is written once the guard
+    /// clears. This exercises the `while is_prompt && (is_agent_active() ||
+    /// is_steer_in_flight())` gate and the steer-only `select!` — not just the
+    /// atomic, which is why it would catch a regression in the drain loop
+    /// itself (e.g. dropping the `is_steer_in_flight()` term).
+    ///
+    /// Unix-only because it needs a real writable child stdin; `cat` drains
+    /// whatever the loop writes and exits on EOF.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_steer_in_flight_blocks_drain_loop_until_cleared() {
+        use std::process::{Command as StdCommand, Stdio};
+
+        let mut child = StdCommand::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cat as a fake pi stdin");
+        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("child stdin")));
+
+        let state = PiQueueState::new();
+        let (handle, join) = spawn_queue(stdin, state.clone(), 0);
+
+        // Simulate the agent_end -> agent_start gap: a steer has been written
+        // to stdin but its turn hasn't started, and the prior turn already
+        // ended (agent NOT active). This is exactly the window the guard
+        // exists to cover.
+        state.set_steer_in_flight();
+
+        let (_id, mut reply_rx) = handle
+            .send_prompt(
+                json!({ "type": "prompt", "text": "queued-follow-up" }),
+                WaitMode::Prompt,
+                "queued-follow-up".to_string(),
+                true,
+            )
+            .await
+            .expect("enqueue follow-up");
+
+        // The drain loop must park in the steer wait and never write the
+        // follow-up while the steer is in flight.
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut reply_rx).await;
+        assert!(
+            blocked.is_err(),
+            "follow-up must stay queued while a steer is in flight"
+        );
+        assert!(state.is_steer_in_flight(), "guard should still be set");
+
+        // The steered turn started (in prod, agent_start/message_start clears
+        // the guard). Clearing it must wake the drain loop and release the
+        // follow-up — proving the `select!` is wired to `done_notify`.
+        state.clear_steer_in_flight();
+
+        let released = tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx)
+            .await
+            .expect("follow-up must be released once the steer clears")
+            .expect("reply channel stayed open");
+        assert!(
+            released.is_ok(),
+            "follow-up should be written after the steer cleared, got {released:?}"
+        );
+
+        // Tear down: end the post-write wait the loop entered, close the
+        // channel so the loop exits, and reap cat.
+        state.signal_terminated();
+        drop(handle);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join).await;
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Pi can emit `agent_end` when an assistant turn asks for a tool, before
+    /// that tool result exists. The queue must still treat the prompt as
+    /// busy, otherwise a follow-up can race the running shell/read/edit tool.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_active_tool_blocks_drain_loop_after_agent_end() {
+        use std::process::{Command as StdCommand, Stdio};
+
+        let mut child = StdCommand::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cat as a fake pi stdin");
+        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("child stdin")));
+
+        let state = PiQueueState::new();
+        let (handle, join) = spawn_queue(stdin, state.clone(), 0);
+
+        state.mark_agent_active();
+        state.mark_tool_active("tool-1");
+        state.mark_agent_idle();
+        state.signal_done_if_idle();
+        assert!(
+            state.has_active_turn_work(),
+            "tool work keeps the turn busy after agent_end"
+        );
+
+        let (_id, mut reply_rx) = handle
+            .send_prompt(
+                json!({ "type": "prompt", "text": "queued-after-tool" }),
+                WaitMode::Prompt,
+                "queued-after-tool".to_string(),
+                true,
+            )
+            .await
+            .expect("enqueue follow-up");
+
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut reply_rx).await;
+        assert!(
+            blocked.is_err(),
+            "follow-up must stay queued while a tool is still running"
+        );
+
+        state.mark_tool_idle("tool-1");
+        state.signal_done_if_idle();
+
+        let released = tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx)
+            .await
+            .expect("follow-up must be released once the tool completes")
+            .expect("reply channel stayed open");
+        assert!(
+            released.is_ok(),
+            "follow-up should be written after the tool finishes, got {released:?}"
+        );
+
+        state.signal_terminated();
+        drop(handle);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join).await;
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Reproduces the Rust-level shape behind a Pi restart while a chat turn is
+    /// mid-flight: the active prompt has been written, a follow-up is parked
+    /// behind `agent_active`, then the process is terminated. This is what
+    /// `PiManager::stop()` triggers when `pi_start_inner` restarts the same
+    /// session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_mid_turn_process_termination_fails_queued_followup() {
+        use std::process::{Command as StdCommand, Stdio};
+
+        let mut child = StdCommand::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cat as a fake pi stdin");
+        let stdin = Arc::new(Mutex::new(child.stdin.take().expect("child stdin")));
+
+        let state = PiQueueState::new();
+        let (handle, join) = spawn_queue(stdin, state.clone(), 0);
+
+        let (_first_id, first_rx) = handle
+            .send_prompt(
+                json!({ "type": "prompt", "text": "active-turn" }),
+                WaitMode::Prompt,
+                "active-turn".to_string(),
+                true,
+            )
+            .await
+            .expect("enqueue first prompt");
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), first_rx)
+            .await
+            .expect("first prompt write should be acknowledged")
+            .expect("first reply channel stayed open");
+        assert!(first.is_ok(), "first prompt should be written, got {first:?}");
+        assert!(
+            state.is_agent_active(),
+            "prompt writes mark the active turn before agent_start arrives"
+        );
+
+        let (_queued_id, mut queued_rx) = handle
+            .send_prompt(
+                json!({ "type": "prompt", "text": "queued-follow-up" }),
+                WaitMode::Prompt,
+                "queued-follow-up".to_string(),
+                true,
+            )
+            .await
+            .expect("enqueue follow-up");
+
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut queued_rx).await;
+        assert!(
+            blocked.is_err(),
+            "follow-up must stay queued while the previous turn is active"
+        );
+
+        state.signal_terminated();
+
+        let queued = tokio::time::timeout(std::time::Duration::from_secs(5), queued_rx)
+            .await
+            .expect("queued prompt should be failed by process termination")
+            .expect("queued reply channel stayed open");
+        assert!(
+            matches!(queued, Err(ref err) if err.contains("Pi process")),
+            "process death while waiting on an active turn loses the queued follow-up: {queued:?}"
+        );
+        assert!(
+            !state.is_agent_active(),
+            "termination clears the active-turn flag for the dead process"
+        );
+
+        drop(handle);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), join).await;
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// Process death must clear the steer guard. Otherwise a steer that dies
+    /// before its `agent_start` arrives would leave `steer_in_flight` set, and
+    /// every subsequent queued prompt would eat the full 30s fallback timeout.
+    #[tokio::test]
+    async fn test_signal_terminated_clears_steer_in_flight() {
+        let state = PiQueueState::new();
+        assert!(!state.is_steer_in_flight(), "starts clear");
+
+        state.set_steer_in_flight();
+        assert!(state.is_steer_in_flight(), "set takes effect");
+
+        state.signal_terminated();
+        assert!(
+            !state.is_steer_in_flight(),
+            "process termination must clear the in-flight steer guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_signal_terminated_clears_active_tools() {
+        let state = PiQueueState::new();
+        state.mark_tool_active("tool-1");
+        assert!(state.has_active_tools(), "tool guard should be set");
+
+        state.signal_terminated();
+        assert!(
+            !state.has_active_tools(),
+            "process termination must clear active tool guards"
+        );
     }
 }

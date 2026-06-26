@@ -14,7 +14,7 @@ use crossbeam_channel::Sender;
 use parking_lot::Mutex;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, trace, warn};
@@ -40,10 +40,47 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MsgWaitForMultipleObjects, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, QS_ALLINPUT,
 };
 
+const LOCKED_SCREEN_UIA_BACKOFF: Duration = Duration::from_millis(1000);
+
+/// Returns true if the user has produced a mouse/keyboard event within
+/// `pause_extraction_on_input_ms`. The UIA worker uses this to skip tree captures during
+/// active input — the resulting tree would be stale within milliseconds anyway, and the
+/// extraction work would compete with input threads for CPU, contributing to perceived lag.
+fn input_too_recent(
+    config: &UiCaptureConfig,
+    start_time: Instant,
+    last_input_at_ms: &AtomicU64,
+) -> bool {
+    if !config.prioritize_input_latency || config.pause_extraction_on_input_ms == 0 {
+        return false;
+    }
+    let last_input = last_input_at_ms.load(Ordering::Relaxed);
+    if last_input == 0 {
+        return false;
+    }
+    let now_ms = start_time.elapsed().as_millis() as u64;
+    now_ms.saturating_sub(last_input) < config.pause_extraction_on_input_ms
+}
+
 /// Shared state for pending focus changes (set by COM handler, read by UIA thread)
 struct PendingFocus {
     hwnd: HWND,
     time: Instant,
+}
+
+fn pause_uia_while_screen_locked(
+    pending_focus: &Arc<Mutex<Option<PendingFocus>>>,
+    click_queue: &Arc<Mutex<Vec<ClickElementRequest>>>,
+    last_capture_time: &mut Instant,
+) -> bool {
+    if !screenpipe_config::screen_is_locked() {
+        return false;
+    }
+
+    *pending_focus.lock() = None;
+    click_queue.lock().clear();
+    *last_capture_time = Instant::now();
+    true
 }
 
 /// Click position request for ElementFromPoint
@@ -520,8 +557,17 @@ pub fn run_uia_thread(
     focused_element: Arc<Mutex<Option<ElementContext>>>,
     stop: Arc<AtomicBool>,
     config: UiCaptureConfig,
+    start_time: Instant,
+    last_input_at_ms: Arc<AtomicU64>,
 ) {
     debug!("UIA worker thread starting");
+
+    // Lower OS thread priority so user input threads can preempt. The UIA worker is
+    // the heaviest a11y consumer — letting it yield to input is the highest-value
+    // piece of the prioritize_input_latency bundle.
+    if config.prioritize_input_latency {
+        super::windows::apply_extraction_thread_priority(config.extraction_thread_priority);
+    }
 
     // Initialize COM (STA for event handler delivery)
     unsafe {
@@ -613,8 +659,9 @@ pub fn run_uia_thread(
     let mut last_capture_time = Instant::now();
     let debounce_dur = Duration::from_millis(config.tree_debounce_ms);
     let interval_dur = Duration::from_millis(config.tree_capture_interval_ms);
+    let mut was_lock_paused = false;
 
-    // Capture initial focused window
+    // Capture initial focused window (no input has happened yet, so input_too_recent is a no-op)
     let initial_hwnd = unsafe { GetForegroundWindow() };
     if !initial_hwnd.is_invalid() {
         capture_and_send(
@@ -629,6 +676,14 @@ pub fn run_uia_thread(
         );
     }
 
+    // Compute the cooldown for shortening MsgWaitForMultipleObjects timeout when input is recent.
+    // We want to wake up shortly after the input window expires to retry the deferred capture.
+    let input_pause_dur_ms = if config.prioritize_input_latency {
+        config.pause_extraction_on_input_ms
+    } else {
+        0
+    };
+
     // Main loop: pump messages + process events
     let mut msg = MSG::default();
     while !stop.load(Ordering::Relaxed) {
@@ -640,8 +695,41 @@ pub fn run_uia_thread(
             }
         }
 
+        if pause_uia_while_screen_locked(&pending_focus, &click_queue, &mut last_capture_time) {
+            was_lock_paused = true;
+            std::thread::sleep(LOCKED_SCREEN_UIA_BACKOFF);
+            continue;
+        }
+
+        if was_lock_paused && config.capture_tree {
+            was_lock_paused = false;
+            let hwnd = unsafe { GetForegroundWindow() };
+            if !hwnd.is_invalid() {
+                capture_and_send(
+                    &uia,
+                    hwnd,
+                    &config,
+                    &tree_tx,
+                    &focused_element,
+                    &mut last_captured_hwnd,
+                    &mut last_tree_hash,
+                    &mut last_capture_time,
+                );
+            } else {
+                last_capture_time = Instant::now();
+            }
+        } else {
+            was_lock_paused = false;
+        }
+
+        // Defer tree captures while the user is actively typing/clicking. The captured
+        // tree would be stale within ms anyway, and the work would steal CPU from input
+        // threads. We keep `pending_focus` and don't bump `last_capture_time` so the
+        // capture is retried on the next loop once input pauses.
+        let skip_capture = input_too_recent(&config, start_time, &last_input_at_ms);
+
         // Check for pending focus change (debounced)
-        if config.capture_tree {
+        if config.capture_tree && !skip_capture {
             let should_capture = {
                 let pending = pending_focus.lock();
                 if let Some(ref pf) = *pending {
@@ -684,6 +772,8 @@ pub fn run_uia_thread(
                         &mut last_tree_hash,
                         &mut last_capture_time,
                     );
+                } else {
+                    last_capture_time = Instant::now();
                 }
             }
         }
@@ -702,13 +792,18 @@ pub fn run_uia_thread(
         // Block until a Windows message arrives or a computed timeout elapses.
         // This replaces the old 50ms sleep-poll: the thread stays asleep until
         // something actually needs to happen (COM event, debounce, or re-capture).
-        let wait_ms = compute_next_timeout(
+        let mut wait_ms = compute_next_timeout(
             &pending_focus,
             debounce_dur,
             &last_capture_time,
             interval_dur,
             &config,
         );
+        // If we just skipped a capture due to recent input, cap the wait so we wake up
+        // shortly after the input cooldown expires and can retry the capture.
+        if skip_capture && input_pause_dur_ms > 0 {
+            wait_ms = wait_ms.min(input_pause_dur_ms);
+        }
         unsafe {
             MsgWaitForMultipleObjects(None, false, wait_ms as u32, QS_ALLINPUT);
         }
@@ -734,6 +829,10 @@ fn compute_next_timeout(
 ) -> u64 {
     let mut min_ms: u64 = 1000; // safety ceiling
 
+    if !config.capture_tree {
+        return min_ms;
+    }
+
     // Time until debounce fires
     if let Some(ref pf) = *pending_focus.lock() {
         let elapsed = pf.time.elapsed();
@@ -757,6 +856,33 @@ fn compute_next_timeout(
     min_ms.max(1) // avoid 0 (which means infinite in Win32)
 }
 
+/// Process names (lowercased, with extension) of apps whose in-process UI Automation
+/// providers crash the *host* process when an external client materializes their full
+/// subtree via a cached `TreeScope_Subtree` request.
+///
+/// Outlook Classic (`OUTLOOK.EXE`) is the documented case: users reported Outlook
+/// crashing whenever they opened the **Sent Items** folder while screenpipe was
+/// recording, and that ending the screenpipe process made the crash disappear. Its
+/// virtualized message-list provider re-enters and faults when we cache the whole grid
+/// in one cross-process call (Sent Items is worst — its recipient column resolves
+/// "person" objects). This mirrors long-standing Outlook quirks that screen readers
+/// (NVDA/JAWS) have had to special-case.
+///
+/// We skip only the a11y *tree* capture for these apps: input, app-switch, window-focus
+/// and clipboard events still flow, and OCR still captures the on-screen content, so the
+/// signal loss is minimal while the crash is eliminated.
+///
+/// This targets Outlook *Classic* only. The "new" Outlook (`olk.exe`) is a WebView2 app
+/// with a different provider and is unaffected.
+const FRAGILE_UIA_TREE_PROVIDERS: &[&str] = &["outlook.exe"];
+
+/// Returns true if `app_name` is a process whose UIA provider can crash when we capture
+/// its full accessibility tree. See [`FRAGILE_UIA_TREE_PROVIDERS`].
+fn is_fragile_uia_tree_provider(app_name: &str) -> bool {
+    let lower = app_name.to_ascii_lowercase();
+    FRAGILE_UIA_TREE_PROVIDERS.iter().any(|p| lower == *p)
+}
+
 /// Capture a window tree and send it through the channel if it changed.
 fn capture_and_send(
     uia: &UiaContext,
@@ -769,6 +895,10 @@ fn capture_and_send(
     last_capture_time: &mut Instant,
 ) {
     let capture_start = Instant::now();
+    // Mark every attempt, not just successful captures. If the focused window
+    // is filtered out or UIA capture fails, leaving the periodic timer overdue
+    // makes the worker retry immediately and spin a CPU core.
+    *last_capture_time = capture_start;
 
     // Get window info
     let (app_name, window_title, pid) = get_window_info(hwnd);
@@ -776,6 +906,18 @@ fn capture_and_send(
     // Check exclusions before making UIA tree calls. Some apps expose slow or
     // buggy providers, so the guard needs to happen before ElementFromHandle.
     if !config.should_capture_target(&app_name, window_title.as_deref()) {
+        return;
+    }
+
+    // Skip the full-subtree walk for apps with fragile UIA providers that crash their
+    // own host process when we materialize the tree (e.g. Outlook Classic on Sent
+    // Items — see is_fragile_uia_tree_provider). Other event capture and OCR are
+    // unaffected, so we lose only the a11y tree for these apps, not the crash.
+    if is_fragile_uia_tree_provider(&app_name) {
+        trace!(
+            "Skipping a11y tree capture for fragile UIA provider '{}' (crash-prone)",
+            app_name
+        );
         return;
     }
 
@@ -956,6 +1098,23 @@ mod tests {
     }
 
     #[test]
+    fn test_fragile_uia_provider_detection() {
+        // Outlook Classic crashes its own process when we walk its tree (Sent Items).
+        // Match must be case-insensitive — szExeFile yields "OUTLOOK.EXE".
+        assert!(is_fragile_uia_tree_provider("OUTLOOK.EXE"));
+        assert!(is_fragile_uia_tree_provider("outlook.exe"));
+        assert!(is_fragile_uia_tree_provider("Outlook.exe"));
+
+        // Must NOT over-match: the "new" Outlook (olk.exe) is a WebView2 app with a
+        // different provider, and unrelated apps must keep their tree capture.
+        assert!(!is_fragile_uia_tree_provider("olk.exe"));
+        assert!(!is_fragile_uia_tree_provider("OUTLOOK")); // no extension → not our exact match
+        assert!(!is_fragile_uia_tree_provider("chrome.exe"));
+        assert!(!is_fragile_uia_tree_provider("notepad.exe"));
+        assert!(!is_fragile_uia_tree_provider(""));
+    }
+
+    #[test]
     fn test_tree_hash_differs() {
         let node1 = AccessibilityNode {
             control_type: "Button".to_string(),
@@ -1085,6 +1244,68 @@ mod tests {
             ],
         };
         assert_eq!(root.node_count(), 4);
+    }
+
+    #[test]
+    fn test_screen_lock_pause_clears_deferred_work() {
+        struct ResetScreenLock;
+        impl Drop for ResetScreenLock {
+            fn drop(&mut self) {
+                screenpipe_config::set_screen_locked(false);
+            }
+        }
+
+        let _reset = ResetScreenLock;
+        screenpipe_config::set_screen_locked(true);
+
+        let pending_focus = Arc::new(Mutex::new(Some(PendingFocus {
+            hwnd: HWND::default(),
+            time: Instant::now(),
+        })));
+        let click_queue = Arc::new(Mutex::new(vec![ClickElementRequest {
+            x: 12,
+            y: 34,
+            timestamp: Utc::now(),
+        }]));
+        let original_capture_time = Instant::now() - Duration::from_secs(5);
+        let mut last_capture_time = original_capture_time;
+
+        assert!(pause_uia_while_screen_locked(
+            &pending_focus,
+            &click_queue,
+            &mut last_capture_time
+        ));
+        assert!(pending_focus.lock().is_none());
+        assert!(click_queue.lock().is_empty());
+        assert!(last_capture_time > original_capture_time);
+
+        screenpipe_config::set_screen_locked(false);
+        assert!(!pause_uia_while_screen_locked(
+            &pending_focus,
+            &click_queue,
+            &mut last_capture_time
+        ));
+    }
+
+    #[test]
+    fn test_compute_next_timeout_ignores_tree_work_when_capture_disabled() {
+        let pending_focus = Arc::new(Mutex::new(Some(PendingFocus {
+            hwnd: HWND::default(),
+            time: Instant::now() - Duration::from_secs(1),
+        })));
+        let mut config = UiCaptureConfig::new();
+        config.capture_tree = false;
+        config.tree_capture_interval_ms = 1;
+
+        let wait_ms = compute_next_timeout(
+            &pending_focus,
+            Duration::from_millis(10),
+            &(Instant::now() - Duration::from_secs(1)),
+            Duration::from_millis(1),
+            &config,
+        );
+
+        assert_eq!(wait_ms, 1000);
     }
 
     /// Comprehensive live test: enumerate ALL visible windows, capture each tree,
@@ -1529,6 +1750,8 @@ mod tests {
         let config2 = config.clone();
         let click_queue2 = click_queue.clone();
         let focused_element2 = focused_element.clone();
+        let start_time = Instant::now();
+        let last_input_at_ms = Arc::new(AtomicU64::new(0));
 
         let thread = std::thread::spawn(move || {
             run_uia_thread(
@@ -1538,6 +1761,8 @@ mod tests {
                 focused_element2,
                 stop2,
                 config2,
+                start_time,
+                last_input_at_ms,
             );
         });
 
@@ -1636,6 +1861,7 @@ mod tests {
 
         let cpu_before = get_process_cpu_time();
         let wall_start = std::time::Instant::now();
+        let last_input_at_ms = Arc::new(AtomicU64::new(0));
 
         let thread = std::thread::spawn(move || {
             run_uia_thread(
@@ -1645,6 +1871,8 @@ mod tests {
                 focused_element2,
                 stop2,
                 config2,
+                wall_start,
+                last_input_at_ms,
             );
         });
 

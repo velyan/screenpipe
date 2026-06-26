@@ -15,6 +15,10 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  deleteCachedBrowserState,
+  setCachedBrowserState,
+} from "../browser-state-cache";
 
 vi.mock("@/lib/chat-storage", () => ({
   listConversations: vi.fn(async () => []),
@@ -22,7 +26,12 @@ vi.mock("@/lib/chat-storage", () => ({
   saveConversationFile: vi.fn(async () => undefined),
 }));
 
-import { handlePiEvent, handleTerminated } from "../stores/pi-event-router";
+import { saveConversationFile } from "@/lib/chat-storage";
+import {
+  flushPendingSaves,
+  handlePiEvent,
+  handleTerminated,
+} from "../stores/pi-event-router";
 import { useChatStore, type SessionRecord } from "../stores/chat-store";
 import type { AgentEventEnvelope, AgentInnerEvent } from "../events/types";
 
@@ -34,7 +43,9 @@ function piEvt(sessionId: string, event: AgentInnerEvent): AgentEventEnvelope {
 }
 
 function reset() {
-  useChatStore.setState({ sessions: {}, currentId: null });
+  vi.clearAllMocks();
+  deleteCachedBrowserState("A");
+  useChatStore.setState({ sessions: {}, currentId: null, panelSessionId: null });
 }
 
 function seed(id: string, overrides: Partial<SessionRecord> = {}) {
@@ -121,6 +132,106 @@ describe("pi-event-router: status mirroring for backgrounded sessions", () => {
     expect(useChatStore.getState().sessions.fresh).toBeDefined();
     expect(useChatStore.getState().sessions.fresh.status).toBe("streaming");
   });
+
+  it("marks a switched-away session unread when new assistant text arrives", async () => {
+    seed("A", {
+      lastViewedAt: 100,
+      streamingMessageId: "msg-1",
+      streamingText: "",
+      contentBlocks: [],
+      messages: [
+        {
+          id: "msg-1",
+          role: "assistant",
+          content: "",
+          contentBlocks: [],
+          timestamp: 100,
+        },
+      ],
+      messageCount: 1,
+    });
+    useChatStore.setState({ currentId: "B" });
+
+    await handlePiEvent(
+      piEvt("A", {
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: "hello" },
+      }),
+    );
+
+    const session = useChatStore.getState().sessions.A;
+    expect(session.lastContentAt).toBeGreaterThan(100);
+    expect(session.unread).toBe(true);
+  });
+});
+
+describe("pi-event-router: browser state preservation", () => {
+  beforeEach(reset);
+
+  it("preserves browserState from the shadow cache when background save runs before the file exists", async () => {
+    seed("A", {
+      messages: [
+        {
+          id: "u1",
+          role: "user",
+          content: "hello",
+          timestamp: 1,
+        },
+      ],
+      messageCount: 1,
+      isLoading: true,
+      isStreaming: true,
+    });
+    useChatStore.setState({ currentId: "B" });
+    setCachedBrowserState("A", {
+      url: "https://example.com/background-shadow",
+      updatedAt: 4_321,
+      width: 480,
+    });
+
+    handleTerminated({ sessionId: "A", exitCode: 0 } as any);
+    await flushPendingSaves();
+
+    expect(saveConversationFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "A",
+        browserState: {
+          url: "https://example.com/background-shadow",
+          updatedAt: 4_321,
+          width: 480,
+        },
+      }),
+    );
+  });
+
+  it("persists never-viewed background chats with a zero lastViewedAt watermark", async () => {
+    seed("A", {
+      messages: [
+        {
+          id: "u1",
+          role: "user",
+          content: "hello",
+          timestamp: 1,
+        },
+      ],
+      messageCount: 1,
+      isLoading: true,
+      isStreaming: true,
+      lastContentAt: 2_000,
+    });
+    useChatStore.setState({ currentId: "B" });
+
+    handleTerminated({ sessionId: "A", exitCode: 0 } as any);
+    await flushPendingSaves();
+
+    expect(saveConversationFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "A",
+        lastContentAt: 2_000,
+        lastViewedAt: 0,
+      }),
+    );
+  });
 });
 
 describe("pi-event-router: background content accumulation (the parallel-chat repro)", () => {
@@ -168,18 +279,119 @@ describe("pi-event-router: background content accumulation (the parallel-chat re
     expect((a3.messages![0] as any).content).toBe("Hello world");
   });
 
-  it("SKIPS content writes for the foreground session (panel owns it)", async () => {
-    // Foreground writes belong to standalone-chat. If the router also
-    // wrote, the same delta would land twice — once in panel state,
-    // once in store messages — and on snapshot the panel's view would
-    // overwrite the router's, producing flicker / duplicates.
+  it("materializes queued background user turns before the assistant reply", async () => {
     seed("A");
-    useChatStore.setState({ currentId: "A" }); // A is foreground
+    useChatStore.setState({ currentId: "B" });
+    await handlePiEvent(
+      piEvt("A", {
+        type: "message_start",
+        message: {
+          role: "user",
+          content:
+            "<conversation_history>\nuser: x\nassistant: y\n</conversation_history>\n\nqueued follow-up",
+        },
+      }),
+    );
+    const session = useChatStore.getState().sessions.A;
+    expect(session.messages).toHaveLength(2);
+    expect((session.messages![0] as any).role).toBe("user");
+    expect((session.messages![0] as any).content).toBe("queued follow-up");
+    expect((session.messages![1] as any).role).toBe("assistant");
+    expect(session.streamingMessageId).toBe((session.messages![1] as any).id);
+  });
+
+  it("keeps one assistant message across turn_end + assistant restart after switch-away", async () => {
+    // Reproduces the user's bug: switch away while a tool-using reply is
+    // mid-stream, then background routing takes over and sees an internal
+    // turn_end followed by another assistant message_start. That must stay in
+    // the SAME assistant bubble instead of splitting into multiple rows.
+    seed("A", {
+      status: "streaming",
+      isLoading: true,
+      isStreaming: true,
+      streamingMessageId: "msg-1",
+      streamingText: "Let me check. ",
+      contentBlocks: [{ type: "text", text: "Let me check. " }],
+      messages: [
+        {
+          id: "msg-1",
+          role: "assistant",
+          content: "Let me check. ",
+          contentBlocks: [{ type: "text", text: "Let me check. " }],
+          timestamp: 1_234,
+        },
+      ],
+      messageCount: 1,
+    });
+    useChatStore.setState({ currentId: "B" });
+
+    await handlePiEvent(piEvt("A", { type: "turn_end" }));
     await handlePiEvent(
       piEvt("A", { type: "message_start", message: { role: "assistant" } }),
     );
-    expect(useChatStore.getState().sessions.A.messages ?? []).toEqual([]);
-    expect(useChatStore.getState().sessions.A.streamingMessageId).toBeFalsy();
+    await handlePiEvent(
+      piEvt("A", {
+        type: "tool_execution_start",
+        toolCallId: "tool-1",
+        toolName: "bash",
+        args: { command: "echo hi" },
+      } as any),
+    );
+    await handlePiEvent(
+      piEvt("A", {
+        type: "tool_execution_end",
+        toolCallId: "tool-1",
+        result: { content: [{ text: "hi" }] },
+      } as any),
+    );
+    await handlePiEvent(
+      piEvt("A", {
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: "Done." },
+      }),
+    );
+
+    const session = useChatStore.getState().sessions.A;
+    expect(session.messages).toHaveLength(1);
+    expect(session.streamingMessageId).toBe("msg-1");
+    const assistant = session.messages![0] as any;
+    expect(assistant.id).toBe("msg-1");
+    expect(assistant.content).toBe("Let me check. Done.");
+    expect(assistant.contentBlocks.map((b: any) => b.type)).toEqual([
+      "text",
+      "tool",
+      "text",
+    ]);
+    expect(assistant.contentBlocks[1].toolCall.result).toBe("hi");
+  });
+
+  it("keeps accumulating during the switch-back gap after currentId flips", async () => {
+    // Regression for the "come back immediately and the queued turn vanishes"
+    // repro. During the handoff window `loadConversation` has already flipped
+    // currentId to A but the new foreground handler is not attached yet, so
+    // the default router must still accept A's events.
+    seed("A");
+    useChatStore.setState({ currentId: "A" });
+
+    await handlePiEvent(
+      piEvt("A", {
+        type: "message_start",
+        message: { role: "user", content: "queued while switching back" },
+      }),
+    );
+    await handlePiEvent(
+      piEvt("A", {
+        type: "message_update",
+        assistantMessageEvent: { type: "text_delta", delta: "still here" },
+      }),
+    );
+
+    const session = useChatStore.getState().sessions.A;
+    expect(session.messages).toHaveLength(2);
+    expect((session.messages![0] as any).role).toBe("user");
+    expect((session.messages![0] as any).content).toBe("queued while switching back");
+    expect((session.messages![1] as any).role).toBe("assistant");
+    expect((session.messages![1] as any).content).toBe("still here");
   });
 });
 
@@ -210,5 +422,39 @@ describe("pi-event-router: agent_terminated", () => {
     seed("A", { status: "streaming" });
     handleTerminated({ sessionId: "A", source: "pi", exitCode: 0 });
     expect(useChatStore.getState().sessions.A.status).toBe("idle");
+  });
+
+  it("persists display labels for backgrounded chats", async () => {
+    seed("A", {
+      status: "streaming",
+      messages: [
+        {
+          id: "user-1",
+          role: "user",
+          content:
+            "search screenpipe for what happened during this meeting and summarize it",
+          displayContent: "Summarize meeting: Design Review",
+          timestamp: 1_234,
+        },
+      ],
+      messageCount: 1,
+    });
+    useChatStore.setState({ currentId: "B" });
+
+    handleTerminated({ sessionId: "A", source: "pi", exitCode: 0 });
+    await flushPendingSaves();
+
+    expect(saveConversationFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "A",
+        title: "Summarize meeting: Design Review",
+        messages: [
+          expect.objectContaining({
+            id: "user-1",
+            displayContent: "Summarize meeting: Design Review",
+          }),
+        ],
+      })
+    );
   });
 });

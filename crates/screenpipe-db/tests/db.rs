@@ -9,6 +9,7 @@ mod tests {
     use chrono::Utc;
     use screenpipe_db::{
         AudioDevice, ContentType, DatabaseManager, DeviceType, Frame, OcrEngine, SearchResult,
+        TagContentType,
     };
 
     async fn setup_test_db() -> DatabaseManager {
@@ -93,6 +94,650 @@ mod tests {
         } else {
             panic!("Expected OCR result");
         }
+    }
+
+    /// `search_with_tags` restricts OCR/audio results to captures carrying ALL
+    /// of the given tags (intersection), an empty slice disables the filter,
+    /// and `count_search_results_with_tags` agrees so pagination stays correct.
+    #[tokio::test]
+    async fn test_search_filter_by_tags() {
+        let db = setup_test_db().await;
+        db.insert_video_chunk("test_video.mp4", "test_device")
+            .await
+            .unwrap();
+
+        async fn frame(db: &DatabaseManager, app: &str, text: &str) -> i64 {
+            let id = db
+                .insert_frame("test_device", None, None, Some(app), Some(""), false, None)
+                .await
+                .unwrap();
+            db.insert_ocr_text(id, text, "", Arc::new(OcrEngine::Tesseract))
+                .await
+                .unwrap();
+            id
+        }
+
+        // Run an OCR search restricted to `tags` (empty = no filter).
+        async fn run(db: &DatabaseManager, tags: &[String]) -> Vec<SearchResult> {
+            db.search_with_tags(
+                "",
+                ContentType::OCR,
+                100,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                tags,
+            )
+            .await
+            .unwrap()
+        }
+
+        let a = frame(&db, "alpha", "first capture").await;
+        let b = frame(&db, "beta", "second capture").await;
+        let _c = frame(&db, "gamma", "third capture").await;
+
+        db.add_tags(
+            a,
+            TagContentType::Vision,
+            vec!["person:ada".to_string(), "project:atlas".to_string()],
+        )
+        .await
+        .unwrap();
+        db.add_tags(b, TagContentType::Vision, vec!["project:atlas".to_string()])
+            .await
+            .unwrap();
+
+        // Single tag → only the frame carrying it.
+        let only_ada = run(&db, &["person:ada".to_string()]).await;
+        assert_eq!(only_ada.len(), 1);
+        match &only_ada[0] {
+            SearchResult::OCR(o) => assert_eq!(o.frame_id, a),
+            other => panic!("expected OCR, got {other:?}"),
+        }
+
+        // Shared tag → both frames carrying it.
+        let atlas = run(&db, &["project:atlas".to_string()]).await;
+        assert_eq!(atlas.len(), 2);
+
+        // Multiple tags → AND semantics: frame must carry all of them.
+        let both = run(
+            &db,
+            &["person:ada".to_string(), "project:atlas".to_string()],
+        )
+        .await;
+        assert_eq!(both.len(), 1);
+        match &both[0] {
+            SearchResult::OCR(o) => assert_eq!(o.frame_id, a),
+            other => panic!("expected OCR, got {other:?}"),
+        }
+
+        // Unknown tag → nothing.
+        assert_eq!(run(&db, &["person:nobody".to_string()]).await.len(), 0);
+
+        // No tag filter → all three frames (the filter is strictly opt-in).
+        assert_eq!(run(&db, &[]).await.len(), 3);
+
+        // Count must agree with the result length so `total` stays correct.
+        let count_atlas = db
+            .count_search_results_with_tags(
+                "",
+                ContentType::OCR,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &["project:atlas".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(count_atlas, 2);
+    }
+
+    // Shared helper: a tag-filtered search for an arbitrary content type.
+    async fn search_ct(
+        db: &DatabaseManager,
+        content_type: ContentType,
+        tags: &[String],
+    ) -> Vec<SearchResult> {
+        db.search_with_tags(
+            "",
+            content_type,
+            100,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            tags,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Audio chunks filter by tag, `content_type=all` unions tagged screen +
+    /// audio (cross-modal), tag matching is exact (not substring), and content
+    /// types without a tag table return nothing.
+    #[tokio::test]
+    async fn test_tag_filter_audio_and_cross_modal() {
+        let db = setup_test_db().await;
+        db.insert_video_chunk("v.mp4", "dev").await.unwrap();
+
+        let device = AudioDevice {
+            name: "test".to_string(),
+            device_type: DeviceType::Output,
+        };
+
+        // Tagged screen frame.
+        let f = db
+            .insert_frame("dev", None, None, Some("app"), Some(""), false, None)
+            .await
+            .unwrap();
+        db.insert_ocr_text(f, "frame text", "", Arc::new(OcrEngine::Tesseract))
+            .await
+            .unwrap();
+        db.add_tags(f, TagContentType::Vision, vec!["person:ada".to_string()])
+            .await
+            .unwrap();
+
+        // Frame tagged with a near-miss tag (proves exact, not substring).
+        let f_adam = db
+            .insert_frame("dev", None, None, Some("app2"), Some(""), false, None)
+            .await
+            .unwrap();
+        db.insert_ocr_text(f_adam, "near miss", "", Arc::new(OcrEngine::Tesseract))
+            .await
+            .unwrap();
+        db.add_tags(
+            f_adam,
+            TagContentType::Vision,
+            vec!["person:adam".to_string()],
+        )
+        .await
+        .unwrap();
+
+        // Tagged audio chunk + an untagged one.
+        let ac = db.insert_audio_chunk("a.mp4", None).await.unwrap();
+        db.insert_audio_transcription(ac, "audio text", 0, "", &device, None, None, None, None)
+            .await
+            .unwrap();
+        db.add_tags(ac, TagContentType::Audio, vec!["person:ada".to_string()])
+            .await
+            .unwrap();
+        let ac2 = db.insert_audio_chunk("a2.mp4", None).await.unwrap();
+        db.insert_audio_transcription(ac2, "other audio", 0, "", &device, None, None, None, None)
+            .await
+            .unwrap();
+
+        // Audio-only, by tag → just the tagged chunk.
+        let audio = search_ct(&db, ContentType::Audio, &["person:ada".to_string()]).await;
+        assert_eq!(audio.len(), 1);
+        assert!(matches!(&audio[0], SearchResult::Audio(a) if a.audio_chunk_id == ac));
+
+        // Exact match, not substring: person:ada must not match person:adam.
+        let ada_ocr = search_ct(&db, ContentType::OCR, &["person:ada".to_string()]).await;
+        assert_eq!(ada_ocr.len(), 1);
+        assert!(matches!(&ada_ocr[0], SearchResult::OCR(o) if o.frame_id == f));
+
+        // content_type=all unions the tagged frame and the tagged audio, and
+        // excludes the person:adam frame and the untagged audio.
+        let all = search_ct(&db, ContentType::All, &["person:ada".to_string()]).await;
+        assert_eq!(all.len(), 2);
+        assert!(all
+            .iter()
+            .any(|r| matches!(r, SearchResult::OCR(o) if o.frame_id == f)));
+        assert!(all
+            .iter()
+            .any(|r| matches!(r, SearchResult::Audio(a) if a.audio_chunk_id == ac)));
+
+        // Input has no tag table → empty under a tag filter.
+        assert_eq!(
+            search_ct(&db, ContentType::Input, &["person:ada".to_string()])
+                .await
+                .len(),
+            0
+        );
+
+        // Count agrees with the cross-modal result set.
+        let total = db
+            .count_search_results_with_tags(
+                "",
+                ContentType::All,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &["person:ada".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+    }
+
+    /// Memories filter by their JSON tags through the same interface
+    /// (`content_type=memory`): exact AND match, never substring, composes
+    /// with FTS, and `content_type=all` still never returns memories.
+    #[tokio::test]
+    async fn test_memory_filter_by_tags() {
+        let db = setup_test_db().await;
+
+        let m1 = db
+            .insert_memory(
+                "ada planning fact",
+                "user",
+                None,
+                Some(r#"["person:ada","project:atlas"]"#),
+                0.5,
+                None,
+            )
+            .await
+            .unwrap();
+        let _m2 = db
+            .insert_memory(
+                "atlas only fact",
+                "user",
+                None,
+                Some(r#"["project:atlas"]"#),
+                0.5,
+                None,
+            )
+            .await
+            .unwrap();
+        let _m3 = db
+            .insert_memory(
+                "adam fact",
+                "user",
+                None,
+                Some(r#"["person:adam"]"#),
+                0.5,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Single tag, exact: person:ada must not match person:adam.
+        let ada = search_ct(&db, ContentType::Memory, &["person:ada".to_string()]).await;
+        assert_eq!(ada.len(), 1);
+        assert!(matches!(&ada[0], SearchResult::Memory(m) if m.id == m1));
+
+        // Shared tag → both memories carrying it.
+        assert_eq!(
+            search_ct(&db, ContentType::Memory, &["project:atlas".to_string()])
+                .await
+                .len(),
+            2
+        );
+
+        // AND semantics across multiple tags.
+        assert_eq!(
+            search_ct(
+                &db,
+                ContentType::Memory,
+                &["person:ada".to_string(), "project:atlas".to_string()],
+            )
+            .await
+            .len(),
+            1
+        );
+
+        // Exact, not substring: project:atl matches nothing.
+        assert_eq!(
+            search_ct(&db, ContentType::Memory, &["project:atl".to_string()])
+                .await
+                .len(),
+            0
+        );
+
+        // No filter → all three.
+        assert_eq!(search_ct(&db, ContentType::Memory, &[]).await.len(), 3);
+
+        // Tags compose with full-text search on memory content.
+        let combined = db
+            .search_with_tags(
+                "planning",
+                ContentType::Memory,
+                100,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &["project:atlas".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(combined.len(), 1);
+        assert!(matches!(&combined[0], SearchResult::Memory(m) if m.id == m1));
+
+        // content_type=all never includes memories, tagged or not.
+        let all = search_ct(&db, ContentType::All, &["person:ada".to_string()]).await;
+        assert!(all.iter().all(|r| !matches!(r, SearchResult::Memory(_))));
+
+        // Count agrees with the memory result set.
+        let n = db
+            .count_search_results_with_tags(
+                "",
+                ContentType::Memory,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &["project:atlas".to_string()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+
+    /// `related_tags` returns the tags that co-occur with the requested ones,
+    /// counted across all three stores (vision frames, audio chunks, memory
+    /// JSON), most-frequent first, with the inputs themselves excluded and
+    /// AND-semantics on multiple inputs.
+    #[tokio::test]
+    async fn test_related_tags_co_occurrence() {
+        let db = setup_test_db().await;
+        db.insert_video_chunk("v.mp4", "dev").await.unwrap();
+
+        // Frame carrying person:ada alongside a project and a workflow.
+        let f_a = db
+            .insert_frame("dev", None, None, Some("app"), Some(""), false, None)
+            .await
+            .unwrap();
+        db.add_tags(
+            f_a,
+            TagContentType::Vision,
+            vec![
+                "person:ada".to_string(),
+                "project:atlas".to_string(),
+                "workflow:planning".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // Frame carrying person:ada with a second person and the same project.
+        let f_b = db
+            .insert_frame("dev", None, None, Some("app"), Some(""), false, None)
+            .await
+            .unwrap();
+        db.add_tags(
+            f_b,
+            TagContentType::Vision,
+            vec![
+                "person:ada".to_string(),
+                "person:connor".to_string(),
+                "project:atlas".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // Unrelated frame — its tag must never surface for person:ada.
+        let f_x = db
+            .insert_frame("dev", None, None, Some("app"), Some(""), false, None)
+            .await
+            .unwrap();
+        db.add_tags(f_x, TagContentType::Vision, vec!["person:bob".to_string()])
+            .await
+            .unwrap();
+
+        // Audio chunk carrying person:ada + the same project (third hit).
+        let ac = db.insert_audio_chunk("a.mp4", None).await.unwrap();
+        db.add_tags(
+            ac,
+            TagContentType::Audio,
+            vec!["person:ada".to_string(), "project:atlas".to_string()],
+        )
+        .await
+        .unwrap();
+
+        // Memory carrying person:ada alongside a different person.
+        db.insert_memory(
+            "ada + drew planning",
+            "user",
+            None,
+            Some(r#"["person:ada","person:drew"]"#),
+            0.5,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Single input tag: project:atlas co-occurs 3× (f_a, f_b, ac); the
+        // three singletons tie and break by name ascending. person:ada (input)
+        // and person:bob (unrelated frame) must be absent.
+        let related = db
+            .related_tags(&["person:ada".to_string()], 50)
+            .await
+            .unwrap();
+        let counts: std::collections::HashMap<&str, i64> =
+            related.iter().map(|(n, c)| (n.as_str(), *c)).collect();
+        assert_eq!(related.len(), 4, "got {related:?}");
+        assert_eq!(related[0], ("project:atlas".to_string(), 3));
+        assert_eq!(counts.get("project:atlas"), Some(&3));
+        assert_eq!(counts.get("workflow:planning"), Some(&1));
+        assert_eq!(counts.get("person:connor"), Some(&1));
+        assert_eq!(counts.get("person:drew"), Some(&1));
+        assert!(!counts.contains_key("person:ada"), "input tag leaked");
+        assert!(!counts.contains_key("person:bob"), "unrelated tag leaked");
+
+        // The `limit` truncates to the top-N by count.
+        let top1 = db
+            .related_tags(&["person:ada".to_string()], 1)
+            .await
+            .unwrap();
+        assert_eq!(top1, vec![("project:atlas".to_string(), 3)]);
+
+        // Multiple inputs → AND: only items carrying BOTH person:ada AND
+        // project:atlas (f_a, f_b, ac — not the memory, which lacks the
+        // project). Co-occurring extras: workflow:planning and person:connor.
+        let both = db
+            .related_tags(&["person:ada".to_string(), "project:atlas".to_string()], 50)
+            .await
+            .unwrap();
+        let both_names: std::collections::HashSet<&str> =
+            both.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(both.len(), 2, "got {both:?}");
+        assert!(both_names.contains("workflow:planning"));
+        assert!(both_names.contains("person:connor"));
+        assert!(!both_names.contains("person:ada"));
+        assert!(!both_names.contains("project:atlas"));
+
+        // Empty input → empty result (no tags to relate against).
+        assert!(db.related_tags(&[], 50).await.unwrap().is_empty());
+    }
+
+    /// Adversarial inputs for `related_tags`: malformed memory JSON, colon-rich
+    /// tag values, duplicate inputs, store isolation, limit edges, unicode, and
+    /// quote/`%`/`_` injection-shaped strings. None may error or leak.
+    #[tokio::test]
+    async fn test_related_tags_edge_cases() {
+        let db = setup_test_db().await;
+        db.insert_video_chunk("v.mp4", "dev").await.unwrap();
+
+        // A frame carrying the anchor + a value that itself contains colons
+        // (e.g. a URL tag) — the split into a namespace happens in the route,
+        // so the DB must return the full name verbatim.
+        let f = db
+            .insert_frame("dev", None, None, Some("app"), Some(""), false, None)
+            .await
+            .unwrap();
+        db.add_tags(
+            f,
+            TagContentType::Vision,
+            vec![
+                "person:ada".to_string(),
+                "url:https://example.com:8080/x".to_string(),
+                "emoji:🦀".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // A memory carrying the anchor + a SQL-injection-shaped value. Bound as
+        // a JSON param, so it's inert; it must come back as data, not break out.
+        db.insert_memory(
+            "weird tags",
+            "user",
+            None,
+            Some(r#"["person:ada","weird:a' OR 1=1 --","like:50%_x"]"#),
+            0.5,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // A memory whose `tags` column is NOT valid JSON. The `json_valid`
+        // guard must skip it instead of letting `json_each` raise and 500.
+        db.insert_memory("legacy", "user", None, Some("not valid json"), 0.5, None)
+            .await
+            .unwrap();
+        // ...and one carrying the anchor twice (deliberately) — the value must
+        // still be counted once per memory, not double.
+        db.insert_memory(
+            "dupe-in-row",
+            "user",
+            None,
+            Some(r#"["person:ada","person:ada","only:here"]"#),
+            0.5,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let related = db
+            .related_tags(&["person:ada".to_string()], 50)
+            .await
+            .unwrap();
+        let names: std::collections::HashSet<&str> =
+            related.iter().map(|(n, _)| n.as_str()).collect();
+        // Colon-rich and unicode values survive intact.
+        assert!(names.contains("url:https://example.com:8080/x"));
+        assert!(names.contains("emoji:🦀"));
+        // Injection-shaped strings come back as plain data.
+        assert!(names.contains("weird:a' OR 1=1 --"));
+        assert!(names.contains("like:50%_x"));
+        assert!(names.contains("only:here"));
+        // The anchor itself is never echoed back.
+        assert!(!names.contains("person:ada"));
+
+        // Duplicate input tags must behave like a single input (the DISTINCT in
+        // the input CTE), NOT silently match nothing.
+        let deduped = db
+            .related_tags(&["person:ada".to_string(), "person:ada".to_string()], 50)
+            .await
+            .unwrap();
+        let deduped_names: std::collections::HashSet<&str> =
+            deduped.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(deduped_names, names, "duplicate inputs must equal single");
+
+        // limit = 0 → no rows (not an error).
+        assert!(db
+            .related_tags(&["person:ada".to_string()], 0)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // A tag that exists on nothing → empty, no error.
+        assert!(db
+            .related_tags(&["person:ghost".to_string()], 50)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Store isolation: an anchor present ONLY in audio still finds its
+        // audio-side co-tags and nothing from unrelated frames/memories.
+        let ac = db.insert_audio_chunk("a.mp4", None).await.unwrap();
+        db.add_tags(
+            ac,
+            TagContentType::Audio,
+            vec!["call:standup".to_string(), "person:bob".to_string()],
+        )
+        .await
+        .unwrap();
+        let audio_only = db
+            .related_tags(&["call:standup".to_string()], 50)
+            .await
+            .unwrap();
+        assert_eq!(audio_only.len(), 1);
+        assert_eq!(audio_only[0], ("person:bob".to_string(), 1));
+    }
+
+    #[tokio::test]
+    async fn test_recent_output_audio_detects_deferred_output_chunk() {
+        let db = setup_test_db().await;
+
+        db.insert_audio_chunk("System Audio (output)_recent.mp4", Some(Utc::now()))
+            .await
+            .unwrap();
+
+        assert!(db.has_recent_output_audio(30).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_recent_output_audio_ignores_input_chunk() {
+        let db = setup_test_db().await;
+
+        db.insert_audio_chunk("AirPods (input)_recent.mp4", Some(Utc::now()))
+            .await
+            .unwrap();
+
+        assert!(!db.has_recent_output_audio(30).await.unwrap());
     }
 
     #[tokio::test]
@@ -471,7 +1116,7 @@ mod tests {
         .unwrap();
 
         let raw_ocr_text: Vec<(String, Option<i64>)> =
-            sqlx::query_as("SELECT text, frame_id FROM ocr_text")
+            sqlx::query_as("SELECT COALESCE(full_text, '') AS text, id AS frame_id FROM frames")
                 .fetch_all(&db.pool)
                 .await
                 .unwrap();
@@ -528,14 +1173,40 @@ mod tests {
 
         // After inserting both audio transcriptions, let's check all audio entries
         let all_audio = db
-            .search_audio("", 100, 0, None, None, None, None, None, None, None, None)
+            .search_audio(
+                "",
+                100,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
             .await
             .unwrap();
         println!("All audio entries: {:?}", all_audio);
 
         // Then try specific search
         let audio_results = db
-            .search_audio("2", 100, 0, None, None, None, None, None, None, None, None)
+            .search_audio(
+                "2",
+                100,
+                0,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
             .await
             .unwrap();
         println!("Audio results for '2': {:?}", audio_results);
@@ -1115,6 +1786,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_search_speakers_limited_returns_more_than_legacy_picker_cap() {
+        let db = setup_test_db().await;
+
+        for i in 0..25 {
+            let speaker = db.insert_speaker(&vec![i as f32; 512]).await.unwrap();
+            db.update_speaker_name(speaker.id, &format!("person {i:02}"))
+                .await
+                .unwrap();
+        }
+
+        let speakers = db.search_speakers_limited("", 50, 0, false).await.unwrap();
+
+        assert_eq!(speakers.len(), 25);
+        assert_eq!(speakers[0].name, "person 00");
+        assert!(speakers.iter().all(|speaker| speaker.metadata == "{}"));
+    }
+
+    #[tokio::test]
     async fn test_delete_speaker() {
         let db = setup_test_db().await;
 
@@ -1143,9 +1832,68 @@ mod tests {
         let speakers = db.search_speakers("").await.unwrap();
         assert_eq!(speakers.len(), 0);
 
-        // make sure audio_chunks are deleted
-        let audio_chunks = db.get_audio_chunks_for_speaker(speaker.id).await.unwrap();
-        assert_eq!(audio_chunks.len(), 0);
+        // Directly verify the orphaned chunk row was deleted
+        assert!(
+            !db.audio_chunk_exists(audio_chunk_id).await.unwrap(),
+            "orphaned audio_chunk row should be deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_speaker_shared_chunk_preserved() {
+        let db = setup_test_db().await;
+
+        let speaker_a = db.insert_speaker(&vec![0.1; 512]).await.unwrap();
+        let speaker_b = db.insert_speaker(&vec![0.2; 512]).await.unwrap();
+
+        // Both speakers reference the same audio chunk
+        let shared_chunk_id = db.insert_audio_chunk("shared.mp4", None).await.unwrap();
+        let device = AudioDevice {
+            name: "test".to_string(),
+            device_type: DeviceType::Output,
+        };
+        db.insert_audio_transcription(
+            shared_chunk_id,
+            "speaker a says hello",
+            0,
+            "",
+            &device,
+            Some(speaker_a.id),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        db.insert_audio_transcription(
+            shared_chunk_id,
+            "speaker b says goodbye",
+            1,
+            "",
+            &device,
+            Some(speaker_b.id),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Delete speaker_a -- shared chunk must survive
+        db.delete_speaker(speaker_a.id).await.unwrap();
+
+        assert!(
+            db.audio_chunk_exists(shared_chunk_id).await.unwrap(),
+            "shared chunk still referenced by speaker_b must not be deleted"
+        );
+
+        // Delete speaker_b -- now the chunk is orphaned and should be removed
+        db.delete_speaker(speaker_b.id).await.unwrap();
+
+        assert!(
+            !db.audio_chunk_exists(shared_chunk_id).await.unwrap(),
+            "chunk should be deleted once all referencing transcriptions are gone"
+        );
     }
 
     #[tokio::test]

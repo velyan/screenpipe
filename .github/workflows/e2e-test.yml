@@ -79,7 +79,7 @@ jobs:
         path: |
           apps/screenpipe-app-tauri/src-tauri/ffmpeg
           apps/screenpipe-app-tauri/src-tauri/vcredist
-          apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.22.0
+          apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.24.2
           apps/screenpipe-app-tauri/src-tauri/bun-x86_64-pc-windows-msvc.exe
         key: Windows-e2e-artifacts-v2-${{ hashFiles('apps/screenpipe-app-tauri/scripts/pre_build.js') }}
         restore-keys: |
@@ -104,6 +104,9 @@ jobs:
       shell: bash
 
     - name: Rust cache
+      # cache restore/save is an optimization only; a transient GHA cache
+      # service error must never fail the job (skipped build+tests, red CI)
+      continue-on-error: true
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: apps/screenpipe-app-tauri/src-tauri
@@ -124,20 +127,32 @@ jobs:
     - name: Download ONNX Runtime (CPU) for Windows
       shell: pwsh
       run: |
-        $url = "https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-win-x64-1.22.0.zip"
-        $tauriDir = "apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.22.0"
+        $url = "https://github.com/microsoft/onnxruntime/releases/download/v1.24.2/onnxruntime-win-x64-1.24.2.zip"
+        $tauriDir = "apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.24.2"
         $ortDir = "ort-system-lib"
-        Invoke-WebRequest -Uri $url -OutFile "onnxruntime-win-x64-1.22.0.zip"
+        # retry: the GitHub release CDN intermittently returns 504, which would otherwise fail the whole job
+        for ($attempt = 1; $attempt -le 5; $attempt++) {
+          try {
+            Invoke-WebRequest -Uri $url -OutFile "onnxruntime-win-x64-1.24.2.zip"
+            break
+          } catch {
+            if ($attempt -eq 5) { throw }
+            Write-Host "onnxruntime download failed on attempt $attempt; retrying..."
+            Start-Sleep -Seconds (10 * $attempt)
+          }
+        }
         if (Test-Path $tauriDir) { Remove-Item $tauriDir -Recurse -Force }
-        7z x onnxruntime-win-x64-1.22.0.zip -o"apps/screenpipe-app-tauri/src-tauri/" -y
+        7z x onnxruntime-win-x64-1.24.2.zip -o"apps/screenpipe-app-tauri/src-tauri/" -y
         if (Test-Path $ortDir) { Remove-Item $ortDir -Recurse -Force }
         Copy-Item -Path $tauriDir -Destination $ortDir -Recurse -Force
 
-    - name: Set ORT env vars
-      shell: bash
-      run: |
-        echo "ORT_STRATEGY=system" >> $GITHUB_ENV
-        echo "ORT_LIB_LOCATION=${{ github.workspace }}/ort-system-lib" >> $GITHUB_ENV
+    # No ORT_STRATEGY/ORT_LIB_LOCATION: link ONNX Runtime via ort's
+    # download-binaries (pyke prebuilt), same as the green release-app and the
+    # ci.yml/windows-integration/release-cli workflows. Setting ORT_LIB_LOCATION
+    # forces ort-sys into system static-linking, which needs onnxruntime_common.lib
+    # + the static _deps tree the dynamic MS prebuilt doesn't ship -> "ort-sys
+    # could not link" (the e2e Windows Build failure). The MS zip downloaded above
+    # is still staged below for the runtime DLL.
 
     - name: Cache Next.js build
       uses: actions/cache@v4
@@ -151,14 +166,17 @@ jobs:
       uses: tauri-apps/tauri-action@v0.5.17
       env:
         OPENBLAS_PATH: ${{ github.workspace }}/apps/screenpipe-app-tauri/src-tauri/openblas
+        # Bypass the billing gate in the e2e build so the suite exercises real
+        # features; the dedicated gate spec re-enables it at runtime.
+        NEXT_PUBLIC_SCREENPIPE_E2E: "true"
       with:
         args: "--no-sign --debug --no-bundle -- --features e2e"
         projectPath: "./apps/screenpipe-app-tauri"
         tauriScript: bunx tauri -v
 
-    # ORT_STRATEGY=system links against onnxruntime.lib but does NOT copy
-    # onnxruntime.dll next to the test binary the way the default
-    # download-binaries+copy-dylibs path would. Without a copy here the
+    # ort links via download-binaries but the audio crate's Windows ort
+    # features omit copy-dylibs, so onnxruntime.dll is NOT copied next to the
+    # test binary automatically. Without a copy here the
     # Windows DLL loader fails to find onnxruntime.dll at runtime and the
     # screenpipe-server thread panics with "Failed to initialize ORT API"
     # on the very first ort::api() call. Tauri's bundle step does this for
@@ -206,7 +224,25 @@ jobs:
       env:
         RECORD_VIDEO: "true"
       run: |
+        Remove-Item -LiteralPath ./e2e/results -Recurse -Force -ErrorAction SilentlyContinue
         bun run test:e2e
+
+    - name: Run Windows Core Recording E2E
+      shell: pwsh
+      working-directory: ./apps/screenpipe-app-tauri
+      env:
+        RECORD_VIDEO: "true"
+        SCREENPIPE_E2E_SEED: "onboarding,no-audio"
+      run: |
+        bun run wdio run e2e/wdio.conf.ts --spec e2e/specs/windows-core-recording.spec.ts
+
+    - name: Generate E2E Coverage Report
+      if: always()
+      shell: pwsh
+      working-directory: ./apps/screenpipe-app-tauri
+      run: |
+        bun run e2e:coverage
+        bun run e2e:coverage:runtime
 
     - name: Upload E2E Test Artifacts
       uses: actions/upload-artifact@v4
@@ -216,6 +252,9 @@ jobs:
         path: |
           ./apps/screenpipe-app-tauri/e2e/videos
           ./apps/screenpipe-app-tauri/e2e/screenshots
+          ./apps/screenpipe-app-tauri/e2e/results
+          ./apps/screenpipe-app-tauri/e2e/COVERAGE.md
+          ./apps/screenpipe-app-tauri/e2e/COVERAGE.runtime.md
 
     - name: Upload Screenpipe data
       uses: actions/upload-artifact@v4
@@ -279,7 +318,7 @@ jobs:
         "$install_dir/bun" --version
 
     - name: Install Linux dependencies
-      timeout-minutes: 20
+      timeout-minutes: 35
       run: |
         set -euo pipefail
         export DEBIAN_FRONTEND=noninteractive
@@ -435,6 +474,9 @@ jobs:
         echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
 
     - name: Rust cache
+      # cache restore/save is an optimization only; a transient GHA cache
+      # service error must never fail the job (skipped build+tests, red CI)
+      continue-on-error: true
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: apps/screenpipe-app-tauri/src-tauri
@@ -468,6 +510,9 @@ jobs:
       uses: tauri-apps/tauri-action@v0.5.17
       env:
         OPENBLAS_PATH: ${{ env.OPENBLAS_PATH }}
+        # Bypass the billing gate in the e2e build so the suite exercises real
+        # features; the dedicated gate spec re-enables it at runtime.
+        NEXT_PUBLIC_SCREENPIPE_E2E: "true"
       with:
         args: "--no-sign --debug --no-bundle -- --features e2e"
         projectPath: "./apps/screenpipe-app-tauri"
@@ -483,6 +528,7 @@ jobs:
       shell: bash
       working-directory: ./apps/screenpipe-app-tauri
       run: |
+        rm -rf ./e2e/results
         export XDG_RUNTIME_DIR=/run/user/$(id -u)
         export XDG_CONFIG_HOME="$HOME/.config"
         export XDG_DATA_HOME="$HOME/.local/share"
@@ -493,6 +539,14 @@ jobs:
 
         bun run test:e2e
 
+    - name: Generate E2E Coverage Report
+      if: always()
+      shell: bash
+      working-directory: ./apps/screenpipe-app-tauri
+      run: |
+        bun run e2e:coverage
+        bun run e2e:coverage:runtime
+
     - name: Upload E2E Test Artifacts
       uses: actions/upload-artifact@v4
       if: always()
@@ -501,6 +555,9 @@ jobs:
         path: |
           ./apps/screenpipe-app-tauri/e2e/videos
           ./apps/screenpipe-app-tauri/e2e/screenshots
+          ./apps/screenpipe-app-tauri/e2e/results
+          ./apps/screenpipe-app-tauri/e2e/COVERAGE.md
+          ./apps/screenpipe-app-tauri/e2e/COVERAGE.runtime.md
 
     - name: Upload Screenpipe data
       uses: actions/upload-artifact@v4
@@ -541,6 +598,9 @@ jobs:
         echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
 
     - name: Rust cache
+      # cache restore/save is an optimization only; a transient GHA cache
+      # service error must never fail the job (skipped build+tests, red CI)
+      continue-on-error: true
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: apps/screenpipe-app-tauri/src-tauri
@@ -579,6 +639,9 @@ jobs:
       uses: tauri-apps/tauri-action@v0.5.17
       env:
         SCREENPIPE_RELEASE_TARGET: aarch64-apple-darwin
+        # Bypass the billing gate in the e2e build so the suite exercises real
+        # features; the dedicated gate spec re-enables it at runtime.
+        NEXT_PUBLIC_SCREENPIPE_E2E: "true"
       with:
         args: "--no-sign --debug --no-bundle -- --features e2e"
         projectPath: "./apps/screenpipe-app-tauri"
@@ -590,7 +653,16 @@ jobs:
       env:
         RECORD_VIDEO: "true"
       run: |
+        rm -rf ./e2e/results
         bun run test:e2e
+
+    - name: Generate E2E Coverage Report
+      if: always()
+      shell: bash
+      working-directory: ./apps/screenpipe-app-tauri
+      run: |
+        bun run e2e:coverage
+        bun run e2e:coverage:runtime
 
     - name: Upload E2E Test Artifacts
       uses: actions/upload-artifact@v4
@@ -600,6 +672,9 @@ jobs:
         path: |
           ./apps/screenpipe-app-tauri/e2e/videos
           ./apps/screenpipe-app-tauri/e2e/screenshots
+          ./apps/screenpipe-app-tauri/e2e/results
+          ./apps/screenpipe-app-tauri/e2e/COVERAGE.md
+          ./apps/screenpipe-app-tauri/e2e/COVERAGE.runtime.md
 
     - name: Upload Screenpipe data
       uses: actions/upload-artifact@v4

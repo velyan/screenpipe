@@ -60,18 +60,23 @@ fn default_native_source() -> String {
 pub async fn calendar_status() -> Result<CalendarStatus, String> {
     #[cfg(target_os = "macos")]
     {
+        use eventkit::AuthorizationStatus;
         use screenpipe_connect::calendar::ScreenpipeCalendar;
 
         let auth_status = ScreenpipeCalendar::authorization_status();
         let status_str = format!("{}", auth_status);
-        let authorized = status_str == "Full Access";
+        let authorized = matches!(auth_status, AuthorizationStatus::FullAccess);
 
         let calendar_count = if authorized {
             tokio::task::spawn_blocking(|| {
                 let cal = ScreenpipeCalendar::new();
-                cal.list_calendars()
-                    .map(|cals| cals.len() as u32)
-                    .unwrap_or(0)
+                match cal.list_calendars() {
+                    Ok(cals) => cals.len() as u32,
+                    Err(e) => {
+                        warn!("calendar_status: authorized but failed to list calendars: {}", e);
+                        0
+                    }
+                }
             })
             .await
             .unwrap_or(0)
@@ -141,7 +146,7 @@ pub async fn calendar_status() -> Result<CalendarStatus, String> {
 
 /// Reset TCC (privacy) permission for Calendars on this app's bundle ID.
 ///
-/// Why: users (Mike, Jarad, Ruark, Louis's own Mac mini) clicked
+/// Why: multiple users (including Louis's own Mac mini) clicked
 /// "Fix Calendar Permission" → macOS opened the Calendars privacy pane
 /// with an EMPTY app list, so they had no way to grant access. Root cause
 /// is a stale TCC record (dev-build → prod-build reinstall, OS update,
@@ -161,24 +166,44 @@ pub async fn calendar_reset_permission(app: tauri::AppHandle) -> Result<String, 
     #[cfg(target_os = "macos")]
     {
         use tauri::Manager;
+
         let bundle_id = app.config().identifier.clone();
         if bundle_id.is_empty() {
             return Err("no bundle identifier in app config".to_string());
         }
+
         info!(
             "calendar: resetting TCC Calendars permission for bundle {}",
             bundle_id
         );
         let output = tokio::process::Command::new("tccutil")
-            .args(["reset", "Calendars", &bundle_id])
+            .args(["reset", "Calendar", &bundle_id])
             .output()
             .await
-            .map_err(|e| format!("failed to run tccutil: {}", e))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("tccutil failed: {}", stderr.trim()));
+            .map_err(|e| format!("failed to run tccutil for {}: {}", bundle_id, e))?;
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if output.status.success() {
+            tokio::task::spawn_blocking(|| {
+                let cal = screenpipe_connect::calendar::ScreenpipeCalendar::new();
+                cal.reset();
+            })
+            .await
+            .map_err(|e| format!("failed to reset EventKit store: {}", e))?;
+            Ok(format!("{}: reset", bundle_id))
+        } else {
+            // tccutil exits non-zero when no row exists. That is fine here:
+            // after reset we request EventKit again so macOS can create a row.
+            warn!(
+                "calendar: tccutil reset Calendar {} returned non-zero: {}",
+                bundle_id, stderr
+            );
+            Ok(format!(
+                "{}: no existing TCC row ({})",
+                bundle_id,
+                if stderr.is_empty() { "no details" } else { stderr.as_str() }
+            ))
         }
-        Ok(format!("reset ok for {}", bundle_id))
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -313,72 +338,93 @@ pub async fn calendar_get_current_meeting() -> Result<Vec<CalendarEventItem>, St
 
 /// Background loop that publishes calendar events to the event bus every 60s.
 /// Consumed by meetings.rs for meeting detection signal #5.
+///
+/// Publishes on every cycle — even an empty list when there are no events or
+/// no auth — so subscribers can distinguish "publisher hasn't run yet" from
+/// "publisher ran and there's nothing." Subscribers (meeting_live_notes) use
+/// the first publication to mark their cache as authoritative and stop
+/// duplicating the fetch.
 pub async fn start_calendar_events_publisher() {
     info!("calendar events publisher: started");
     loop {
-        #[cfg(target_os = "macos")]
-        {
-            use screenpipe_connect::calendar::ScreenpipeCalendar;
+        let items: Vec<CalendarEventItem> = collect_calendar_events().await;
 
-            let status = ScreenpipeCalendar::authorization_status();
-            if format!("{}", status) == "Full Access" {
-                match tokio::task::spawn_blocking(|| {
-                    let cal = ScreenpipeCalendar::new();
-                    cal.get_events(1, 2)
-                })
-                .await
-                {
-                    Ok(Ok(events)) => {
-                        let items: Vec<CalendarEventItem> =
-                            events.into_iter().map(calendar_event_to_item).collect();
-                        if let Err(e) = screenpipe_events::send_event("calendar_events", items) {
-                            debug!("calendar publisher: failed to send event: {}", e);
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        debug!("calendar publisher: fetch failed: {}", e);
-                    }
-                    Err(e) => {
-                        error!("calendar publisher: task panicked: {}", e);
-                    }
-                }
-            }
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            use screenpipe_connect::calendar_windows::ScreenpipeCalendar;
-
-            match tokio::task::spawn_blocking(|| {
-                let cal = ScreenpipeCalendar::new()?;
-                let calendars = cal.list_calendars().unwrap_or_default();
-                info!(
-                    "calendar publisher: found {} calendars: {:?}",
-                    calendars.len(),
-                    calendars
-                );
-                cal.get_events(1, 2)
-            })
-            .await
-            {
-                Ok(Ok(events)) => {
-                    info!("calendar publisher: fetched {} events", events.len());
-                    let items: Vec<CalendarEventItem> =
-                        events.into_iter().map(calendar_event_to_item_win).collect();
-                    if let Err(e) = screenpipe_events::send_event("calendar_events", items) {
-                        warn!("calendar publisher: failed to send event: {}", e);
-                    }
-                }
-                Ok(Err(e)) => {
-                    warn!("calendar publisher: fetch failed: {}", e);
-                }
-                Err(e) => {
-                    error!("calendar publisher: task panicked: {}", e);
-                }
-            }
+        if let Err(e) = screenpipe_events::send_event("calendar_events", items) {
+            debug!("calendar publisher: failed to send event: {}", e);
         }
 
         tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+    }
+}
+
+async fn collect_calendar_events() -> Vec<CalendarEventItem> {
+    #[cfg(target_os = "macos")]
+    {
+        use screenpipe_connect::calendar::ScreenpipeCalendar;
+
+        // Allow reads once access was granted this session, even if the OS's
+        // cached status still lags (macOS 26 reports a stale non-FullAccess
+        // value for minutes after an in-process grant). `get_events` re-checks
+        // and re-syncs internally; explicit denials still yield no events.
+        let status = ScreenpipeCalendar::authorization_status();
+        if format!("{}", status) != "Full Access"
+            && !ScreenpipeCalendar::access_granted_this_session()
+        {
+            return Vec::new();
+        }
+
+        match tokio::task::spawn_blocking(|| {
+            let cal = ScreenpipeCalendar::new();
+            cal.get_events(1, 2)
+        })
+        .await
+        {
+            Ok(Ok(events)) => events.into_iter().map(calendar_event_to_item).collect(),
+            Ok(Err(e)) => {
+                warn!("calendar publisher: fetch failed (status={}): {}", status, e);
+                Vec::new()
+            }
+            Err(e) => {
+                error!("calendar publisher: task panicked: {}", e);
+                Vec::new()
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use screenpipe_connect::calendar_windows::ScreenpipeCalendar;
+
+        match tokio::task::spawn_blocking(|| {
+            let cal = ScreenpipeCalendar::new()?;
+            let calendars = cal.list_calendars().unwrap_or_default();
+            info!(
+                "calendar publisher: found {} calendars: {:?}",
+                calendars.len(),
+                calendars
+            );
+            cal.get_events(1, 2)
+        })
+        .await
+        {
+            Ok(Ok(events)) => {
+                info!("calendar publisher: fetched {} events", events.len());
+                events.into_iter().map(calendar_event_to_item_win).collect()
+            }
+            Ok(Err(e)) => {
+                warn!("calendar publisher: fetch failed: {}", e);
+                Vec::new()
+            }
+            Err(e) => {
+                error!("calendar publisher: task panicked: {}", e);
+                Vec::new()
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Vec::new()
     }
 }
 

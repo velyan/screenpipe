@@ -30,7 +30,8 @@ interface StreamTimeSeriesResponse {
 function createMockFrame(
   timestamp: string,
   deviceId: string = "test-device",
-  frameId: number = 1
+  frameId: number = 1,
+  audio: unknown[] = []
 ): StreamTimeSeriesResponse {
   return {
     timestamp,
@@ -45,7 +46,7 @@ function createMockFrame(
           ocr_text: "test text",
           browser_url: null,
         },
-        audio: [],
+        audio,
       },
     ],
   };
@@ -108,6 +109,30 @@ describe("Timeline Store Logic - Frame Refresh Bug Tests", () => {
     );
 
     expect(result.frames.length).toBe(1);
+  });
+
+  it("should merge same-timestamp transcript backfills into cached timeline frames", () => {
+    const timestamp = "2026-06-25T20:19:01.273Z";
+    const existingFrames = [createMockFrame(timestamp, "monitor_1", 1000192500)];
+    const existingTimestamps = new Set([timestamp]);
+    const transcript = {
+      audio_chunk_id: 1000220712,
+      transcription: "this transcript arrived after the cached frame rendered",
+      device_name: "MacBook Pro Microphone",
+      is_input: true,
+    };
+
+    const result = mergeTimelineFrames({
+      existingFrames,
+      existingTimestamps,
+      incomingFrames: [
+        createMockFrame(timestamp, "monitor_1", 1000192500, [transcript]),
+      ],
+    });
+
+    expect(result.frames.length).toBe(1);
+    expect(result.changed).toBe(true);
+    expect(result.frames[0].devices[0].audio).toEqual([transcript]);
   });
 
   /**

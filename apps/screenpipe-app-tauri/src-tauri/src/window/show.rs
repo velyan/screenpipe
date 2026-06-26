@@ -404,6 +404,18 @@ impl ShowRewindWindow {
 
     pub fn show(&self, app: &AppHandle) -> tauri::Result<WebviewWindow> {
         let id = self.id();
+        if crate::enterprise_policy::is_app_ui_hidden() && id != RewindWindowId::PermissionRecovery
+        {
+            info!(
+                "enterprise: suppressed {} window in hidden UI mode",
+                id.label()
+            );
+            return Err(tauri::Error::Anyhow(anyhow::anyhow!(
+                "window suppressed by enterprise hidden UI mode: {}",
+                id.label()
+            )));
+        }
+
         let onboarding_store = OnboardingStore::get(app)
             .unwrap_or_else(|_| None)
             .unwrap_or_default();
@@ -454,15 +466,19 @@ impl ShowRewindWindow {
             }
 
             if id.label() == RewindWindowId::Search.label() {
-                // Navigate to /search to reset state (clear previous results)
-                let nav_url = if let Some(query) = self.metadata() {
-                    format!("/search/{}", query)
-                } else {
-                    "/search".to_string()
-                };
-                let _ = window
-                    .eval(&format!("window.location.replace(`{}`);", nav_url))
-                    .ok();
+                // Reset the modal IN PLACE instead of reloading the webview.
+                // The search window is kept warm across opens (close() hides it
+                // rather than destroying it — see `close()` below), so a full
+                // `location.replace("/search")` here would throw the warm webview
+                // away and force a multi-second Next.js cold-boot on every open,
+                // during which the input is unresponsive (the ~10s "stuck" bug).
+                // Emitting "search-reset" lets the React side clear previous
+                // results and refocus the input instantly. metadata() carries an
+                // optional prefill query (empty string when none).
+                let _ = window.emit(
+                    "search-reset",
+                    serde_json::json!({ "query": self.metadata() }),
+                );
 
                 // Reposition to center of primary monitor
                 if let Ok(Some(monitor)) = app.primary_monitor() {
@@ -525,6 +541,13 @@ impl ShowRewindWindow {
                         ));
                     }
                 }
+                // Windows: if the user opted into `minimizeToTrayOnClose`, the
+                // Home window may have been hidden with skip_taskbar(true) on
+                // close. Clear that flag here so the window reappears in the
+                // taskbar regardless of whether we were previously hidden or
+                // minimized. No-op on macOS/Linux. See main.rs CloseRequested.
+                #[cfg(target_os = "windows")]
+                let _ = window.set_skip_taskbar(false);
                 window.show().ok();
 
                 #[cfg(target_os = "macos")]
@@ -666,6 +689,7 @@ impl ShowRewindWindow {
                     .unwrap_or_default()
                     .unwrap_or_default();
                 let overlay_mode = settings.overlay_mode;
+                #[allow(unused_variables)] // show_in_recording consumed only on Windows (display affinity)
                 let show_in_recording =
                     crate::config::is_e2e_mode() || settings.show_overlay_in_screen_recording;
                 // Record what mode we're creating so we can detect changes later
@@ -706,6 +730,7 @@ impl ShowRewindWindow {
                     #[cfg(not(target_os = "macos"))]
                     let window = {
                         let app_clone = app.clone();
+                        #[cfg(target_os = "windows")]
                         let capturable = show_in_recording;
                         let builder = self
                             .window_builder_with_label(
@@ -717,6 +742,7 @@ impl ShowRewindWindow {
                             .inner_size(win_w, win_h)
                             .min_inner_size(800.0, 600.0)
                             .decorations(true)
+                            .skip_taskbar(true)
                             .visible(false)
                             .focused(false)
                             .transparent(false)
@@ -1198,6 +1224,7 @@ impl ShowRewindWindow {
                 // Debounce focus-loss so three-finger workspace swipes don't hide mid-animation.
                 // On Linux the main window is a normal decorated window — don't auto-hide on focus loss,
                 // as that makes the window unclickable and breaks the standard desktop UX.
+                #[cfg(not(target_os = "linux"))]
                 let app_clone = app.clone();
                 let window_clone = window.clone();
                 #[cfg(not(target_os = "linux"))]
@@ -1820,6 +1847,36 @@ impl ShowRewindWindow {
         //     }
         //     return Ok(());
         // }
+
+        // Search: hide instead of destroy so the webview stays warm. Recreating
+        // the window forces a full Next.js cold-boot on every open (the input is
+        // unresponsive for several seconds); reuse via show()'s existing-window
+        // branch makes reopen instant. `window.close()` on the class-swizzled
+        // NSPanel also risks a use-after-free SIGSEGV (see the creation path),
+        // which order_out avoids.
+        if id.label() == RewindWindowId::Search.label() {
+            if let Some(window) = id.get(app) {
+                #[cfg(target_os = "macos")]
+                {
+                    let window_clone = window.clone();
+                    run_on_main_thread_safe(app, move || {
+                        use objc::{msg_send, sel, sel_impl};
+                        use tauri_nspanel::cocoa::base::{id, nil};
+                        if let Ok(ns_win) = window_clone.ns_window() {
+                            let ns_win = ns_win as id;
+                            unsafe {
+                                let _: () = msg_send![ns_win, orderOut: nil];
+                            }
+                        }
+                    });
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    window.hide().ok();
+                }
+            }
+            return Ok(());
+        }
 
         if let Some(window) = id.get(app) {
             // On Windows, minimize the Settings window instead of closing it

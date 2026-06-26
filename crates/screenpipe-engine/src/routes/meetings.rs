@@ -10,7 +10,7 @@ use axum::{
 use oasgen::{oasgen, OaSchema};
 
 use screenpipe_db::DatabaseManager;
-use screenpipe_db::{MeetingRecord, MeetingTranscriptSegment};
+use screenpipe_db::{MeetingRecord, MeetingTranscriptSegment, MEETING_END_REASON_EXPLICIT_STOP};
 
 use crate::meeting_telemetry::{capture_detection_decision, capture_detection_feedback};
 use crate::server::AppState;
@@ -64,6 +64,64 @@ pub struct StartMeetingRequest {
 #[derive(OaSchema, Deserialize, Debug)]
 pub struct StopMeetingRequest {
     pub id: Option<i64>,
+    /// When false, skip auto-appending the user's typed text (and edited
+    /// files) to the meeting note. Defaults to true to preserve historical
+    /// behavior.
+    #[serde(default = "default_append_typed_text")]
+    pub append_typed_text: bool,
+}
+
+fn default_append_typed_text() -> bool {
+    true
+}
+
+impl Default for StopMeetingRequest {
+    fn default() -> Self {
+        Self {
+            id: None,
+            append_typed_text: default_append_typed_text(),
+        }
+    }
+}
+
+/// Body extractor for `POST /meetings/stop` that tolerates a missing/empty
+/// request body, treating it as `StopMeetingRequest::default()` ("stop whatever
+/// meeting is currently active"). The plain `axum::Json` extractor rejects an
+/// empty body with an opaque 400 ("EOF while parsing"), which made the endpoint
+/// impossible to use for any client that didn't send a body (e.g. the MCP
+/// `stop-meeting` tool). Deriving `OaSchema` keeps the request documented in the
+/// generated OpenAPI spec.
+#[derive(OaSchema)]
+pub struct StopBody(pub StopMeetingRequest);
+
+#[axum::async_trait]
+impl<S> axum::extract::FromRequest<S> for StopBody
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, JsonResponse<Value>);
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        let bytes = axum::body::Bytes::from_request(req, state)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    JsonResponse(json!({"error": "failed to read request body"})),
+                )
+            })?;
+        let parsed = if bytes.is_empty() {
+            StopMeetingRequest::default()
+        } else {
+            serde_json::from_slice(&bytes).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    JsonResponse(json!({"error": format!("invalid request body: {e}")})),
+                )
+            })?
+        };
+        Ok(StopBody(parsed))
+    }
 }
 
 #[derive(OaSchema, Deserialize, Debug)]
@@ -82,6 +140,10 @@ pub struct ListMeetingsRequest {
     pub limit: u32,
     #[serde(default)]
     pub offset: u32,
+    /// Case-insensitive substring match against title, attendees, and note.
+    /// Empty / whitespace-only values are ignored.
+    #[serde(default)]
+    pub q: Option<String>,
 }
 
 fn default_limit() -> u32 {
@@ -195,12 +257,18 @@ pub(crate) async fn list_meetings_handler(
 ) -> Result<JsonResponse<Vec<MeetingRecord>>, (StatusCode, JsonResponse<Value>)> {
     let start_time_str = request.start_time.map(|dt| dt.to_rfc3339());
     let end_time_str = request.end_time.map(|dt| dt.to_rfc3339());
+    let query_str = request
+        .q
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     let meetings = state
         .db
         .list_meetings(
             start_time_str.as_deref(),
             end_time_str.as_deref(),
+            query_str,
             request.limit,
             request.offset,
         )
@@ -443,8 +511,13 @@ pub(crate) async fn start_meeting_handler(
 ) -> Result<JsonResponse<MeetingRecord>, (StatusCode, JsonResponse<Value>)> {
     let app = body.app.as_deref().unwrap_or("manual");
     let resumed_existing = body.id.is_some();
+
+    // Resolve the current active meeting up-front so every branch can reason
+    // about it. This is the guard that prevents a second open `meetings` row
+    // from being inserted while one already exists — the historical bug that
+    // produced duplicate "ongoing" entries in the UI.
+    let status = resolve_meeting_status(&state).await?;
     let id = if let Some(id) = body.id {
-        let status = resolve_meeting_status(&state).await?;
         if status.active && status.active_meeting_id != Some(id) {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -471,6 +544,102 @@ pub(crate) async fn start_meeting_handler(
             })?;
         }
         id
+    } else if let Some(active_id) = status.active_meeting_id {
+        // Something is already recording. Two cases:
+        //   1) The active meeting is already the manual one — idempotent
+        //      re-entry. Optionally enrich title/attendees if the caller
+        //      provided new values (e.g. user clicked a Coming Up event
+        //      after a manual start), then return the existing row.
+        //   2) The active meeting is auto-detected. Adopt it as the manual
+        //      meeting and enrich it with the caller's title/attendees
+        //      (typically sourced from a calendar event). This matches the
+        //      user's mental model — "start meeting" on a call that's
+        //      already being captured should attach to it, not spawn a
+        //      parallel ghost row.
+        if status.manual_active {
+            // Idempotent: enrich only if blank, never overwrite user input.
+            let existing = state.db.get_meeting_by_id(active_id).await.map_err(|e| {
+                (
+                    StatusCode::NOT_FOUND,
+                    JsonResponse(json!({"error": format!("meeting not found: {}", e)})),
+                )
+            })?;
+            let title_update = body
+                .title
+                .as_deref()
+                .filter(|t| !t.trim().is_empty())
+                .filter(|_| {
+                    existing
+                        .title
+                        .as_deref()
+                        .is_none_or(|s| s.trim().is_empty())
+                });
+            let attendees_update = body
+                .attendees
+                .as_deref()
+                .filter(|a| !a.trim().is_empty())
+                .filter(|_| {
+                    existing
+                        .attendees
+                        .as_deref()
+                        .is_none_or(|s| s.trim().is_empty())
+                });
+            if title_update.is_some() || attendees_update.is_some() {
+                if let Err(e) = state
+                    .db
+                    .update_meeting(
+                        active_id,
+                        None,
+                        None,
+                        title_update,
+                        attendees_update,
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "start_meeting: idempotent enrich failed for {}: {}",
+                        active_id,
+                        e
+                    );
+                }
+            }
+            active_id
+        } else {
+            // Adopt the auto-detected meeting. Enrich with caller-supplied
+            // metadata, treating blank/whitespace as "no value" so an empty
+            // body doesn't wipe out detector-stamped fields.
+            let title_update = body.title.as_deref().filter(|t| !t.trim().is_empty());
+            let attendees_update = body.attendees.as_deref().filter(|a| !a.trim().is_empty());
+            if title_update.is_some() || attendees_update.is_some() {
+                if let Err(e) = state
+                    .db
+                    .update_meeting(
+                        active_id,
+                        None,
+                        None,
+                        title_update,
+                        attendees_update,
+                        None,
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "start_meeting: adoption enrich failed for {}: {}",
+                        active_id,
+                        e
+                    );
+                }
+            }
+            tracing::info!(
+                "start_meeting: adopting active auto-detected meeting (id={}, app={:?})",
+                active_id,
+                status.meeting_app
+            );
+            active_id
+        }
     } else {
         state
             .db
@@ -482,10 +651,34 @@ pub(crate) async fn start_meeting_handler(
             )
             .await
             .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    JsonResponse(json!({"error": e.to_string()})),
-                )
+                // The unique partial index on open meetings (see migration
+                // 20260603000000) turns a duplicate-insert race into a
+                // UNIQUE constraint failure. Map it to 409 Conflict so the
+                // client knows to refresh status and retry, instead of
+                // surfacing a generic 500.
+                //
+                // SQLite reports an expression-index violation by the index
+                // name, not a column: `UNIQUE constraint failed: index
+                // 'idx_meetings_single_open'`. Match on the index name so this
+                // keeps working if columns change — `meetings.meeting_end`
+                // would never match (NULLs are distinct, which is why the
+                // index is on the constant expression `(1)` in the first place).
+                let msg = e.to_string();
+                if msg.contains("UNIQUE constraint failed")
+                    && msg.contains("idx_meetings_single_open")
+                {
+                    (
+                        StatusCode::CONFLICT,
+                        JsonResponse(json!({
+                            "error": "another meeting is already active",
+                        })),
+                    )
+                } else {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        JsonResponse(json!({"error": msg})),
+                    )
+                }
             })?
     };
 
@@ -539,7 +732,7 @@ pub(crate) async fn start_meeting_handler(
 #[oasgen]
 pub(crate) async fn stop_meeting_handler(
     State(state): State<Arc<AppState>>,
-    axum::Json(body): axum::Json<StopMeetingRequest>,
+    StopBody(body): StopBody,
 ) -> Result<JsonResponse<MeetingRecord>, (StatusCode, JsonResponse<Value>)> {
     let requested_id = body.id;
     let status = resolve_meeting_status(&state).await?;
@@ -548,6 +741,17 @@ pub(crate) async fn stop_meeting_handler(
             if status.stoppable_meeting_id == Some(id) || status.active_meeting_id == Some(id) {
                 id
             } else {
+                // Idempotency: a client can hold a stale meeting id after the
+                // backend's active meeting changed underneath it (e.g. the
+                // auto-detector ended a manually-started meeting). If the id
+                // refers to a meeting that is already ended, treat the stop as
+                // a success so the UI can resync instead of wedging on a 400
+                // ("manually started meeting cannot be stopped").
+                if let Ok(meeting) = state.db.get_meeting_by_id(id).await {
+                    if meeting.meeting_end.is_some() {
+                        return Ok(JsonResponse(meeting));
+                    }
+                }
                 return Err((
                     StatusCode::BAD_REQUEST,
                     JsonResponse(json!({"error": "requested meeting is not the active meeting"})),
@@ -564,17 +768,17 @@ pub(crate) async fn stop_meeting_handler(
 
     let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 
-    state
-        .db
-        .end_meeting_with_typed_text(id, &now, true)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                JsonResponse(json!({"error": e.to_string()})),
-            )
-        })?;
-
+    // Release runtime state BEFORE persisting. An explicit stop is a runtime
+    // intent — the audio batch-deferral flag and detector tracking must release
+    // even when the write pool is wedged. If they only release *after* the
+    // end-write (as before), a stalled write pool turns the stop into a
+    // deadlock: audio stays in batch-deferral, the transcription/write queue
+    // never drains, so the end-write can never acquire a connection
+    // ("pool timed out while waiting for an open connection"), so the flag
+    // never clears — leaving the meeting permanently unstoppable with hundreds
+    // of transcription segments stranded (#4525). These three releases touch
+    // no DB (RwLock + AtomicBool + in-process event bus), so a stalled write
+    // pool cannot block them.
     {
         let mut lock = state.manual_meeting.write().await;
         if *lock == Some(id) {
@@ -584,6 +788,41 @@ pub(crate) async fn stop_meeting_handler(
     if let Some(detector) = state.audio_manager.meeting_detector().await {
         detector.set_v2_in_meeting(false);
     }
+    // Signal the detector loop to drop tracking immediately (skip grace period).
+    // The app comes from the already-resolved status so this needs no DB read
+    // and fires even when the pool is wedged.
+    if let Err(e) = screenpipe_events::send_event(
+        "detector_stop_tracking",
+        serde_json::json!({
+            "meeting_id": id,
+            "app": status.meeting_app.clone().unwrap_or_default(),
+        }),
+    ) {
+        tracing::warn!(
+            "failed to emit detector_stop_tracking event for meeting {}: {}",
+            id,
+            e
+        );
+    }
+
+    // Persist the end best-effort. The runtime is already released above, so
+    // even if this times out (pool wedged), the deferral drains and a retry —
+    // or the detector's own grace-timeout end — completes persistence.
+    state
+        .db
+        .end_meeting_with_typed_text(
+            id,
+            &now,
+            body.append_typed_text,
+            Some(MEETING_END_REASON_EXPLICIT_STOP),
+        )
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                JsonResponse(json!({"error": e.to_string()})),
+            )
+        })?;
 
     if let Ok(status) = resolve_meeting_status(&state).await {
         emit_meeting_status_changed(&status);
@@ -610,25 +849,136 @@ pub(crate) async fn stop_meeting_handler(
         None,
     );
 
-    // Signal detector to stop tracking this meeting immediately (skip grace period)
-    if let Err(e) = screenpipe_events::send_event(
-        "detector_stop_tracking",
-        serde_json::json!({ "meeting_id": id, "app": &meeting.meeting_app }),
-    ) {
-        tracing::warn!(
-            "failed to emit detector_stop_tracking event for meeting {}: {}",
-            id,
-            e
-        );
-    }
-
     Ok(JsonResponse(meeting))
+}
+
+/// Export request: pass `meeting_id` to export a meeting (its window is resolved
+/// from the DB), or `start`/`end` for an arbitrary wall-clock range (`end` defaults
+/// to now). `start`/`end` accept ISO 8601 or relative (`"2h ago"`, `"now"`). Same
+/// `meeting_id` XOR `start`/`end` contract as the `screenpipe export` CLI and the
+/// in-app `export_recording` Tauri command.
+#[derive(OaSchema, Deserialize, Debug)]
+pub struct ExportRequest {
+    #[serde(default)]
+    pub meeting_id: Option<i64>,
+    #[serde(default)]
+    pub start: Option<String>,
+    #[serde(default)]
+    pub end: Option<String>,
+    /// Absolute output .mp4 path. If omitted, writes to `<data-dir>/exports/`.
+    #[serde(default)]
+    pub output_path: Option<String>,
+}
+
+#[derive(OaSchema, Serialize, Debug)]
+pub struct ExportResponse {
+    pub output_path: String,
+    pub frame_count: usize,
+    pub audio_chunk_count: usize,
+    pub duration_secs: f64,
+    pub file_size_bytes: u64,
+}
+
+/// Render a recording to a single MP4 (screen frames + synced audio) via the engine
+/// export core. Pass `meeting_id` (window resolved from the DB) or `start`/`end` for an
+/// arbitrary range. Long-running: the caller should show a progress indicator. Writes to
+/// `output_path` if given, else the data dir's `exports/` folder. This is the HTTP twin of
+/// the `screenpipe export` CLI — same `meeting_id` XOR `start`/`end` contract.
+#[oasgen]
+pub(crate) async fn export_handler(
+    State(state): State<Arc<AppState>>,
+    axum::Json(body): axum::Json<ExportRequest>,
+) -> Result<JsonResponse<ExportResponse>, (StatusCode, JsonResponse<Value>)> {
+    let bad_request = |msg: String| {
+        (
+            StatusCode::BAD_REQUEST,
+            JsonResponse(json!({ "error": msg })),
+        )
+    };
+    let server_error = |e: anyhow::Error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            JsonResponse(json!({ "error": format!("{e:#}") })),
+        )
+    };
+
+    // Explicit output path wins; otherwise name a file under `<data-dir>/exports/`.
+    let explicit_output = body
+        .output_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from);
+    let default_output = |stem: String| {
+        state
+            .screenpipe_dir
+            .join("exports")
+            .join(format!("{stem}_{}.mp4", Utc::now().format("%Y%m%d_%H%M%S")))
+    };
+
+    // meeting_id XOR start/end, same contract as the `screenpipe export` CLI.
+    let summary = match (body.meeting_id, body.start.is_some() || body.end.is_some()) {
+        (Some(id), _) => {
+            let output = explicit_output.unwrap_or_else(|| default_output(format!("meeting_{id}")));
+            crate::meeting_export::export_meeting_to_mp4(&state.db, id, &output)
+                .await
+                .map_err(server_error)?
+        }
+        (None, true) => {
+            let start_raw = body.start.as_deref().ok_or_else(|| {
+                bad_request("end requires start (give the range a beginning)".to_string())
+            })?;
+            let start = crate::routes::time::parse_flexible_datetime(start_raw)
+                .map_err(|e| bad_request(format!("start: {e}")))?;
+            let end = match body.end.as_deref() {
+                Some(s) => crate::routes::time::parse_flexible_datetime(s)
+                    .map_err(|e| bad_request(format!("end: {e}")))?,
+                None => Utc::now(),
+            };
+            let output = explicit_output.unwrap_or_else(|| default_output("export".to_string()));
+            crate::meeting_export::export_range_to_mp4(&state.db, start, end, &output)
+                .await
+                .map_err(server_error)?
+        }
+        (None, false) => {
+            return Err(bad_request(
+                "provide either meeting_id or start/end".to_string(),
+            ))
+        }
+    };
+
+    Ok(JsonResponse(ExportResponse {
+        output_path: summary.output_path,
+        frame_count: summary.frame_count,
+        audio_chunk_count: summary.audio_chunk_count,
+        duration_secs: summary.duration_secs,
+        file_size_bytes: summary.file_size_bytes,
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn test_stop_meeting_request_tolerant_body() {
+        // A missing body falls back to the default: stop the active meeting,
+        // appending typed text (historical behavior).
+        let d = StopMeetingRequest::default();
+        assert_eq!(d.id, None);
+        assert!(d.append_typed_text);
+
+        // An empty JSON object parses to the same defaults (the `{}` path).
+        let empty: StopMeetingRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.id, None);
+        assert!(empty.append_typed_text);
+
+        // A partial body still works and keeps the default for omitted fields.
+        let partial: StopMeetingRequest = serde_json::from_str(r#"{"id":5}"#).unwrap();
+        assert_eq!(partial.id, Some(5));
+        assert!(partial.append_typed_text);
+    }
 
     #[test]
     fn test_list_meetings_request_relative_dates() {

@@ -36,6 +36,9 @@ export const userSchema = z.object({
   contact: z.string().nullable(),
   cloud_subscribed: z.boolean().nullable(),
   credits_balance: z.number().nullable(),
+  app_entitled: z.boolean().nullable().optional(),
+  subscription_plan: z.string().nullable().optional(),
+  entitlement: z.any().nullable().optional(),
 });
 
 export const aiProviderTypeSchema = z.enum(["openai", "native-ollama", "custom", "screenpipe-cloud", "pi", "anthropic"]);
@@ -71,6 +74,7 @@ export const settingsStoreSchema = z.object({
   meetingLiveTranscriptionProvider: z.string().optional(),
   audioDevices: z.array(z.string()),
   disableAudio: z.boolean(),
+  audioCaptureMode: z.enum(["always", "meetings-only", "disabled"]).optional(),
   languages: z.array(z.string()),
   
   // Video Settings
@@ -240,23 +244,27 @@ export const getFieldHelperText = (field: keyof SettingsStore, settings: any) =>
 // `visiblePresets` should be the filtered list the user actually sees,
 // so hidden presets (e.g. Pi presets in enterprise builds) don't block creation.
 export const validatePresetName = (name: string, visiblePresets: AIPreset[], currentId?: string): FieldValidationResult => {
-  if (!name.trim()) {
+  const normalizedName = name.trim();
+
+  if (!normalizedName) {
     return { isValid: false, error: "Preset name is required" };
   }
 
-  if (name.trim().toLowerCase().endsWith("copy")) {
+  if (normalizedName.toLowerCase().endsWith("copy")) {
     return { isValid: false, error: "Preset name cannot end with 'copy'" };
   }
 
   const exists = visiblePresets.some(
-    preset => preset.id.toLowerCase() === name.toLowerCase() && preset.id !== currentId
+    preset =>
+      preset.id.trim().toLowerCase() === normalizedName.toLowerCase() &&
+      preset.id !== currentId
   );
 
   if (exists) {
     return { isValid: false, error: "A preset with this name already exists" };
   }
 
-  if (!/^[a-zA-Z0-9\s\-_]+$/.test(name)) {
+  if (!/^[a-zA-Z0-9\s\-_]+$/.test(normalizedName)) {
     return { isValid: false, error: "Only letters, numbers, spaces, hyphens, and underscores are allowed" };
   }
 

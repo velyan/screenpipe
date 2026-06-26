@@ -20,8 +20,9 @@ import { Loader2 } from "lucide-react";
 import { useToast } from "@/components/ui/use-toast";
 import { listen } from "@tauri-apps/api/event";
 import posthog from "posthog-js";
-import { PermissionsReview } from "@/components/pipe-store";
+import { InstallRiskSummary, getPipeInstallRisk } from "@/components/pipe-store";
 import { localFetch } from "@/lib/api";
+import { useFeedbackStore } from "@/lib/stores/feedback-store";
 
 interface PipeInstallRequest {
   url: string;
@@ -49,9 +50,11 @@ export function PipeInstallDialog() {
   const [preview, setPreview] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [installing, setInstalling] = useState(false);
+  const [installRiskAcknowledged, setInstallRiskAcknowledged] = useState(false);
   const [registryDetail, setRegistryDetail] = useState<RegistryPipeDetail | null>(null);
   const [, setSection] = useQueryState("section");
   const { toast } = useToast();
+  const openFeedback = useFeedbackStore((s) => s.openFeedback);
 
   // Listen for install-pipe events from deep link handler
   useEffect(() => {
@@ -59,6 +62,7 @@ export function PipeInstallDialog() {
       setRequest(event.payload);
       setPreview(null);
       setRegistryDetail(null);
+      setInstallRiskAcknowledged(false);
       setLoading(true);
 
       const url = event.payload.url;
@@ -149,7 +153,18 @@ export function PipeInstallDialog() {
     } catch (err: any) {
       toast({
         title: "failed to install pipe",
-        description: err.message,
+        description: (
+          <span>
+            {err.message}{" "}
+            <button
+              type="button"
+              className="underline underline-offset-2 text-inherit opacity-80 hover:opacity-100"
+              onClick={() => openFeedback(`Pipe install failed: ${err.message}`)}
+            >
+              report issue
+            </button>
+          </span>
+        ),
         variant: "destructive",
       });
     } finally {
@@ -160,6 +175,7 @@ export function PipeInstallDialog() {
   const handleCancel = () => {
     posthog.capture("pipe_install_cancelled", { url: request?.url });
     setRequest(null);
+    setInstallRiskAcknowledged(false);
   };
 
   // Strip frontmatter for display
@@ -167,6 +183,12 @@ export function PipeInstallDialog() {
   const previewLines = body.split("\n").slice(0, 15).join("\n");
 
   const isRegistry = request ? isRegistrySource(request.url) : false;
+  const registryRisk = registryDetail
+    ? getPipeInstallRisk({
+      permissions: registryDetail.permissions as any,
+      author_verified: registryDetail.author_verified,
+    })
+    : "safe";
 
   return (
     <>
@@ -176,7 +198,9 @@ export function PipeInstallDialog() {
             <AlertDialogTitle className="text-sm">install pipe?</AlertDialogTitle>
             <AlertDialogDescription className="text-xs">
               {isRegistry
-                ? "a pipe from the store wants to install. review the permissions below before installing."
+                ? registryRisk === "high"
+                  ? "Unverified publisher. Can access all your screen data."
+                  : "Review the requested access before installing."
                 : "a pipe from an external link wants to install. pipes are AI agents that run on your screen data — review the prompt below before installing."}
             </AlertDialogDescription>
           </AlertDialogHeader>
@@ -191,18 +215,15 @@ export function PipeInstallDialog() {
               {isRegistry ? "loading pipe details..." : "loading pipe content..."}
             </div>
           ) : isRegistry && registryDetail ? (
-            <div className="space-y-3">
-              <div className="text-sm font-medium">
-                {registryDetail.title}
-                <span className="text-xs text-muted-foreground ml-2">
-                  by {registryDetail.author}
-                </span>
-              </div>
-              <PermissionsReview
-                permissions={registryDetail.permissions as any}
-                authorVerified={registryDetail.author_verified}
-              />
-            </div>
+            <InstallRiskSummary
+              title={registryDetail.title}
+              author={registryDetail.author}
+              authorVerified={registryDetail.author_verified}
+              permissions={registryDetail.permissions as any}
+              acknowledgeId="registry-pipe-risk-ack"
+              acknowledged={installRiskAcknowledged}
+              onAcknowledgedChange={setInstallRiskAcknowledged}
+            />
           ) : preview ? (
             <div className="border rounded overflow-hidden">
               <div className="px-3 py-1.5 bg-muted text-[10px] uppercase tracking-wider text-muted-foreground border-b">
@@ -225,12 +246,12 @@ export function PipeInstallDialog() {
 
           <AlertDialogFooter>
             <AlertDialogCancel className="text-xs" onClick={handleCancel}>
-              cancel
+              not now
             </AlertDialogCancel>
             <AlertDialogAction
               className="text-xs"
               onClick={handleInstall}
-              disabled={installing}
+              disabled={installing || (isRegistry && registryRisk === "high" && !installRiskAcknowledged)}
             >
               {installing ? (
                 <>
@@ -238,7 +259,7 @@ export function PipeInstallDialog() {
                   installing...
                 </>
               ) : (
-                "install"
+                "install pipe"
               )}
             </AlertDialogAction>
           </AlertDialogFooter>

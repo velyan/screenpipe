@@ -109,15 +109,15 @@ impl DbConfig {
         match tier {
             DeviceTier::High => Self::default(),
             DeviceTier::Mid => Self {
-                mmap_size: 128 * 1024 * 1024, // 128 MB
-                cache_size_kb: 32_000,        // 32 MB
+                mmap_size: 0,          // disabled — see DbConfig::default (prevents DB corruption)
+                cache_size_kb: 32_000, // 32 MB
                 read_pool_max: 12,
                 read_pool_min: 2,
                 write_pool_max: 6,
             },
             DeviceTier::Low => Self {
-                mmap_size: 32 * 1024 * 1024, // 32 MB
-                cache_size_kb: 8_000,        // 8 MB
+                mmap_size: 0,         // disabled — see DbConfig::default (prevents DB corruption)
+                cache_size_kb: 8_000, // 8 MB
                 read_pool_max: 5,
                 read_pool_min: 1,
                 write_pool_max: 4,
@@ -130,14 +130,50 @@ impl Default for DbConfig {
     /// High-tier defaults — identical to the previous hardcoded values.
     fn default() -> Self {
         Self {
-            mmap_size: 256 * 1024 * 1024, // 256 MB
-            cache_size_kb: 64_000,        // 64 MB
+            // mmap disabled (0): memory-mapped I/O maps the DB file *writably*
+            // into screenpipe's address space, where a stray write from any
+            // native code (capture, CoreAudio, ONNX/PII models, sqlite_vec)
+            // can silently scribble onto DB pages and corrupt the file on disk
+            // ("database disk image is malformed"). Buffered I/O through the
+            // page cache below is the safe default and the integrity win is
+            // worth the small read-throughput cost for a capture product.
+            mmap_size: 0,
+            cache_size_kb: 64_000, // 64 MB
             read_pool_max: 27,
             read_pool_min: 3,
             write_pool_max: 8,
         }
     }
 }
+
+/// SQLite pragmas that MUST be identical on **every** connection/pool opened
+/// against the same `db.sqlite`. The single source of truth shared by the engine
+/// `DatabaseManager` pools (`screenpipe-db`) and the secret-store pool
+/// (`screenpipe-secrets`).
+///
+/// Why this exists: those two long-lived pools both write the same WAL and its
+/// shared `-shm` WAL-index. If they disagree on these pragmas they race
+/// checkpoints on `-shm` and it desyncs into "database disk image is malformed"
+/// (`SQLITE_CORRUPT`, code 11). The historical bug: the secret pool set only
+/// `journal_mode`/`synchronous` and silently inherited SQLite's default
+/// `wal_autocheckpoint=1000` while the engine used `4000`, so the two pools
+/// checkpointed the same WAL on different thresholds. Apply EXACTLY these on
+/// every pool; never set any of them to a different value on a side pool.
+///
+/// `mmap_size` (must stay `0`, see [`DbConfig`]) and `cache_size` are applied
+/// per-pool because they're tier-configurable; correctness only needs
+/// `mmap_size == 0` everywhere, which the pool-parity test asserts separately.
+pub const WAL_SAFETY_PRAGMAS: [(&str, &str); 4] = [
+    ("journal_mode", "WAL"),
+    // NORMAL is safe under WAL (commit waits for the WAL write, not an fsync of
+    // the main DB) and cuts commit latency vs the FULL default.
+    ("synchronous", "NORMAL"),
+    ("temp_store", "MEMORY"),
+    // Checkpoint after ~4000 pages (~16MB) not SQLite's default 1000 (~4MB).
+    // CRITICAL: every pool over this file must use the SAME threshold or they
+    // race checkpoints on the shared -shm WAL-index (the corruption above).
+    ("wal_autocheckpoint", "4000"),
+];
 
 /// Audio/transcription channel capacities tuned per device tier.
 ///
@@ -179,14 +215,23 @@ impl Default for ChannelConfig {
 }
 
 /// Detect the macOS major version, or `None` on other platforms.
+///
+/// Cached for process lifetime — the value cannot change at runtime, and the
+/// underlying detection forks `sw_vers`, which showed up as a hot leaf frame
+/// in CPU profiling (~33 hits/15s sample) when called from the engine-pick
+/// and is-engine-unsafe paths.
 #[cfg(target_os = "macos")]
 pub fn macos_major_version() -> Option<u32> {
-    let output = std::process::Command::new("sw_vers")
-        .arg("-productVersion")
-        .output()
-        .ok()?;
-    let version_str = String::from_utf8_lossy(&output.stdout);
-    version_str.trim().split('.').next()?.parse().ok()
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<Option<u32>> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        let output = std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+            .ok()?;
+        let version_str = String::from_utf8_lossy(&output.stdout);
+        version_str.trim().split('.').next()?.parse().ok()
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -428,7 +473,10 @@ mod tests {
     fn db_config_low_is_smaller() {
         let high = DbConfig::for_tier(DeviceTier::High);
         let low = DbConfig::for_tier(DeviceTier::Low);
-        assert!(low.mmap_size < high.mmap_size);
+        // mmap is disabled (0) on every tier to prevent stray-write DB
+        // corruption, so it's equal across tiers, not smaller.
+        assert_eq!(low.mmap_size, 0);
+        assert_eq!(high.mmap_size, 0);
         assert!(low.cache_size_kb < high.cache_size_kb);
         assert!(low.read_pool_max < high.read_pool_max);
     }

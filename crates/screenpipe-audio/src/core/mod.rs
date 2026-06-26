@@ -10,6 +10,8 @@ pub mod process_tap;
 #[cfg(all(target_os = "linux", feature = "pulseaudio"))]
 pub mod pulse;
 mod run_record_and_transcribe;
+pub use run_record_and_transcribe::StreamDeath;
+pub mod sck_output_watchdog;
 pub mod source_buffer;
 pub mod stream;
 use crate::AudioInput;

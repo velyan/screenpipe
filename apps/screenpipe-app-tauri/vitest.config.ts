@@ -28,11 +28,15 @@ export default defineConfig({
 			"e2e/**",
 			"src-tauri/target/**",
 			"lib/utils/redact-pii.test.ts",
+			"lib/utils/html-sandbox.test.ts",
 			"lib/utils/meeting-state.test.ts",
+			"lib/utils/sanitize-tool-call-xml.test.ts",
 			"lib/__tests__/team-crypto.test.ts",
 			"lib/__tests__/team-api-contract.test.ts",
+			"lib/__tests__/team-pipes.test.ts",
 			"components/__tests__/url-detection-benchmark.test.ts",
 			"lib/hooks/__tests__/timeline-reconnection.test.ts",
+			"lib/hooks/__tests__/timeline-liveness.test.ts",
 			"lib/hooks/__tests__/timeline-store-logic.test.ts",
 			"lib/hooks/__tests__/server-push-old-frames.test.ts",
 			"lib/hooks/__tests__/window-focus-refresh.test.ts",
@@ -57,6 +61,8 @@ export default defineConfig({
 	resolve: {
 		alias: {
 			"@": path.resolve(__dirname, "./"),
+			"@ee": path.resolve(__dirname, "../../ee/desktop"),
+			"@screenpipe-ext": path.resolve(__dirname, "../../crates/screenpipe-core/assets/extensions"),
 		},
 	},
 });

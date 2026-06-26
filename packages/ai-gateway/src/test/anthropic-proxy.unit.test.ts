@@ -376,8 +376,12 @@ describe('proxyToAnthropic', () => {
 
 		await proxyToAnthropic(request, 'sk-ant-test-key');
 
-		// System parameter should be passed through as-is
-		expect(capturedBody.system).toBe('You are a helpful assistant.');
+		// String system prompts are converted to block form with a cache_control
+		// marker (prompt caching — text content preserved verbatim). The old
+		// behavior only did this above 4096 chars; the gate lost cache hits.
+		expect(capturedBody.system).toEqual([
+			{ type: 'text', text: 'You are a helpful assistant.', cache_control: { type: 'ephemeral' } },
+		]);
 	});
 });
 
@@ -468,6 +472,65 @@ describe('createProvider routing', () => {
 		const provider = createProvider('gemini-3-flash', env);
 		// Should NOT be AnthropicProvider
 		expect(provider).not.toBeInstanceOf(AnthropicProvider);
+	});
+});
+
+// ============================================================================
+// AnthropicProvider.createStreamingCompletion — OpenAI-compatible SSE
+// ============================================================================
+describe('AnthropicProvider.createStreamingCompletion', () => {
+	async function readStream(stream: ReadableStream): Promise<string> {
+		const reader = stream.getReader();
+		const decoder = new TextDecoder();
+		let fullText = '';
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			fullText += decoder.decode(value, { stream: true });
+		}
+		return fullText;
+	}
+
+	it('emits finish_reason before [DONE] for text streams', async () => {
+		const provider = new AnthropicProvider('sk-test') as any;
+		provider.client.messages.create = async function* () {
+			yield { type: 'message_start', message: { usage: { input_tokens: 3 } } };
+			yield { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Hi' } };
+			yield { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } };
+			yield { type: 'message_stop' };
+		};
+
+		const out = await readStream(await provider.createStreamingCompletion({
+			model: 'claude-opus-4-7',
+			messages: [{ role: 'user', content: 'hi' }],
+			stream: true,
+		}));
+
+		expect(out).toContain('"content":"Hi"');
+		expect(out).toContain('"finish_reason":"stop"');
+		expect(out.indexOf('"finish_reason":"stop"')).toBeLessThan(out.indexOf('[DONE]'));
+	});
+
+	it('maps Anthropic tool_use stop_reason to OpenAI tool_calls', async () => {
+		const provider = new AnthropicProvider('sk-test') as any;
+		provider.client.messages.create = async function* () {
+			yield { type: 'content_block_start', content_block: { type: 'tool_use', id: 'toolu_1', name: 'search' } };
+			yield { type: 'content_block_delta', delta: { type: 'input_json_delta', partial_json: '{"q":"x"}' } };
+			yield { type: 'content_block_stop' };
+			yield { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 5 } };
+			yield { type: 'message_stop' };
+		};
+
+		const out = await readStream(await provider.createStreamingCompletion({
+			model: 'claude-opus-4-7',
+			messages: [{ role: 'user', content: 'search' }],
+			stream: true,
+			tools: [{ name: 'search', input_schema: { type: 'object' } } as any],
+		}));
+
+		expect(out).toContain('"tool_calls"');
+		expect(out).toContain('"finish_reason":"tool_calls"');
+		expect(out.indexOf('"finish_reason":"tool_calls"')).toBeLessThan(out.indexOf('[DONE]'));
 	});
 });
 
@@ -594,8 +657,9 @@ describe('isModelAllowed with Anthropic model IDs', () => {
 		expect(isModelAllowed('claude-opus-4-6', 'subscribed')).toBe(true);
 	});
 
-	it('should allow sonnet for logged_in users', () => {
-		expect(isModelAllowed('claude-sonnet-4-5-20250929', 'logged_in')).toBe(true);
+	it('should deny sonnet for logged_in users (Business-only)', () => {
+		expect(isModelAllowed('claude-sonnet-4-5-20250929', 'logged_in')).toBe(false);
+		expect(isModelAllowed('claude-sonnet-4-5-20250929', 'subscribed')).toBe(true);
 	});
 
 	it('should allow any model for subscribed (wildcard)', () => {

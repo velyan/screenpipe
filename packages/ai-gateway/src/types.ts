@@ -85,6 +85,15 @@ export interface RequestBody {
 	max_completion_tokens?: number;
 	tool_choice?: string | { type: 'function'; function: { name: string } };
 	response_format?: ResponseFormat;
+	/**
+	 * Gateway-internal latency tier for the Vertex Gemini lane. Set by the
+	 * router from the request's latency class (see resolveLatencyClass in
+	 * index.ts), NEVER sent by clients and NEVER forwarded upstream — providers
+	 * build their request bodies field-by-field, and only GeminiProvider reads
+	 * this (to add Vertex flex headers). 'flex' = 50% off, best-effort latency,
+	 * for background (pipe/summary) traffic where no user is waiting.
+	 */
+	serviceTier?: 'flex' | 'standard';
 }
 
 type InputSchema = Anthropic.Tool.InputSchema;
@@ -145,6 +154,17 @@ export interface Env {
 	VERTEX_SERVICE_ACCOUNT_JSON: string;
 	VERTEX_PROJECT_ID: string;
 	VERTEX_REGION: string;
+	// Vertex auth mode: "sakey" (default, SA-key JWT) or "wif" (keyless Workload
+	// Identity Federation → screenpipe-prod). See buildWifConfig in providers/vertex.ts.
+	VERTEX_AUTH_MODE?: string;
+	WIF_SIGNING_KEY?: string; // PKCS#8 PEM, the Worker's OIDC signing key (secret)
+	WIF_JWT_KID?: string;
+	WIF_JWT_ISSUER?: string;
+	WIF_JWT_AUDIENCE?: string;
+	WIF_JWT_SUBJECT?: string;
+	WIF_STS_AUDIENCE?: string;
+	WIF_SA_EMAIL?: string;
+	WIF_PROJECT_ID?: string; // GCP project WIF Vertex calls bill to (default screenpipe-prod)
 	// D1 database for usage tracking
 	DB: D1Database;
 	// Sentry error tracking
@@ -158,7 +178,7 @@ export interface Env {
 	// Auto-reload settings
 	WEBSITE_URL: string;
 	AUTO_RELOAD_SECRET: string;
-	// OpenRouter (DeepSeek, Llama, Qwen, Mistral via single API)
+	// OpenRouter (Llama, Qwen, Mistral via single API)
 	OPENROUTER_API_KEY: string;
 	// Tinfoil — confidential inference in secure enclaves
 	TINFOIL_API_KEY: string;
@@ -187,6 +207,11 @@ export interface Env {
 	LIMIT_SUBSCRIBED_DAILY?: string;
 	LIMIT_SUBSCRIBED_RPM?: string;
 	LIMIT_IP_DAILY?: string;
+	// Per-minute RPM for free (weight-0) models — a separate, much higher bucket
+	// so heavy free usage never trips the low paid-model limit. Tunable per tier.
+	LIMIT_ANONYMOUS_FREE_RPM?: string;
+	LIMIT_LOGGED_IN_FREE_RPM?: string;
+	LIMIT_SUBSCRIBED_FREE_RPM?: string;
 }
 
 // User tier for rate limiting and model access
@@ -205,6 +230,13 @@ export interface AuthResult {
 export interface TierLimits {
 	dailyQueries: number;
 	rpm: number;
+	/**
+	 * Per-minute RPM for free (weight-0) models. Tracked in a separate bucket
+	 * from `rpm` (paid models), so free traffic never consumes the low paid
+	 * limit and vice-versa. Always >= `rpm`. The daily *cost* cap remains the
+	 * real backstop against runaway free loops.
+	 */
+	freeRpm: number;
 	allowedModels: string[];
 }
 
@@ -230,6 +262,11 @@ export interface UsageStatus {
 	resets_at: string;
 	model_access: string[];
 	credits_balance?: number;
+	/** Gateway-controlled signal for the app's at-the-cap upsell banner. True only
+	 *  for non-Business tiers while model gating is enabled — so the master
+	 *  kill-switch (MODEL_GATING_ENABLED) turns the banner off server-side too,
+	 *  no app release needed. */
+	upsell_banner?: boolean;
 	upgrade_options?: {
 		login?: { benefit: string };
 		subscribe?: { benefit: string };

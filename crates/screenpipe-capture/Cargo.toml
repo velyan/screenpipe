@@ -1,0 +1,25 @@
+[package]
+name = "screenpipe-capture"
+version = "0.1.0"
+edition = "2021"
+description = "Paired screenshot + accessibility-tree capture, persisted to the screenpipe DB. Shared by the engine binary and the SDK."
+license-file = { workspace = true }
+
+[dependencies]
+screenpipe-a11y = { path = "../screenpipe-a11y" }
+screenpipe-core = { path = "../screenpipe-core", default-features = false, features = ["security"] }
+screenpipe-db = { path = "../screenpipe-db" }
+screenpipe-screen = { path = "../screenpipe-screen" }
+
+anyhow = { workspace = true }
+chrono = { workspace = true }
+image = { workspace = true }
+once_cell = { workspace = true }
+regex = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }

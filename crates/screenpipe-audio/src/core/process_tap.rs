@@ -10,14 +10,14 @@
 //! returns empty displays after sleep/wake cycles.
 
 use anyhow::{anyhow, Result};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
 use ca::aggregate_device_keys as agg_keys;
 use ca::sub_device_keys as sub_keys;
-use cidre::{cat, cf, core_audio as ca, ns, os};
+use cidre::{cat, cf, core_audio as ca, os};
 
 use super::stream::AudioStreamConfig;
 use crate::utils::audio::audio_to_mono;
@@ -71,8 +71,240 @@ fn detect_os_version() -> Option<(u64, u64, u64)> {
 }
 
 // ---------------------------------------------------------------------------
+// Per-app exclusion list for the Process Tap
+// ---------------------------------------------------------------------------
+
+/// Per-app exclusion list for the macOS CoreAudio Process Tap.
+///
+/// The exclusion list is a JSON file with the shape:
+///
+/// ```json
+/// { "excluded_apps": [{ "bundle_id": "com.example.app", "name": "Example" }] }
+/// ```
+///
+/// Path defaults to `$HOME/.screenpipe/audio-exclusions.json` and can be
+/// overridden with the `SCREENPIPE_AUDIO_EXCLUSIONS_PATH` environment
+/// variable. The engine reads the file on every Process Tap rebuild and
+/// polls its mtime + the resolved AudioObjectID set on the existing 500ms
+/// loop in [`spawn_process_tap_capture`], so changes (file edits, an
+/// excluded app launching, or an excluded app quitting) take effect without
+/// an engine restart, subject to the existing 60s `REBUILD_COOLDOWN` to
+/// prevent tap thrash.
+///
+/// Errors are intentionally swallowed (missing file, malformed JSON, wrong
+/// JSON shape) and surface as an empty exclusion list: losing the tap
+/// entirely is much worse for the user than losing the exclusion filter.
+mod exclusions {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::SystemTime;
+
+    use cidre::{arc, core_audio as ca, ns};
+
+    pub const ENV_OVERRIDE: &str = "SCREENPIPE_AUDIO_EXCLUSIONS_PATH";
+    pub const DEFAULT_RELATIVE_PATH: &str = ".screenpipe/audio-exclusions.json";
+
+    /// Snapshot of the exclusion state used by the rebuild loop to detect drift.
+    ///
+    /// AudioObjectIDs are stored as `u32` (their underlying `ca::Obj`
+    /// representation) so snapshots can be compared without holding
+    /// Objective-C-bound references across thread boundaries — the
+    /// `spawn_blocking` rebuild thread doesn't have an autorelease pool
+    /// owning these by default.
+    #[derive(Default, Clone)]
+    pub struct Snapshot {
+        pub bundle_ids: Vec<String>,
+        pub audio_object_ids: Vec<u32>,
+        pub mtime: Option<SystemTime>,
+    }
+
+    /// Returns the active config-file path: env override wins, else
+    /// `$HOME/.screenpipe/audio-exclusions.json`.
+    pub fn config_path() -> PathBuf {
+        let override_val = std::env::var(ENV_OVERRIDE).ok();
+        let home = std::env::var("HOME").unwrap_or_default();
+        resolved_path(override_val.as_deref(), &home)
+    }
+
+    /// Pure resolution helper, factored out for testability without
+    /// mutating process-wide environment variables.
+    fn resolved_path(env_override: Option<&str>, home: &str) -> PathBuf {
+        if let Some(p) = env_override {
+            return PathBuf::from(p);
+        }
+        PathBuf::from(home).join(DEFAULT_RELATIVE_PATH)
+    }
+
+    /// Returns the bundle IDs declared in the file and the file's mtime.
+    /// Missing file, unreadable file, malformed JSON, or wrong-shape JSON
+    /// all produce an empty list, by design.
+    pub fn read_bundle_ids(path: &Path) -> (Vec<String>, Option<SystemTime>) {
+        let Ok(meta) = fs::metadata(path) else {
+            return (Vec::new(), None);
+        };
+        let mtime = meta.modified().ok();
+        let body = match fs::read_to_string(path) {
+            Ok(b) => b,
+            Err(_) => return (Vec::new(), mtime),
+        };
+        let parsed: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+        let ids = parsed
+            .get("excluded_apps")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|entry| {
+                        entry
+                            .get("bundle_id")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        (ids, mtime)
+    }
+
+    /// Resolve bundle IDs to the AudioObjectIDs of their currently running
+    /// processes. A bundle ID that isn't running produces no entry; multiple
+    /// running instances of the same bundle each contribute their own
+    /// AudioObjectID. The result is sorted+deduped so snapshots can be
+    /// compared with `==`.
+    pub fn resolve_to_audio_object_ids(bundle_ids: &[String]) -> Vec<u32> {
+        let mut out = Vec::new();
+        for bid in bundle_ids {
+            let bid_ns = ns::String::with_str(bid);
+            let apps = ns::RunningApp::with_bundle_id(&bid_ns);
+            for app in apps.iter() {
+                let pid = app.pid();
+                if let Ok(proc) = ca::Process::with_pid(pid) {
+                    // ca::Process(pub Obj) where Obj(pub u32) is #[repr(transparent)].
+                    // The inner u32 is the AudioObjectID that the tap descriptor
+                    // expects (wrapped in ns::Number, see build_exclusion_array).
+                    let audio_obj_id = proc.0 .0;
+                    if audio_obj_id != 0 {
+                        out.push(audio_obj_id);
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// Build the `ns::Array<ns::Number>` exclusion list in the shape that
+    /// `TapDesc::with_stereo_global_tap_excluding_processes` expects.
+    pub fn build_exclusion_array(audio_object_ids: &[u32]) -> arc::R<ns::Array<ns::Number>> {
+        let numbers: Vec<arc::R<ns::Number>> = audio_object_ids
+            .iter()
+            .map(|id| ns::Number::with_u32(*id))
+            .collect();
+        ns::Array::from_slice_retained(&numbers)
+    }
+
+    /// Build a complete snapshot by reading the file and resolving once.
+    pub fn snapshot() -> Snapshot {
+        let (bundle_ids, mtime) = read_bundle_ids(&config_path());
+        let audio_object_ids = resolve_to_audio_object_ids(&bundle_ids);
+        Snapshot {
+            bundle_ids,
+            audio_object_ids,
+            mtime,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::io::Write;
+
+        fn write_tmp(body: &str) -> tempfile::NamedTempFile {
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            f.write_all(body.as_bytes()).unwrap();
+            f
+        }
+
+        #[test]
+        fn missing_file_returns_empty() {
+            let (ids, mt) = read_bundle_ids(Path::new(
+                "/nonexistent/screenpipe-audio-exclusion-test/path.json",
+            ));
+            assert!(ids.is_empty());
+            assert!(mt.is_none());
+        }
+
+        #[test]
+        fn malformed_json_returns_empty() {
+            let f = write_tmp("{ not json");
+            let (ids, mt) = read_bundle_ids(f.path());
+            assert!(ids.is_empty());
+            // File exists, so mtime should be populated even on parse failure.
+            assert!(mt.is_some());
+        }
+
+        #[test]
+        fn missing_key_returns_empty() {
+            let f = write_tmp(r#"{"other_key": ["x"]}"#);
+            assert!(read_bundle_ids(f.path()).0.is_empty());
+        }
+
+        #[test]
+        fn empty_array_returns_empty() {
+            let f = write_tmp(r#"{"excluded_apps": []}"#);
+            assert!(read_bundle_ids(f.path()).0.is_empty());
+        }
+
+        #[test]
+        fn entries_missing_bundle_id_are_skipped() {
+            let f =
+                write_tmp(r#"{"excluded_apps": [{}, {"bundle_id": "com.a"}, {"name": "no id"}]}"#);
+            let (ids, _) = read_bundle_ids(f.path());
+            assert_eq!(ids, vec!["com.a".to_string()]);
+        }
+
+        #[test]
+        fn well_formed_returns_list() {
+            let f = write_tmp(
+                r#"{"excluded_apps": [{"bundle_id": "com.stremio.stremio"}, {"bundle_id": "com.spotify.client"}]}"#,
+            );
+            let (ids, mt) = read_bundle_ids(f.path());
+            assert_eq!(
+                ids,
+                vec![
+                    "com.stremio.stremio".to_string(),
+                    "com.spotify.client".to_string()
+                ]
+            );
+            assert!(mt.is_some());
+        }
+
+        #[test]
+        fn resolved_path_env_override_wins() {
+            let p = resolved_path(Some("/tmp/custom.json"), "/Users/anyone");
+            assert_eq!(p, PathBuf::from("/tmp/custom.json"));
+        }
+
+        #[test]
+        fn resolved_path_default_uses_home() {
+            let p = resolved_path(None, "/Users/anyone");
+            assert_eq!(
+                p,
+                PathBuf::from("/Users/anyone/.screenpipe/audio-exclusions.json")
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // IO proc callback
 // ---------------------------------------------------------------------------
+
+/// Monotonic generation id assigned to each tap build. Logged on lifecycle
+/// events and sampled from the callback so a stale-generation call (a callback
+/// firing for a tap we thought we'd torn down) is visible in a support log.
+static TAP_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 struct TapCallbackCtx {
     tx: broadcast::Sender<Vec<f32>>,
@@ -83,6 +315,26 @@ struct TapCallbackCtx {
     // and with the polling thread below (drops the whole capture in ~30μs).
     // cpal/SCK paths don't check is_running either — only is_disconnected.
     is_disconnected: Arc<AtomicBool>,
+
+    // --- Teardown coordination (fixes the IO-callback-vs-stop UAF) ---
+    //
+    // CoreAudio's IO thread (HALC_ProxyIOContext::IOWorkLoop) can be executing
+    // `tap_io_proc` while the rebuild thread tears this capture down. cidre's
+    // StartedDevice::drop calls only AudioDeviceStop, which does NOT drain an
+    // in-flight callback on an aggregate/proxy device, so freeing this ctx
+    // right after the stop is a use-after-free. These three fields let the
+    // teardown path keep the ctx alive until no callback can touch it.
+    /// Generation id for this build. Diagnostics only.
+    generation: u64,
+    /// Set true at the very start of teardown, BEFORE AudioDeviceStop, so a
+    /// callback CoreAudio dispatches during the stop/destroy window does no
+    /// work (never touches `tx`) and returns immediately.
+    stopping: AtomicBool,
+    /// Number of callbacks currently inside `tap_io_proc` for this ctx.
+    /// Incremented on entry, decremented on every exit. Teardown drains this
+    /// to zero — after the device is stopped + destroyed, so no *new* callback
+    /// can start — before freeing the ctx.
+    active: AtomicUsize,
 }
 
 // Diagnostic counters — report callback rate + peak amplitude at INFO level
@@ -139,6 +391,26 @@ extern "C" fn tap_io_proc(
         None => return Default::default(),
     };
 
+    // RAII active-call guard. Mark this callback in-flight before doing any
+    // work and clear it on every return path. Teardown waits for the count to
+    // reach zero before freeing `ctx`, so the pointer CoreAudio handed us
+    // stays valid for the whole duration of this call. Acquire/Release pair
+    // with the teardown's load so the drain observes our increment.
+    ctx.active.fetch_add(1, Ordering::Acquire);
+    struct ActiveGuard<'a>(&'a AtomicUsize);
+    impl Drop for ActiveGuard<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::Release);
+        }
+    }
+    let _active = ActiveGuard(&ctx.active);
+
+    // Teardown has begun (stop/destroy in progress). Drop the frame; do not
+    // touch `tx` or buffers. The guard above still drains us correctly.
+    if ctx.stopping.load(Ordering::Acquire) {
+        return Default::default();
+    }
+
     if ctx.is_disconnected.load(Ordering::Relaxed) {
         return Default::default();
     }
@@ -180,8 +452,8 @@ extern "C" fn tap_io_proc(
         let max_amp = f32::from_bits(TAP_MAX_AMP_BITS.swap(0, Ordering::Relaxed));
         let rate = count as f64 / 10.0;
         info!(
-            "[tap_io_proc] {:.1} callbacks/s over 10s, {} samples/call, peak_amp={:.5}, ch={}",
-            rate, sample_count, max_amp, ctx.channels
+            "[tap_io_proc] gen {} — {:.1} callbacks/s over 10s, {} samples/call, peak_amp={:.5}, ch={}",
+            ctx.generation, rate, sample_count, max_amp, ctx.channels
         );
     }
 
@@ -196,22 +468,112 @@ extern "C" fn tap_io_proc(
 // ---------------------------------------------------------------------------
 
 /// Owns all CoreAudio resources for a Process Tap capture session.
-/// Drop order: _started (stops IO) → _tap (destroys tap) → _ctx_ptr (frees memory).
+///
+/// Teardown order (see `Drop`): mark `stopping` → stop+destroy the device →
+/// dispatch grace + drain in-flight callbacks → free the ctx → (`_tap`
+/// destroyed last by the compiler-generated field drop).
 struct ProcessTapCapture {
-    _started: cidre::core_audio::hardware::StartedDevice<ca::AggregateDevice>,
+    _started: Option<cidre::core_audio::hardware::StartedDevice<ca::AggregateDevice>>,
     _tap: ca::hardware_tapping::TapGuard,
     _ctx_ptr: *mut TapCallbackCtx,
+    generation: u64,
 }
 
 unsafe impl Send for ProcessTapCapture {}
 
+/// How long teardown waits for in-flight callbacks to exit before giving up
+/// and leaking the ctx instead of freeing it.
+const CALLBACK_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Pause between device stop/destroy and the active-count drain. Stop/destroy
+/// do not synchronize with a callback CoreAudio dispatched a moment earlier
+/// whose first instruction (the `active` increment) has not executed yet; such
+/// a call is invisible to the drain until it runs. Two-ish IO cycles (~10ms
+/// each at 48kHz / 512 frames) let it either count itself in or finish
+/// entirely, so a zero reading afterwards is trustworthy. Teardown runs on the
+/// dedicated rebuild thread at most about once a minute, so the stall is free.
+const CALLBACK_DISPATCH_GRACE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Spin-wait (bounded by `timeout`) for `active` to drop to zero. Returns the
+/// number of callbacks still marked active when it stopped waiting: 0 means
+/// fully drained, anything else means the caller must NOT free the ctx.
+fn drain_active(active: &AtomicUsize, timeout: std::time::Duration) -> usize {
+    let deadline = std::time::Instant::now() + timeout;
+    let mut spins: u64 = 0;
+    loop {
+        let in_flight = active.load(Ordering::Acquire);
+        if in_flight == 0 {
+            return 0;
+        }
+        if std::time::Instant::now() >= deadline {
+            return in_flight;
+        }
+        std::hint::spin_loop();
+        spins = spins.wrapping_add(1);
+        if spins % 1024 == 0 {
+            std::thread::yield_now();
+        }
+    }
+}
+
 impl Drop for ProcessTapCapture {
     fn drop(&mut self) {
-        info!("Process Tap capture stopping");
+        let generation = self.generation;
+        info!("Process Tap gen {} stopping", generation);
+
+        // 1. Signal teardown BEFORE stopping the device. Any callback CoreAudio
+        //    dispatches during the stop/destroy window will see this and return
+        //    without touching `tx` — but it still bumps `active`, so the drain
+        //    below waits for it.
         if !self._ctx_ptr.is_null() {
+            unsafe { (*self._ctx_ptr).stopping.store(true, Ordering::Release) };
+        }
+
+        // 2. Stop the IO proc and destroy the aggregate device. cidre's
+        //    StartedDevice::drop does AudioDeviceStop, then dropping the
+        //    AggregateDevice calls AudioHardwareDestroyAggregateDevice. After
+        //    this returns, CoreAudio will not *begin* new IO callbacks for this
+        //    generation; at most one may still be in-flight from before the stop.
+        if let Some(started) = self._started.take() {
+            std::mem::drop(started);
+        }
+
+        // 3. Grace, then drain in-flight callbacks. A callback that started
+        //    before the stop completed has already dereferenced `ctx` (valid
+        //    then) and bumped `active`; wait for it to exit so we never free
+        //    underneath it. This is the fix for the IO-thread vs StopIOProc
+        //    use-after-free. The grace sleep first covers the edge where a
+        //    callback was dispatched but has not yet executed its increment,
+        //    which would otherwise read as "drained" (see
+        //    CALLBACK_DISPATCH_GRACE).
+        //
+        //    Bounded: tap callbacks run for ~microseconds, so the drain returns
+        //    almost immediately. If something pathological keeps a callback
+        //    "active" past the deadline we LEAK the ctx rather than free memory
+        //    CoreAudio might still touch — a small one-time leak is strictly
+        //    better than a segfault.
+        if !self._ctx_ptr.is_null() {
+            std::thread::sleep(CALLBACK_DISPATCH_GRACE);
+            let active = unsafe { &(*self._ctx_ptr).active };
+            let remaining = drain_active(active, CALLBACK_DRAIN_TIMEOUT);
+            if remaining > 0 {
+                warn!(
+                    "Process Tap gen {} teardown: {} callback(s) still active after {:?} — \
+                     leaking ctx to avoid use-after-free",
+                    generation, remaining, CALLBACK_DRAIN_TIMEOUT
+                );
+                // Leak: skip the free below by nulling the pointer.
+                self._ctx_ptr = std::ptr::null_mut();
+            }
+        }
+
+        // 4. No callback can run for this generation now — free the ctx.
+        if !self._ctx_ptr.is_null() {
+            debug!("Process Tap gen {} freeing ctx", generation);
             unsafe {
                 let _ = Box::from_raw(self._ctx_ptr);
             }
+            self._ctx_ptr = std::ptr::null_mut();
         }
     }
 }
@@ -221,12 +583,24 @@ impl Drop for ProcessTapCapture {
 // ---------------------------------------------------------------------------
 
 /// Build a fresh Process Tap + aggregate device against the current default
-/// output. Returns the capture handle, its audio config, and the UID of the
-/// device it's anchored to (so callers can detect when the default changes).
+/// output. Returns the capture handle, its audio config, the UID of the
+/// device it's anchored to (so callers can detect when the default changes),
+/// and the exclusion snapshot the tap was built with (so callers can detect
+/// when the exclusion list drifts and a rebuild is needed).
+///
+/// The user-configured exclusion list is always augmented with Screenpipe's
+/// own CoreAudio process object. Other tap-based meeting recorders do this by
+/// default to avoid recapturing their own playback, notifications, or live
+/// monitoring audio into the meeting/system stream.
 fn build_capture(
     tx: broadcast::Sender<Vec<f32>>,
     is_disconnected: Arc<AtomicBool>,
-) -> Result<(ProcessTapCapture, AudioStreamConfig, String)> {
+) -> Result<(
+    ProcessTapCapture,
+    AudioStreamConfig,
+    String,
+    exclusions::Snapshot,
+)> {
     let output_device = ca::System::default_output_device()
         .map_err(|s| anyhow!("No default output device: {:?}", s))?;
     let output_uid = output_device
@@ -235,7 +609,23 @@ fn build_capture(
     let output_uid_str = output_uid.to_string();
     debug!("Process Tap: anchoring to '{}'", output_uid_str);
 
-    let tap_desc = ca::TapDesc::with_stereo_global_tap_excluding_processes(&ns::Array::new());
+    let snapshot = exclusions::snapshot();
+    let self_process_id = current_process_audio_object_id();
+    let exclusion_ids =
+        merge_exclusion_audio_object_ids(snapshot.audio_object_ids.clone(), self_process_id);
+    let excluded_array = exclusions::build_exclusion_array(&exclusion_ids);
+    if !snapshot.bundle_ids.is_empty() {
+        info!(
+            "Process Tap: excluding {} bundle ID(s), resolved to {} AudioObjectID(s), self_excluded={}: {:?}",
+            snapshot.bundle_ids.len(),
+            snapshot.audio_object_ids.len(),
+            self_process_id.is_some(),
+            snapshot.bundle_ids
+        );
+    } else if self_process_id.is_some() {
+        debug!("Process Tap: excluding Screenpipe's own audio process");
+    }
+    let tap_desc = ca::TapDesc::with_stereo_global_tap_excluding_processes(&excluded_array);
     let tap = tap_desc.create_process_tap().map_err(|s| {
         anyhow!(
             "Failed to create process tap ({:?}). \
@@ -247,13 +637,7 @@ fn build_capture(
     let asbd = tap
         .asbd()
         .map_err(|s| anyhow!("Failed to read tap format: {:?}", s))?;
-    let sample_rate = asbd.sample_rate;
     let channels = asbd.channels_per_frame as u16;
-    info!(
-        "Process Tap: {:.0} Hz, {} ch, {} bit",
-        sample_rate, channels, asbd.bits_per_channel
-    );
-    let config = AudioStreamConfig::new(sample_rate as u32, channels);
 
     let sub_device =
         cf::DictionaryOf::with_keys_values(&[sub_keys::uid()], &[output_uid.as_type_ref()]);
@@ -286,10 +670,29 @@ fn build_capture(
     let agg_device = ca::AggregateDevice::with_desc(&agg_desc)
         .map_err(|s| anyhow!("Failed to create aggregate device: {:?}", s))?;
 
+    // Use the aggregate device's nominal sample rate, not the tap's asbd.
+    // The aggregate is anchored to the output device (e.g. headphones), and its
+    // rate reflects what's actually being delivered. When the output device runs
+    // at 96kHz (common for headphone DACs), asbd may still report 48kHz, causing
+    // the recording pipeline to interpret 1.44M samples as 30s @ 48kHz when
+    // they're actually 15s @ 96kHz — produces files that play at 2x slowmo.
+    let sample_rate = agg_device.nominal_sample_rate().unwrap_or(asbd.sample_rate);
+    info!(
+        "Process Tap: {:.0} Hz (asbd reported {:.0} Hz), {} ch, {} bit",
+        sample_rate, asbd.sample_rate, channels, asbd.bits_per_channel
+    );
+    let config = AudioStreamConfig::new(sample_rate as u32, channels);
+
+    let generation = TAP_GENERATION
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1);
     let mut ctx = Box::new(TapCallbackCtx {
         tx,
         channels,
         is_disconnected,
+        generation,
+        stopping: AtomicBool::new(false),
+        active: AtomicUsize::new(0),
     });
 
     let proc_id = agg_device
@@ -298,15 +701,38 @@ fn build_capture(
 
     let started = ca::device_start(agg_device, Some(proc_id))
         .map_err(|s| anyhow!("Failed to start aggregate device: {:?}", s))?;
+    debug!(
+        "Process Tap gen {} started (device '{}', {} ch)",
+        generation, output_uid_str, channels
+    );
 
     let ctx_ptr = Box::into_raw(ctx);
     let capture = ProcessTapCapture {
-        _started: started,
+        _started: Some(started),
         _tap: tap,
         _ctx_ptr: ctx_ptr,
+        generation,
     };
 
-    Ok((capture, config, output_uid_str))
+    Ok((capture, config, output_uid_str, snapshot))
+}
+
+fn current_process_audio_object_id() -> Option<u32> {
+    let process = ca::Process::with_pid(std::process::id() as i32).ok()?;
+    let ca::Obj(id) = *process;
+    (id != 0).then_some(id)
+}
+
+fn merge_exclusion_audio_object_ids(
+    mut configured: Vec<u32>,
+    self_process_id: Option<u32>,
+) -> Vec<u32> {
+    if let Some(id) = self_process_id {
+        configured.push(id);
+    }
+    configured.sort_unstable();
+    configured.dedup();
+    configured
 }
 
 /// Create and start a CoreAudio Process Tap for system audio capture.
@@ -325,12 +751,18 @@ pub fn spawn_process_tap_capture(
     is_disconnected: Arc<AtomicBool>,
 ) -> Result<(AudioStreamConfig, tokio::task::JoinHandle<()>)> {
     info!("Creating CoreAudio Process Tap for system audio");
-    let (capture, config, initial_uid) = build_capture(tx.clone(), is_disconnected.clone())?;
-    info!("Process Tap capture started (device: {})", initial_uid);
+    let (capture, config, initial_uid, initial_snapshot) =
+        build_capture(tx.clone(), is_disconnected.clone())?;
+    info!(
+        "Process Tap capture started (device: {}, exclusions: {})",
+        initial_uid,
+        initial_snapshot.bundle_ids.len()
+    );
 
     let handle = tokio::task::spawn_blocking(move || {
         let mut current: Option<ProcessTapCapture> = Some(capture);
         let mut current_uid = initial_uid;
+        let mut current_snapshot = initial_snapshot;
 
         // ~500ms poll: responsive enough that a device switch is inaudible
         // in the downstream pipeline (30s segment window dominates), cheap
@@ -341,7 +773,7 @@ pub fn spawn_process_tap_capture(
         // silent audio (AND the callback is firing, so it's not just that
         // the IO proc stalled), rebuild the aggregate once. This catches
         // the "tap anchored to BuiltInSpeaker while all app audio is
-        // routed to AirPods" failure mode that Ruark hit on v2.4.46 — the
+        // routed to AirPods" failure mode reported on v2.4.46. The
         // tap runs happily, the callback fires, but every buffer is
         // zeros because the aggregate's sub-device has no signal and the
         // global-tap → aggregate delivery path stays mute. See the
@@ -356,9 +788,18 @@ pub fn spawn_process_tap_capture(
         // actual cause is that nothing is playing (e.g. user isn't in a
         // call) rather than a broken anchor.
         const REBUILD_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+        // Exponential backoff for silence-driven rebuilds: if rebuilding doesn't
+        // restore audio, the cause is usually "nothing is playing" rather than a
+        // broken anchor, so doubling the cooldown each consecutive silence
+        // rebuild stops the once-a-minute teardown/start churn (and the extra
+        // CoreAudio teardown windows that go with it). Capped so the tap still
+        // recovers within a few minutes once audio resumes. Reset on real audio
+        // or any non-silence rebuild (device switch / exclusion change).
+        const SILENCE_BACKOFF_CAP: u32 = 4; // 60s → 120 → 240 → 480 → 960s max
 
         let mut silence_started: Option<std::time::Instant> = None;
         let mut last_rebuild: Option<std::time::Instant> = None;
+        let mut silence_rebuild_streak: u32 = 0;
 
         while !is_disconnected.load(Ordering::Relaxed) {
             std::thread::sleep(POLL);
@@ -370,6 +811,7 @@ pub fn spawn_process_tap_capture(
 
             if got_real_audio {
                 silence_started = None;
+                silence_rebuild_streak = 0;
             } else if window_callbacks > 0 {
                 // Callback IS firing — buffers are just silent. Start (or
                 // continue) the silence window.
@@ -382,11 +824,15 @@ pub fn spawn_process_tap_capture(
             // device-change path already covers it, and rebuilding when
             // the device is genuinely asleep will just fail.
 
+            // Cooldown grows with the consecutive-silence-rebuild streak.
+            let silence_cooldown = REBUILD_COOLDOWN
+                .checked_mul(1u32 << silence_rebuild_streak.min(SILENCE_BACKOFF_CAP))
+                .unwrap_or(REBUILD_COOLDOWN);
             let should_rebuild_for_silence = silence_started
                 .map(|t| t.elapsed().as_secs() >= WATCHDOG_SILENCE_SECS)
                 .unwrap_or(false)
                 && last_rebuild
-                    .map(|t| t.elapsed() >= REBUILD_COOLDOWN)
+                    .map(|t| t.elapsed() >= silence_cooldown)
                     .unwrap_or(true);
 
             // Check the current default output device UID.
@@ -401,7 +847,24 @@ pub fn spawn_process_tap_capture(
 
             let should_rebuild_for_switch = new_uid != current_uid;
 
-            if !should_rebuild_for_switch && !should_rebuild_for_silence {
+            // Re-snapshot the exclusion list. Cheap: one stat() + one
+            // NSRunningApp::with_bundle_id per configured bundle ID
+            // (typically 0–5 IDs). The file is only re-read if its mtime
+            // changed since the last build.
+            let new_snapshot = exclusions::snapshot();
+            let exclusion_set_changed =
+                new_snapshot.audio_object_ids != current_snapshot.audio_object_ids;
+            let exclusion_mtime_changed =
+                new_snapshot.mtime.is_some() && new_snapshot.mtime != current_snapshot.mtime;
+            let should_rebuild_for_exclusions = (exclusion_set_changed || exclusion_mtime_changed)
+                && last_rebuild
+                    .map(|t| t.elapsed() >= REBUILD_COOLDOWN)
+                    .unwrap_or(true);
+
+            if !should_rebuild_for_switch
+                && !should_rebuild_for_silence
+                && !should_rebuild_for_exclusions
+            {
                 continue;
             }
 
@@ -414,12 +877,32 @@ pub fn spawn_process_tap_capture(
                      anchored to. Rebuilding capture.",
                     WATCHDOG_SILENCE_SECS, current_uid, SILENCE_AMP_EPS
                 );
-            } else {
+            } else if should_rebuild_for_switch {
                 info!(
                     "Default output changed ({} → {}), respawning Process Tap",
                     current_uid, new_uid
                 );
+            } else {
+                let reason = if exclusion_mtime_changed && !exclusion_set_changed {
+                    "exclusions file changed (same resolved set)"
+                } else if exclusion_set_changed && !exclusion_mtime_changed {
+                    "excluded app launched/quit"
+                } else {
+                    "exclusions file and resolved set both changed"
+                };
+                info!(
+                    "Audio exclusion drift detected ({}): {} bundle ID(s) -> {} AudioObjectID(s). Rebuilding Process Tap.",
+                    reason,
+                    new_snapshot.bundle_ids.len(),
+                    new_snapshot.audio_object_ids.len()
+                );
             }
+
+            // Whether this rebuild is purely silence-driven — used to drive the
+            // exponential backoff (a switch/exclusion rebuild resets it).
+            let silence_only_rebuild = should_rebuild_for_silence
+                && !should_rebuild_for_switch
+                && !should_rebuild_for_exclusions;
 
             // Drop the old capture BEFORE building the new one. The old
             // aggregate device is still bound to the previous sub-device
@@ -428,10 +911,15 @@ pub fn spawn_process_tap_capture(
             current = None;
 
             match build_capture(tx.clone(), is_disconnected.clone()) {
-                Ok((cap, _cfg, uid)) => {
-                    info!("Process Tap re-anchored to '{}'", uid);
+                Ok((cap, _cfg, uid, snapshot)) => {
+                    info!(
+                        "Process Tap re-anchored to '{}' (exclusions: {})",
+                        uid,
+                        snapshot.bundle_ids.len()
+                    );
                     current = Some(cap);
                     current_uid = uid;
+                    current_snapshot = snapshot;
                     silence_started = None;
                     last_rebuild = Some(std::time::Instant::now());
                 }
@@ -440,15 +928,26 @@ pub fn spawn_process_tap_capture(
                     // isn't fully available yet (Bluetooth handoff). Update
                     // current_uid so we don't retry the same switch every
                     // tick; capture stays silent until the user switches
-                    // again or the next default-change fires.
+                    // again or the next default-change fires. Also update
+                    // current_snapshot so an exclusion-driven retry doesn't
+                    // hammer on every tick either.
                     warn!(
-                        "Process Tap rebuild failed after switch to '{}': {}",
-                        new_uid, e
+                        "Process Tap rebuild failed (switch={}, exclusions={}): {}",
+                        should_rebuild_for_switch, should_rebuild_for_exclusions, e
                     );
                     current_uid = new_uid;
+                    current_snapshot = new_snapshot;
                     last_rebuild = Some(std::time::Instant::now());
                 }
             }
+
+            // Update the silence backoff: grow on a silence-only rebuild,
+            // reset on any switch/exclusion rebuild.
+            silence_rebuild_streak = if silence_only_rebuild {
+                silence_rebuild_streak.saturating_add(1)
+            } else {
+                0
+            };
         }
 
         drop(current);
@@ -475,5 +974,112 @@ mod tests {
         assert!(version.is_some(), "sw_vers should return a version");
         let (major, _, _) = version.unwrap();
         assert!(major >= 10, "macOS major version should be >= 10");
+    }
+
+    #[test]
+    fn drain_active_returns_immediately_when_idle() {
+        let active = AtomicUsize::new(0);
+        let start = std::time::Instant::now();
+        assert_eq!(
+            drain_active(&active, std::time::Duration::from_millis(500)),
+            0
+        );
+        // No callbacks in flight: must not burn anywhere near the timeout.
+        assert!(start.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn drain_active_waits_out_an_in_flight_callback() {
+        let active = Arc::new(AtomicUsize::new(1));
+        let io_thread = {
+            let active = active.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                active.fetch_sub(1, Ordering::Release);
+            })
+        };
+        // Generous timeout: the point is that it waits, not how fast.
+        assert_eq!(drain_active(&active, std::time::Duration::from_secs(5)), 0);
+        io_thread.join().unwrap();
+    }
+
+    #[test]
+    fn drain_active_times_out_and_reports_stuck_callbacks() {
+        let active = AtomicUsize::new(2);
+        let start = std::time::Instant::now();
+        assert_eq!(
+            drain_active(&active, std::time::Duration::from_millis(50)),
+            2
+        );
+        // Timed out, so the full deadline must have elapsed and the caller
+        // (Drop) would leak the ctx instead of freeing it.
+        assert!(start.elapsed() >= std::time::Duration::from_millis(50));
+    }
+
+    #[test]
+    fn merge_exclusion_audio_object_ids_adds_self_and_dedupes() {
+        assert_eq!(
+            merge_exclusion_audio_object_ids(vec![42, 7, 42], Some(7)),
+            vec![7, 42]
+        );
+    }
+
+    #[test]
+    fn merge_exclusion_audio_object_ids_preserves_configured_when_self_unavailable() {
+        assert_eq!(
+            merge_exclusion_audio_object_ids(vec![3, 1, 3], None),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn coreaudio_tap_description_excludes_current_process() {
+        if !is_process_tap_available() {
+            eprintln!("skipping: CoreAudio Process Tap is unavailable on this macOS version");
+            return;
+        }
+
+        let Some(self_process_id) = current_process_audio_object_id() else {
+            panic!("current process did not translate to a CoreAudio process object");
+        };
+
+        let exclusion_ids = merge_exclusion_audio_object_ids(Vec::new(), Some(self_process_id));
+        let excluded_array = exclusions::build_exclusion_array(&exclusion_ids);
+        let tap_desc = ca::TapDesc::with_stereo_global_tap_excluding_processes(&excluded_array);
+
+        assert!(
+            tap_desc.is_exclusive(),
+            "global-excluding tap must be exclusive"
+        );
+        assert!(
+            tap_desc
+                .processes()
+                .iter()
+                .any(|n| n.as_u32() == self_process_id),
+            "pre-create tap description must include current process AudioObjectID {self_process_id}"
+        );
+
+        let tap = tap_desc
+            .create_process_tap()
+            .unwrap_or_else(|status| {
+                panic!(
+                    "CoreAudio refused to create process tap ({status:?}); this test creates a tap description but does not start aggregate-device recording"
+                )
+            });
+
+        let created_desc = tap
+            .desc()
+            .expect("created CoreAudio tap should expose its CATapDescription");
+        assert!(
+            created_desc.is_exclusive(),
+            "created CoreAudio tap must remain a global-excluding tap"
+        );
+        assert!(
+            created_desc
+                .processes()
+                .iter()
+                .any(|n| n.as_u32() == self_process_id),
+            "created CoreAudio tap description must contain current process AudioObjectID {self_process_id}"
+        );
     }
 }

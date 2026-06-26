@@ -23,7 +23,7 @@
  * exactly the regression we want CI to surface.
  */
 
-import { openHomeWindow, waitForAppReady, t } from "../helpers/test-utils.js";
+import { waitForAppReady, t } from "../helpers/test-utils.js";
 import { invokeOrThrow } from "../helpers/tauri.js";
 
 interface LocalApiConfig {
@@ -55,13 +55,18 @@ interface FetchResult {
 async function fetchJson(
   url: string,
   headers: Record<string, string> = {},
+  init: { method?: string; body?: string } = {},
 ): Promise<FetchResult> {
   const timeoutMs = t(5_000);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const r = await fetch(url, { headers, signal: controller.signal });
+    const r = await fetch(url, {
+      ...init,
+      headers,
+      signal: controller.signal,
+    });
     let body: unknown = null;
     const text = await r.text();
     try {
@@ -95,17 +100,45 @@ describe("Local HTTP API", function () {
 
   before(async () => {
     await waitForAppReady();
-    // Need a Tauri-origin webview to invoke commands. Home is the canonical
-    // long-lived window and is already opened by sibling specs. Idempotent.
-    await openHomeWindow();
 
     // Server boot is on its own thread; in CI it can take a few seconds
-    // longer than the home window appearing. Poll until /health responds
-    // or the budget runs out.
+    // longer than the home window appearing. On a dev box another screenpipe
+    // may already own :3030, so honor SCREENPIPE_PORT and only accept the
+    // resolved config once it points at the isolated E2E server.
+    const expectedPort = process.env.SCREENPIPE_PORT
+      ? Number(process.env.SCREENPIPE_PORT)
+      : null;
     const deadline = Date.now() + t(30_000);
     let lastErr = "";
+    let cfg: LocalApiConfig | null = null;
     while (Date.now() < deadline) {
-      const res = await fetchJson("http://127.0.0.1:3030/health").catch(
+      const candidate = await getLocalApiConfig().catch(() => {
+        const envKey =
+          process.env.SCREENPIPE_API_KEY ??
+          process.env.SCREENPIPE_LOCAL_API_KEY ??
+          process.env.SCREENPIPE_API_AUTH_KEY ??
+          null;
+        return expectedPort && envKey
+          ? { key: envKey, port: expectedPort, auth_enabled: true }
+          : null;
+      });
+      if (!candidate?.port) {
+        lastErr = "get_local_api_config not ready";
+        await browser.pause(500);
+        continue;
+      }
+      if (expectedPort && candidate.port !== expectedPort) {
+        lastErr = `waiting for isolated port ${expectedPort}, got ${candidate.port}`;
+        await browser.pause(500);
+        continue;
+      }
+      if (candidate.auth_enabled && !candidate.key) {
+        lastErr = "local api auth enabled without key";
+        await browser.pause(500);
+        continue;
+      }
+
+      const res = await fetchJson(`http://127.0.0.1:${candidate.port}/health`).catch(
         (e: unknown) => ({
           ok: false,
           status: 0,
@@ -113,15 +146,17 @@ describe("Local HTTP API", function () {
           error: e instanceof Error ? e.message : String(e),
         }),
       );
-      if (res.ok) break;
+      if (res.ok) {
+        cfg = candidate;
+        break;
+      }
       lastErr = res.error ?? `status=${res.status}`;
       await browser.pause(500);
     }
-    if (Date.now() >= deadline) {
+    if (!cfg) {
       throw new Error(`Server /health did not respond within budget: ${lastErr}`);
     }
 
-    const cfg = await getLocalApiConfig();
     port = cfg.port;
     key = cfg.key;
   });
@@ -135,11 +170,44 @@ describe("Local HTTP API", function () {
     expect(res.body).toHaveProperty("status");
   });
 
-  it("GET /audio/device/status — unauthed, returns object with audio disabled", async () => {
+  it("GET /health — no-recording seed reports audio disabled", async () => {
+    const res = await fetchJson(`http://127.0.0.1:${port}/health`);
+    expect(res.ok).toBe(true);
+    expect(res.body).toHaveProperty("audio_status", "disabled");
+  });
+
+  it("GET /audio/device/status — unauthed, returns no devices with audio disabled", async () => {
     const res = await fetchJson(`http://127.0.0.1:${port}/audio/device/status`);
-    // 404 is acceptable here only if the route is gated off; status code
-    // shouldn't be a server error.
-    expect(res.status).toBeLessThan(500);
+    expect(res.ok).toBe(true);
+    expect(Array.isArray(res.body)).toBe(true);
+    expect(res.body).toHaveLength(0);
+  });
+
+  it("POST /audio/start — rejects while audio is disabled", async () => {
+    if (!key) throw new Error("local api key not ready");
+    const res = await fetchJson(
+      `http://127.0.0.1:${port}/audio/start`,
+      { Authorization: `Bearer ${key}` },
+      { method: "POST" },
+    );
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe(409);
+    expect(res.body).toHaveProperty("message", "Audio capture is disabled in settings");
+  });
+
+  it("POST /audio/device/start — rejects before opening a device while audio is disabled", async () => {
+    if (!key) throw new Error("local api key not ready");
+    const res = await fetchJson(
+      `http://127.0.0.1:${port}/audio/device/start`,
+      { Authorization: `Bearer ${key}`, "content-type": "application/json" },
+      {
+        method: "POST",
+        body: JSON.stringify({ device_name: "E2E Disabled Microphone (input)" }),
+      },
+    );
+    expect(res.ok).toBe(false);
+    expect(res.status).toBe(409);
+    expect(res.body).toHaveProperty("message", "Audio capture is disabled in settings");
   });
 
   it("GET /connections — authed, returns 2xx with an array body", async function () {

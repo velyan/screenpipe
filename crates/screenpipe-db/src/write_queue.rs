@@ -19,6 +19,7 @@
 //! to ~5ms amortized over the entire batch.
 
 use chrono::{DateTime, Utc};
+use sqlx::migrate::MigrateDatabase;
 use sqlx::{Pool, Sqlite};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -57,6 +58,186 @@ pub fn request_write_resume() {
         notify.notify_one();
     }
     info!("write_queue: resume requested (wake)");
+}
+
+// ── Disk-I/O wedge recovery ──────────────────────────────────────────────
+//
+// A persistent fatal disk error ("disk I/O error" / "database disk image is
+// malformed" / pool lost) makes every batch fail at acquire / BEGIN IMMEDIATE.
+// The old loop retried the SAME pool 3× then dropped the batch forever, silently
+// losing writes until a manual restart (see reference_db_corruption_mmap). The
+// drain loop now escalates on consecutive fatal batches:
+//   * every `WRITE_POOL_REOPEN_EVERY` it reopens its own write pool in-process
+//     (cheap; drops poisoned write connections);
+//   * at `DEGRADED_AFTER` it flips `WriteQueueHealth::degraded` so the app can
+//     surface "recording degraded";
+//   * at `PERSISTENT_FAILURE_AFTER` it fires the `on_persistent_failure` hook
+//     once — the seam the app uses to restart the engine, the only thing that
+//     rebuilds the shared WAL-index + read pool (the real cure).
+
+/// Reopen the write pool every N consecutive fatal batches.
+const WRITE_POOL_REOPEN_EVERY: u64 = 5;
+/// Flip the queue to `degraded` after this many consecutive fatal batches.
+const DEGRADED_AFTER: u64 = 3;
+/// Fire the persistent-failure hook (engine restart) after this many consecutive
+/// fatal batches. Each fatal batch takes ~150ms+ (3 retries with backoff), so this
+/// is ~6s+ of uninterrupted total write failure — long enough to rule out a
+/// transient blip, short enough to bound data loss.
+const PERSISTENT_FAILURE_AFTER: u64 = 40;
+
+/// Outcome of draining one batch, used by the drain loop to drive recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchOutcome {
+    /// The batch committed, or only hit per-row errors — the connection path is fine.
+    Healthy,
+    /// The batch failed with a fatal/recyclable connection-level error
+    /// (disk I/O, malformed, pool lost). The write path is wedged.
+    FatalConnection,
+}
+
+/// Shared, cloneable health/observability for the write queue. The app polls this
+/// (or reacts to the persistent-failure hook) to surface degradation and recover.
+#[derive(Clone, Default)]
+pub struct WriteQueueHealth {
+    inner: Arc<WriteQueueHealthInner>,
+}
+
+#[derive(Default)]
+struct WriteQueueHealthInner {
+    consecutive_fatal: std::sync::atomic::AtomicU64,
+    total_fatal_batches: std::sync::atomic::AtomicU64,
+    write_pool_reopens: std::sync::atomic::AtomicU64,
+    persistent_failure_signals: std::sync::atomic::AtomicU64,
+    degraded: AtomicBool,
+    last_success_unix_ms: std::sync::atomic::AtomicI64,
+}
+
+impl WriteQueueHealth {
+    /// True once writes have failed for `DEGRADED_AFTER`+ consecutive batches.
+    pub fn is_degraded(&self) -> bool {
+        self.inner.degraded.load(Ordering::SeqCst)
+    }
+    /// Consecutive fatal batches right now (0 when healthy).
+    pub fn consecutive_fatal_batches(&self) -> u64 {
+        self.inner.consecutive_fatal.load(Ordering::SeqCst)
+    }
+    /// How many times the write pool was reopened in-process.
+    pub fn write_pool_reopens(&self) -> u64 {
+        self.inner.write_pool_reopens.load(Ordering::SeqCst)
+    }
+    /// How many times the persistent-failure hook fired (engine-restart requests).
+    pub fn persistent_failure_signals(&self) -> u64 {
+        self.inner.persistent_failure_signals.load(Ordering::SeqCst)
+    }
+    /// Unix-ms timestamp of the last healthy batch (0 if never).
+    pub fn last_success_unix_ms(&self) -> i64 {
+        self.inner.last_success_unix_ms.load(Ordering::SeqCst)
+    }
+
+    fn record_success(&self) {
+        self.inner.consecutive_fatal.store(0, Ordering::SeqCst);
+        self.inner.degraded.store(false, Ordering::SeqCst);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        self.inner.last_success_unix_ms.store(now, Ordering::SeqCst);
+    }
+    /// Records a fatal batch; returns the new consecutive count.
+    fn record_fatal(&self) -> u64 {
+        self.inner
+            .total_fatal_batches
+            .fetch_add(1, Ordering::SeqCst);
+        self.inner.consecutive_fatal.fetch_add(1, Ordering::SeqCst) + 1
+    }
+    fn set_degraded(&self) {
+        self.inner.degraded.store(true, Ordering::SeqCst);
+    }
+    fn note_reopen(&self) {
+        self.inner.write_pool_reopens.fetch_add(1, Ordering::SeqCst);
+    }
+    fn note_persistent_signal(&self) {
+        self.inner
+            .persistent_failure_signals
+            .fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Hook invoked once when writes have failed persistently — the seam the app uses
+/// to restart the engine (rebuilding every pool + the shared WAL-index).
+pub type PersistentFailureHook = Arc<dyn Fn() + Send + Sync>;
+
+/// A slot the app fills (after `DatabaseManager` is built) with the
+/// persistent-failure hook. Shared so the drain loop reads whatever the app
+/// last set; empty until wired.
+pub(crate) type PersistentFailureSlot = Arc<std::sync::Mutex<Option<PersistentFailureHook>>>;
+
+pub(crate) fn persistent_failure_slot(
+    hook: Option<PersistentFailureHook>,
+) -> PersistentFailureSlot {
+    Arc::new(std::sync::Mutex::new(hook))
+}
+
+/// Rebuilds the write pool from the same options used at startup, so the drain
+/// loop can drop poisoned connections in-process without a full restart.
+#[derive(Clone)]
+pub(crate) struct WritePoolRebuilder {
+    options: sqlx::sqlite::SqliteConnectOptions,
+    max_connections: u32,
+    min_connections: u32,
+    acquire_timeout: Duration,
+}
+
+impl WritePoolRebuilder {
+    pub(crate) fn new(
+        options: sqlx::sqlite::SqliteConnectOptions,
+        max_connections: u32,
+        min_connections: u32,
+        acquire_timeout: Duration,
+    ) -> Self {
+        Self {
+            options,
+            max_connections,
+            min_connections,
+            acquire_timeout,
+        }
+    }
+    async fn rebuild(&self) -> Result<Pool<Sqlite>, sqlx::Error> {
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(self.max_connections)
+            .min_connections(self.min_connections)
+            .acquire_timeout(self.acquire_timeout)
+            .connect_with(self.options.clone())
+            .await
+    }
+}
+
+/// Optional recovery wiring for the drain loop. `Default` keeps the production
+/// thresholds and disables the rebuilder/hook (used by `spawn_write_drain` and the
+/// existing tests — behaviour unchanged).
+pub(crate) struct WriteDrainOpts {
+    pub rebuilder: Option<WritePoolRebuilder>,
+    pub on_persistent_failure: PersistentFailureSlot,
+    pub health: WriteQueueHealth,
+    /// Reopen the write pool every N consecutive fatal batches.
+    pub reopen_every: u64,
+    /// Flip `degraded` after this many consecutive fatal batches.
+    pub degraded_after: u64,
+    /// Fire the persistent-failure hook after this many consecutive fatal batches.
+    pub persistent_after: u64,
+}
+
+impl Default for WriteDrainOpts {
+    fn default() -> Self {
+        Self {
+            rebuilder: None,
+            on_persistent_failure: persistent_failure_slot(None),
+            health: WriteQueueHealth::default(),
+            reopen_every: WRITE_POOL_REOPEN_EVERY,
+            degraded_after: DEGRADED_AFTER,
+            persistent_after: PERSISTENT_FAILURE_AFTER,
+        }
+    }
 }
 
 // ── Write operation definitions ──────────────────────────────────────────
@@ -115,9 +296,8 @@ pub(crate) enum WriteOp {
         accessibility_tree_json: Option<String>,
         content_hash: Option<i64>,
         simhash: Option<i64>,
-        ocr_text: Option<String>,
+        /// Per-word OCR bounding boxes, stored on the frame (`frames.text_json`).
         ocr_text_json: Option<String>,
-        ocr_engine: Option<String>,
         /// Pre-computed full_text for FTS indexing
         full_text: Option<String>,
         /// When Some, this frame references another frame's elements (dedup).
@@ -138,31 +318,17 @@ pub(crate) enum WriteOp {
         time_end: String,
     },
     InsertUiEvent {
-        timestamp: String,
-        session_id: Option<String>,
-        relative_ms: i64,
-        event_type: String,
-        x: Option<i32>,
-        y: Option<i32>,
-        delta_x: Option<i32>,
-        delta_y: Option<i32>,
-        button: Option<i32>,
-        click_count: Option<i32>,
-        key_code: Option<i32>,
-        modifiers: Option<i32>,
-        text_content: Option<String>,
-        text_length: Option<i32>,
-        app_name: Option<String>,
-        app_pid: Option<i32>,
-        window_title: Option<String>,
-        browser_url: Option<String>,
-        element_role: Option<String>,
-        element_name: Option<String>,
-        element_value: Option<String>,
-        element_description: Option<String>,
-        element_automation_id: Option<String>,
-        element_bounds: Option<String>,
-        frame_id: Option<i64>,
+        event: UiEventWrite,
+    },
+    InsertUiEventsBatch {
+        events: Vec<UiEventWrite>,
+    },
+    /// Update `ui_events.frame_id` for a single row. Used by the frame
+    /// linker to fill in the frame that a UI event triggered, after the
+    /// capture loop reports the resulting frame_id.
+    UpdateUiEventFrameId {
+        row_id: i64,
+        frame_id: i64,
     },
     DeleteAudioChunksBatch {
         chunk_ids: Vec<i64>,
@@ -307,6 +473,35 @@ pub(crate) struct FrameBatchWindow {
     pub text_json: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct UiEventWrite {
+    pub timestamp: String,
+    pub session_id: Option<String>,
+    pub relative_ms: i64,
+    pub event_type: String,
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    pub delta_x: Option<i32>,
+    pub delta_y: Option<i32>,
+    pub button: Option<i32>,
+    pub click_count: Option<i32>,
+    pub key_code: Option<i32>,
+    pub modifiers: Option<i32>,
+    pub text_content: Option<String>,
+    pub text_length: Option<i32>,
+    pub app_name: Option<String>,
+    pub app_pid: Option<i32>,
+    pub window_title: Option<String>,
+    pub browser_url: Option<String>,
+    pub element_role: Option<String>,
+    pub element_name: Option<String>,
+    pub element_value: Option<String>,
+    pub element_description: Option<String>,
+    pub element_automation_id: Option<String>,
+    pub element_bounds: Option<String>,
+    pub frame_id: Option<i64>,
+}
+
 /// Which table to mark as synced.
 #[derive(Debug, Clone)]
 pub enum SyncTable {
@@ -327,6 +522,10 @@ pub(crate) enum WriteResult {
     Unit,
     /// Result of InsertFramesBatch: Vec of (frame_id, window_index) pairs.
     FrameBatch(Vec<(i64, usize)>),
+    /// Result of InsertUiEventsBatch: one row id per inserted event, in order.
+    /// Callers need this so frame-linker correlation ids can be paired with
+    /// the actual `ui_events.id` after batch flush.
+    Ids(Vec<i64>),
 }
 
 /// A pending write: the operation plus a channel to send the result back.
@@ -361,23 +560,56 @@ impl WriteQueue {
 
 /// Spawn the write coalescing drain loop. Returns a `WriteQueue` handle
 /// that callers use to submit writes.
+/// Back-compat wrapper with no recovery wiring. Production uses
+/// [`spawn_write_drain_with`]; this stays for the existing test harness.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn spawn_write_drain(
     write_pool: Pool<Sqlite>,
     write_semaphore: Arc<Semaphore>,
+    db_path: Arc<str>,
+) -> WriteQueue {
+    spawn_write_drain_with(
+        write_pool,
+        write_semaphore,
+        db_path,
+        WriteDrainOpts::default(),
+    )
+}
+
+/// Like [`spawn_write_drain`] but with recovery wiring (in-process write-pool
+/// rebuild + persistent-failure hook + shared health). The caller keeps a clone
+/// of `opts.health` to observe degradation.
+pub(crate) fn spawn_write_drain_with(
+    write_pool: Pool<Sqlite>,
+    write_semaphore: Arc<Semaphore>,
+    db_path: Arc<str>,
+    opts: WriteDrainOpts,
 ) -> WriteQueue {
     let (tx, rx) = mpsc::channel::<PendingWrite>(CHANNEL_CAPACITY);
 
-    tokio::spawn(drain_loop(rx, write_pool, write_semaphore));
+    tokio::spawn(drain_loop(rx, write_pool, write_semaphore, db_path, opts));
 
     WriteQueue { tx }
 }
 
 async fn drain_loop(
     mut rx: mpsc::Receiver<PendingWrite>,
-    write_pool: Pool<Sqlite>,
+    mut write_pool: Pool<Sqlite>,
     write_semaphore: Arc<Semaphore>,
+    db_path: Arc<str>,
+    opts: WriteDrainOpts,
 ) {
+    let WriteDrainOpts {
+        rebuilder,
+        on_persistent_failure,
+        health,
+        reopen_every,
+        degraded_after,
+        persistent_after,
+    } = opts;
     let mut batch: Vec<PendingWrite> = Vec::with_capacity(MAX_BATCH_SIZE);
+    let mut consecutive_fatal: u64 = 0;
+    let mut hook_fired = false;
 
     loop {
         // Block until at least one write arrives, then take up to MAX_BATCH_SIZE
@@ -414,8 +646,68 @@ async fn drain_loop(
         }
 
         debug!("write_queue: draining batch of {} writes", batch.len());
-        execute_batch(&write_pool, &write_semaphore, &mut batch).await;
+        let outcome = execute_batch(&write_pool, &write_semaphore, &mut batch, &db_path).await;
         batch.clear();
+
+        match outcome {
+            BatchOutcome::Healthy => {
+                if consecutive_fatal > 0 {
+                    info!(
+                        "write_queue: write path recovered after {} consecutive fatal batch(es)",
+                        consecutive_fatal
+                    );
+                }
+                consecutive_fatal = 0;
+                hook_fired = false;
+                health.record_success();
+            }
+            BatchOutcome::FatalConnection => {
+                consecutive_fatal = health.record_fatal();
+
+                // Tier 2: reopen our write pool in-process every N fatal batches.
+                // Drops poisoned write connections without a full restart. Cheap
+                // (~ms) and idempotent; retried periodically until writes recover.
+                if reopen_every != 0 && consecutive_fatal.is_multiple_of(reopen_every) {
+                    if let Some(rb) = &rebuilder {
+                        match rb.rebuild().await {
+                            Ok(new_pool) => {
+                                let old = std::mem::replace(&mut write_pool, new_pool);
+                                old.close().await;
+                                health.note_reopen();
+                                warn!(
+                                    "write_queue: reopened write pool after {} consecutive fatal I/O batches",
+                                    consecutive_fatal
+                                );
+                            }
+                            Err(e) => {
+                                warn!("write_queue: write pool reopen failed (will retry): {}", e)
+                            }
+                        }
+                    }
+                }
+
+                // Tier 3a: surface degradation early so the app/health route reports it.
+                if consecutive_fatal >= degraded_after {
+                    health.set_degraded();
+                }
+
+                // Tier 3b: fire the engine-restart hook once per outage. A restart is
+                // the only thing that rebuilds the shared WAL-index + read pool — the
+                // cure for a process-wide desync that an in-process reopen can't fix.
+                if consecutive_fatal >= persistent_after && !hook_fired {
+                    hook_fired = true;
+                    health.note_persistent_signal();
+                    error!(
+                        "write_queue: persistent write failure ({} consecutive fatal batches) — requesting engine restart to rebuild all pools + WAL-index",
+                        consecutive_fatal
+                    );
+                    let hook = on_persistent_failure.lock().unwrap().clone();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
+                }
+            }
+        }
     }
 
     // Shutdown: drain remaining writes
@@ -426,7 +718,7 @@ async fn drain_loop(
             "write_queue: shutdown — flushing {} remaining writes",
             tail_batch.len()
         );
-        execute_batch(&write_pool, &write_semaphore, &mut tail_batch).await;
+        let _ = execute_batch(&write_pool, &write_semaphore, &mut tail_batch, &db_path).await;
         tail_batch.clear();
     }
     debug!("write_queue: drain loop exited");
@@ -436,7 +728,8 @@ async fn execute_batch(
     write_pool: &Pool<Sqlite>,
     write_semaphore: &Arc<Semaphore>,
     batch: &mut Vec<PendingWrite>,
-) {
+    db_path: &str,
+) -> BatchOutcome {
     // Acquire write semaphore once for the entire batch
     let _permit: OwnedSemaphorePermit = match tokio::time::timeout(
         Duration::from_secs(30),
@@ -446,13 +739,14 @@ async fn execute_batch(
     {
         Ok(Ok(permit)) => permit,
         Ok(Err(_)) => {
+            // Pool closed — shutdown path, not a disk wedge.
             send_error_to_all(batch, sqlx::Error::PoolClosed);
-            return;
+            return BatchOutcome::Healthy;
         }
         Err(_) => {
             warn!("write_queue: semaphore acquisition timed out for batch");
             send_error_to_all(batch, sqlx::Error::PoolTimedOut);
-            return;
+            return BatchOutcome::Healthy;
         }
     };
 
@@ -462,18 +756,44 @@ async fn execute_batch(
     let mut conn_opt = None;
 
     for attempt in 1..=max_retries {
-        let mut conn =
-            match tokio::time::timeout(Duration::from_secs(5), write_pool.acquire()).await {
-                Ok(Ok(conn)) => conn,
-                Ok(Err(e)) => {
-                    send_error_to_all(batch, e);
-                    return;
+        // Bind the timeout result first: inlining it into `match` puts this
+        // construct right at rustfmt's width boundary, where the formatter is
+        // non-idempotent (it flip-flops the layout, failing `fmt --check`).
+        let acquired = tokio::time::timeout(Duration::from_secs(5), write_pool.acquire()).await;
+        let mut conn = match acquired {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                // Retry runtime connection-loss errors before failing queued
+                // writes. CANTOPEN needs explicit file recovery; IOERR/malformed
+                // usually clears by letting sqlx discard the failed acquire path
+                // and trying a fresh handle.
+                if should_recycle_sqlite_connection(&e) && attempt < max_retries {
+                    let recovered = if is_cantopen_error(&e) {
+                        ensure_db_openable(db_path).await
+                    } else {
+                        false
+                    };
+                    warn!(
+                        "write_queue: acquire connection error (attempt {}/{}), db_recovered={}, retrying: {}",
+                        attempt, max_retries, recovered, e
+                    );
+                    last_error = Some(e);
+                    tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                    continue;
                 }
-                Err(_) => {
-                    send_error_to_all(batch, sqlx::Error::PoolTimedOut);
-                    return;
-                }
-            };
+                let fatal = should_recycle_sqlite_connection(&e);
+                send_error_to_all(batch, e);
+                return if fatal {
+                    BatchOutcome::FatalConnection
+                } else {
+                    BatchOutcome::Healthy
+                };
+            }
+            Err(_) => {
+                send_error_to_all(batch, sqlx::Error::PoolTimedOut);
+                return BatchOutcome::Healthy;
+            }
+        };
 
         match sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await {
             Ok(_) => {
@@ -506,10 +826,34 @@ async fn execute_batch(
                 tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
                 continue;
             }
+            Err(e) if should_recycle_sqlite_connection(&e) => {
+                let recovered = if is_cantopen_error(&e) {
+                    ensure_db_openable(db_path).await
+                } else {
+                    false
+                };
+                warn!(
+                    "write_queue: BEGIN IMMEDIATE connection error (attempt {}/{}), db_recovered={}, detaching connection: {}",
+                    attempt, max_retries, recovered, e
+                );
+                let _raw = conn.detach();
+                if attempt < max_retries {
+                    last_error = Some(e);
+                    tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                    continue;
+                }
+                send_error_to_all(batch, e);
+                return BatchOutcome::FatalConnection;
+            }
             Err(e) => {
                 warn!("write_queue: BEGIN IMMEDIATE failed: {}", e);
+                let fatal = is_connection_error(&e);
                 send_error_to_all(batch, e);
-                return;
+                return if fatal {
+                    BatchOutcome::FatalConnection
+                } else {
+                    BatchOutcome::Healthy
+                };
             }
         }
     }
@@ -519,8 +863,19 @@ async fn execute_batch(
         None => {
             let e = last_error.unwrap_or_else(|| sqlx::Error::PoolTimedOut);
             warn!("write_queue: BEGIN IMMEDIATE exhausted retries: {}", e);
+            // A nested-transaction error that survived all retries means a
+            // pooled connection is stuck with an orphaned transaction that
+            // per-attempt ROLLBACK didn't clear within the budget. Treating it
+            // as Healthy would leave the wedge in place (writes silently fail,
+            // SCREENPIPE-CLI-RC) — escalate to FatalConnection so the drain
+            // loop's pool reopen recovers it, same as for IOERR/CANTOPEN.
+            let fatal = should_recycle_sqlite_connection(&e) || is_nested_transaction_error(&e);
             send_error_to_all(batch, e);
-            return;
+            return if fatal {
+                BatchOutcome::FatalConnection
+            } else {
+                BatchOutcome::Healthy
+            };
         }
     };
 
@@ -551,7 +906,10 @@ async fn execute_batch(
     }
 
     // COMMIT or ROLLBACK
+    let mut outcome = BatchOutcome::Healthy;
     if any_fatal {
+        // A fatal connection error mid-batch wedged the write path.
+        outcome = BatchOutcome::FatalConnection;
         if let Err(e) = sqlx::query("ROLLBACK").execute(&mut *conn).await {
             warn!("write_queue: ROLLBACK failed: {}, detaching connection", e);
             let _raw = conn.detach();
@@ -563,6 +921,7 @@ async fn execute_batch(
             }
         }
     } else if let Err(e) = sqlx::query("COMMIT").execute(&mut *conn).await {
+        let fatal = is_connection_error(&e);
         warn!("write_queue: COMMIT failed: {}", e);
         // Always detach. The previous code skipped detaching when the
         // error was "cannot commit - no transaction is active" on the
@@ -581,13 +940,18 @@ async fn execute_batch(
         for pw in batch.drain(..) {
             let _ = pw.respond.send(Err(sqlx::Error::WorkerCrashed));
         }
-        return;
+        return if fatal {
+            BatchOutcome::FatalConnection
+        } else {
+            BatchOutcome::Healthy
+        };
     }
 
     // Send results to callers
     for (pw, result) in batch.drain(..).zip(results.into_iter()) {
         let _ = pw.respond.send(result);
     }
+    outcome
 }
 
 async fn execute_single_write(
@@ -640,6 +1004,25 @@ async fn execute_single_write(
             .execute(&mut **conn)
             .await?;
 
+            // Flip the chunk's processing status in the same TX so the
+            // reconciliation sweep can't re-pick this chunk between the
+            // INSERT landing and a separate UPDATE. INSERT OR IGNORE
+            // collisions (UNIQUE on chunk_id+text) still count as
+            // "transcribed" — the row already exists, we've considered
+            // this chunk.
+            sqlx::query(
+                "UPDATE audio_chunks \
+                 SET transcription_status = 'transcribed', \
+                     transcription_attempts = transcription_attempts + 1, \
+                     last_transcription_attempt_at = ?1, \
+                     transcription_failure_reason = NULL \
+                 WHERE id = ?2",
+            )
+            .bind(ts)
+            .bind(audio_chunk_id)
+            .execute(&mut **conn)
+            .await?;
+
             if result.rows_affected() == 0 {
                 Ok(WriteResult::Id(0))
             } else {
@@ -663,34 +1046,65 @@ async fn execute_single_write(
         } => {
             let ts = timestamp.unwrap_or_else(Utc::now);
 
-            // If transcription is duplicate, just ensure chunk exists
+            // Cross-device duplicate detected by the read-side dedup check.
+            // The chunk row still needs to exist (so the audio file is
+            // findable on disk for playback / future reconciliation), but no
+            // transcription row is recorded. We mark status='transcribed'
+            // because we *did* process this chunk — its content is captured
+            // on the other device's row. Without this flip the reconciliation
+            // sweep would re-pick the chunk forever (the original zombie loop).
             if *is_duplicate {
-                if *existing_chunk_id != 0 {
-                    return Ok(WriteResult::Id(*existing_chunk_id));
-                }
-                let id =
+                let audio_chunk_id = if *existing_chunk_id != 0 {
+                    *existing_chunk_id
+                } else {
                     sqlx::query("INSERT INTO audio_chunks (file_path, timestamp) VALUES (?1, ?2)")
                         .bind(file_path.as_str())
                         .bind(ts)
                         .execute(&mut **conn)
                         .await?
-                        .last_insert_rowid();
-                return Ok(WriteResult::Id(id));
+                        .last_insert_rowid()
+                };
+                sqlx::query(
+                    "UPDATE audio_chunks \
+                     SET transcription_status = 'transcribed', \
+                         transcription_attempts = transcription_attempts + 1, \
+                         last_transcription_attempt_at = ?1, \
+                         transcription_failure_reason = NULL \
+                     WHERE id = ?2",
+                )
+                .bind(ts)
+                .bind(audio_chunk_id)
+                .execute(&mut **conn)
+                .await?;
+                return Ok(WriteResult::Id(audio_chunk_id));
             }
 
-            // If transcription is empty, just ensure chunk exists
+            // Empty STT result — same story as Duplicate but marked 'silent'
+            // so ops can distinguish silent capture from dedup-suppressed.
             if transcription.trim().is_empty() {
-                if *existing_chunk_id != 0 {
-                    return Ok(WriteResult::Id(*existing_chunk_id));
-                }
-                let id =
+                let audio_chunk_id = if *existing_chunk_id != 0 {
+                    *existing_chunk_id
+                } else {
                     sqlx::query("INSERT INTO audio_chunks (file_path, timestamp) VALUES (?1, ?2)")
                         .bind(file_path.as_str())
                         .bind(ts)
                         .execute(&mut **conn)
                         .await?
-                        .last_insert_rowid();
-                return Ok(WriteResult::Id(id));
+                        .last_insert_rowid()
+                };
+                sqlx::query(
+                    "UPDATE audio_chunks \
+                     SET transcription_status = 'silent', \
+                         transcription_attempts = transcription_attempts + 1, \
+                         last_transcription_attempt_at = ?1, \
+                         transcription_failure_reason = NULL \
+                     WHERE id = ?2",
+                )
+                .bind(ts)
+                .bind(audio_chunk_id)
+                .execute(&mut **conn)
+                .await?;
+                return Ok(WriteResult::Id(audio_chunk_id));
             }
 
             // Insert chunk if needed
@@ -705,7 +1119,7 @@ async fn execute_single_write(
                     .last_insert_rowid()
             };
 
-            // Insert transcription
+            // Insert transcription + flip status atomically.
             let text_length = transcription.len() as i64;
             sqlx::query(
                 "INSERT OR IGNORE INTO audio_transcriptions (audio_chunk_id, transcription, offset_index, timestamp, transcription_engine, device, is_input_device, speaker_id, start_time, end_time, text_length) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -721,6 +1135,19 @@ async fn execute_single_write(
             .bind(start_time)
             .bind(end_time)
             .bind(text_length)
+            .execute(&mut **conn)
+            .await?;
+
+            sqlx::query(
+                "UPDATE audio_chunks \
+                 SET transcription_status = 'transcribed', \
+                     transcription_attempts = transcription_attempts + 1, \
+                     last_transcription_attempt_at = ?1, \
+                     transcription_failure_reason = NULL \
+                 WHERE id = ?2",
+            )
+            .bind(ts)
+            .bind(audio_chunk_id)
             .execute(&mut **conn)
             .await?;
 
@@ -742,9 +1169,7 @@ async fn execute_single_write(
             accessibility_tree_json,
             content_hash,
             simhash,
-            ocr_text,
             ocr_text_json,
-            ocr_engine,
             full_text,
             elements_ref_frame_id,
         } => {
@@ -754,23 +1179,31 @@ async fn execute_single_write(
                     browser_url, app_name, window_name, focused, device_name,
                     snapshot_path, capture_trigger, accessibility_text, text_source,
                     accessibility_tree_json, content_hash, simhash, full_text,
-                    elements_ref_frame_id, document_path
+                    elements_ref_frame_id, document_path, text_json
                 ) VALUES (
                     NULL, 0, ?1, ?2,
                     ?3, ?4, ?5, ?6, ?7,
                     ?8, ?9, ?10, ?11,
                     ?12, ?13, ?14, ?15,
-                    ?16, ?17
+                    ?16, ?17, ?18
                 )"#,
             )
             .bind(timestamp)
-            .bind(snapshot_path.as_str())
+            .bind(if snapshot_path.is_empty() {
+                None
+            } else {
+                Some(snapshot_path.as_str())
+            })
             .bind(browser_url.as_deref())
             .bind(app_name.as_deref())
             .bind(window_name.as_deref())
             .bind(focused)
             .bind(device_name.as_str())
-            .bind(snapshot_path.as_str())
+            .bind(if snapshot_path.is_empty() {
+                None
+            } else {
+                Some(snapshot_path.as_str())
+            })
             .bind(capture_trigger.as_deref())
             .bind(accessibility_text.as_deref())
             .bind(text_source.as_deref())
@@ -780,37 +1213,15 @@ async fn execute_single_write(
             .bind(full_text.as_deref())
             .bind(elements_ref_frame_id)
             .bind(document_path.as_deref())
+            .bind(ocr_text_json.as_deref())
             .execute(&mut **conn)
             .await?
             .last_insert_rowid();
 
-            // Insert OCR text in same transaction (always — needed for search)
-            // Element inserts are deferred to a separate transaction (see caller).
-            // Duplicate app_name/window_name/focused from the frame onto the OCR
-            // row so queries like `SELECT ... FROM ocr_text WHERE app_name='Obsidian'`
-            // actually return results. Without these binds the columns fall back
-            // to their schema defaults ('' / NULL / false), making OCR data
-            // effectively untagged even though the parent frame has the metadata.
-            if let (Some(text), Some(text_json), Some(engine)) = (
-                ocr_text.as_deref(),
-                ocr_text_json.as_deref(),
-                ocr_engine.as_deref(),
-            ) {
-                let text_length = text.len() as i64;
-                sqlx::query(
-                    "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine, text_length, app_name, window_name, focused) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                )
-                .bind(id)
-                .bind(text)
-                .bind(text_json)
-                .bind(engine)
-                .bind(text_length)
-                .bind(app_name.as_deref().unwrap_or(""))
-                .bind(window_name.as_deref())
-                .bind(focused)
-                .execute(&mut **conn)
-                .await?;
-            }
+            // OCR text/metadata now lives on the frame itself: full_text feeds
+            // frames_fts (search) and text_json holds the per-word bounds. The
+            // ocr_text table was retired in 2026-06. Element rows are still
+            // deferred to a separate transaction by the caller.
 
             if let Some(ref_id) = elements_ref_frame_id {
                 debug!(
@@ -894,46 +1305,29 @@ async fn execute_single_write(
             Ok(WriteResult::Unit)
         }
 
-        WriteOp::InsertUiEvent {
-            timestamp,
-            session_id,
-            relative_ms,
-            event_type,
-            x,
-            y,
-            delta_x,
-            delta_y,
-            button,
-            click_count,
-            key_code,
-            modifiers,
-            text_content,
-            text_length,
-            app_name,
-            app_pid,
-            window_title,
-            browser_url,
-            element_role,
-            element_name,
-            element_value,
-            element_description,
-            element_automation_id,
-            element_bounds,
-            frame_id,
-        } => {
-            let result = sqlx::query(
-                "INSERT INTO ui_events (timestamp, session_id, relative_ms, event_type, x, y, delta_x, delta_y, button, click_count, key_code, modifiers, text_content, text_length, app_name, app_pid, window_title, browser_url, element_role, element_name, element_value, element_description, element_automation_id, element_bounds, frame_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
-            )
-            .bind(timestamp.as_str()).bind(session_id.as_deref()).bind(relative_ms).bind(event_type.as_str())
-            .bind(x).bind(y).bind(delta_x).bind(delta_y)
-            .bind(button).bind(click_count).bind(key_code).bind(modifiers)
-            .bind(text_content.as_deref()).bind(text_length)
-            .bind(app_name.as_deref()).bind(app_pid).bind(window_title.as_deref()).bind(browser_url.as_deref())
-            .bind(element_role.as_deref()).bind(element_name.as_deref()).bind(element_value.as_deref())
-            .bind(element_description.as_deref()).bind(element_automation_id.as_deref()).bind(element_bounds.as_deref())
-            .bind(frame_id)
-            .execute(&mut **conn).await?;
-            Ok(WriteResult::Id(result.last_insert_rowid()))
+        WriteOp::InsertUiEvent { event } => {
+            let id = insert_ui_event_row(conn, event).await?;
+            Ok(WriteResult::Id(id))
+        }
+
+        WriteOp::InsertUiEventsBatch { events } => {
+            let mut ids = Vec::with_capacity(events.len());
+            for event in events {
+                ids.push(insert_ui_event_row(conn, event).await?);
+            }
+            Ok(WriteResult::Ids(ids))
+        }
+
+        WriteOp::UpdateUiEventFrameId { row_id, frame_id } => {
+            // FrameLinker emits UPDATEs after pairing a trigger event with
+            // the frame it caused us to capture. `frame_id IS NULL` guards
+            // against accidental clobber if a duplicate update is enqueued.
+            sqlx::query("UPDATE ui_events SET frame_id = ?1 WHERE id = ?2 AND frame_id IS NULL")
+                .bind(frame_id)
+                .bind(row_id)
+                .execute(&mut **conn)
+                .await?;
+            Ok(WriteResult::Unit)
         }
 
         WriteOp::DeleteAudioChunksBatch { chunk_ids } => {
@@ -1008,18 +1402,23 @@ async fn execute_single_write(
             window_name,
             sync_id,
         } => {
-            let now = Utc::now().to_rfc3339();
+            // ocr_text retired (2026-06): synced OCR text now lands on the frame
+            // that SyncInsertFrame already created. Fill in full_text (search) and
+            // any metadata the frame record didn't carry. Idempotent on replay.
+            let _ = sync_id;
             sqlx::query(
-                r#"INSERT INTO ocr_text (frame_id, text, focused, app_name, window_name, sync_id, synced_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"#,
+                r#"UPDATE frames SET
+                    full_text = ?2,
+                    focused = COALESCE(focused, ?3),
+                    app_name = COALESCE(NULLIF(app_name, ''), ?4),
+                    window_name = COALESCE(window_name, ?5)
+                   WHERE id = ?1"#,
             )
             .bind(frame_id)
             .bind(text.as_str())
             .bind(focused)
             .bind(app_name.as_str())
             .bind(window_name.as_deref())
-            .bind(sync_id.as_str())
-            .bind(now.as_str())
             .execute(&mut **conn)
             .await?;
             Ok(WriteResult::Id(*frame_id))
@@ -1174,6 +1573,8 @@ async fn execute_single_write(
             ocr_engine_str,
             windows,
         } => {
+            // ocr_engine is no longer persisted per-frame (ocr_text table retired).
+            let _ = ocr_engine_str;
             let mut results = Vec::with_capacity(windows.len());
             for (idx, window) in windows.iter().enumerate() {
                 let full_text = if window.text.is_empty() {
@@ -1181,9 +1582,15 @@ async fn execute_single_write(
                 } else {
                     Some(window.text.as_str())
                 };
+                // text_json (per-word OCR bounds) now lives on the frame.
+                let text_json = if window.text_json.is_empty() {
+                    None
+                } else {
+                    Some(window.text_json.as_str())
+                };
 
                 let frame_id = sqlx::query(
-                    "INSERT INTO frames (video_chunk_id, offset_index, timestamp, name, browser_url, app_name, window_name, focused, device_name, full_text) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    "INSERT INTO frames (video_chunk_id, offset_index, timestamp, name, browser_url, app_name, window_name, focused, device_name, full_text, text_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
                 )
                 .bind(video_chunk_id)
                 .bind(offset_index)
@@ -1195,28 +1602,12 @@ async fn execute_single_write(
                 .bind(window.focused)
                 .bind(device_name.as_str())
                 .bind(full_text)
+                .bind(text_json)
                 .execute(&mut **conn)
                 .await?
                 .last_insert_rowid();
 
-                // Insert OCR text — duplicate app/window/focused from frame so
-                // OCR rows are filterable (see handler above for rationale).
-                let text_length = window.text.len() as i64;
-                sqlx::query(
-                    "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine, text_length, app_name, window_name, focused) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                )
-                .bind(frame_id)
-                .bind(&window.text)
-                .bind(&window.text_json)
-                .bind(ocr_engine_str.as_str())
-                .bind(text_length)
-                .bind(window.app_name.as_deref().unwrap_or(""))
-                .bind(window.window_name.as_deref())
-                .bind(window.focused)
-                .execute(&mut **conn)
-                .await?;
-
-                // Dual-write: insert OCR elements into unified elements table
+                // OCR elements still go to the unified elements table for rendering.
                 if !window.text_json.is_empty() {
                     crate::db::DatabaseManager::insert_ocr_elements(
                         conn,
@@ -1342,6 +1733,44 @@ async fn execute_single_write(
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
+async fn insert_ui_event_row(
+    conn: &mut sqlx::pool::PoolConnection<Sqlite>,
+    event: &UiEventWrite,
+) -> Result<i64, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO ui_events (timestamp, session_id, relative_ms, event_type, x, y, delta_x, delta_y, button, click_count, key_code, modifiers, text_content, text_length, app_name, app_pid, window_title, browser_url, element_role, element_name, element_value, element_description, element_automation_id, element_bounds, frame_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
+    )
+    .bind(event.timestamp.as_str())
+    .bind(event.session_id.as_deref())
+    .bind(event.relative_ms)
+    .bind(event.event_type.as_str())
+    .bind(event.x)
+    .bind(event.y)
+    .bind(event.delta_x)
+    .bind(event.delta_y)
+    .bind(event.button)
+    .bind(event.click_count)
+    .bind(event.key_code)
+    .bind(event.modifiers)
+    .bind(event.text_content.as_deref())
+    .bind(event.text_length)
+    .bind(event.app_name.as_deref())
+    .bind(event.app_pid)
+    .bind(event.window_title.as_deref())
+    .bind(event.browser_url.as_deref())
+    .bind(event.element_role.as_deref())
+    .bind(event.element_name.as_deref())
+    .bind(event.element_value.as_deref())
+    .bind(event.element_description.as_deref())
+    .bind(event.element_automation_id.as_deref())
+    .bind(event.element_bounds.as_deref())
+    .bind(event.frame_id)
+    .execute(&mut **conn)
+    .await?;
+
+    Ok(result.last_insert_rowid())
+}
+
 fn send_error_to_all(batch: &mut Vec<PendingWrite>, error: sqlx::Error) {
     let err_str = error.to_string();
     for pw in batch.drain(..) {
@@ -1363,40 +1792,131 @@ fn send_error_to_all(batch: &mut Vec<PendingWrite>, error: sqlx::Error) {
 /// malformed" until the connection is dropped. Treat them as fatal so
 /// the batch loop drops the connection instead of reusing it for
 /// follow-on writes that will all fail in confusing ways.
+#[cfg(test)]
 fn is_fatal_sqlite_message(msg_lower: &str) -> bool {
-    msg_lower.contains("disk i/o error") || msg_lower.contains("malformed")
+    crate::sqlite_error::is_fatal_sqlite_message(msg_lower)
 }
 
 fn is_connection_error(e: &sqlx::Error) -> bool {
-    if matches!(
-        e,
-        sqlx::Error::Io(_) | sqlx::Error::PoolClosed | sqlx::Error::PoolTimedOut
-    ) {
-        return true;
-    }
-    if let sqlx::Error::Database(db) = e {
-        return is_fatal_sqlite_message(&db.message().to_lowercase());
-    }
-    false
+    crate::sqlite_error::is_sqlite_connection_error(e)
+}
+
+fn should_recycle_sqlite_connection(e: &sqlx::Error) -> bool {
+    crate::sqlite_error::should_recycle_sqlite_connection(e)
 }
 
 fn is_nested_transaction_error(e: &sqlx::Error) -> bool {
+    let needle = "cannot start a transaction within a transaction";
     match e {
-        sqlx::Error::Database(db_err) => db_err
-            .message()
-            .to_lowercase()
-            .contains("cannot start a transaction within a transaction"),
+        // The live BEGIN IMMEDIATE failure surfaces as a Database error;
+        // Protocol is matched too because the error gets re-wrapped as it
+        // propagates (and so the predicate is unit-testable the same way the
+        // other classifiers are).
+        sqlx::Error::Database(db_err) => db_err.message().to_lowercase().contains(needle),
+        sqlx::Error::Protocol(msg) => msg.to_lowercase().contains(needle),
         _ => false,
     }
 }
 
 fn is_busy_error(e: &sqlx::Error) -> bool {
-    match e {
-        sqlx::Error::Database(db_err) => {
-            let msg = db_err.message().to_lowercase();
-            msg.contains("database is locked") || msg.contains("database table is locked")
+    crate::sqlite_error::is_sqlite_busy_error(e)
+}
+
+/// SQLITE_CANTOPEN — "unable to open database file". At runtime this means the
+/// data dir/file vanished out from under an open pool (deleted folder, etc.).
+fn is_cantopen_error(e: &sqlx::Error) -> bool {
+    crate::sqlite_error::is_sqlite_cantopen_error(e)
+}
+
+/// Ensure the database file's parent directory exists.
+///
+/// Fixes "unable to open database file" (SQLITE_CANTOPEN): a missing parent dir
+/// fails every open. Called at startup (`create_tree = true`, builds the whole
+/// path for fresh installs) and from the write_queue's runtime recovery
+/// (`create_tree = false`). Skips in-memory DBs. Returns true if it created the
+/// directory.
+///
+/// Runtime recovery is mountpoint-safe: when the whole tree is gone (the
+/// grandparent is also missing — the signature of an unmounted volume) it does
+/// nothing, so we never shadow a mountpoint with a stray local dir when the
+/// volume returns. It only heals the recoverable case: a single deleted dir
+/// whose parent still exists.
+pub(crate) fn ensure_db_parent_dir(database_path: &str, create_tree: bool) -> bool {
+    if database_path.contains(":memory:") {
+        return false;
+    }
+    let parent = match std::path::Path::new(database_path).parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => return false,
+    };
+    if parent.exists() {
+        return false;
+    }
+    if !create_tree {
+        if let Some(gp) = parent.parent() {
+            if !gp.as_os_str().is_empty() && !gp.exists() {
+                warn!(
+                    "db: parent tree of {} is gone (likely unmounted volume); not recreating",
+                    parent.display()
+                );
+                return false;
+            }
         }
-        _ => false,
+    }
+    match std::fs::create_dir_all(parent) {
+        Ok(_) => {
+            warn!("db: created missing parent dir {}", parent.display());
+            true
+        }
+        Err(e) => {
+            warn!(
+                "db: failed to create parent dir {}: {}",
+                parent.display(),
+                e
+            );
+            false
+        }
+    }
+}
+
+/// Make the database openable again after the data dir/file vanished mid-run
+/// (the SQLITE_CANTOPEN runtime recovery). Recreates the parent dir
+/// (mountpoint-safe, via [`ensure_db_parent_dir`]) AND an empty db file —
+/// recreating the dir alone is not enough because the write pool opens with
+/// `create_if_missing = false`, so a fresh `acquire()` against a missing file
+/// would CANTOPEN again.
+///
+/// The recreated db is **empty**: the schema is restored by migrations on the
+/// next startup. This only clears CANTOPEN so the pool can reconnect instead of
+/// erroring every queued write; it does not recover the lost rows.
+///
+/// Returns true if the db file exists (is openable) afterward. In-memory DBs are
+/// always openable. Stays mountpoint-safe: if `ensure_db_parent_dir` declined to
+/// recreate the dir (e.g. unmounted volume), the file is not created either.
+async fn ensure_db_openable(db_path: &str) -> bool {
+    if db_path.contains(":memory:") {
+        return true;
+    }
+    ensure_db_parent_dir(db_path, false);
+    // Only recreate the file if the parent dir actually exists now —
+    // ensure_db_parent_dir is mountpoint-safe and may have intentionally
+    // skipped recreation (don't shadow an unmounted volume with a stray file).
+    match std::path::Path::new(db_path).parent() {
+        Some(p) if !p.as_os_str().is_empty() && !p.exists() => return false,
+        _ => {}
+    }
+    let connection_string = format!("sqlite:{}", db_path);
+    // create_database opens with create_if_missing(true) then closes; it is a
+    // no-op (does not truncate) if the file already exists.
+    match sqlx::Sqlite::create_database(&connection_string).await {
+        Ok(_) => {
+            warn!("db: recreated empty database file {}", db_path);
+            true
+        }
+        Err(e) => {
+            warn!("db: failed to recreate database file {}: {}", db_path, e);
+            false
+        }
     }
 }
 
@@ -1406,6 +1926,79 @@ fn is_busy_error(e: &sqlx::Error) -> bool {
 mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
+
+    #[test]
+    fn ensure_db_parent_dir_creates_and_is_mountpoint_safe() {
+        let base = std::env::temp_dir().join(format!("sp_wq_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let db = base.join("a/b/db.sqlite");
+        // create_tree builds the whole missing path (fresh install)
+        assert!(ensure_db_parent_dir(&db.to_string_lossy(), true));
+        assert!(db.parent().unwrap().exists());
+        // runtime recovery heals a single deleted dir whose parent still exists
+        std::fs::remove_dir_all(base.join("a/b")).unwrap();
+        assert!(ensure_db_parent_dir(&db.to_string_lossy(), false));
+        // mountpoint-safe: whole tree gone + runtime mode => no-op (don't shadow)
+        std::fs::remove_dir_all(&base).unwrap();
+        let deep = base.join("gone/db.sqlite");
+        assert!(!ensure_db_parent_dir(&deep.to_string_lossy(), false));
+        assert!(!base.exists());
+        // in-memory is always skipped
+        assert!(!ensure_db_parent_dir("sqlite::memory:", true));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Regression for SCREENPIPE-CLI-HA: after the data dir/file vanishes
+    /// mid-run, the runtime recovery must make a *fresh* connection openable
+    /// again. Recreating the parent dir alone is NOT enough — the write pool
+    /// opens with create_if_missing=false, so the file must be recreated too.
+    #[tokio::test]
+    async fn ensure_db_openable_recreates_file_and_clears_cantopen() {
+        use sqlx::sqlite::SqliteConnectOptions;
+        use sqlx::{ConnectOptions, Connection};
+
+        let base = std::env::temp_dir().join(format!("sp_wq_cantopen_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = base.join("data");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("db.sqlite");
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let conn_str = format!("sqlite:{}", db_path_str);
+
+        // prod-like options (mirror db.rs): NO create_if_missing => default false
+        let opts: SqliteConnectOptions = conn_str.parse().unwrap();
+
+        // file exists -> opens fine
+        sqlx::Sqlite::create_database(&conn_str).await.unwrap();
+        opts.clone().connect().await.unwrap().close().await.unwrap();
+
+        // data dir vanishes mid-run
+        std::fs::remove_dir_all(&dir).unwrap();
+        // precondition: a fresh open now CANTOPENs (the bug)
+        assert!(opts.clone().connect().await.is_err());
+
+        // recovery: must recreate dir AND file so a fresh open succeeds
+        assert!(ensure_db_openable(&db_path_str).await);
+        assert!(db_path.exists(), "recovery must recreate the db file");
+        opts.clone()
+            .connect()
+            .await
+            .expect("fresh connection must open after recovery")
+            .close()
+            .await
+            .unwrap();
+
+        // mountpoint-safe: whole tree gone (unmounted volume) => no file created
+        std::fs::remove_dir_all(&base).unwrap();
+        let on_volume = base.join("vol/db.sqlite");
+        assert!(!ensure_db_openable(&on_volume.to_string_lossy()).await);
+        assert!(!base.exists(), "must not shadow an unmounted volume");
+
+        // in-memory is always openable
+        assert!(ensure_db_openable("sqlite::memory:").await);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     async fn setup_test_db() -> (Pool<Sqlite>, Arc<Semaphore>) {
         let pool = SqlitePoolOptions::new()
@@ -1418,7 +2011,11 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS audio_chunks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 file_path TEXT NOT NULL,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                transcription_status TEXT NOT NULL DEFAULT 'pending',
+                transcription_attempts INTEGER NOT NULL DEFAULT 0,
+                last_transcription_attempt_at TIMESTAMP,
+                transcription_failure_reason TEXT
             )",
         )
         .execute(&pool)
@@ -1478,22 +2075,10 @@ mod tests {
                 content_hash INTEGER,
                 simhash INTEGER,
                 full_text TEXT,
+                text_json TEXT,
+                full_text_redacted_at INTEGER,
                 elements_ref_frame_id INTEGER DEFAULT NULL,
                 document_path TEXT
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS ocr_text (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                frame_id INTEGER NOT NULL,
-                text TEXT NOT NULL,
-                text_json TEXT NOT NULL DEFAULT '',
-                ocr_engine TEXT NOT NULL DEFAULT '',
-                text_length INTEGER DEFAULT 0
             )",
         )
         .execute(&pool)
@@ -1507,7 +2092,7 @@ mod tests {
     #[tokio::test]
     async fn test_single_write() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let result = queue
             .submit(WriteOp::InsertAudioChunk {
@@ -1533,7 +2118,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_coalescing() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         // Submit many writes concurrently — they should be batched
         let mut handles = Vec::new();
@@ -1567,7 +2152,7 @@ mod tests {
     #[tokio::test]
     async fn test_ordering_chunk_before_transcription() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         // Insert chunk first
         let chunk_result = queue
@@ -1616,7 +2201,7 @@ mod tests {
     #[tokio::test]
     async fn test_combined_chunk_and_transcription() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let result = queue
             .submit(WriteOp::InsertAudioChunkAndTranscription {
@@ -1669,7 +2254,7 @@ mod tests {
     #[tokio::test]
     async fn test_duplicate_transcription_skipped() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let result = queue
             .submit(WriteOp::InsertAudioChunkAndTranscription {
@@ -1705,7 +2290,7 @@ mod tests {
     #[tokio::test]
     async fn test_video_chunk_insert() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let result = queue
             .submit(WriteOp::InsertVideoChunkWithFps {
@@ -1731,7 +2316,7 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_frame_insert() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let result = queue
             .submit(WriteOp::InsertSnapshotFrameWithOcr {
@@ -1749,9 +2334,7 @@ mod tests {
                 accessibility_tree_json: None,
                 content_hash: Some(12345),
                 simhash: Some(67890),
-                ocr_text: None,
                 ocr_text_json: None,
-                ocr_engine: None,
                 full_text: Some("page content".to_string()),
                 elements_ref_frame_id: None,
             })
@@ -1773,7 +2356,7 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_mixed_writes() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let mut handles = Vec::new();
 
@@ -1824,7 +2407,13 @@ mod tests {
         let queue = WriteQueue { tx };
 
         let pool_clone = pool.clone();
-        let handle = tokio::spawn(drain_loop(rx, pool_clone, sem));
+        let handle = tokio::spawn(drain_loop(
+            rx,
+            pool_clone,
+            sem,
+            std::sync::Arc::from("sqlite::memory:"),
+            WriteDrainOpts::default(),
+        ));
 
         // Submit a write
         let result = queue
@@ -1857,7 +2446,7 @@ mod tests {
     #[tokio::test]
     async fn test_empty_transcription_skipped() {
         let (pool, sem) = setup_test_db().await;
-        let queue = spawn_write_drain(pool.clone(), sem);
+        let queue = spawn_write_drain(pool.clone(), sem, std::sync::Arc::from("sqlite::memory:"));
 
         let result = queue
             .submit(WriteOp::InsertAudioChunkAndTranscription {
@@ -1926,6 +2515,45 @@ mod tests {
         assert!(is_connection_error(&sqlx::Error::Io(
             std::io::Error::other("broken pipe")
         )));
+    }
+
+    #[test]
+    fn sqlite_connection_recycle_classifies_begin_and_acquire_failures() {
+        assert!(should_recycle_sqlite_connection(&sqlx::Error::Protocol(
+            "error returned from database: (code: 522) disk i/o error".into()
+        )));
+        assert!(should_recycle_sqlite_connection(&sqlx::Error::Protocol(
+            "error returned from database: (code: 11) database disk image is malformed".into()
+        )));
+        assert!(!should_recycle_sqlite_connection(&sqlx::Error::Protocol(
+            "database is locked".into()
+        )));
+        assert!(!should_recycle_sqlite_connection(&sqlx::Error::Protocol(
+            "no such table: foo".into()
+        )));
+    }
+
+    #[test]
+    fn persistent_stuck_transaction_escalates_to_fatal_on_exhausted_retries() {
+        let stuck = sqlx::Error::Protocol(
+            "error returned from database: (code: 1) cannot start a transaction within a transaction"
+                .into(),
+        );
+        // Detected as a nested-transaction error in both wrapper forms.
+        assert!(is_nested_transaction_error(&stuck));
+
+        // The exhausted-retries decision escalates it to FatalConnection
+        // (so the drain loop reopens the pool) even though it is NOT in the
+        // plain recycle set — that's the gap this guards.
+        assert!(!should_recycle_sqlite_connection(&stuck));
+        assert!(should_recycle_sqlite_connection(&stuck) || is_nested_transaction_error(&stuck));
+
+        // A genuinely benign per-row error must stay non-fatal.
+        let benign = sqlx::Error::Protocol("no such table: foo".into());
+        assert!(!is_nested_transaction_error(&benign));
+        assert!(
+            !(should_recycle_sqlite_connection(&benign) || is_nested_transaction_error(&benign))
+        );
     }
 
     /// `Database` errors flow through `is_fatal_sqlite_message`: a

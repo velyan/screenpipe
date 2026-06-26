@@ -16,19 +16,26 @@ import {
   Check,
   Copy,
   Loader2,
+  Play,
+  Search,
   User,
   X,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { cn } from "@/lib/utils";
+import { commands } from "@/lib/utils/tauri";
 import { Button } from "@/components/ui/button";
+import { MediaComponent } from "@/components/rewind/media";
 import { SpeakerAssignPopover } from "@/components/speaker-assign-popover";
 import { useHealthCheck } from "@/lib/hooks/use-health-check";
+import type { LiveCaptureState } from "@/lib/utils/live-capture-state";
 import {
   fetchMeetingAudio,
   type MeetingAudioChunk,
 } from "@/lib/utils/meeting-context";
 import type { MeetingRecord } from "@/lib/utils/meeting-format";
+import { ListeningSticks } from "./listening-sticks";
+import { splitForHighlight } from "./transcript-highlight";
 
 interface TranscriptPanelProps {
   meeting: MeetingRecord;
@@ -39,9 +46,34 @@ interface TranscriptPanelProps {
   /** Incremented by the parent after a meeting-level retranscribe finishes. */
   refreshKey?: number;
   headerActions?: React.ReactNode;
+  captureState?: LiveCaptureState;
 }
 
 const AUTO_FOLLOW_THRESHOLD_PX = 48;
+
+// User-chosen transcript panel height persists across meetings/sessions so the
+// drawer stays at the size you dragged it to. Stored in px; absent → fall back
+// to the responsive default class (`h-[min(42vh,360px)]`).
+const PANEL_HEIGHT_STORAGE_KEY = "screenpipe-meeting-transcript-height";
+const MIN_PANEL_HEIGHT_PX = 120;
+// Cap so the drawer can never swallow the whole window and bury the note.
+const MAX_PANEL_HEIGHT_FRACTION = 0.7;
+
+function clampPanelHeight(height: number): number {
+  const max =
+    typeof window !== "undefined"
+      ? Math.round(window.innerHeight * MAX_PANEL_HEIGHT_FRACTION)
+      : 600;
+  return Math.max(MIN_PANEL_HEIGHT_PX, Math.min(height, Math.max(max, MIN_PANEL_HEIGHT_PX)));
+}
+
+function loadStoredPanelHeight(): number | null {
+  if (typeof window === "undefined") return null;
+  const raw = window.localStorage.getItem(PANEL_HEIGHT_STORAGE_KEY);
+  if (!raw) return null;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? clampPanelHeight(n) : null;
+}
 
 function isNearBottom(el: HTMLDivElement): boolean {
   return (
@@ -252,11 +284,14 @@ export function TranscriptPanel({
   isLive,
   refreshKey = 0,
   headerActions,
+  captureState,
 }: TranscriptPanelProps) {
   const [chunks, setChunks] = useState<MeetingAudioChunk[]>([]);
   const [loading, setLoading] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [query, setQuery] = useState("");
+  const [searchOpen, setSearchOpen] = useState(false);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const [copied, setCopied] = useState(false);
   const [liveBlocks, setLiveBlocks] = useState<LiveTranscriptBlock[]>([]);
   const [liveStatus, setLiveStatus] = useState<LiveStreamingStatus | null>(
@@ -266,7 +301,97 @@ export function TranscriptPanel({
   const [isFollowingLive, setIsFollowingLive] = useState(true);
   const [hasUnseenLive, setHasUnseenLive] = useState(false);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  // User-dragged height in px (null = responsive default). Drag the top grip to
+  // shrink/grow the drawer so it takes less of the window.
+  const [panelHeight, setPanelHeight] = useState<number | null>(() =>
+    loadStoredPanelHeight(),
+  );
+  const [isResizing, setIsResizing] = useState(false);
+  const resizeStateRef = useRef<{ startY: number; startHeight: number } | null>(
+    null,
+  );
   const { health } = useHealthCheck();
+
+  const handleResizeMove = useCallback((e: PointerEvent) => {
+    const state = resizeStateRef.current;
+    if (!state) return;
+    // The drawer is docked above the control row and grows upward, so dragging
+    // the grip up (smaller clientY) makes it taller.
+    setPanelHeight(clampPanelHeight(state.startHeight + (state.startY - e.clientY)));
+  }, []);
+
+  const handleResizeEnd = useCallback(() => {
+    resizeStateRef.current = null;
+    setIsResizing(false);
+    window.removeEventListener("pointermove", handleResizeMove);
+    window.removeEventListener("pointerup", handleResizeEnd);
+    if (typeof document !== "undefined") {
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+    }
+    setPanelHeight((h) => {
+      if (h != null && typeof window !== "undefined") {
+        window.localStorage.setItem(PANEL_HEIGHT_STORAGE_KEY, String(h));
+      }
+      return h;
+    });
+  }, [handleResizeMove]);
+
+  const handleResizeStart = useCallback(
+    (e: React.PointerEvent) => {
+      e.preventDefault();
+      // First drag from the default class height: measure the rendered panel so
+      // resizing starts from where the eye sees it, not a guess.
+      const startHeight =
+        panelHeight ??
+        panelRef.current?.getBoundingClientRect().height ??
+        360;
+      resizeStateRef.current = { startY: e.clientY, startHeight };
+      setIsResizing(true);
+      window.addEventListener("pointermove", handleResizeMove);
+      window.addEventListener("pointerup", handleResizeEnd);
+      if (typeof document !== "undefined") {
+        document.body.style.userSelect = "none";
+        document.body.style.cursor = "ns-resize";
+      }
+    },
+    [panelHeight, handleResizeMove, handleResizeEnd],
+  );
+
+  const handleResizeReset = useCallback(() => {
+    setPanelHeight(null);
+    if (typeof window !== "undefined") {
+      window.localStorage.removeItem(PANEL_HEIGHT_STORAGE_KEY);
+    }
+  }, []);
+
+  const handleResizeKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
+      e.preventDefault();
+      const base =
+        panelHeight ??
+        panelRef.current?.getBoundingClientRect().height ??
+        360;
+      const step = e.shiftKey ? 40 : 16;
+      const next = clampPanelHeight(base + (e.key === "ArrowUp" ? step : -step));
+      setPanelHeight(next);
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem(PANEL_HEIGHT_STORAGE_KEY, String(next));
+      }
+    },
+    [panelHeight],
+  );
+
+  // Tear down window listeners if the panel unmounts mid-drag.
+  useEffect(
+    () => () => {
+      window.removeEventListener("pointermove", handleResizeMove);
+      window.removeEventListener("pointerup", handleResizeEnd);
+    },
+    [handleResizeMove, handleResizeEnd],
+  );
 
   // Time bounds for the meeting. Live meetings extend to "now" so newly
   // captured chunks are included on each refetch.
@@ -452,10 +577,44 @@ export function TranscriptPanel({
     const durableText = normalizeForDedupe(
       chunks.map((c) => c.transcription ?? "").join(" "),
     );
+    // Cross-device echo suppression. Without headphones the mic ("input"/"me")
+    // picks up the speaker output, so the remote's words arrive on BOTH the
+    // input stream and the clean system-audio ("output"/"speaker") stream.
+    // macOS VoiceProcessingIO AEC does not remove this (it has no downlink
+    // reference), and the engine's cross-device dedup only runs on the deferred
+    // durable path — so during a live meeting both copies reach the UI. The
+    // output capture is the clean source, so drop an input block when most of
+    // its words are covered by a nearby output block.
+    const ECHO_WINDOW_MS = 6000;
+    const outputBlocks = liveBlocks
+      .filter((b) => b.deviceType.toLowerCase() === "output")
+      .map((b) => ({
+        ts: timestampMs(b.capturedAt),
+        norm: normalizeForDedupe(b.text),
+      }));
+    const isInputEchoOfOutput = (
+      block: LiveTranscriptBlock,
+      normalized: string,
+    ) => {
+      if (block.deviceType.toLowerCase() !== "input") return false;
+      const ts = timestampMs(block.capturedAt);
+      const ref = new Set(
+        outputBlocks
+          .filter((o) => Math.abs(o.ts - ts) <= ECHO_WINDOW_MS)
+          .flatMap((o) => o.norm.split(" "))
+          .filter(Boolean),
+      );
+      if (ref.size === 0) return false;
+      const words = normalized.split(" ").filter(Boolean);
+      if (words.length === 0) return false;
+      const covered = words.filter((w) => ref.has(w)).length / words.length;
+      return covered >= 0.6;
+    };
     return liveBlocks.filter((block) => {
       const normalized = normalizeForDedupe(block.text);
       if (normalized.length < 24) return true;
-      return !durableText.includes(normalized.slice(0, 80));
+      if (durableText.includes(normalized.slice(0, 80))) return false;
+      return !isInputEchoOfOutput(block, normalized);
     });
   }, [chunks, liveBlocks]);
   const visibleLiveSpeakerBlocks = useMemo(
@@ -482,7 +641,7 @@ export function TranscriptPanel({
       .map((b) => `[${formatClock(b.startMs)}] ${b.speakerName}\n${b.text}`)
       .join("\n\n");
     try {
-      await navigator.clipboard.writeText(text);
+      await commands.copyTextToClipboard(text);
       setCopied(true);
       setTimeout(() => setCopied(false), 1500);
     } catch {
@@ -530,6 +689,37 @@ export function TranscriptPanel({
   }, [isOpen, meeting.id, query]);
 
   useEffect(() => {
+    if (searchOpen) {
+      searchInputRef.current?.focus();
+    }
+  }, [searchOpen]);
+
+  useEffect(() => {
+    if (!isOpen) {
+      setSearchOpen(false);
+      setQuery("");
+    }
+  }, [isOpen]);
+
+  // ⌘F / ctrl+F focuses transcript search while the panel is open — the
+  // webview has no native find bar, so the shortcut is unclaimed.
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.shiftKey || event.altKey) {
+        return;
+      }
+      if (event.key.toLowerCase() !== "f") return;
+      event.preventDefault();
+      setSearchOpen(true);
+      // Covers the already-open case; the searchOpen effect covers the rest.
+      requestAnimationFrame(() => searchInputRef.current?.focus());
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isOpen]);
+
+  useEffect(() => {
     if (!isOpen || !isLive || query.trim()) return;
     if (!isFollowingLive) {
       setHasUnseenLive(hasTranscriptContent);
@@ -555,9 +745,11 @@ export function TranscriptPanel({
       return `${liveErrorSummary(liveError)}. Background recording is still running.`;
     }
     if (chunks.length === 0 && visibleLiveBlocks.length === 0) {
-      return isLive
-        ? "no transcript captured yet — speak into your mic or wait a moment"
-        : "no transcript was captured for this meeting";
+      if (!isLive) return "no transcript was captured for this meeting";
+      return (
+        captureState?.transcriptEmptyCopy ??
+        "no transcript yet — audio can take a minute to appear; keep the meeting open"
+      );
     }
     if (filteredBlocks.length === 0 && query.trim()) {
       return `no matches for "${query.trim()}"`;
@@ -572,9 +764,13 @@ export function TranscriptPanel({
     loaded,
     isLive,
     liveError,
+    captureState,
   ]);
   const compactEmptyState =
     Boolean(emptyCopy) && !loading && !hasTranscriptContent;
+  // Honor the user-dragged height only once there's real content — the empty
+  // state stays compact (108px) so it isn't a tall blank box.
+  const useCustomHeight = isOpen && !compactEmptyState && panelHeight != null;
   const showSearch = displayBlocks.length > 0 || Boolean(query.trim());
   const showFollowButton =
     isLive && !query.trim() && hasTranscriptContent && !isFollowingLive;
@@ -595,22 +791,94 @@ export function TranscriptPanel({
           user can read transcript and edit the note simultaneously. Esc still
           closes via the keyboard handler below. */}
       <div
+        ref={panelRef}
         className={cn(
-          "mb-3 flex flex-col border border-border bg-background transition-all duration-200 ease-out",
+          "mb-3 flex flex-col border border-border bg-background",
+          // No transition while dragging so height tracks the pointer 1:1.
+          !isResizing && "transition-all duration-200 ease-out",
           !isOpen && "hidden",
+          isOpen && compactEmptyState && "min-h-[108px] translate-y-0 opacity-100",
           isOpen &&
-            (compactEmptyState
-              ? "min-h-[108px] translate-y-0 opacity-100"
-              : "h-[min(42vh,360px)] min-h-[220px] translate-y-0 opacity-100"),
+            !compactEmptyState &&
+            !useCustomHeight &&
+            "h-[min(42vh,360px)] min-h-[220px] translate-y-0 opacity-100",
+          isOpen &&
+            !compactEmptyState &&
+            useCustomHeight &&
+            "min-h-0 translate-y-0 opacity-100",
         )}
+        style={useCustomHeight ? { height: panelHeight ?? undefined } : undefined}
         aria-hidden={!isOpen}
         onKeyDown={(e) => {
           if (e.key === "Escape") onClose();
         }}
       >
-        <header className="flex items-center justify-end px-4 py-3 border-b border-border shrink-0">
-          <div className="flex items-center gap-1">
+        {!compactEmptyState && (
+          <div
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="resize transcript panel"
+            tabIndex={0}
+            title="drag to resize · double-click to reset"
+            onPointerDown={handleResizeStart}
+            onDoubleClick={handleResizeReset}
+            onKeyDown={handleResizeKeyDown}
+            className="group flex h-2.5 shrink-0 cursor-ns-resize touch-none items-center justify-center bg-background hover:bg-muted/60 focus:outline-none focus-visible:bg-muted/60"
+          >
+            <span className="h-0.5 w-8 rounded-full bg-border transition-colors group-hover:bg-muted-foreground/40" />
+          </div>
+        )}
+        <header className="flex items-center gap-2 px-4 py-1.5 border-b border-border shrink-0">
+          {showSearch && (searchOpen || Boolean(query.trim())) ? (
+            <input
+              ref={searchInputRef}
+              type="search"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  e.stopPropagation();
+                  setQuery("");
+                  setSearchOpen(false);
+                }
+              }}
+              placeholder="search transcript..."
+              className="min-w-0 flex-1 bg-transparent text-xs px-2 h-7 border border-input focus:outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
+            />
+          ) : (
+            <div className="flex-1" />
+          )}
+          {query.trim() && (
+            <span
+              className="shrink-0 text-[10px] tabular-nums text-muted-foreground"
+              title="matching segments"
+            >
+              {filteredBlocks.length}/{displayBlocks.length}
+            </span>
+          )}
+          <div className="flex items-center gap-1 shrink-0">
             {headerActions}
+            {showSearch && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => {
+                  setSearchOpen((prev) => {
+                    const next = !prev;
+                    if (!next) setQuery("");
+                    return next;
+                  });
+                }}
+                className={cn(
+                  "h-7 w-7 p-0",
+                  searchOpen && "bg-accent text-accent-foreground",
+                )}
+                title={searchOpen ? "hide search" : "search transcript (⌘F)"}
+                aria-pressed={searchOpen}
+              >
+                <Search className="h-3.5 w-3.5" />
+              </Button>
+            )}
             <Button
               variant="ghost"
               size="sm"
@@ -644,18 +912,6 @@ export function TranscriptPanel({
           </div>
         )}
 
-        {showSearch && (
-          <div className="px-4 py-2 border-b border-border shrink-0">
-            <input
-              type="search"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="search transcript..."
-              className="w-full bg-transparent text-xs px-2 py-1 border border-input focus:outline-none focus:ring-1 focus:ring-ring placeholder:text-muted-foreground/50"
-            />
-          </div>
-        )}
-
         <div className="relative min-h-0 flex-1">
           <div
             ref={containerRef}
@@ -673,12 +929,21 @@ export function TranscriptPanel({
             {emptyCopy && (
               <div
                 className={cn(
-                  "flex items-center px-4 text-xs text-muted-foreground",
+                  "flex items-center gap-3 px-4 text-xs text-muted-foreground",
                   compactEmptyState
                     ? "min-h-14 justify-start text-left"
                     : "min-h-full justify-center py-8 text-center",
                 )}
               >
+                {isLive &&
+                  !liveError &&
+                  chunks.length === 0 &&
+                  visibleLiveBlocks.length === 0 && (
+                    <ListeningSticks
+                      height={12}
+                      className="shrink-0 text-muted-foreground"
+                    />
+                  )}
                 <span>{emptyCopy}</span>
               </div>
             )}
@@ -689,6 +954,7 @@ export function TranscriptPanel({
                   <SpeakerParagraph
                     key={b.key}
                     block={b}
+                    query={query}
                     onSpeakerAssigned={refetch}
                   />
                 ))}
@@ -718,14 +984,17 @@ export function TranscriptPanel({
 
 function SpeakerParagraph({
   block,
+  query,
   onSpeakerAssigned,
 }: {
   block: SpeakerBlock;
+  query: string;
   onSpeakerAssigned: () => void;
 }) {
+  const [showPlayer, setShowPlayer] = useState(false);
   return (
     <li
-      className="px-4 py-2.5 hover:bg-muted/30 transition-colors"
+      className="group px-4 py-2.5 hover:bg-muted/30 transition-colors"
       style={{ contain: "layout paint" }}
     >
       <div className="flex items-baseline gap-2 mb-1">
@@ -755,10 +1024,63 @@ function SpeakerParagraph({
             {block.speakerName}
           </span>
         )}
+        <span
+          className="shrink-0 text-[10px] tabular-nums text-muted-foreground/60"
+          title={new Date(block.startMs).toLocaleString()}
+        >
+          {formatClock(block.startMs)}
+        </span>
+        {block.firstAudioFilePath && (
+          <button
+            type="button"
+            onClick={() => setShowPlayer((value) => !value)}
+            className={cn(
+              "ml-auto inline-flex h-5 w-5 shrink-0 items-center justify-center self-center transition-opacity",
+              "text-muted-foreground hover:text-foreground",
+              showPlayer
+                ? "opacity-100"
+                : "opacity-0 group-hover:opacity-100 focus-visible:opacity-100",
+            )}
+            title={showPlayer ? "hide audio" : "play this segment's audio"}
+            aria-label={showPlayer ? "hide audio" : "play this segment's audio"}
+            aria-expanded={showPlayer}
+          >
+            {showPlayer ? (
+              <X className="h-3 w-3" />
+            ) : (
+              <Play className="h-3 w-3" />
+            )}
+          </button>
+        )}
       </div>
       <p className="text-xs leading-relaxed text-foreground/90 whitespace-pre-wrap break-words">
-        {block.text}
+        <HighlightedText text={block.text} query={query} />
       </p>
+      {showPlayer && block.firstAudioFilePath && (
+        <div className="mt-2">
+          <MediaComponent filePath={block.firstAudioFilePath} />
+        </div>
+      )}
     </li>
+  );
+}
+
+/** Body text with case-insensitive `<mark>` runs over search matches. */
+function HighlightedText({ text, query }: { text: string; query: string }) {
+  const runs = useMemo(() => splitForHighlight(text, query), [text, query]);
+  if (runs.length === 1 && !runs[0].match) return <>{runs[0].text}</>;
+  return (
+    <>
+      {runs.map((run, index) =>
+        run.match ? (
+          // Grayscale inversion, not yellow — per the design system.
+          <mark key={index} className="bg-foreground text-background">
+            {run.text}
+          </mark>
+        ) : (
+          <React.Fragment key={index}>{run.text}</React.Fragment>
+        ),
+      )}
+    </>
   );
 }

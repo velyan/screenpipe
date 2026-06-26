@@ -29,6 +29,67 @@ pub fn finalize_webview_window(window: tauri::WebviewWindow) -> tauri::WebviewWi
     window
 }
 
+/// Make the live app match the enterprise hidden-UI policy.
+///
+/// The startup window gate (`main.rs`) already honors `is_app_ui_hidden()` —
+/// but only when the policy is known *before* windows are created (env var or a
+/// bundled `enterprise.json`). When the admin flips "hide app" in the workspace
+/// policy, it reaches the device on the frontend's 5-minute poll and is pushed
+/// to Rust via `set_enterprise_policy` — long after the Home/Onboarding window
+/// has already been shown. `show()` then refuses *new* windows, but nothing
+/// retracts the ones already on screen, so the UI stayed visible.
+///
+/// This reconciles the running session with the current policy:
+///   * hidden  → order every user-facing window off-screen (so nothing is left
+///     visible) and drop the dock icon (macOS Accessory), then rebuild the tray
+///     so its "open app" entries disappear.
+///   * visible → restore the normal activation policy + full tray menu; windows
+///     reopen on demand via the tray/shortcut.
+///
+/// Permission-recovery is intentionally never hidden — a managed background
+/// device may still need the macOS permission flow to surface.
+///
+/// Windows are *hidden* (orderOut / `hide()`), never closed: closing the
+/// class-swizzled NSPanels (main/chat/search) risks a use-after-free SIGSEGV
+/// (see the close path in `show.rs`), and hiding keeps the webviews warm for a
+/// later policy reversal.
+pub fn enforce_enterprise_ui_visibility(app: &tauri::AppHandle) {
+    use tauri::Manager;
+
+    let hidden = crate::enterprise_policy::is_app_ui_hidden();
+
+    // The enterprise policy hook calls this on every 5-min poll. Only do work
+    // on an actual transition — otherwise we'd hide-already-hidden windows and
+    // (worse) rebuild the tray every poll, flickering the menu-bar icon.
+    // -1 = unknown (first call), 0 = visible, 1 = hidden.
+    static LAST_APPLIED: std::sync::atomic::AtomicI8 = std::sync::atomic::AtomicI8::new(-1);
+    let next = if hidden { 1 } else { 0 };
+    if LAST_APPLIED.swap(next, std::sync::atomic::Ordering::SeqCst) == next {
+        return;
+    }
+
+    if hidden {
+        let recovery = show::RewindWindowId::PermissionRecovery.label();
+        for (label, window) in app.webview_windows() {
+            if label.as_str() == recovery {
+                continue;
+            }
+            let _ = window.hide();
+        }
+        #[cfg(target_os = "macos")]
+        panel::MAIN_PANEL_SHOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+        tracing::info!("enterprise: hidden-UI policy enforced — app windows hidden");
+    }
+
+    // Always re-apply the activation policy + tray so a policy change in EITHER
+    // direction is reflected immediately (Accessory+minimal tray when hidden,
+    // Regular+full tray when not).
+    #[cfg(target_os = "macos")]
+    panel::reset_to_regular_and_refresh_tray(app);
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    crate::tray::recreate_tray(app);
+}
+
 // These re-exports preserve the original public API surface. Some are only
 // consumed inside the `window` sub-modules (via `super::`) but external
 // callers (commands.rs, space_monitor.rs, etc.) may also reference them.

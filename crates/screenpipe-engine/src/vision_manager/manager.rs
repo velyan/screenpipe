@@ -16,8 +16,10 @@ use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::event_driven_capture::{CaptureTrigger, TriggerSender};
+use crate::event_driven_capture::{CaptureTriggerMsg, TriggerSender};
 use crate::focus_aware_controller::FocusAwareController;
+use crate::frame_linker_actor::{linker_channel, spawn_frame_linker, LinkerSender};
+use crate::high_fps_controller::HighFpsController;
 use crate::hot_frame_cache::HotFrameCache;
 use crate::power::PowerProfile;
 
@@ -27,6 +29,7 @@ pub struct VisionManagerConfig {
     pub output_path: String,
     pub ignored_windows: Vec<String>,
     pub included_windows: Vec<String>,
+    pub ignored_urls: Vec<String>,
     pub vision_metrics: Arc<PipelineMetrics>,
     pub use_pii_removal: bool,
     /// Stable IDs of monitors the user selected for recording (e.g. "MSI G271_1920x1080_2002,-1080").
@@ -44,6 +47,19 @@ pub struct VisionManagerConfig {
     /// snapshot max width via `screenpipe_core::video::*`. Values: "low",
     /// "balanced" (default), "high", "max".
     pub video_quality: String,
+
+    /// Mitsukeru fork: overrides for `EventDrivenCaptureConfig`.
+    /// Each field is applied only when `Some(_)`. None = follow active PowerProfile.
+    pub idle_capture_interval_ms: Option<u64>,
+    pub visual_check_interval_ms: Option<u64>,
+    pub visual_change_threshold: Option<f64>,
+    pub min_capture_interval_ms: Option<u64>,
+    /// Override `EventDrivenCaptureConfig::capture_on_keystroke`.
+    /// None = engine default (false). PowerProfile does not touch this.
+    pub capture_on_keystroke: Option<bool>,
+    /// Override `EventDrivenCaptureConfig::capture_on_clipboard`.
+    /// None = engine default (false). PowerProfile does not touch this.
+    pub capture_on_clipboard: Option<bool>,
 }
 
 /// Status of the VisionManager
@@ -62,9 +78,21 @@ pub struct VisionManager {
     status: Arc<RwLock<VisionManagerStatus>>,
     /// Map of monitor_id -> JoinHandle
     recording_tasks: Arc<DashMap<u32, JoinHandle<()>>>,
+    /// Map of monitor_id -> high-fps HD recorder JoinHandle. Spawned alongside
+    /// each capture loop; idles until an HD session is active. Aborted in
+    /// `stop_monitor` (ffmpeg self-finalizes on stdin EOF).
+    hd_recording_tasks: Arc<DashMap<u32, JoinHandle<()>>>,
     /// Broadcast sender for capture triggers — shared with UI recorder.
     /// Each monitor subscribes via `trigger_tx.subscribe()`.
     trigger_tx: TriggerSender,
+    /// Sender for the frame-linker actor — shared with UI recorder and
+    /// each event-driven capture loop. The recorder forwards
+    /// `EventPersisted` after batch flush; the capture loop forwards
+    /// `FrameCaptured` after each successful capture; the actor pairs
+    /// them and applies `UPDATE ui_events SET frame_id` writes.
+    linker_tx: LinkerSender,
+    /// Stop flag for the linker actor task.
+    linker_stop: Arc<AtomicBool>,
     /// Hot frame cache — capture pushes frames here for zero-DB timeline reads.
     hot_frame_cache: Option<Arc<HotFrameCache>>,
     /// Power profile receiver — each monitor gets a clone.
@@ -75,6 +103,15 @@ pub struct VisionManager {
     /// controller report Active for all monitors, preserving the pre-feature
     /// behaviour for those users.
     focus_controller: Arc<FocusAwareController>,
+    /// Shared runtime control for the HD-recording override (bound
+    /// sessions only — see `HighFpsController`). `None` means the
+    /// feature is unavailable on this engine (e.g. vision-only build
+    /// with no detector / no AppState route surface). Each capture loop
+    /// polls `snapshot()` once per tick.
+    high_fps_controller: Option<Arc<HighFpsController>>,
+    /// Set when the user's monitor allowlist matched zero connected displays and
+    /// we fell back to recording every monitor. Clears the filter for hot-plug too.
+    stale_allowlist_fallback: Arc<AtomicBool>,
 }
 
 impl VisionManager {
@@ -85,7 +122,20 @@ impl VisionManager {
         vision_handle: Handle,
     ) -> Self {
         // Single broadcast channel shared across all monitors + UI recorder.
-        let (trigger_tx, _rx) = tokio::sync::broadcast::channel::<CaptureTrigger>(64);
+        let (trigger_tx, _rx) = tokio::sync::broadcast::channel::<CaptureTriggerMsg>(
+            crate::event_driven_capture::TRIGGER_CHANNEL_BUFFER,
+        );
+
+        // Frame-linker actor: pairs UI events with the frames they
+        // caused us to capture. Single shared instance across all
+        // monitors and the UI recorder. Lives as long as the
+        // VisionManager.
+        let (linker_tx, linker_rx) = linker_channel();
+        let linker_stop = Arc::new(AtomicBool::new(false));
+        {
+            let _guard = vision_handle.enter();
+            spawn_frame_linker(db.clone(), linker_rx, linker_stop.clone());
+        }
 
         // Focus-aware capture is always on. `new_tracker()` always succeeds —
         // returns a null tracker on platforms without a native impl. Controller
@@ -104,16 +154,23 @@ impl VisionManager {
             vision_handle,
             status: Arc::new(RwLock::new(VisionManagerStatus::Stopped)),
             recording_tasks: Arc::new(DashMap::new()),
+            hd_recording_tasks: Arc::new(DashMap::new()),
             trigger_tx,
+            linker_tx,
+            linker_stop,
             hot_frame_cache: None,
             power_profile_rx: None,
             focus_controller,
+            high_fps_controller: None,
+            stale_allowlist_fallback: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Set the hot frame cache so captures push frames into it.
-    pub fn with_hot_frame_cache(mut self, cache: Arc<HotFrameCache>) -> Self {
-        self.hot_frame_cache = Some(cache);
+    /// Set the hot frame cache so captures push frames into it. Pass `None` to
+    /// disable frame buffering (e.g. when the timeline feature is disabled — the
+    /// hot cache is only consumed by the timeline streaming endpoint).
+    pub fn with_hot_frame_cache(mut self, cache: Option<Arc<HotFrameCache>>) -> Self {
+        self.hot_frame_cache = cache;
         self
     }
 
@@ -123,10 +180,25 @@ impl VisionManager {
         self
     }
 
+    /// Wire the shared high-FPS controller so capture loops can react to
+    /// manual toggles and meeting-detected transitions at runtime.
+    pub fn with_high_fps_controller(mut self, controller: Arc<HighFpsController>) -> Self {
+        self.high_fps_controller = Some(controller);
+        self
+    }
+
     /// Get a clone of the broadcast trigger sender.
     /// Pass this to `start_ui_recording()` so UI events trigger captures.
     pub fn trigger_sender(&self) -> TriggerSender {
         self.trigger_tx.clone()
+    }
+
+    /// Get a clone of the frame-linker sender. Pass this to
+    /// `start_ui_recording()` and the event-driven capture loops so
+    /// they can report `EventPersisted` and `FrameCaptured` for
+    /// pairing.
+    pub fn linker_sender(&self) -> LinkerSender {
+        self.linker_tx.clone()
     }
 
     /// Get current status
@@ -134,10 +206,24 @@ impl VisionManager {
         *self.status.read().await
     }
 
+    /// Shared capture-pipeline metrics. The monitor watcher's silent-wedge
+    /// watchdog reads this to tell a real stall (attempts firing but nothing
+    /// persisted) apart from a healthy static screen (which still ticks
+    /// `last_db_write_ts` via dedup-skip). Mirrors what /health reports.
+    pub fn vision_metrics(&self) -> &Arc<PipelineMetrics> {
+        &self.config.vision_metrics
+    }
+
     /// Check whether a monitor is allowed by the user's monitor filter settings.
     /// Uses prefix matching (name + resolution) so that position changes after
     /// reconnect don't break the filter.
     pub fn is_monitor_allowed(&self, monitor: &screenpipe_screen::monitor::SafeMonitor) -> bool {
+        if self
+            .stale_allowlist_fallback
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return true;
+        }
         if self.config.use_all_monitors || self.config.monitor_ids.is_empty() {
             return true;
         }
@@ -189,7 +275,36 @@ impl VisionManager {
             }
         }
 
-        let task_count = self.recording_tasks.len();
+        let mut task_count = self.recording_tasks.len();
+        if task_count == 0 && total_monitors > 0 && !self.config.use_all_monitors {
+            warn!(
+                "VisionManager: allowlist {:?} matched 0/{} display(s) — \
+                 falling back to all connected monitors (stale monitor_ids?)",
+                self.config.monitor_ids, total_monitors
+            );
+            self.stale_allowlist_fallback
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            for monitor in list_monitors().await {
+                let monitor_id = monitor.id();
+                if let Err(e) = self.start_monitor(monitor_id).await {
+                    warn!(
+                        "Failed to start recording on monitor {} during stale-id fallback: {:?}",
+                        monitor_id, e
+                    );
+                }
+            }
+            task_count = self.recording_tasks.len();
+            if task_count > 0 {
+                info!(
+                    "VisionManager started via stale monitor_ids fallback ({}/{} monitor(s))",
+                    task_count, total_monitors
+                );
+                return Ok(());
+            }
+            self.stale_allowlist_fallback
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+
         if task_count == 0 {
             // Roll status back so the next .start() attempt isn't blocked by the
             // idempotency guard above.
@@ -318,11 +433,22 @@ impl VisionManager {
             .as_ref()
             .map(|rx| rx.borrow().jpeg_quality.min(baseline_q))
             .unwrap_or(baseline_q);
+        let max_snapshot_width = video_quality_to_max_snapshot_width(&self.config.video_quality);
         let snapshot_writer = Arc::new(SnapshotWriter::new(
             format!("{}/data", output_path),
             initial_jpeg_quality,
-            video_quality_to_max_snapshot_width(&self.config.video_quality),
+            max_snapshot_width,
         ));
+
+        // Cap the macOS SCK capture stream to the same width as the snapshot
+        // writer. The GPU downscales before replayd delivers the framebuffer,
+        // saving WindowServer composite + readback cost without affecting
+        // anything that wasn't going to be downsized in user space anyway.
+        // Text extraction is primarily a11y-tree-driven (unchanged) and OCR
+        // runs only as a fallback; both see the same image they'd see after
+        // the snapshot-writer downscale.
+        #[cfg(target_os = "macos")]
+        screenpipe_screen::monitor::set_sck_capture_max_width(max_snapshot_width);
 
         // Create activity feed for this monitor
         let activity_feed = ActivityFeed::new();
@@ -333,6 +459,7 @@ impl VisionManager {
         let tree_walker_config = TreeWalkerConfig {
             ignored_windows: self.config.ignored_windows.clone(),
             included_windows: self.config.included_windows.clone(),
+            ignored_urls: self.config.ignored_urls.clone(),
             monitor_x: monitor.x() as f64,
             monitor_y: monitor.y() as f64,
             monitor_width: monitor.width() as f64,
@@ -344,10 +471,34 @@ impl VisionManager {
         // Event-driven capture config — seed jpeg_quality from the user's
         // chosen videoQuality so power-profile updates can use it as the
         // baseline ceiling (`min(profile, baseline)`) at runtime.
-        let capture_config = EventDrivenCaptureConfig {
+        let mut capture_config = EventDrivenCaptureConfig {
             jpeg_quality: baseline_q,
             ..EventDrivenCaptureConfig::default()
         };
+        // Mitsukeru fork: apply per-parameter CLI / settings overrides if any.
+        // These force the value regardless of the active PowerProfile.
+        // Carry the user's explicit idle override as a *pin* as well as the
+        // live value, so a runtime PowerProfile transition can't relax the
+        // guaranteed capture floor back to the profile's (much larger) value.
+        capture_config.idle_capture_interval_override_ms = self.config.idle_capture_interval_ms;
+        if let Some(v) = self.config.idle_capture_interval_ms {
+            capture_config.idle_capture_interval_ms = v;
+        }
+        if let Some(v) = self.config.visual_check_interval_ms {
+            capture_config.visual_check_interval_ms = v;
+        }
+        if let Some(v) = self.config.visual_change_threshold {
+            capture_config.visual_change_threshold = v;
+        }
+        if let Some(v) = self.config.min_capture_interval_ms {
+            capture_config.min_capture_interval_ms = v;
+        }
+        if let Some(v) = self.config.capture_on_keystroke {
+            capture_config.capture_on_keystroke = v;
+        }
+        if let Some(v) = self.config.capture_on_clipboard {
+            capture_config.capture_on_clipboard = v;
+        }
 
         // Subscribe to the shared broadcast channel so UI events reach this monitor
         let trigger_rx = self.trigger_tx.subscribe();
@@ -363,6 +514,34 @@ impl VisionManager {
         let languages = self.config.languages.clone();
         let power_profile_rx = self.power_profile_rx.clone();
         let focus_controller = self.focus_controller.clone();
+        let linker_tx = Some(self.linker_tx.clone());
+        let high_fps_controller = self.high_fps_controller.clone();
+
+        // Spawn the decoupled high-fps HD recorder alongside this monitor's
+        // capture loop. It idles until an HD session is active, then records a
+        // CFR H.264 chunk with NO OCR (the event loop above keeps indexing
+        // sparsely). Shares the same Arc<SafeMonitor> + HighFpsController; runs
+        // on its own task, aborted in `stop_monitor`.
+        {
+            let hd_config = crate::hd_recorder::HdRecorderConfig {
+                ignored_windows: self.config.ignored_windows.clone(),
+                included_windows: self.config.included_windows.clone(),
+                ignored_urls: self.config.ignored_urls.clone(),
+            };
+            let hd_handle = self
+                .vision_handle
+                .spawn(crate::hd_recorder::hd_recorder_loop(
+                    self.db.clone(),
+                    monitor.clone(),
+                    monitor_id,
+                    device_name.clone(),
+                    std::path::PathBuf::from(format!("{}/data", output_path)),
+                    hd_config,
+                    Arc::new(AtomicBool::new(false)),
+                    high_fps_controller.clone(),
+                ));
+            self.hd_recording_tasks.insert(monitor_id, hd_handle);
+        }
 
         info!(
             "Starting event-driven capture for monitor {} (device: {})",
@@ -390,6 +569,8 @@ impl VisionManager {
                 languages,
                 power_profile_rx,
                 focus_controller,
+                linker_tx,
+                high_fps_controller,
             )
             .await
             {
@@ -406,6 +587,11 @@ impl VisionManager {
 
     /// Stop recording on a specific monitor
     pub async fn stop_monitor(&self, monitor_id: u32) -> Result<()> {
+        // Stop the HD recorder first. Aborting drops its ffmpeg stdin, which
+        // sends EOF so ffmpeg finalizes the .mp4 (moov atom) on its own.
+        if let Some((_, hd_handle)) = self.hd_recording_tasks.remove(&monitor_id) {
+            hd_handle.abort();
+        }
         if let Some((_, handle)) = self.recording_tasks.remove(&monitor_id) {
             info!("Stopping vision recording for monitor {}", monitor_id);
 
@@ -474,6 +660,11 @@ impl VisionManager {
     /// Shutdown the VisionManager
     pub async fn shutdown(&self) -> Result<()> {
         info!("Shutting down VisionManager");
+        // Signal the frame-linker actor to stop. Drops of the cloned
+        // senders held by recorder/capture loops will also close the
+        // channel; either path exits the actor cleanly.
+        self.linker_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.stop().await
     }
 }
@@ -495,6 +686,7 @@ mod tests {
             output_path: std::env::temp_dir().to_string_lossy().into_owned(),
             ignored_windows: vec![],
             included_windows: vec![],
+            ignored_urls: vec![],
             vision_metrics: Arc::new(PipelineMetrics::default()),
             use_pii_removal: false,
             monitor_ids,
@@ -503,45 +695,62 @@ mod tests {
             pause_on_drm_content: false,
             languages: vec![Language::English],
             video_quality: "balanced".to_string(),
+            idle_capture_interval_ms: None,
+            visual_check_interval_ms: None,
+            visual_change_threshold: None,
+            min_capture_interval_ms: None,
+            capture_on_keystroke: None,
+            capture_on_clipboard: None,
         };
         VisionManager::new(config, db, Handle::current())
     }
 
-    /// Regression: with an allowlist that matches zero physical monitors,
-    /// `start()` must return `Err` and leave status as `Stopped`, so the
-    /// outer `CaptureSession::start` stays None and the tray can retry.
-    ///
-    /// Before the fix: `start()` returned `Ok(())` silently with zero tasks,
-    /// and the outer detached spawn swallowed the no-op — leaving a "dead"
-    /// `CaptureSession` parked in `RecordingState.capture`. Every subsequent
-    /// tray click then hit the `is_some()` short-circuit in `recording.rs`.
+    /// When the allowlist is stale but physical monitors exist, fall back to
+    /// recording all connected displays instead of failing capture start.
     #[tokio::test]
-    async fn start_with_no_allowed_monitors_returns_err() {
-        // A stable_id prefix that cannot exist on any real host.
+    async fn start_with_stale_allowlist_falls_back_to_all_monitors() {
+        let monitors = list_monitors().await;
+        if monitors.is_empty() {
+            // Headless CI — nothing to fall back to.
+            return;
+        }
+
+        let stale = vec!["Display 999_9999x9999_0,0".to_string()];
+        let vm = make_vm_with_monitor_ids(stale).await;
+
+        vm.start()
+            .await
+            .expect("expected Ok via stale-id fallback when monitors exist");
+
+        assert!(
+            !vm.recording_tasks.is_empty(),
+            "fallback should start at least one monitor task"
+        );
+        assert_eq!(vm.status().await, VisionManagerStatus::Running);
+
+        vm.stop().await.expect("stop after fallback start");
+    }
+
+    /// With zero physical monitors, a stale allowlist still fails cleanly.
+    #[tokio::test]
+    async fn start_with_no_connected_monitors_returns_err() {
+        let monitors = list_monitors().await;
+        if !monitors.is_empty() {
+            // Needs a headless environment — skip on dev machines with displays.
+            return;
+        }
+
         let stale = vec!["Display 999_9999x9999_0,0".to_string()];
         let vm = make_vm_with_monitor_ids(stale).await;
 
         let result = vm.start().await;
         assert!(
             result.is_err(),
-            "expected Err when allowlist matches zero monitors, got: {:?}",
+            "expected Err when no monitors are connected, got: {:?}",
             result
         );
-
-        // Status must be rolled back to Stopped so a subsequent retry
-        // (with a corrected allowlist) isn't blocked by the idempotency guard.
-        assert_eq!(
-            vm.status().await,
-            VisionManagerStatus::Stopped,
-            "status must be rolled back to Stopped on Err, otherwise retry is blocked"
-        );
-
-        // Recording tasks map must stay empty — nothing was spawned.
-        assert_eq!(
-            vm.recording_tasks.len(),
-            0,
-            "no tasks should exist after failed start"
-        );
+        assert_eq!(vm.status().await, VisionManagerStatus::Stopped);
+        assert_eq!(vm.recording_tasks.len(), 0);
     }
 
     /// Verify that stop_monitor completes promptly when the task finishes normally.

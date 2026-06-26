@@ -19,8 +19,10 @@ import { getStartDate } from "@/lib/actions/get-start-date";
 import { useTimelineData } from "@/lib/hooks/use-timeline-data";
 import { useCurrentFrame } from "@/lib/hooks/use-current-frame";
 import { TimelineSlider } from "@/components/rewind/timeline/timeline";
+import { SearchResultStrip } from "@/components/rewind/search-result-strip";
 import { useMeetings } from "@/lib/hooks/use-meetings";
 import { useTimelineStore } from "@/lib/hooks/use-timeline-store";
+import { shiftIndexForPrependedFrames } from "@/lib/hooks/timeline-live-edge";
 import { findNearestDateWithFrames } from "@/lib/actions/has-frames-date";
 import { CurrentFrameTimeline } from "@/components/rewind/current-frame-timeline";
 import { useSearchHighlight } from "@/lib/hooks/use-search-highlight";
@@ -33,7 +35,6 @@ import { usePipes, type TemplatePipe } from "@/lib/hooks/use-pipes";
 
 import posthog from "posthog-js";
 import { toast } from "@/components/ui/use-toast";
-import { DailySummaryCard } from "@/components/rewind/daily-summary";
 import { useTimelineFilters } from "@/components/rewind/hooks/use-timeline-filters";
 import { useScrollZoom } from "@/components/rewind/hooks/use-scroll-zoom";
 import { useDateNavigation } from "@/components/rewind/hooks/use-date-navigation";
@@ -60,7 +61,10 @@ export interface DeviceMetadata {
 	file_path: string;
 	app_name: string;
 	window_name: string;
-	ocr_text: string;
+	/** Frame text (accessibility-derived for most captures, OCR fallback). */
+	text: string;
+	/** @deprecated Legacy alias for `text`; the server still sends it but read `text`. */
+	ocr_text?: string;
 	timestamp: string;
 	browser_url?: string;
 }
@@ -86,65 +90,6 @@ export interface TimeRange {
 const easeOutCubic = (x: number): number => {
 	return 1 - Math.pow(1 - x, 3);
 };
-
-// Tiny dot-strip showing all search-result positions; click to jump.
-// Each result is a small bar; the active one is bright yellow with a glow.
-// Renders nothing for ≤1 result (the counter alone is sufficient).
-function SearchResultStrip({
-	resultsLength,
-	activeIndex,
-	onJump,
-}: {
-	resultsLength: number;
-	activeIndex: number;
-	onJump: (index: number) => void;
-}) {
-	if (resultsLength <= 1) return null;
-	const stripWidth = 110;
-	const stripHeight = 14;
-	const denom = Math.max(1, resultsLength - 1);
-	return (
-		<div
-			className="relative shrink-0"
-			style={{ width: stripWidth, height: stripHeight }}
-			role="slider"
-			aria-label="Search result position"
-			aria-valuemin={1}
-			aria-valuemax={resultsLength}
-			aria-valuenow={activeIndex + 1}
-		>
-			<div className="absolute left-0 right-0 top-1/2 -translate-y-1/2 h-px bg-white/15" />
-			{Array.from({ length: resultsLength }).map((_, i) => {
-				const isActive = i === activeIndex;
-				const x = (i / denom) * stripWidth;
-				return (
-					<button
-						key={i}
-						type="button"
-						onClick={() => onJump(i)}
-						className="absolute top-1/2 cursor-pointer focus:outline-none"
-						style={{
-							left: x - (isActive ? 2 : 1),
-							width: isActive ? 4 : 2,
-							height: isActive ? 10 : 5,
-							transform: "translateY(-50%)",
-							borderRadius: 1.5,
-							backgroundColor: isActive
-								? "rgb(250, 204, 21)"
-								: "rgba(255, 255, 255, 0.45)",
-							boxShadow: isActive
-								? "0 0 5px rgba(250, 204, 21, 0.7)"
-								: "none",
-							transition: "all 120ms ease-out",
-							zIndex: isActive ? 2 : 1,
-						}}
-						title={`Match ${i + 1}`}
-					/>
-				);
-			})}
-		</div>
-	);
-}
 
 export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 	const { isMac } = usePlatform();
@@ -360,17 +305,47 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 		showSearchModal,
 	});
 
-	// Track if user is at "live edge" (viewing newest frame, index 0)
-	const isAtLiveEdge = currentIndex === 0;
-	const prevFramesLengthRef = useRef(frames.length);
+	// When new frames stream in (live recording), they're prepended at the
+	// front (newest-first), shifting every already-loaded frame to a higher
+	// index. Keep currentIndex pointing at the same frame the user is viewing
+	// by shifting it forward by the number of frames added at the front — a
+	// no-op at the live edge (index 0), where we stay pinned to the newest.
+	//
+	// Subscribe directly to the store (not via reactive state) so we don't
+	// re-render the whole timeline on every flush. Read the live index via the
+	// functional setState updater (prev) and gate on lastFlushTimestamp so each
+	// flush is processed exactly once.
+	//
+	// IMPORTANT: do NOT gate this on a React ref tracking frames.length. Store
+	// subscribers fire synchronously inside set(), BEFORE React re-renders, so
+	// such a ref is one flush stale and silently drops the first shift — which
+	// desyncs currentIndex below currentFrame and makes ArrowRight die early at
+	// index 0 (the original "stuck going right after ~5 moves" bug). The shift
+	// math lives in shiftIndexForPrependedFrames so it can be unit-tested; see
+	// lib/hooks/__tests__/timeline-live-edge-shift.test.ts.
+	//
+	// LIVE-EDGE AUTO-FOLLOW: when the user is parked on the newest frame (index
+	// 0) and isn't doing anything else, advance the *displayed* frame to the new
+	// newest as it streams in — otherwise the image freezes on an old frame
+	// while the scrubber grows (the "I came back and it was stuck until I hit
+	// refresh" report). Gated below so it never fights manual scrubbing,
+	// playback, seeking, navigation, or search review. Frame loads are debounced
+	// (use-frame-loading), so following sparse live frames is cheap.
+	const liveFollowBlockedRef = useRef(false);
+	useEffect(() => {
+		liveFollowBlockedRef.current =
+			isPlaying || !!seekingTimestamp || searchNavFrame || inSearchReviewMode;
+	}, [isPlaying, seekingTimestamp, searchNavFrame, inSearchReviewMode]);
 
-	// When new frames arrive and user is NOT at live edge, adjust index to stay on same frame.
-	// Subscribe directly to the store instead of via reactive state to avoid re-rendering the
-	// entire timeline component every 150ms when lastFlushTimestamp changes.
+	// Mirror currentIndex into a ref so the store subscriber (which runs
+	// synchronously inside set(), before render) can read the user's current
+	// position. We CANNOT read this from inside the setCurrentIndex updater
+	// because React defers functional updaters until render — a value captured
+	// there is not yet set when the subscriber needs it.
 	const currentIndexRef = useRef(currentIndex);
-	currentIndexRef.current = currentIndex;
-	const framesLengthRef = useRef(frames.length);
-	framesLengthRef.current = frames.length;
+	useEffect(() => {
+		currentIndexRef.current = currentIndex;
+	}, [currentIndex]);
 
 	useEffect(() => {
 		let prevTs = 0;
@@ -379,15 +354,28 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 			if (lastFlushTimestamp === prevTs) return;
 			prevTs = lastFlushTimestamp;
 
-			if (newFramesCount > 0 && currentIndexRef.current !== 0 && framesLengthRef.current > prevFramesLengthRef.current) {
-				setCurrentIndex(prev => prev + newFramesCount);
-			}
-			prevFramesLengthRef.current = framesLengthRef.current;
 			if (newFramesCount > 0) {
+				// Was the user parked on the newest frame (live edge) as of the last
+				// render? Read from the ref, not from inside the updater below.
+				const wasAtLiveEdge = currentIndexRef.current === 0;
+
+				setCurrentIndex((prev) => shiftIndexForPrependedFrames(prev, newFramesCount));
+
+				if (
+					wasAtLiveEdge &&
+					!liveFollowBlockedRef.current &&
+					!isNavigatingRef.current &&
+					!pendingNavigationRef.current
+				) {
+					// state is the post-flush snapshot, so frames[0] is the new newest.
+					const newest = state.frames[0];
+					if (newest) setCurrentFrame(newest);
+				}
+
 				clearNewFramesCount();
 			}
 		});
-	}, [clearNewFramesCount]);
+	}, [clearNewFramesCount, setCurrentFrame]);
 
 	// Listen for window focus events to refresh timeline data (debounced)
 	useEffect(() => {
@@ -518,13 +506,37 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 		const targetDate = new Date(targetTimestamp);
 		if (isNaN(targetDate.getTime())) return;
 
+		// Pause playback so the jump settles on a still moment. Preserves the
+		// prior cross-day behavior (handleDateChange paused; navigateDirectToDate
+		// does not). resetFilters still runs via the pending-navigation effect.
+		pausePlayback();
 		setSeekingTimestamp(targetTimestamp);
 		pendingNavigationRef.current = targetDate;
 
-		if (!isSameDay(targetDate, currentDate)) {
-			await handleDateChange(targetDate);
+		// Same-day with the day's frames already loaded: jump in place instantly.
+		// The "process pending navigation" effect only re-runs when frames/
+		// currentDate change, so without this fast path a same-day jump (the
+		// common case: searching today while viewing today) never moves.
+		if (isSameDay(targetDate, currentDate)) {
+			const hasTargetDayFrames = frames.some((f) =>
+				isSameDay(new Date(f.timestamp), targetDate)
+			);
+			if (hasTargetDayFrames) {
+				jumpToTime(targetDate);
+				pendingNavigationRef.current = null;
+				setSeekingTimestamp(null);
+				return;
+			}
 		}
-	}, [currentDate]); // eslint-disable-line react-hooks/exhaustive-deps
+
+		// Cross-day, or same-day with stale/empty frames (e.g. the window was
+		// hidden): fetch around the exact moment and let the pending-navigation
+		// effect jump once frames arrive. Use navigateDirectToDate, not
+		// handleDateChange — the latter overwrites pendingNavigationRef with the
+		// nearest *day* (local midnight), landing the jump at the start of the
+		// day instead of the captured moment.
+		await navigateDirectToDate(targetDate);
+	}, [currentDate, frames, jumpToTime, navigateDirectToDate, pausePlayback]); // eslint-disable-line react-hooks/exhaustive-deps
 
 	// Listen for navigate-to-timestamp events from search window / deep links
 	useEffect(() => {
@@ -749,12 +761,13 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 			contextParts.push(`Apps: ${Array.from(apps).join(", ")}`);
 		}
 
-		// Add sample OCR text (first few frames)
+		// Add sample frame text (first few frames)
 		const ocrSamples: string[] = [];
 		selectedFrames.slice(0, 3).forEach((frame) => {
 			frame.devices.forEach((device) => {
-				if (device.metadata.ocr_text && device.metadata.ocr_text.length > 0) {
-					const sample = device.metadata.ocr_text.slice(0, 200);
+				const frameText = device.metadata.text ?? device.metadata.ocr_text;
+				if (frameText && frameText.length > 0) {
+					const sample = frameText.slice(0, 200);
 					if (sample.trim()) {
 						ocrSamples.push(sample);
 					}
@@ -1047,6 +1060,34 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 
 	// The same Timeline component is used in both overlay and window mode.
 	// The window sizing/decoration is handled by Rust (window_api.rs).
+
+	// Timeline disabled by the user: render a lightweight placeholder and never
+	// mount CurrentFrameTimeline (which attaches the native Live Text overlay).
+	// This both honors the setting and prevents the VisionKit overlay from
+	// leaking a native selection layer over other windows (e.g. the chat input).
+	if (settings?.disableTimeline === true) {
+		return (
+			<div
+				className="inset-0 flex flex-col items-center justify-center text-foreground relative bg-background"
+				data-testid="section-timeline-disabled"
+				style={{ height: embedded ? "100%" : "100vh" }}
+			>
+				<div className="text-center p-8 max-w-md">
+					<div className="mx-auto mb-6 w-16 h-16 rounded-full bg-muted/50 border border-border flex items-center justify-center">
+						<MonitorOff className="w-8 h-8 text-muted-foreground" />
+					</div>
+					<h3 className="text-lg font-mono font-semibold uppercase tracking-wide mb-2">
+						Timeline Disabled
+					</h3>
+					<p className="text-sm font-mono text-muted-foreground leading-relaxed">
+						The timeline is turned off in settings. Re-enable it under
+						Display settings to browse your recorded history.
+					</p>
+				</div>
+			</div>
+		);
+	}
+
 	return (
 		<TimelineProvider>
 			<div
@@ -1068,6 +1109,8 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 					{currentFrame ? (
 						<CurrentFrameTimeline
 							currentFrame={currentFrame}
+							isPlaying={isPlaying}
+							playbackSpeed={playbackSpeed}
 							allDeviceIds={allDeviceIds}
 							embedded={embedded}
 							navBarRef={navBarRef}
@@ -1166,7 +1209,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 									</p>
 
 									<button
-										onClick={() => commands.showWindow({ Home: { page: null } })}
+										onClick={() => commands.showWindow({ Home: { page: "recording" } })}
 										className="inline-flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-full text-sm font-medium hover:bg-primary/90 transition-colors"
 									>
 										<Settings className="w-4 h-4" />
@@ -1224,6 +1267,7 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 				<div ref={navBarRef} className={`absolute top-0 left-0 right-0 z-40 px-4 pb-4 ${embedded ? "pt-2" : "pt-[calc(env(safe-area-inset-top)+16px)]"}`}>
 					<TimelineControls
 						currentDate={currentDate}
+						currentTime={currentFrame ? new Date(currentFrame.timestamp) : null}
 						startAndEndDates={startAndEndDates}
 						onDateChange={handleDateChange}
 						onJumpToday={handleJumpToday}
@@ -1251,37 +1295,40 @@ export default function Timeline({ embedded = false }: { embedded?: boolean }) {
 					/>
 				</div>
 
-				{/* Daily Summary — top right, below controls */}
-				<div className={`absolute ${embedded ? "top-12" : "top-[calc(env(safe-area-inset-top)+56px)]"} right-4 z-40`}>
-					<DailySummaryCard currentDate={currentDate} />
-				</div>
-
 				{/* Browser URL bar — at top of frame, above nav */}
 				{(() => {
 					const browserUrl = currentFrame?.devices?.[0]?.metadata?.browser_url;
 					if (!browserUrl) return null;
+					// browser_url from screenpipe often lacks a protocol (e.g. "github.com/foo");
+					// both tauri shell.open and window.open reject/misroute schemeless inputs.
+					const openableUrl = browserUrl.includes("://") ? browserUrl : `https://${browserUrl}`;
+					const isHttps = openableUrl.startsWith("https://");
 					return (
 						<div className={`absolute ${embedded ? "top-[56px]" : "top-[calc(env(safe-area-inset-top)+4px)]"} left-0 right-0 z-[45] flex justify-center pointer-events-none`}>
 							<button
 								type="button"
 								className="flex items-center gap-1.5 max-w-lg min-w-0 px-3 py-1 rounded-full bg-black/70 backdrop-blur-sm border border-white/10 hover:bg-black/80 hover:border-white/20 transition-colors cursor-pointer pointer-events-auto"
-								title={`Open ${browserUrl}`}
-								onClick={async () => {
+								title={`Open ${openableUrl}`}
+								onClick={async (e) => {
+									e.stopPropagation();
 									try {
-										const { open } = await import("@tauri-apps/plugin-shell");
-										await open(browserUrl);
-									} catch {
-										window.open(browserUrl, "_blank");
+										const { openUrl } = await import("@tauri-apps/plugin-opener");
+										await openUrl(openableUrl);
+									} catch (err) {
+										console.error("failed to open url", openableUrl, err);
+										try {
+											window.open(openableUrl, "_blank", "noopener,noreferrer");
+										} catch {}
 									}
 								}}
 							>
-								{browserUrl.startsWith("https") ? (
+								{isHttps ? (
 									<Lock className="w-3 h-3 text-green-400/80 shrink-0" />
 								) : (
 									<Globe className="w-3 h-3 text-white/40 shrink-0" />
 								)}
 								<span className="text-[12px] font-mono text-white/80 truncate">
-									{browserUrl.replace(/^https?:\/\/(www\.)?/, "")}
+									{openableUrl.replace(/^https?:\/\/(www\.)?/, "")}
 								</span>
 								<ExternalLink className="w-3 h-3 text-white/40 shrink-0" />
 							</button>
