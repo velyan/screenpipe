@@ -133,12 +133,17 @@ impl DatabaseManager {
     }
 
     /// Fetch the (text, text_json) OCR pair for a frame.
+    ///
+    /// The standalone `ocr_text` table was retired by the
+    /// `20260613130000_unify_ocr_text_into_frames` migration: `ocr_text.text`
+    /// now lives in `frames.full_text` and `ocr_text.text_json` in
+    /// `frames.text_json`.
     pub async fn get_frame_ocr_data(
         &self,
         frame_id: i64,
     ) -> Result<(Option<String>, Option<String>), sqlx::Error> {
         let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-            "SELECT text, text_json FROM ocr_text WHERE frame_id = ?1 LIMIT 1",
+            "SELECT full_text, text_json FROM frames WHERE id = ?1 LIMIT 1",
         )
         .bind(frame_id)
         .fetch_optional(&self.pool)

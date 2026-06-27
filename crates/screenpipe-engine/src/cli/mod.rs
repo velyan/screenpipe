@@ -432,7 +432,7 @@ pub struct RecordArgs {
     #[arg(long, default_value_t = true)]
     pub use_pii_removal: bool,
 
-    /// Enable Apple Intelligence main-body text distillation (opt-in).
+    /// Enable experimental main-body text distillation (opt-in).
     #[arg(
         long,
         default_value_t = false,

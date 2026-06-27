@@ -12,7 +12,7 @@ use once_cell::sync::Lazy;
 use tracing::debug;
 
 const PROMPT_VERSION: i64 = 2;
-const PROVIDER_APPLE_INTELLIGENCE: &str = "apple_intelligence";
+const PROVIDER_MODEL_DISTILLATION: &str = "model_distillation";
 const PROVIDER_RAW_FALLBACK: &str = "raw_fallback";
 const PROVIDER_HEURISTIC_FALLBACK: &str = "heuristic_fallback";
 const MEMORY_CACHE_CAPACITY: usize = 512;
@@ -192,7 +192,7 @@ pub async fn distill_main_body_text(
                 main_body_text: distilled.to_string(),
                 excluded_ui_text: contract.excluded_ui_text.clone(),
                 confidence: contract.confidence,
-                provider: PROVIDER_APPLE_INTELLIGENCE.to_string(),
+                provider: PROVIDER_MODEL_DISTILLATION.to_string(),
                 prompt_version: PROMPT_VERSION,
             };
 
@@ -1673,80 +1673,12 @@ fn memory_cache_put(cache_key: &str, value: &CachedDistillation) {
     }
 }
 
-#[cfg(feature = "apple-intelligence")]
-async fn invoke_provider(
-    input: &DistillationInput<'_>,
-    prefiltered_text: &str,
-) -> Result<DistilledContract, String> {
-    use screenpipe_apple_intelligence::{check_availability, generate_json, Availability};
-
-    if check_availability() != Availability::Available {
-        return Err("unavailable".to_string());
-    }
-
-    let mut nodes_preview = String::new();
-    if let Some(nodes) = input.nodes {
-        let compact: Vec<_> = nodes
-            .iter()
-            .take(80)
-            .map(|n| {
-                serde_json::json!({
-                    "role": n.role,
-                    "text": n.text,
-                    "bounds": n.bounds.clone()
-                })
-            })
-            .collect();
-        nodes_preview = serde_json::to_string(&compact).unwrap_or_default();
-    }
-
-    let instructions = "Return JSON only. Keep only primary user content. Remove nav/menu/sidebar/toolbars/chrome/status labels/repeated UI.";
-    let prompt = format!(
-        "Distill UI text into main body content.\n\
-         App: {}\n\
-         Window: {}\n\
-         URL: {}\n\
-         Visible-only candidate text:\n{}\n\
-         Accessibility nodes (optional):\n{}",
-        input.app_name.unwrap_or(""),
-        input.window_name.unwrap_or(""),
-        input.browser_url.unwrap_or(""),
-        prefiltered_text,
-        nodes_preview
-    );
-
-    let schema = r#"{
-      "type":"object",
-      "additionalProperties": false,
-      "properties":{
-        "main_body_text":{"type":"string"},
-        "excluded_ui_text":{"type":"array","items":{"type":"string"}},
-        "confidence":{"type":"number","minimum":0,"maximum":1}
-      },
-      "required":["main_body_text","excluded_ui_text","confidence"]
-    }"#;
-
-    let instructions_owned = instructions.to_string();
-    let prompt_owned = prompt;
-    let schema_owned = schema.to_string();
-    let output = tokio::task::spawn_blocking(move || {
-        generate_json(Some(&instructions_owned), &prompt_owned, &schema_owned)
-    })
-    .await
-    .map_err(|_| "provider_error".to_string())?
-    .map_err(|_| "provider_error".to_string())?;
-
-    serde_json::from_value::<DistilledContract>(output.json)
-        .map_err(|_| "invalid_output".to_string())
-}
-
-#[cfg(not(feature = "apple-intelligence"))]
 async fn invoke_provider(
     _input: &DistillationInput<'_>,
     _prefiltered_text: &str,
 ) -> Result<DistilledContract, String> {
-    debug!("main-body distillation unavailable: apple-intelligence feature not enabled");
-    Err("unavailable".to_string())
+    debug!("main-body distillation provider unavailable; using heuristic fallback");
+    Err("provider_unavailable".to_string())
 }
 
 #[cfg(test)]
@@ -2065,6 +1997,88 @@ mod tests {
         assert!(out.main_body_text.contains("main article content"));
         assert!(!out.main_body_text.contains("Hide sidebar"));
         assert!(!out.main_body_text.contains("Go back"));
+        assert!(!out.main_body_text.contains("Research Folder"));
+    }
+
+    #[tokio::test]
+    async fn enabled_distillation_uses_heuristic_fallback_when_provider_is_unavailable() {
+        let nodes = vec![
+            AccessibilityTreeNode {
+                role: "AXButton".to_string(),
+                text: "Hide sidebar".to_string(),
+                depth: 1,
+                bounds: Some(NodeBounds {
+                    left: 0.01,
+                    top: 0.02,
+                    width: 0.10,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "Research Folder".to_string(),
+                depth: 2,
+                bounds: Some(NodeBounds {
+                    left: 0.03,
+                    top: 0.30,
+                    width: 0.15,
+                    height: 0.03,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXHeading".to_string(),
+                text: "Example Article: Build, Lead, or Learn".to_string(),
+                depth: 3,
+                bounds: Some(NodeBounds {
+                    left: 0.31,
+                    top: 0.20,
+                    width: 0.48,
+                    height: 0.05,
+                }),
+                ..Default::default()
+            },
+            AccessibilityTreeNode {
+                role: "AXStaticText".to_string(),
+                text: "This paragraph describes the main article content after the page header."
+                    .to_string(),
+                depth: 3,
+                bounds: Some(NodeBounds {
+                    left: 0.31,
+                    top: 0.31,
+                    width: 0.54,
+                    height: 0.08,
+                }),
+                ..Default::default()
+            },
+        ];
+
+        let input = DistillationInput {
+            raw_text: "Hide sidebar\nResearch Folder\nExample Article: Build, Lead, or Learn\nThis paragraph describes the main article content after the page header.",
+            ocr_text_json: None,
+            app_name: Some("Arc"),
+            window_name: Some("Example Article: Build, Lead, or Learn"),
+            browser_url: Some("https://example.test/articles/enabled-provider-unavailable"),
+            content_hash: Some(9_991),
+            nodes: Some(&nodes),
+            focused_element: None,
+        };
+
+        let out = distill_main_body_text(
+            input,
+            &DistillationConfig {
+                enabled: true,
+                min_confidence: 0.60,
+            },
+        )
+        .await;
+
+        assert_eq!(out.metadata.status, "provider_unavailable");
+        assert_eq!(out.metadata.provider, PROVIDER_HEURISTIC_FALLBACK);
+        assert!(out.main_body_text.contains("Example Article"));
+        assert!(out.main_body_text.contains("main article content"));
+        assert!(!out.main_body_text.contains("Hide sidebar"));
         assert!(!out.main_body_text.contains("Research Folder"));
     }
 
