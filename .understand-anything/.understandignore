@@ -1,0 +1,76 @@
+# .understandignore — patterns for files/dirs to exclude from analysis
+# Syntax: same as .gitignore (globs, # comments, ! negation, trailing / for dirs)
+# Lines below are suggestions — uncomment to activate.
+# Use ! prefix to force-include something excluded by defaults.
+#
+# Built-in defaults (always excluded unless negated):
+#   node_modules/, .git/, dist/, build/, obj/, *.lock, *.min.js, etc.
+#
+.understand-anything/
+*.wav
+*.webp
+*.bmp
+*.icns
+*.onnx
+*.bytes
+*.stderr
+*.keep
+apps/screenpipe-app-tauri/src-tauri/ui_monitor-*
+
+# --- From .gitignore (uncomment to exclude) ---
+
+# *.exe
+# *.exe~
+# *.dll
+# *.dylib
+# *.so
+# *.test
+# *target
+# *.rs.bk
+# .secrets
+# data/
+# text_json/
+# src-tauri/deno-*
+# tauri_key_louis.key
+# .DS_Store
+# onnxruntime-win-x64*/
+# .env
+# .env.local
+# app.py
+# *.pyc
+# *.pyo
+# *.pyd
+# *.py
+# *.pyw
+# *.pyz
+# *.py3
+# *.py3w
+# *.py3z
+# screenpipe-app-tauri/src-tauri/.next/
+# .vercel
+# .wrangler/
+# .playwright*
+# .claude/worktrees/
+# .claude/*.local* # local changes are specific to the individual developer, let's not check them in for everyone.
+# .claude/*.lock
+# apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-arm64-1.19.2/
+# apps/screenpipe-app-tauri/src-tauri/onnxruntime-win-x64-1.19.2/
+# crates/screenpipe-audio/onnxruntime-win-x64-1.19.2.zip
+# crates/screenpipe-audio/onnxruntime-win-arm64-1.19.2.zip
+# crates/screenpipe-audio/openblas-0.3.31-x64.zip
+# crates/screenpipe-audio/openblas-0.3.31-woa64-dll.zip
+# apps/screenpipe-app-tauri/src-tauri/openblas/
+# apps/screenpipe-app-tauri/src-tauri/mlx.metallib
+# .serena/
+# .worktrees/
+
+# --- Detected directories (uncomment to exclude) ---
+
+# docs/
+# scripts/
+
+# --- Test file patterns (uncomment to exclude) ---
+
+# *.test.*
+# *.spec.*
+# *.snap
