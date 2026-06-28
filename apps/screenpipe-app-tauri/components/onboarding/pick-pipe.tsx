@@ -15,7 +15,6 @@ import { motion, AnimatePresence } from "framer-motion";
 import { Loader, Check } from "lucide-react";
 import { useOnboarding } from "@/lib/hooks/use-onboarding";
 import { scheduleFirstRunNotification } from "@/lib/notifications";
-import { commands } from "@/lib/utils/tauri";
 import posthog from "posthog-js";
 import { localFetch } from "@/lib/api";
 
@@ -24,7 +23,6 @@ type Pipe = {
   title: string;
   subtitle: string;
   defaultOn: boolean;
-  gmailBoost: boolean;
 };
 
 // Two-pipe bundle. digital-clone is the breakout install (~4.8k organic
@@ -36,14 +34,12 @@ const PIPES: Pipe[] = [
     title: "digital-clone",
     subtitle: "your AI you",
     defaultOn: true,
-    gmailBoost: true,
   },
   {
     slug: "personal-crm",
     title: "personal-crm",
     subtitle: "remember everyone you meet",
     defaultOn: true,
-    gmailBoost: true,
   },
 ];
 
@@ -142,17 +138,14 @@ async function installAndEnable(slug: string, retries = 3): Promise<void> {
 function PipeRow({
   pipe,
   selected,
-  gmailConnected,
   onToggle,
   delay,
 }: {
   pipe: Pipe;
   selected: boolean;
-  gmailConnected: boolean;
   onToggle: (slug: string) => void;
   delay: number;
 }) {
-  const showGmailBadge = gmailConnected && pipe.gmailBoost;
   return (
     <motion.button
       type="button"
@@ -184,11 +177,6 @@ function PipeRow({
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             <p className="font-mono text-sm font-semibold">{pipe.title}</p>
-            {showGmailBadge && (
-              <span className="font-mono text-[8px] px-1 py-0.5 border border-foreground/20 text-muted-foreground/60 leading-none shrink-0">
-                + gmail
-              </span>
-            )}
           </div>
           <p className="font-mono text-[11px] text-muted-foreground mt-0.5">
             {pipe.subtitle}
@@ -207,7 +195,6 @@ export default function PickPipe() {
   const [seconds, setSeconds] = useState(0);
   const [showSkip, setShowSkip] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [gmailConnected, setGmailConnected] = useState(false);
   const { completeOnboarding } = useOnboarding();
   const isCompletingRef = useRef(false);
   const mountTimeRef = useRef(Date.now());
@@ -220,18 +207,6 @@ export default function PickPipe() {
   useEffect(() => {
     const timer = setTimeout(() => setShowSkip(true), 5000);
     return () => clearTimeout(timer);
-  }, []);
-
-  // Check if Gmail was connected in the previous connect-apps step
-  useEffect(() => {
-    commands
-      .oauthStatus("gmail", null)
-      .then((res) => {
-        if (res.status === "ok" && res.data.connected) {
-          setGmailConnected(true);
-        }
-      })
-      .catch(() => {});
   }, []);
 
   const toggle = useCallback((slug: string) => {
@@ -375,7 +350,6 @@ export default function PickPipe() {
               key={p.slug}
               pipe={p}
               selected={selected.has(p.slug)}
-              gmailConnected={gmailConnected}
               onToggle={toggle}
               delay={0.3 + i * 0.08}
             />

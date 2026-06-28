@@ -33,7 +33,7 @@ describe("connection suggestions", () => {
 
     const merged = mergeConnectionSuggestions(autoSuggestions, [
       { id: "google-calendar", name: "Google Calendar", icon: "google-calendar" },
-      { id: "gmail", name: "Gmail", icon: "gmail" },
+      { id: "google-docs", name: "Google Docs", icon: "google-docs" },
     ]);
 
     expect(merged).toEqual([
@@ -52,7 +52,7 @@ describe("connection suggestions", () => {
       [{ text: "Summarize current work" }],
       [
         { id: "google-calendar", name: "Google Calendar", icon: "google-calendar" },
-        { id: "gmail", name: "Gmail", icon: "gmail" },
+        { id: "google-docs", name: "Google Docs", icon: "google-docs" },
       ],
       [{ text: "Prep tomorrow's Sam and Priya call briefs from Google Calendar", connectionIcon: "google-calendar" }]
     );
@@ -79,7 +79,7 @@ describe("connection suggestions", () => {
       { id: "owned-default", name: "Owned Default", connected: false },
       { id: "github", name: "GitHub", connected: true },
       { id: "notion", name: "Notion", connected: false },
-      { id: "gmail", name: "Gmail", connected: false },
+      { id: "google-docs", name: "Google Docs", connected: false },
       { id: "slack", name: "Slack", connected: false },
     ];
 

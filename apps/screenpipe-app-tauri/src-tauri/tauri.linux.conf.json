@@ -12,7 +12,8 @@
                 "depends": [
                     "tesseract-ocr",
                     "libtesseract-dev",
-                    "ffmpeg"
+                    "ffmpeg",
+                    "libopenblas0"
                 ]
             },
             "appimage": {

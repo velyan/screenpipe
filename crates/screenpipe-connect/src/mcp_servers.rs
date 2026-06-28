@@ -2218,7 +2218,7 @@ mod tests {
             Some("linear-workflows")
         );
         assert_eq!(parse_mcp_connection_id("mcp:"), None);
-        assert_eq!(parse_mcp_connection_id("gmail"), None);
+        assert_eq!(parse_mcp_connection_id("google-calendar"), None);
         assert_eq!(parse_mcp_connection_id("notion:crm"), None);
     }
 
@@ -2236,7 +2236,7 @@ mod tests {
         assert!(is_mcp_connection_configured(&dir, "mcp:enabled").await);
         assert!(!is_mcp_connection_configured(&dir, "mcp:disabled").await);
         assert!(!is_mcp_connection_configured(&dir, "mcp:missing").await);
-        assert!(!is_mcp_connection_configured(&dir, "gmail").await);
+        assert!(!is_mcp_connection_configured(&dir, "google-calendar").await);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2254,7 +2254,7 @@ mod tests {
         linear.name = "Linear".to_string();
         store.upsert(linear, None).await.unwrap();
 
-        let connections = vec!["gmail".to_string(), "mcp:linear".to_string()];
+        let connections = vec!["google-calendar".to_string(), "mcp:linear".to_string()];
         let ctx = render_context_for_connections(&dir, 3030, &connections).await;
 
         assert!(ctx.contains("Linear (mcp:linear)"));

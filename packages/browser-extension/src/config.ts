@@ -17,7 +17,7 @@ export const STORAGE_KEY_BASE_URL = "screenpipe_base_url";
  * Canonical browser-bridge path. The legacy `/browser/*` paths are still
  * accepted by the server as aliases for older installed extensions, but new
  * clients always use `/connections/browser/*` so the extension lives in the
- * same route family as every other integration (Slack, Notion, Gmail, …).
+ * same route family as every other integration (Slack, Notion, Google Calendar, …).
  */
 const BROWSER_BASE_PATH = "/connections/browser";
 

@@ -5,7 +5,7 @@
 "use client";
 
 import React from "react";
-import { Monitor, Mic, MicOff, Volume2, VolumeX, Phone } from "lucide-react";
+import { Monitor, Mic, MicOff, Volume2, VolumeX, Phone, Pause } from "lucide-react";
 import posthog from "posthog-js";
 import {
   Popover,
@@ -34,6 +34,7 @@ interface RecordingStatusProps {
   meetingApp?: string | null;
   meetingLoading: boolean;
   onToggleMeeting: () => void;
+  onPauseRecording?: () => void | Promise<void>;
   isTranslucent?: boolean;
   /** buttons float over full-bleed video (timeline, sidebar collapsed) */
   floatingOverMedia?: boolean;
@@ -62,13 +63,16 @@ export function RecordingStatus({
   meetingApp,
   meetingLoading,
   onToggleMeeting,
+  onPauseRecording,
   isTranslucent,
   floatingOverMedia,
 }: RecordingStatusProps) {
   const [open, setOpen] = React.useState(false);
+  const [pauseLoading, setPauseLoading] = React.useState(false);
 
   const pausedCount = devices.filter((d) => !d.active).length;
   const allActive = devices.length > 0 && pausedCount === 0;
+  const canPauseRecording = devices.some((d) => d.active);
 
   const summary =
     devices.length === 0
@@ -76,7 +80,7 @@ export function RecordingStatus({
       : pausedCount === 0
         ? "recording"
         : `${pausedCount} device${pausedCount > 1 ? "s" : ""} paused`;
-  const label = meetingActive ? `${summary} · meeting` : summary;
+  const label = meetingActive ? `${summary} · meeting notes` : summary;
 
   const toggleDevice = async (device: RecordingDevice) => {
     const endpoint = device.active
@@ -103,6 +107,17 @@ export function RecordingStatus({
           d.fullName === device.fullName ? { ...d, active: device.active } : d
         )
       );
+    }
+  };
+
+  const pauseRecording = async () => {
+    if (!onPauseRecording || pauseLoading) return;
+    setPauseLoading(true);
+    try {
+      await onPauseRecording();
+      setOpen(false);
+    } finally {
+      setPauseLoading(false);
     }
   };
 
@@ -137,10 +152,16 @@ export function RecordingStatus({
                 aria-hidden="true"
                 className={cn(
                   "h-2 w-2 rounded-full transition-all",
+                  // Drive the dot color off `currentColor` so it follows the
+                  // theme on the translucent sidebar: `vibrant-sidebar-fg`
+                  // resolves to black in light mode and white in dark mode
+                  // (with the same pre-JS system-preference fallbacks the rest
+                  // of the vibrant sidebar uses). A hardcoded white dot was
+                  // invisible on the light translucent background.
                   isTranslucent
                     ? allActive
-                      ? "bg-white"
-                      : "border border-white bg-transparent"
+                      ? "vibrant-sidebar-fg bg-current"
+                      : "vibrant-sidebar-fg border border-current bg-transparent"
                     : allActive
                       ? "bg-foreground"
                       : "border border-foreground bg-transparent",
@@ -164,6 +185,21 @@ export function RecordingStatus({
         <div className="px-3 py-2 border-b border-border">
           <span className="text-xs font-medium text-foreground">{label}</span>
         </div>
+        {onPauseRecording && (
+          <div className="px-3 py-2 border-b border-border">
+            <button
+              type="button"
+              onClick={() => void pauseRecording()}
+              disabled={!canPauseRecording || pauseLoading}
+              data-testid="recording-status-pause-all"
+              title="pause all screen and audio recording"
+              className="flex w-full items-center justify-center gap-1.5 rounded-md border border-border px-2 py-1.5 text-[11px] font-medium text-foreground transition-colors hover:bg-muted/60 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              <Pause aria-hidden="true" className="h-3 w-3" />
+              {pauseLoading ? "pausing recording" : "pause all recording"}
+            </button>
+          </div>
+        )}
         <div className="py-1">
           {devices.length === 0 && (
             <div className="px-3 py-2 text-[11px] text-muted-foreground">
@@ -220,15 +256,16 @@ export function RecordingStatus({
             )}
           />
           <span className="flex-1 min-w-0 truncate text-[11px] text-foreground">
-            {meetingActive ? `meeting${meetingApp ? ` · ${meetingApp}` : ""}` : "meeting"}
+            {meetingActive ? `meeting notes${meetingApp ? ` · ${meetingApp}` : ""}` : "meeting notes"}
           </span>
           <button
             onClick={onToggleMeeting}
             disabled={meetingLoading}
             data-testid="recording-status-meeting-toggle"
-            className="text-[10px] text-muted-foreground hover:text-foreground transition-colors shrink-0 disabled:opacity-50"
+            title={meetingActive ? "stop the meeting note only" : "start meeting notes"}
+            className="text-[10px] text-muted-foreground hover:text-foreground transition-colors shrink-0 disabled:opacity-50 whitespace-nowrap"
           >
-            {meetingActive ? "stop" : "start"}
+            {meetingActive ? "stop notes" : "start notes"}
           </button>
         </div>
       </PopoverContent>

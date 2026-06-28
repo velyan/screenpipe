@@ -33,7 +33,7 @@ describe("connectionNameToId", () => {
 });
 
 describe("parseConnectionChip", () => {
-  const known = (id: string) => ["slack", "input-monitoring", "gmail"].includes(id);
+  const known = (id: string) => ["slack", "input-monitoring", "google-calendar"].includes(id);
 
   it("round-trips the model-content form produced by buildChipModelContent", () => {
     const prompt = "Summarize recent Slack discussions";
@@ -51,8 +51,8 @@ describe("parseConnectionChip", () => {
   });
 
   it("parses the display form (id provided directly)", () => {
-    const parsed = parseConnectionChip("[chip:gmail|Gmail] Show important emails", known);
-    expect(parsed).toEqual({ chip: { id: "gmail", name: "Gmail" }, prompt: "Show important emails" });
+    const parsed = parseConnectionChip("[chip:google-calendar|Google Calendar] Show my next events", known);
+    expect(parsed).toEqual({ chip: { id: "google-calendar", name: "Google Calendar" }, prompt: "Show my next events" });
   });
 
   it("returns null when the resolved id is not a known integration", () => {

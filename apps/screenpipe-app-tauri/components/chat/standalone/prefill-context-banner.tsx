@@ -4,7 +4,7 @@
 "use client";
 
 import { X } from "lucide-react";
-import { getApiBaseUrl } from "@/lib/api";
+import { getApiBaseUrl, appendAuthToken } from "@/lib/api";
 import type { PrefillComposerProps } from "./composer-types";
 
 export function PrefillContextBanner({
@@ -22,7 +22,7 @@ export function PrefillContextBanner({
             <div className="relative group">
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
-                src={`${getApiBaseUrl()}/frames/${prefill.frameId}`}
+                src={appendAuthToken(`${getApiBaseUrl()}/frames/${prefill.frameId}`)}
                 alt="Attached frame"
                 className="w-16 h-12 object-cover rounded border border-border/50"
               />

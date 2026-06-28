@@ -9,6 +9,7 @@ pub mod backup;
 mod browser;
 pub mod connection;
 pub mod db;
+pub mod diagnose;
 pub mod export;
 pub mod install;
 pub mod login;
@@ -292,6 +293,25 @@ pub enum Command {
 
     /// Check system readiness (permissions, ffmpeg, etc.)
     Doctor,
+
+    /// Collect recent logs + system info and send them to screenpipe support,
+    /// returning a ticket id. The headless twin of the app's "send logs &
+    /// feedback" button — for VPS/boxes with no UI, or for an agent to
+    /// self-report a crash. Use `--dry-run` to only save the bundle locally.
+    Diagnose {
+        /// Short description of the problem (attached as feedback)
+        #[arg(short = 'm', long)]
+        message: Option<String>,
+        /// Data directory. Default to $HOME/.screenpipe
+        #[arg(long, value_hint = ValueHint::DirPath)]
+        data_dir: Option<String>,
+        /// Local API port to probe for a live /health snapshot
+        #[arg(short = 'p', long, default_value_t = 3030)]
+        port: u16,
+        /// Collect + save the bundle to a temp file without uploading
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
 
     /// Manage local API authentication
     Auth {

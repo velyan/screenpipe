@@ -564,8 +564,8 @@ mod imp {
             let mut cfg = cfg;
             cfg.resolve_upload_mode().await;
             info!(
-                "enterprise sync: resolved upload mode = {:?}",
-                std::mem::discriminant(&cfg.upload_mode)
+                "enterprise sync: resolved upload mode = {}",
+                cfg.upload_mode.label()
             );
 
             ee_sync::run(cfg, local, rx).await;

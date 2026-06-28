@@ -397,6 +397,22 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Command::Diagnose {
+            ref message,
+            ref data_dir,
+            port,
+            dry_run,
+        } => {
+            let local_data_dir = get_base_dir(data_dir)?;
+            screenpipe_engine::cli::diagnose::handle_diagnose_command(
+                &local_data_dir,
+                message.as_deref(),
+                port,
+                dry_run,
+            )
+            .await?;
+            return Ok(());
+        }
         Command::Record(args) => args,
     };
 
@@ -477,6 +493,22 @@ async fn main() -> anyhow::Result<()> {
                         [
                             // User hasn't granted screen recording permission (CLI-49)
                             r"Screen recording permission denied",
+                            // User hasn't granted microphone access — Windows WASAPI
+                            // E_ACCESSDENIED building the input stream (CLI-F4: top live
+                            // engine issue, 45 users / 200+ events). The OS (or another
+                            // app holding the device exclusively) refuses capture;
+                            // retrying can't clear it, so it's not an actionable bug.
+                            r"backend-specific error has occurred: Access is denied",
+                            // device_monitor's periodic capture-device check failing with an
+                            // OS backend error — overwhelmingly a denied macOS TCC permission
+                            // (screen/audio capture), which the OS reports in the user's
+                            // LOCALE, so the English "Screen recording permission denied"
+                            // pattern above misses it (CLI-WH: 1 user / 126 events, a
+                            // Japanese TCC-denied string). The check re-runs each cycle, so a
+                            // standing denial floods Sentry. Matching the English wrapper
+                            // prefix catches every locale; device-check backend errors
+                            // (permission, unplugged) are user-environment, not our bug.
+                            r"device check error: A backend-specific error has occurred",
                             // Local DB corruption — user dropped/restored part of their db.sqlite
                             r"no such table: main\.speaker_embeddings",
                             // Concurrent DB access / user ran CLI while app was running

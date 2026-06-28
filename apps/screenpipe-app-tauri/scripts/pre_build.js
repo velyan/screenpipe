@@ -299,6 +299,36 @@ async function linkSystemBinary(binaryName, destination) {
 	}
 }
 
+async function isSymlink(filePath) {
+	try {
+		return (await fs.lstat(filePath)).isSymbolicLink();
+	} catch {
+		return false;
+	}
+}
+
+async function downloadStaticLinuxFfmpeg() {
+	const archive = 'ffmpeg-linux-amd64-static.tar.xz';
+	const staleDirs = await fs.readdir(cwd, { withFileTypes: true });
+	for (const entry of staleDirs) {
+		if (entry.isDirectory() && /^ffmpeg-.*-amd64-static$/.test(entry.name)) {
+			await fs.rm(path.join(cwd, entry.name), { recursive: true, force: true });
+		}
+	}
+
+	await $`wget --no-config ${config.linux.ffmpegUrl} -O ${archive}`
+	await $`tar xf ${archive}`
+
+	const entries = await fs.readdir(cwd, { withFileTypes: true });
+	const extracted = entries.find((entry) => entry.isDirectory() && /^ffmpeg-.*-amd64-static$/.test(entry.name));
+	if (!extracted) {
+		throw new Error('static Linux ffmpeg archive did not contain an ffmpeg-*-amd64-static directory');
+	}
+
+	await fs.rename(path.join(cwd, extracted.name), config.ffmpegRealname)
+	await fs.rm(archive, { force: true })
+}
+
 async function copySystemBinary(binaryName, destination) {
 	const source = await findOnPath(binaryName);
 	if (!source) {
@@ -508,35 +538,26 @@ if (platform == 'linux') {
 	}
 
 	// Setup FFMPEG
-	if (!(await fs.exists(config.ffmpegRealname))) {
-		if (inCI) {
-			await fs.mkdir(config.ffmpegRealname, { recursive: true });
-			const linkedFfmpeg = await linkSystemBinary('ffmpeg', path.join(config.ffmpegRealname, 'ffmpeg'));
-			await linkSystemBinary('ffprobe', path.join(config.ffmpegRealname, 'ffprobe'));
-			await linkSystemBinary('qt-faststart', path.join(config.ffmpegRealname, 'qt-faststart'));
-			if (!linkedFfmpeg) {
-				throw new Error('CI expected ffmpeg from apt, but command -v ffmpeg failed');
-			}
-		} else {
-			await $`wget --no-config -nc ${config.linux.ffmpegUrl} -O ${config.linux.ffmpegName}.tar.xz`
-			await $`tar xf ${config.linux.ffmpegName}.tar.xz`
-			await $`mv ${config.linux.ffmpegName} ${config.ffmpegRealname}`
-			await $`rm ${config.linux.ffmpegName}.tar.xz`
+	const ffmpegBinary = path.join(config.ffmpegRealname, 'ffmpeg');
+	const ffprobeBinary = path.join(config.ffmpegRealname, 'ffprobe');
+	if (
+		!(await fs.exists(ffmpegBinary)) ||
+		!(await fs.exists(ffprobeBinary)) ||
+		(await isSymlink(ffmpegBinary)) ||
+		(await isSymlink(ffprobeBinary))
+	) {
+		if (await fs.exists(config.ffmpegRealname)) {
+			await fs.rm(config.ffmpegRealname, { recursive: true, force: true });
 		}
+		await downloadStaticLinuxFfmpeg();
 	} else {
 		console.log('FFMPEG already exists');
 	}
 		// Setup TESSERACT
-	if (!(await fs.exists(config.linux.tesseractName))) {
-		if (inCI) {
-			const linkedTesseract = await linkSystemBinary('tesseract', config.linux.tesseractName);
-			if (!linkedTesseract) {
-				throw new Error('CI expected tesseract from apt, but command -v tesseract failed');
-			}
-		} else {
-			await $`wget --no-config -nc ${config.linux.tesseractUrl} -O ${config.linux.tesseractName}`
-			await $`chmod +x ${config.linux.tesseractName}` // Make the Tesseract binary executable
-		}
+	if (!(await fs.exists(config.linux.tesseractName)) || (await isSymlink(config.linux.tesseractName))) {
+		await fs.rm(config.linux.tesseractName, { force: true });
+		await $`wget --no-config -nc ${config.linux.tesseractUrl} -O ${config.linux.tesseractName}`
+		await $`chmod +x ${config.linux.tesseractName}` // Make the Tesseract binary executable
 	} else {
 		console.log('TESSERACT already exists');
 	}

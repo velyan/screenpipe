@@ -38,8 +38,6 @@ import { join, homeDir, tempDir, dirname } from "@tauri-apps/api/path";
 import { AppleCalendarCard } from "./apple-calendar-card";
 import { GoogleCalendarCard } from "./google-calendar-card";
 import { GoogleDocsCard } from "./google-docs-card";
-import { GoogleSheetsCard } from "./google-sheets-card";
-import { GmailCard } from "./gmail-card";
 import { IcsCalendarCard } from "./ics-calendar-card";
 import { RemoteAgentCard } from "./remote-agent-card";
 import { BrowserUrlCard } from "./browser-url-card";
@@ -661,7 +659,6 @@ const INTEGRATION_ICONS: Record<string, React.ReactNode> = {
       </svg>
     ),
     quickbooks: <img src="/images/quickbooks.svg" alt="QuickBooks Online" className="w-5 h-5" />,
-    "google-sheets": <img src="/images/google-sheets.svg" alt="Google Sheets" className="w-5 h-5" />,
     notion: <img src="/images/notion.svg" alt="Notion" className="w-5 h-5 dark:invert" />,
     linear: <img src="/images/linear.svg" alt="Linear" className="w-5 h-5" />,
     krisp: <img src="/images/krisp.svg" alt="Krisp" className="w-5 h-5 dark:invert" />,
@@ -770,15 +767,6 @@ const INTEGRATION_ICONS: Record<string, React.ReactNode> = {
         <path d="M19.655 14.262c.281 0 .557.023.828.064 0 .005-.005.01-.005.014-.105.267-.234.534-.381.786l-1.219 2.106c-1.112 1.936-3.177 3.127-5.411 3.127h-2.432c-2.23 0-4.294-1.191-5.412-3.127l-1.218-2.106a6.251 6.251 0 0 1 0-6.252l1.218-2.106C6.736 4.832 8.8 3.641 11.035 3.641h2.432c2.23 0 4.294 1.191 5.411 3.127l1.219 2.106c.147.252.271.519.381.786 0 .004.005.009.005.014-.267.041-.543.064-.828.064-1.816 0-2.501-.607-3.291-1.306-.764-.676-1.711-1.517-3.44-1.517h-1.029c-1.251 0-2.387.455-3.2 1.278-.796.805-1.233 1.904-1.233 3.099v1.411c0 1.196.437 2.295 1.233 3.099.813.823 1.949 1.278 3.2 1.278h1.034c1.729 0 2.676-.841 3.439-1.517.791-.703 1.471-1.306 3.287-1.301Zm.005-3.237c.399 0 .794-.036 1.179-.11-.002-.004-.002-.01-.002-.014-.073-.414-.193-.823-.349-1.218.731-.12 1.407-.396 1.986-.819 0-.004-.005-.013-.005-.018-.331-1.085-.832-2.101-1.489-3.03-.649-.915-1.435-1.719-2.331-2.395-1.867-1.398-4.088-2.138-6.428-2.138-1.448 0-2.855.28-4.175.841-1.273.543-2.423 1.315-3.407 2.299S2.878 6.552 2.341 7.83c-.557 1.324-.842 2.726-.842 4.175 0 1.448.281 2.855.842 4.174.542 1.274 1.314 2.423 2.298 3.407s2.129 1.761 3.407 2.299c1.324.556 2.727.841 4.175.841 2.34 0 4.561-.74 6.428-2.137a10.815 10.815 0 0 0 2.331-2.396c.652-.929 1.158-1.949 1.489-3.03 0-.004.005-.014.005-.018-.579-.423-1.255-.699-1.986-.819.161-.395.276-.804.349-1.218.005-.009.005-.014.005-.023.869.166 1.692.506 2.404 1.035.685.505.552 1.075.446 1.416C22.184 20.437 17.619 24 12.221 24c-6.625 0-12-5.375-12-12s5.37-12 12-12c5.398 0 9.963 3.563 11.471 8.464.106.341.239.915-.446 1.421-.717.529-1.535.873-2.404 1.034.128.716.128 1.45 0 2.166-.387-.074-.782-.11-1.182-.11-4.184 0-3.968 2.823-6.736 2.823h-1.029c-1.899 0-3.15-1.357-3.15-3.095v-1.411c0-1.738 1.251-3.094 3.15-3.094h1.034c2.768 0 2.552 2.823 6.731 2.827Z"/>
       </svg>
     ),
-    gmail: (
-      <svg viewBox="0 0 999.517 749.831" className="w-5 h-5" aria-hidden>
-        <path fill="#4285F4" d="M68.149 749.831h159.014V363.654L0 193.282v488.4C0 719.391 30.553 749.831 68.149 749.831"/>
-        <path fill="#34A853" d="M772.354 749.831h159.014c37.709 0 68.149-30.553 68.149-68.149v-488.4L772.354 363.654"/>
-        <path fill="#FBBC04" d="M772.354 68.342v295.312l227.163-170.372V102.417c0-84.277-96.203-132.322-163.557-81.779"/>
-        <path fill="#EA4335" d="M227.163 363.654V68.342l272.595 204.447 272.595-204.447v295.312L499.758 568.1"/>
-        <path fill="#C5221F" d="M0 102.417v90.865l227.163 170.372V68.342L163.557 20.638C96.09-29.906 0 18.139 0 102.417"/>
-      </svg>
-    ),
     calcom: (
       <svg viewBox="0 0 24 24" className="w-5 h-5 text-foreground" fill="currentColor" aria-hidden>
         <path d="M2.408 14.488C1.035 14.488 0 13.4 0 12.058c0-1.346.982-2.443 2.408-2.443.758 0 1.282.233 1.691.765l-.66.55a1.343 1.343 0 0 0-1.03-.442c-.93 0-1.44.711-1.44 1.57 0 .86.559 1.557 1.44 1.557.413 0 .765-.147 1.043-.443l.651.573c-.391.51-.929.743-1.695.743zM6.948 10.913h.89v3.49h-.89v-.51c-.185.362-.493.604-1.083.604-.943 0-1.695-.82-1.695-1.826 0-1.007.752-1.825 1.695-1.825.585 0 .898.241 1.083.604zm.026 1.758c0-.546-.374-.998-.964-.998-.568 0-.938.457-.938.998 0 .528.37.998.938.998.586 0 .964-.456.964-.998zM8.467 9.503h.89v4.895h-.89zM9.752 13.937a.53.53 0 0 1 .542-.528c.313 0 .533.242.533.528a.527.527 0 0 1-.533.537.534.534 0 0 1-.542-.537zM14.23 13.839c-.33.403-.832.658-1.426.658a1.806 1.806 0 0 1-1.84-1.826c0-1.007.778-1.825 1.84-1.825.572 0 1.07.241 1.4.622l-.687.577c-.172-.215-.396-.376-.713-.376-.568 0-.938.456-.938.998 0 .541.37.997.938.997.343 0 .58-.179.757-.42zM14.305 12.671c0-1.007.78-1.825 1.84-1.825 1.061 0 1.84.818 1.84 1.825 0 1.007-.779 1.826-1.84 1.826-1.06-.005-1.84-.82-1.84-1.826zm2.778 0c0-.546-.37-.998-.938-.998-.568-.004-.937.452-.937.998 0 .542.37.998.937.998.568 0 .938-.456.938-.998zM24 12.269v2.13h-.89v-1.911c0-.604-.281-.864-.704-.864-.396 0-.678.197-.678.864v1.91h-.89v-1.91c0-.604-.285-.864-.704-.864-.396 0-.744.197-.744.864v1.91h-.89v-3.49h.89v.484c.185-.376.52-.564 1.035-.564.489 0 .898.241 1.123.649.224-.417.554-.65 1.153-.65.731.005 1.299.56 1.299 1.442z"/>
@@ -856,11 +844,9 @@ const ALL_CONNECTION_CATEGORIES = "All";
 
 // Per-connection quickstart prompts shown when "Try in Chat" is clicked.
 export const TRY_IN_CHAT_PROMPTS: Record<string, string> = {
-  gmail: "Show me important emails from the last week",
   slack: "Summarize recent Slack discussions",
   "google-calendar": "What's on my calendar this week?",
   "google-docs": "Summarize my recent documents",
-  "google-sheets": "Help me analyze data from my spreadsheets",
   obsidian: "What did I write about recently in my notes?",
   notion: "Find recent project notes in my Notion",
   linear: "Show my open issues and tasks",
@@ -3278,6 +3264,42 @@ function ApiIntegrationPanel({ integration, onRefresh }: {
 
 const KRISP_MCP_URL = "https://mcp.krisp.ai/mcp";
 const PLAUD_MCP_URL = "https://mcp.plaud.ai/mcp";
+// Providers that run a first-party remote MCP server whose OAuth supports
+// Dynamic Client Registration (RFC 7591). For these, the tile connects in
+// one click via OAuthMcpPanel — no API key and no human-created
+// client_id/secret — replacing the old API-key form (or the connector
+// OAuth flow + its registered app). URLs are the streamable-HTTP endpoint
+// (/mcp), NOT the legacy /sse transport the engine can't drive. Each id
+// must match a registered connector id so it lands on the right tile.
+// (DCR support verified live against each provider's OAuth metadata.)
+const MCP_OAUTH_PROVIDERS: {
+  id: string;
+  name: string;
+  url: string;
+  description: React.ReactNode;
+}[] = [
+  { id: "linear", name: "Linear", url: "https://mcp.linear.app/mcp", description: <>Connect Linear so your AI can search and manage your issues, projects, and cycles. Sign-in uses Linear&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "stripe", name: "Stripe", url: "https://mcp.stripe.com", description: <>Connect Stripe so your AI can query your customers, payments, invoices, and subscriptions. Sign-in uses Stripe&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "sentry", name: "Sentry", url: "https://mcp.sentry.dev/mcp", description: <>Connect Sentry so your AI can search your issues, events, and releases. Sign-in uses Sentry&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "intercom", name: "Intercom", url: "https://mcp.intercom.com/mcp", description: <>Connect Intercom so your AI can search your conversations, contacts, and help content. Sign-in uses Intercom&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "asana", name: "Asana", url: "https://mcp.asana.com/mcp", description: <>Connect Asana so your AI can search and manage your tasks, projects, and portfolios. Sign-in uses Asana&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "monday", name: "monday.com", url: "https://mcp.monday.com/mcp", description: <>Connect monday.com so your AI can work with your boards, items, and updates. Sign-in uses monday&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "clickup", name: "ClickUp", url: "https://mcp.clickup.com/mcp", description: <>Connect ClickUp so your AI can search and manage your tasks, docs, and spaces. Sign-in uses ClickUp&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "airtable", name: "Airtable", url: "https://mcp.airtable.com/mcp", description: <>Connect Airtable so your AI can read and update your bases, tables, and records. Sign-in uses Airtable&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "confluence", name: "Confluence", url: "https://mcp.atlassian.com/v1/mcp", description: <>Connect Atlassian so your AI can search and edit your Confluence pages (and Jira issues). Sign-in uses Atlassian&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "jira", name: "Jira", url: "https://mcp.atlassian.com/v1/mcp", description: <>Connect Atlassian so your AI can search and manage your Jira issues (and Confluence pages). Sign-in uses Atlassian&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+  { id: "notion", name: "Notion", url: "https://mcp.notion.com/mcp", description: <>Connect Notion so your AI can search, read, and write your pages and databases. Sign-in uses Notion&apos;s OAuth — no API key, and screenpipe never sees your password.</> },
+];
+
+export function isMcpOAuthProviderTileConnected(
+  id: string,
+  apiConnected: boolean,
+  mcpProviderConnected: Record<string, boolean>,
+): boolean {
+  if (!MCP_OAUTH_PROVIDERS.some(p => p.id === id)) return apiConnected;
+  return apiConnected || !!mcpProviderConnected[id];
+}
+
 // Excalidraw+ exposes the workspace (scenes, collections, search) over a
 // remote MCP gated by a static API key, not OAuth (no discovery metadata on
 // the host), so it uses the ApiKeyMcpPanel below instead of OAuthMcpPanel.
@@ -3756,13 +3778,13 @@ export function ConnectionsSection({
   const [appleCalendarConnected, setAppleCalendarConnected] = useState(false);
   const [googleCalendarConnected, setGoogleCalendarConnected] = useState(false);
   const [googleDocsConnected, setGoogleDocsConnected] = useState(false);
-  const [googleSheetsConnected, setGoogleSheetsConnected] = useState(false);
-  const [gmailConnected, setGmailConnected] = useState(false);
   const [customMcpConnected, setCustomMcpConnected] = useState(false);
   const [customMcpServerCount, setCustomMcpServerCount] = useState(0);
   const [customMcpEnabledCount, setCustomMcpEnabledCount] = useState(0);
   const [krispConnected, setKrispConnected] = useState(false);
   const [plaudConnected, setPlaudConnected] = useState(false);
+  // Per-provider connection status for the MCP-OAuth tiles (keyed by id).
+  const [mcpProviderConnected, setMcpProviderConnected] = useState<Record<string, boolean>>({});
   const [excalidrawConnected, setExcalidrawConnected] = useState(false);
   const [importedSkillsCount, setImportedSkillsCount] = useState(0);
 
@@ -3796,12 +3818,6 @@ export function ConnectionsSection({
     commands.oauthStatus("google-docs", null).then(res => {
       setGoogleDocsConnected(res.status === "ok" && res.data.connected);
     }).catch(() => {});
-    commands.oauthStatus("google-sheets", null).then(res => {
-      setGoogleSheetsConnected(res.status === "ok" && res.data.connected);
-    }).catch(() => {});
-    commands.oauthStatus("gmail", null).then(res => {
-      setGmailConnected(res.status === "ok" && res.data.connected);
-    }).catch(() => {});
     localFetch("/mcp-servers").then(async r => {
       if (!r.ok) {
         setCustomMcpConnected(false);
@@ -3809,6 +3825,7 @@ export function ConnectionsSection({
         setCustomMcpEnabledCount(0);
         setKrispConnected(false);
         setPlaudConnected(false);
+        setMcpProviderConnected({});
         setExcalidrawConnected(false);
         return;
       }
@@ -3820,6 +3837,10 @@ export function ConnectionsSection({
       setCustomMcpConnected(enabled.length > 0);
       setKrispConnected(list.some(s => s.enabled && (s.url ?? "").replace(/\/+$/, "") === KRISP_MCP_URL));
       setPlaudConnected(list.some(s => s.enabled && (s.url ?? "").replace(/\/+$/, "") === PLAUD_MCP_URL));
+      const enabledUrls = new Set(list.filter(s => s.enabled).map(s => (s.url ?? "").replace(/\/+$/, "")));
+      setMcpProviderConnected(Object.fromEntries(
+        MCP_OAUTH_PROVIDERS.map(p => [p.id, enabledUrls.has(p.url.replace(/\/+$/, ""))])
+      ));
       setExcalidrawConnected(list.some(s => s.enabled && (s.url ?? "").replace(/\/+$/, "") === EXCALIDRAW_MCP_URL));
     }).catch(() => {
       setCustomMcpConnected(false);
@@ -3827,6 +3848,7 @@ export function ConnectionsSection({
       setCustomMcpEnabledCount(0);
       setKrispConnected(false);
       setPlaudConnected(false);
+      setMcpProviderConnected({});
       setExcalidrawConnected(false);
     });
     if (typeof window !== "undefined" && platform() === "macos") {
@@ -3914,7 +3936,6 @@ export function ConnectionsSection({
       ...(os === "macos" ? [{ id: "apple-calendar", name: "Apple Calendar", icon: "apple-calendar", connected: appleCalendarConnected }] : []),
       { id: "google-calendar", name: "Google Calendar", icon: "google-calendar", connected: false },
       { id: "google-docs", name: "Google Docs", icon: "google-docs", connected: false },
-      { id: "gmail", name: "Gmail", icon: "gmail", connected: false },
       { id: "ics-calendar", name: "ICS Calendar", icon: "ics-calendar", connected: false },
       { id: "remote-agent", name: "Remote agent", icon: "remote-agent", connected: false },
       { id: "whatsapp", name: "WhatsApp", icon: "whatsapp", connected: false, detected: detectedConnectionIds.has("whatsapp") },
@@ -3951,14 +3972,21 @@ export function ConnectionsSection({
         id: i.id,
         name: i.name,
         icon: i.icon,
-        connected: i.connected,
+        // MCP-OAuth providers connect via their remote MCP server. The dot
+        // lights for the MCP connection OR an existing API-key/connector-OAuth
+        // connection, so users who connected the old way don't appear to lose it.
+        connected: isMcpOAuthProviderTileConnected(i.id, i.connected, mcpProviderConnected),
         category: normalizeConnectionCategory(i.category),
         description: i.description || undefined,
       }));
     // Update connected status from API for hardcoded tiles that also exist in API
     for (const h of hardcoded) {
       const api = integrations.find(i => i.id === h.id);
-      if (api) h.connected = api.connected;
+      h.connected = isMcpOAuthProviderTileConnected(
+        h.id,
+        api ? api.connected : h.connected,
+        mcpProviderConnected,
+      );
     }
     // Google OAuth dots are driven by direct oauthStatus (not the cached API), so they stay
     // in sync immediately after connect/disconnect without waiting for cache expiry.
@@ -3966,10 +3994,6 @@ export function ConnectionsSection({
     if (googleCalTile) googleCalTile.connected = googleCalendarConnected;
     const googleDocsTile = hardcoded.find(h => h.id === "google-docs");
     if (googleDocsTile) googleDocsTile.connected = googleDocsConnected;
-    const googleSheetsTile = hardcoded.find(h => h.id === "google-sheets");
-    if (googleSheetsTile) googleSheetsTile.connected = googleSheetsConnected;
-    const gmailTile = hardcoded.find(h => h.id === "gmail");
-    if (gmailTile) gmailTile.connected = gmailConnected;
     // Custom MCP tile shows the dot when any user-registered MCP server is enabled.
     const customMcpTile = hardcoded.find(h => h.id === "custom-mcp");
     if (customMcpTile) {
@@ -3982,7 +4006,7 @@ export function ConnectionsSection({
       category: CONNECTION_CATEGORY_BY_ID[tile.id] ?? tile.category ?? "Other",
       description: tile.description ?? CONNECTION_HARDCODED_DESCRIPTIONS[tile.id],
     }));
-  }, [os, claudeInstalled, cursorInstalled, codexInstalled, grokInstalled, chatgptConnected, browserUrlConnected, browserUrlDetected, integrations, appleCalendarConnected, googleCalendarConnected, googleDocsConnected, googleSheetsConnected, gmailConnected, customMcpConnected, customMcpServerCount, krispConnected, plaudConnected, excalidrawConnected, importedSkillsCount, detectedConnectionIds]);
+  }, [os, claudeInstalled, cursorInstalled, codexInstalled, grokInstalled, chatgptConnected, browserUrlConnected, browserUrlDetected, integrations, appleCalendarConnected, googleCalendarConnected, googleDocsConnected, customMcpConnected, customMcpServerCount, krispConnected, plaudConnected, mcpProviderConnected, excalidrawConnected, importedSkillsCount, detectedConnectionIds]);
 
   const isDefaultView = !search.trim() && categoryFilter === ALL_CONNECTION_CATEGORIES;
 
@@ -4037,6 +4061,54 @@ export function ConnectionsSection({
 
   const renderPanel = () => {
     if (!selected) return null;
+    // Providers with a first-party remote MCP (OAuth + DCR) connect in one
+    // click — this intercepts both old API-key tiles (Linear, Stripe, …) and
+    // connector-OAuth tiles (Notion, Jira) before the switch below.
+    const mcpProvider = MCP_OAUTH_PROVIDERS.find(p => p.id === selected);
+    if (mcpProvider) {
+      // Anyone already connected the old way (API key, or connector OAuth for
+      // Notion/Jira) keeps that connection — the credential and pipes are
+      // untouched. Surface it under an "advanced" disclosure so they can still
+      // see/rotate/remove it; otherwise the one-click OAuth is the primary path.
+      const existing = selectedIntegration;
+      const hasManual = !!existing && (existing.is_oauth || existing.fields.length > 0);
+      return (
+        <div className="space-y-3">
+          <OAuthMcpPanel
+            name={mcpProvider.name}
+            mcpUrl={mcpProvider.url}
+            description={mcpProvider.description}
+            onConnected={() => setMcpProviderConnected(m => ({ ...m, [mcpProvider.id]: true }))}
+            onDisconnected={() => setMcpProviderConnected(m => ({ ...m, [mcpProvider.id]: false }))}
+          />
+          {hasManual && existing && (
+            <details open={existing.connected && !mcpProviderConnected[mcpProvider.id]}>
+              <summary className="text-[11px] text-muted-foreground cursor-pointer select-none hover:text-foreground">
+                advanced: {existing.connected
+                  ? "manage your existing connection"
+                  : "connect with an API key instead"}
+              </summary>
+              <div className="pt-2">
+                {existing.is_oauth ? (
+                  <OAuthPanel
+                    integrationId={existing.id}
+                    integrationName={existing.name}
+                    supportsOAuthInstances={!!existing.supports_oauth_instances}
+                    onConnected={() => refreshIntegrationConnection(existing.id, true)}
+                    onDisconnected={() => refreshIntegrationConnection(existing.id, false)}
+                  />
+                ) : (
+                  <ApiIntegrationPanel
+                    integration={existing}
+                    onRefresh={fetchIntegrations}
+                  />
+                )}
+              </div>
+            </details>
+          )}
+        </div>
+      );
+    }
     switch (selected) {
       case "claude": return <ClaudePanel
         onConnected={() => setClaudeInstalled(true)}
@@ -4065,8 +4137,6 @@ export function ConnectionsSection({
         onDisconnected={() => { setGoogleCalendarConnected(false); notifyConnectionsUpdated(); fetchIntegrations(); }}
       />;
       case "google-docs": return <GoogleDocsCard />;
-      case "google-sheets": return <GoogleSheetsCard onConnectionChange={fetchIntegrations} />;
-      case "gmail": return <GmailCard />;
       case "ics-calendar": return <IcsCalendarCard />;
       case "remote-agent": return <RemoteAgentCard />;
       case "whatsapp": return <WhatsAppPanel />;

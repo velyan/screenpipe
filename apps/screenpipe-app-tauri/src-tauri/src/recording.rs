@@ -710,6 +710,47 @@ pub async fn stop_screenpipe(
     Ok(())
 }
 
+/// Hard ceiling on capture/server teardown that runs *immediately before* the
+/// process restarts or exits.
+///
+/// A wedged `session.stop()` must never hold the process hostage: it's about to
+/// be replaced or killed, so a perfectly clean teardown is best-effort only
+/// (`server.rs` retries the port bind if the next boot races teardown). The
+/// macOS `VisionManager` shutdown only self-aborts after 10s, and audio-device
+/// teardown can stall right after sleep/wake — so without an outer bound the
+/// relaunch is held until those internal timeouts fire one after another.
+///
+/// See the 2026-06-26 MacBook Air incident: a 2.5.57 → 2.5.73 update froze for
+/// ~57s before relaunching — the `VisionManager` 10s abort plus impatient Quit
+/// re-clicks piling additional *unbounded* teardowns on top of each other.
+pub const PRE_EXIT_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Outcome of a time-bounded teardown (see [`bounded_teardown`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum TeardownOutcome {
+    /// Teardown finished cleanly.
+    Completed,
+    /// Teardown ran to completion but reported an error.
+    Failed(String),
+    /// Teardown did not finish within the timeout and was dropped so the
+    /// pending restart/exit can proceed regardless.
+    TimedOut,
+}
+
+/// Run a teardown future under a hard timeout so a wedged capture/audio
+/// shutdown can never stall a pending restart or exit. Returns
+/// [`TeardownOutcome::TimedOut`] (dropping the teardown) once `timeout` elapses.
+pub async fn bounded_teardown<F>(timeout: Duration, teardown: F) -> TeardownOutcome
+where
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    match tokio::time::timeout(timeout, teardown).await {
+        Ok(Ok(())) => TeardownOutcome::Completed,
+        Ok(Err(e)) => TeardownOutcome::Failed(e),
+        Err(_) => TeardownOutcome::TimedOut,
+    }
+}
+
 /// Start the server (if not running) and capture.
 /// This is the main entry point called by the frontend.
 #[tauri::command]
@@ -1376,5 +1417,45 @@ mod db_wedge_tests {
             assert_eq!(s.decide(t, WINDOW, MAX), WedgeAction::Restart);
             t += WINDOW + Duration::from_secs(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod teardown_tests {
+    use super::{bounded_teardown, TeardownOutcome};
+    use std::time::{Duration, Instant};
+
+    #[tokio::test]
+    async fn completes_when_teardown_returns_ok() {
+        let out = bounded_teardown(Duration::from_secs(5), async { Ok(()) }).await;
+        assert_eq!(out, TeardownOutcome::Completed);
+    }
+
+    #[tokio::test]
+    async fn surfaces_teardown_error_without_timing_out() {
+        let out = bounded_teardown(Duration::from_secs(5), async { Err("boom".to_string()) }).await;
+        assert_eq!(out, TeardownOutcome::Failed("boom".to_string()));
+    }
+
+    /// Regression for the 2026-06-26 MacBook Air hang: a teardown that never
+    /// completes (e.g. a wedged `VisionManager`/audio shutdown) must be dropped
+    /// at the timeout so the pending restart/exit proceeds — it must NOT block
+    /// for the full duration of the inner future.
+    #[tokio::test]
+    async fn times_out_when_teardown_wedges() {
+        let timeout = Duration::from_millis(100);
+        let started = Instant::now();
+        let out = bounded_teardown(timeout, async {
+            // Stand-in for a wedged teardown that would otherwise hang for ages.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok(())
+        })
+        .await;
+        assert_eq!(out, TeardownOutcome::TimedOut);
+        assert!(
+            started.elapsed() < timeout + Duration::from_secs(2),
+            "teardown should be bounded by the timeout, took {:?}",
+            started.elapsed()
+        );
     }
 }

@@ -70,6 +70,18 @@ pub enum EnterpriseUploadMode {
     DirectReadable(DirectUploadConfig),
 }
 
+impl EnterpriseUploadMode {
+    /// Stable, human-readable mode name for logs / support output. Avoids the
+    /// `{:?}`-on-`discriminant` footgun that printed a bare `Discriminant(0)`.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::HostedIngest => "hosted_ingest",
+            Self::DirectEncrypted(_) => "direct_encrypted",
+            Self::DirectReadable(_) => "direct_readable",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DirectUploadConfig {
     pub ticket_url: String,
@@ -675,6 +687,19 @@ mod tests {
     // ever drift (or our encryptor mis-flows the nonce/key), this test
     // breaks loudly before any customer sees corrupt ciphertext.
     use screenpipe_core::sync::crypto::decrypt;
+
+    #[test]
+    fn upload_mode_label_is_readable_not_a_discriminant() {
+        assert_eq!(EnterpriseUploadMode::HostedIngest.label(), "hosted_ingest");
+        assert_eq!(
+            EnterpriseUploadMode::DirectReadable(direct_cfg()).label(),
+            "direct_readable"
+        );
+        assert_eq!(
+            EnterpriseUploadMode::DirectEncrypted(direct_cfg()).label(),
+            "direct_encrypted"
+        );
+    }
 
     fn direct_cfg() -> DirectUploadConfig {
         DirectUploadConfig {

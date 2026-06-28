@@ -151,6 +151,7 @@ export function useChatPrefillListener({
 
         const trimmedContext = context?.trim();
         const fullMessage = trimmedContext ? `${trimmedContext}\n\n${prompt}` : prompt;
+        const visiblePrompt = displayLabel?.trim() ? displayLabel : prompt;
 
         (async () => {
           try {
@@ -172,7 +173,7 @@ export function useChatPrefillListener({
             setMessages([]);
             setPrefillContext(null);
             setPrefillFrameId(null);
-            setInput(fullMessage);
+            setInput(visiblePrompt);
 
             const newSid = crypto.randomUUID();
             piSessionIdRef.current = newSid;
@@ -181,7 +182,7 @@ export function useChatPrefillListener({
             autoSendBypassRef.current = true;
             await new Promise((resolve) => setTimeout(resolve, 200));
             if (sendMessageRef.current) {
-              await sendMessageRef.current(fullMessage, displayLabel, prefillImages);
+              await sendMessageRef.current(fullMessage, visiblePrompt, prefillImages);
               setInput("");
               if (inputRef.current) inputRef.current.style.height = "auto";
             }

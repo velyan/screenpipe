@@ -197,7 +197,7 @@ pub async fn run_pipe_now(
     }
 
     // Refresh connections context so the pipe system prompt includes currently
-    // connected integrations (Google Calendar, Gmail, etc.).
+    // connected integrations (Google Calendar, Google Docs, etc.).
     let screenpipe_dir = mgr
         .pipes_dir()
         .parent()

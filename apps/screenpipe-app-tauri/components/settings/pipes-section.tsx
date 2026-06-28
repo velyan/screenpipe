@@ -163,7 +163,7 @@ if the pipe needs an external app or a user-configured MCP server, declare it in
 ---
 schedule: every 30m
 connections:
-  - gmail
+  - google-calendar
   - mcp:my-server-id
 ---
 \`\`\`

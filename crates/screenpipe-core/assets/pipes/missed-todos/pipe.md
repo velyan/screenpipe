@@ -21,7 +21,7 @@ Keep memory healthy so it never drifts:
 
 Find action items and to-dos from the last 3 days that I may have missed. Read the screenpipe skill first. Use limit=10 per search, max 5 searches over the last 3 days. Query the API only — do not write or run code.
 
-Look across messages, email, meetings, docs, and issue trackers (e.g. Slack, Gmail, Notion, Linear, GitHub) for commitments and tasks — phrases like "I'll", "can you", "TODO", "follow up", "by Friday", action items, and unchecked checkboxes.
+Look across messages, meetings, docs, and issue trackers (e.g. Slack, Notion, Linear, GitHub) for commitments and tasks — phrases like "I'll", "can you", "TODO", "follow up", "by Friday", action items, and unchecked checkboxes.
 
 Use this exact format:
 

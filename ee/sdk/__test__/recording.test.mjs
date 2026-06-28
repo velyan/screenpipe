@@ -15,7 +15,8 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { statSync, rmSync, existsSync } from "node:fs";
+import { statSync, rmSync, readdirSync } from "node:fs";
+import { basename, dirname, extname, join } from "node:path";
 
 import {
   Recorder,
@@ -24,6 +25,42 @@ import {
   isEnvError,
   assertMp4,
 } from "./_helpers.mjs";
+
+function mp4OutputPaths(template) {
+  const paths = new Set();
+  try {
+    statSync(template);
+    paths.add(template);
+  } catch {}
+
+  const dir = dirname(template);
+  const file = basename(template);
+  const fileExt = extname(file);
+  const ext = fileExt || ".mp4";
+  const stem = fileExt ? basename(file, fileExt) : file;
+  try {
+    for (const entry of readdirSync(dir)) {
+      if (entry === file || (entry.startsWith(`${stem}-monitor-`) && entry.endsWith(ext))) {
+        paths.add(join(dir, entry));
+      }
+    }
+  } catch {}
+  return [...paths].sort();
+}
+
+function removeMp4Outputs(template) {
+  for (const path of mp4OutputPaths(template)) {
+    try { rmSync(path); } catch {}
+  }
+  try { rmSync(template); } catch {}
+}
+
+function assertRecordedMp4(template) {
+  const paths = mp4OutputPaths(template);
+  assert.ok(paths.length > 0, `mp4 missing: ${template}`);
+  for (const path of paths) assertMp4(path);
+  return paths;
+}
 
 /** Helper: record for `ms`, sampling size+frames at cadence `tickMs`. */
 async function recordAndSample(output, ms, tickMs = 250) {
@@ -47,18 +84,20 @@ test("a ~2 s recording writes a parseable MP4", async (t) => {
   const output = tempMp4("e2e-basic");
   try {
     const { samples } = await recordAndSample(output, 2000);
-    assertMp4(output);
-    assert.ok(
-      statSync(output).size > 1024,
-      `final file too small: ${statSync(output).size} bytes`,
-    );
+    const paths = assertRecordedMp4(output);
+    for (const path of paths) {
+      assert.ok(
+        statSync(path).size > 1024,
+        `final file too small: ${statSync(path).size} bytes`,
+      );
+    }
     assert.ok(samples.length >= 4, `too few samples: ${samples.length}`);
   } catch (e) {
     const msg = (e && e.message) || String(e);
     if (isEnvError(msg)) { t.skip(`environment: ${msg}`); return; }
     throw e;
   } finally {
-    try { rmSync(output); } catch {}
+    removeMp4Outputs(output);
   }
 });
 
@@ -84,7 +123,7 @@ test("framesWritten grows monotonically during capture", async (t) => {
     if (isEnvError(msg)) { t.skip(`environment: ${msg}`); return; }
     throw e;
   } finally {
-    try { rmSync(output); } catch {}
+    removeMp4Outputs(output);
   }
 });
 
@@ -99,15 +138,15 @@ test("observed frame rate is within 60% of the 15 fps target", async (t) => {
     const delta = last.frames - first.frames;
     if (delta === 0) { t.skip("no frames during window (headless)"); return; }
     const fps = delta / elapsed;
-    // CI VMs are slow — we target 15 fps but accept 6–20 fps to stay green
-    // without masking a genuine regression (e.g. capture dropping to 2 fps).
-    assert.ok(fps >= 6 && fps <= 20, `unexpected fps: ${fps.toFixed(2)}`);
+    // framesWritten is aggregate across all default multi-monitor MP4 loops.
+    // Keep the lower bound strict for dropped capture, but allow aggregate FPS.
+    assert.ok(fps >= 6 && fps <= 60, `unexpected fps: ${fps.toFixed(2)}`);
   } catch (e) {
     const msg = (e && e.message) || String(e);
     if (isEnvError(msg)) { t.skip(`environment: ${msg}`); return; }
     throw e;
   } finally {
-    try { rmSync(output); } catch {}
+    removeMp4Outputs(output);
   }
 });
 
@@ -128,16 +167,15 @@ test("two sequential recordings write two distinct MP4s", async (t) => {
       await new Promise((ok) => setTimeout(ok, 1000));
       await r.stop();
     }
-    assert.ok(existsSync(outA) && existsSync(outB));
-    assertMp4(outA);
-    assertMp4(outB);
-    assert.notEqual(outA, outB);
+    const pathsA = assertRecordedMp4(outA);
+    const pathsB = assertRecordedMp4(outB);
+    assert.ok(pathsA.every((path) => !pathsB.includes(path)));
   } catch (e) {
     const msg = (e && e.message) || String(e);
     if (isEnvError(msg)) { t.skip(`environment: ${msg}`); return; }
     throw e;
   } finally {
-    for (const p of [outA, outB]) { try { rmSync(p); } catch {} }
+    for (const p of [outA, outB]) removeMp4Outputs(p);
   }
 });
 
@@ -149,16 +187,17 @@ test("stop() flushes the final moov/moof — file is playable by ffprobe", async
     await r.start();
     await new Promise((ok) => setTimeout(ok, 1500));
     await r.stop();
+    const [probePath] = assertRecordedMp4(output);
 
     const { spawnSync } = await import("node:child_process");
     const probe = spawnSync(
       "ffprobe",
-      ["-v", "error", "-print_format", "json", "-show_streams", output],
+      ["-v", "error", "-print_format", "json", "-show_streams", probePath],
       { encoding: "utf8" },
     );
     if (probe.status !== 0) {
       // ffprobe not available — fall back to header magic check.
-      assertMp4(output);
+      assertMp4(probePath);
       return;
     }
     const parsed = JSON.parse(probe.stdout || "{}");
@@ -172,6 +211,6 @@ test("stop() flushes the final moov/moof — file is playable by ffprobe", async
     if (isEnvError(msg)) { t.skip(`environment: ${msg}`); return; }
     throw e;
   } finally {
-    try { rmSync(output); } catch {}
+    removeMp4Outputs(output);
   }
 });

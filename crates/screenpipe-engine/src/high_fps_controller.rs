@@ -275,11 +275,19 @@ impl HighFpsController {
     /// that will never come.
     pub fn start_meeting_session(&self, meeting_id: i64) -> HighFpsSnapshot {
         let now = Instant::now();
-        let in_meeting = self
-            .detector
-            .as_ref()
-            .map(|d| d.is_in_meeting())
-            .unwrap_or(false);
+        // Use the same meeting signal as `snapshot()`: the desktop app builds
+        // this controller with NO detector handle and drives meeting state
+        // through `meeting_started`/`meeting_ended` events (`event_in_meeting`,
+        // set via `set_in_meeting`). Checking only `self.detector` here meant
+        // the app always saw "not in a meeting" and downgraded every
+        // meeting-triggered session to the bounded 30-min `STALE_MEETING_FALLBACK`
+        // timer — so HD stopped 30 min into any longer call instead of staying
+        // bound to the meeting. Fall back to the event flag when no detector is
+        // wired so a fresh meeting gets the proper meeting-bound session.
+        let in_meeting = match self.detector.as_ref() {
+            Some(d) => d.is_in_meeting(),
+            None => self.event_in_meeting.load(Ordering::Relaxed),
+        };
         let (kind, expires_at, log_reason) = if in_meeting {
             (
                 SessionKind::Meeting { meeting_id },
@@ -689,6 +697,45 @@ mod tests {
         ));
         let remaining = s.remaining_secs.unwrap();
         assert!(remaining >= MAX_MEETING_DURATION.as_secs() - 5);
+    }
+
+    #[test]
+    fn app_meeting_session_is_meeting_bound_via_event_flag() {
+        // Regression: the desktop app builds the controller with NO detector
+        // and signals meetings through set_in_meeting (event_in_meeting). The
+        // meeting_started handler calls set_in_meeting(true) and THEN
+        // start_meeting_session(id). Before the fix, start_meeting_session only
+        // consulted self.detector (None → false), so it downgraded every
+        // meeting to the 30-min STALE_MEETING_FALLBACK timer and HD stopped
+        // 30 min into any longer call. With the event-flag fallback, a fresh
+        // meeting must be meeting-bound with the ~4h cap.
+        let c = Arc::new(HighFpsController::new(None, DefaultMode::Always, 100));
+        c.set_in_meeting(true);
+        c.start_meeting_session(293);
+        let s = c.snapshot();
+        assert!(matches!(
+            s.kind,
+            Some(SessionKind::Meeting { meeting_id: 293 })
+        ));
+        let remaining = s.remaining_secs.unwrap();
+        assert!(remaining >= MAX_MEETING_DURATION.as_secs() - 5);
+        // And it ends when the matching meeting ends (not only on the cap).
+        c.handle_meeting_ended(293);
+        assert!(!c.snapshot().active);
+    }
+
+    #[test]
+    fn app_stale_click_without_meeting_still_falls_back_to_timer() {
+        // Counter-test: no detector AND no active meeting (event flag false) is
+        // a genuine stale click — must still downgrade to the bounded timer so
+        // it can't sit waiting for a meeting_ended that never comes.
+        let c = Arc::new(HighFpsController::new(None, DefaultMode::Always, 100));
+        c.start_meeting_session(42);
+        let s = c.snapshot();
+        assert!(matches!(s.kind, Some(SessionKind::Timer)));
+        let remaining = s.remaining_secs.unwrap();
+        assert!(remaining <= STALE_MEETING_FALLBACK.as_secs());
+        assert!(remaining >= STALE_MEETING_FALLBACK.as_secs() - 5);
     }
 
     #[test]

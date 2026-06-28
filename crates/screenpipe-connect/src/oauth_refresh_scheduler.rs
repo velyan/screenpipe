@@ -528,8 +528,8 @@ mod tests {
     #[test]
     fn parse_key_instance() {
         assert_eq!(
-            parse_oauth_key("oauth:gmail:louis@screenpi.pe"),
-            Some(("gmail", Some("louis@screenpi.pe")))
+            parse_oauth_key("oauth:google-calendar:louis@screenpi.pe"),
+            Some(("google-calendar", Some("louis@screenpi.pe")))
         );
     }
 

@@ -31,7 +31,7 @@
           },
           {
             "group": "connect",
-            "pages": ["mcp-server", "mcp-apps", "connections", "connection-reference", "cloud-archive", "privacy-data-flow", "privacy-filter", "teams"]
+            "pages": ["mcp-server", "connections", "connection-reference", "cloud-archive", "privacy-data-flow", "privacy-filter", "teams"]
           },
           {
             "group": "use cases",

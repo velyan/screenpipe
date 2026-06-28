@@ -2167,7 +2167,12 @@ mod tests {
 
     #[test]
     fn test_should_retry_empty_text_walk_only_for_non_empty_node_tree() {
-        let mut state = WalkState::new(&TreeWalkerConfig::default(), Instant::now());
+        let mut state = WalkState::new(
+            &TreeWalkerConfig::default(),
+            Instant::now(),
+            Vec::new(),
+            String::new(),
+        );
         assert!(!should_retry_empty_text_walk(&state));
 
         state.node_count = 3;

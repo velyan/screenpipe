@@ -84,7 +84,7 @@ describe("isScreenpipeApi", () => {
       )
     ).toBe(false);
     expect(
-      isScreenpipeApi("http://127.0.0.1:3030/connections/gmail?instance=x@screenpipe.com")
+      isScreenpipeApi("http://127.0.0.1:3030/connections/google-calendar?instance=x@screenpipe.com")
     ).toBe(false);
   });
 

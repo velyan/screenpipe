@@ -20,6 +20,7 @@ use chrono::Utc;
 use crossbeam_channel::RecvTimeoutError;
 use screenpipe_a11y::config::UiCaptureConfig;
 use screenpipe_a11y::events::{EventData, UiEvent};
+use screenpipe_a11y::platform::RecordingHandle;
 use screenpipe_a11y::platform::UiRecorder;
 use screenpipe_a11y::tree::{
     create_tree_walker, SkipReason, TreeSnapshot, TreeWalkResult, TreeWalkerConfig,
@@ -37,7 +38,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::Instant;
-use screenpipe_a11y::platform::RecordingHandle;
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
@@ -196,12 +196,7 @@ impl Recorder {
     /// short-held read lock on the reason string.
     pub fn filter_status(&self) -> (bool, Option<String>) {
         let paused = self.filter.paused.load(Ordering::Relaxed);
-        let reason = self
-            .filter
-            .last_reason
-            .read()
-            .ok()
-            .and_then(|g| g.clone());
+        let reason = self.filter.last_reason.read().ok().and_then(|g| g.clone());
         (paused, reason)
     }
 
@@ -552,14 +547,15 @@ fn derive_mp4_output_path(template: &str, monitor_id: u32, multi: bool) -> Strin
         return template.to_string();
     }
     let path = std::path::Path::new(template);
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("session");
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("session");
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("mp4");
     let parent = path.parent();
     let file_name = format!("{stem}-monitor-{monitor_id}.{ext}");
     match parent {
-        Some(p) if !p.as_os_str().is_empty() => {
-            p.join(file_name).to_string_lossy().into_owned()
-        }
+        Some(p) if !p.as_os_str().is_empty() => p.join(file_name).to_string_lossy().into_owned(),
         _ => file_name,
     }
 }
@@ -590,17 +586,39 @@ async fn resolve_paired_monitors(ids: Option<&[u32]>) -> Result<Vec<SafeMonitor>
 fn ui_capture_config_from_options(opts: Option<&UiCaptureOptions>) -> UiCaptureConfig {
     let mut cfg = UiCaptureConfig::default();
     cfg.enabled = true;
-    let Some(o) = opts else { return cfg; };
-    if let Some(v) = o.capture_clicks { cfg.capture_clicks = v; }
-    if let Some(v) = o.capture_text { cfg.capture_text = v; }
-    if let Some(v) = o.capture_keystrokes { cfg.capture_keystrokes = v; }
-    if let Some(v) = o.capture_app_switch { cfg.capture_app_switch = v; }
-    if let Some(v) = o.capture_window_focus { cfg.capture_window_focus = v; }
-    if let Some(v) = o.capture_scroll { cfg.capture_scroll = v; }
-    if let Some(v) = o.capture_clipboard { cfg.capture_clipboard = v; }
-    if let Some(v) = o.capture_clipboard_content { cfg.capture_clipboard_content = v; }
-    if let Some(v) = o.capture_context { cfg.capture_context = v; }
-    if let Some(v) = o.capture_mouse_move { cfg.capture_mouse_move = v; }
+    let Some(o) = opts else {
+        return cfg;
+    };
+    if let Some(v) = o.capture_clicks {
+        cfg.capture_clicks = v;
+    }
+    if let Some(v) = o.capture_text {
+        cfg.capture_text = v;
+    }
+    if let Some(v) = o.capture_keystrokes {
+        cfg.capture_keystrokes = v;
+    }
+    if let Some(v) = o.capture_app_switch {
+        cfg.capture_app_switch = v;
+    }
+    if let Some(v) = o.capture_window_focus {
+        cfg.capture_window_focus = v;
+    }
+    if let Some(v) = o.capture_scroll {
+        cfg.capture_scroll = v;
+    }
+    if let Some(v) = o.capture_clipboard {
+        cfg.capture_clipboard = v;
+    }
+    if let Some(v) = o.capture_clipboard_content {
+        cfg.capture_clipboard_content = v;
+    }
+    if let Some(v) = o.capture_context {
+        cfg.capture_context = v;
+    }
+    if let Some(v) = o.capture_mouse_move {
+        cfg.capture_mouse_move = v;
+    }
     cfg
 }
 
@@ -728,11 +746,7 @@ async fn focus_watch_loop(filter: Arc<FilterState>, stop_flag: Arc<AtomicBool>) 
 
         // Fast path: no filter configured → make sure paused is false and
         // skip the (potentially expensive) a11y walk entirely.
-        let is_empty = filter
-            .config
-            .read()
-            .map(|c| c.is_empty())
-            .unwrap_or(true);
+        let is_empty = filter.config.read().map(|c| c.is_empty()).unwrap_or(true);
         if is_empty {
             filter.paused.store(false, Ordering::Relaxed);
             if let Ok(mut r) = filter.last_reason.write() {
@@ -793,7 +807,9 @@ fn evaluate_focus(filter: &FilterState) -> Option<(bool, Option<String>)> {
             let cfg = filter.config.read().ok()?;
             let url = snap.browser_url.as_deref().unwrap_or("");
             let url_blocked = !url.is_empty() && cfg.filters.is_url_blocked(url);
-            let title_blocked = cfg.filters.is_title_suggesting_blocked_url(&snap.window_name);
+            let title_blocked = cfg
+                .filters
+                .is_title_suggesting_blocked_url(&snap.window_name);
             if url_blocked || title_blocked {
                 Some((true, Some("ignored_url".to_string())))
             } else {
@@ -838,9 +854,8 @@ async fn start_paired_captures(
     // What `screenpipe-js` and any tool reading the CLI's DB expects.
     let db_path = data_dir.join("db.sqlite");
     let snapshots_dir = data_dir.join("data");
-    std::fs::create_dir_all(&snapshots_dir).with_context(|| {
-        format!("create snapshots dir {}", snapshots_dir.display())
-    })?;
+    std::fs::create_dir_all(&snapshots_dir)
+        .with_context(|| format!("create snapshots dir {}", snapshots_dir.display()))?;
 
     let db = Arc::new(
         DatabaseManager::new(&db_path.to_string_lossy(), DbConfig::default())
@@ -1025,7 +1040,9 @@ async fn paired_capture_loop_for_monitor(
 
         // Universal debounce. Skips both rapid-fire events and idle/visual
         // ticks that arrive too close to the previous capture.
-        if last_capture.elapsed() < MIN_CAPTURE_GAP { continue; }
+        if last_capture.elapsed() < MIN_CAPTURE_GAP {
+            continue;
+        }
 
         // Walk the accessibility tree on a blocking thread. The walker is
         // not Send, so we construct it inside spawn_blocking.
@@ -1074,7 +1091,11 @@ async fn paired_capture_loop_for_monitor(
             document_path: snapshot.document_path.as_deref(),
             focused: true,
             capture_trigger: trigger_label,
+            capture_provenance: None,
+            force_ocr: false,
             use_pii_removal,
+            enable_main_body_distillation: false,
+            main_body_distillation_threshold: 0.60,
             languages: Vec::new(),
             elements_ref_frame_id: None,
             screenshot_disabled: false,
@@ -1101,10 +1122,7 @@ async fn paired_capture_loop_for_monitor(
 /// the `last_scroll` Instant so the scroll_stop timer can fire after a
 /// quiet period — they don't trigger a capture themselves. Move events
 /// are too noisy to be useful triggers.
-fn trigger_from_event(
-    ev: &UiEvent,
-    last_scroll: &mut Option<Instant>,
-) -> Option<&'static str> {
+fn trigger_from_event(ev: &UiEvent, last_scroll: &mut Option<Instant>) -> Option<&'static str> {
     match &ev.data {
         EventData::Click { .. } => Some("click"),
         EventData::Text { .. } => Some("typing_pause"),
@@ -1316,7 +1334,10 @@ mod tests {
             char_count: Some(5),
         });
         let mut last_scroll = None;
-        assert_eq!(trigger_from_event(&ev, &mut last_scroll), Some("typing_pause"));
+        assert_eq!(
+            trigger_from_event(&ev, &mut last_scroll),
+            Some("typing_pause")
+        );
     }
 
     #[test]
@@ -1336,7 +1357,10 @@ mod tests {
             pid: 1234,
         });
         let mut last_scroll = None;
-        assert_eq!(trigger_from_event(&ev, &mut last_scroll), Some("app_switch"));
+        assert_eq!(
+            trigger_from_event(&ev, &mut last_scroll),
+            Some("app_switch")
+        );
     }
 
     #[test]

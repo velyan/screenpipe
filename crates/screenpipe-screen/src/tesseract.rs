@@ -7,7 +7,7 @@ use rusty_tesseract::{Args, DataOutput, Image};
 use screenpipe_core::{Language, TESSERACT_LANGUAGES};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 use tracing::warn;
 
 /// Ensure TESSDATA_PREFIX is set so tesseract can find language data files.
@@ -95,12 +95,53 @@ fn ensure_bundled_tesseract_on_path() {
     });
 }
 
+/// Whether a `tesseract` binary is resolvable, probed once per process.
+///
+/// rusty-tesseract's `get_tesseract_command()` does `find_tesseract_path().unwrap()`
+/// (command.rs:108) — when no binary is found it PANICS ("called `Option::unwrap()`
+/// on a `None` value") instead of returning Err, unwinding the tokio capture
+/// worker (SCREENPIPE-CLI-V3 / CLI-T0: Linux/npx hosts with no system tesseract
+/// and no bundled one). #4564's `catch_unwind` stops the crash, but the panic
+/// hook still fires on every frame → continued Sentry noise plus stack-unwind +
+/// backtrace cost ~30×/sec for the whole session. Pre-flighting the *same*
+/// resolution rusty-tesseract uses lets us disable OCR cleanly and log exactly
+/// once, so the panic never happens in the common missing-binary case. The
+/// `catch_unwind` below stays as a belt-and-suspenders net for other tesseract
+/// misbehavior (e.g. a present-but-broken binary).
+///
+/// Cached because the binary's presence does not change within a process run and
+/// `find_tesseract_path()` stats several locations + walks PATH each call. The
+/// `ensure_bundled_tesseract_on_path()` / `ensure_tessdata_prefix()` env setup
+/// runs (once) before the first probe, so the bundled CLI binary is on PATH by
+/// the time we look.
+fn tesseract_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let found = rusty_tesseract::find_tesseract_path().is_some();
+        if !found {
+            warn!(
+                "tesseract binary not found (no system install and none bundled next to \
+                 the engine); OCR disabled for this session — install tesseract-ocr to \
+                 enable screen text capture"
+            );
+        }
+        found
+    })
+}
+
 pub fn perform_ocr_tesseract(
     image: &DynamicImage,
     languages: Vec<Language>,
 ) -> (String, String, Option<f64>) {
     ensure_bundled_tesseract_on_path();
     ensure_tessdata_prefix();
+
+    // No tesseract binary → skip OCR instead of letting rusty-tesseract panic on
+    // every frame (SCREENPIPE-CLI-V3 / CLI-T0). Returns the same empty sentinel
+    // as a failed OCR so the rest of the capture pipeline is unaffected.
+    if !tesseract_available() {
+        return (String::new(), "[]".to_string(), None);
+    }
 
     let language_string = match languages.is_empty() {
         true => "eng".to_string(),
@@ -267,14 +308,31 @@ mod tests {
 
     // SCREENPIPE-CLI-V3 / CLI-T0: rusty_tesseract panics (unwrap on None) when
     // the tesseract binary is unavailable. perform_ocr_tesseract must absorb that
-    // via catch_unwind and return an empty result instead of unwinding the
-    // worker. Runs whether or not tesseract is installed: missing → exercises the
-    // catch_unwind path; present → normal OCR of a blank image. Either way it
-    // must return (not panic) with structured JSON.
+    // and return an empty result instead of unwinding the worker. Runs whether or
+    // not tesseract is installed: missing → exercises the tesseract_available()
+    // pre-flight skip; present → normal OCR of a blank image. The catch_unwind
+    // around image_to_data backs both paths up. Either way it must return (not
+    // panic) with structured JSON.
     #[test]
     fn perform_ocr_tesseract_is_panic_safe() {
         let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(8, 8));
         let (_text, json, _conf) = perform_ocr_tesseract(&img, vec![]);
         assert!(json.starts_with('['), "expected JSON array, got: {json}");
+    }
+
+    // The availability probe is cached for the process, so the enable/disable-OCR
+    // decision must be stable: no flapping between frames, and it must agree with
+    // a direct resolution probe. (Whether tesseract is actually present depends on
+    // the test host — we assert consistency, not a specific value.)
+    #[test]
+    fn tesseract_available_is_stable() {
+        let a = tesseract_available();
+        let b = tesseract_available();
+        assert_eq!(a, b, "cached availability must not flap");
+        assert_eq!(
+            a,
+            rusty_tesseract::find_tesseract_path().is_some(),
+            "probe must match rusty-tesseract's own resolution"
+        );
     }
 }

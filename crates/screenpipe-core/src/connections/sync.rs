@@ -937,7 +937,7 @@ mod tests {
 
     /// An OAuth row carrying an explicit rotation generation.
     fn oauth_conn(key: &str, rev: u64, modified: &str, by: &str) -> SyncedConnection {
-        let mut c = connection(key, "gmail", modified, by, true);
+        let mut c = connection(key, "google-calendar", modified, by, true);
         c.oauth_rev = rev;
         c
     }
@@ -1042,17 +1042,30 @@ mod tests {
         // though A's timestamp is newer. This is the brick-prevention case.
         let local = manifest(
             "A",
-            vec![oauth_conn("gmail", 1, "2026-05-10T00:00:00Z", "A")],
+            vec![oauth_conn(
+                "google-calendar",
+                1,
+                "2026-05-10T00:00:00Z",
+                "A",
+            )],
         );
         let remote = manifest(
             "B",
-            vec![oauth_conn("gmail", 2, "2026-05-01T00:00:00Z", "B")],
+            vec![oauth_conn(
+                "google-calendar",
+                2,
+                "2026-05-01T00:00:00Z",
+                "B",
+            )],
         );
 
         let (merged, actions) = merge_manifests(&local, &remote, "A");
-        assert_eq!(actions, vec![ConnectionSyncAction::Updated("gmail".into())]);
-        assert_eq!(merged.connections["gmail"].oauth_rev, 2);
-        assert_eq!(merged.connections["gmail"].last_modified_by, "B");
+        assert_eq!(
+            actions,
+            vec![ConnectionSyncAction::Updated("google-calendar".into())]
+        );
+        assert_eq!(merged.connections["google-calendar"].oauth_rev, 2);
+        assert_eq!(merged.connections["google-calendar"].last_modified_by, "B");
     }
 
     #[test]
@@ -1062,17 +1075,30 @@ mod tests {
         // timestamp must NOT overwrite it.
         let local = manifest(
             "A",
-            vec![oauth_conn("gmail", 2, "2026-05-01T00:00:00Z", "A")],
+            vec![oauth_conn(
+                "google-calendar",
+                2,
+                "2026-05-01T00:00:00Z",
+                "A",
+            )],
         );
         let remote = manifest(
             "B",
-            vec![oauth_conn("gmail", 1, "2026-05-10T00:00:00Z", "B")],
+            vec![oauth_conn(
+                "google-calendar",
+                1,
+                "2026-05-10T00:00:00Z",
+                "B",
+            )],
         );
 
         let (merged, actions) = merge_manifests(&local, &remote, "A");
-        assert_eq!(actions, vec![ConnectionSyncAction::Skipped("gmail".into())]);
-        assert_eq!(merged.connections["gmail"].oauth_rev, 2);
-        assert_eq!(merged.connections["gmail"].last_modified_by, "A");
+        assert_eq!(
+            actions,
+            vec![ConnectionSyncAction::Skipped("google-calendar".into())]
+        );
+        assert_eq!(merged.connections["google-calendar"].oauth_rev, 2);
+        assert_eq!(merged.connections["google-calendar"].last_modified_by, "A");
     }
 
     #[test]
@@ -1081,16 +1107,29 @@ mod tests {
         // refresh token, so the fresher access token (newer timestamp) wins.
         let local = manifest(
             "A",
-            vec![oauth_conn("gmail", 3, "2026-05-10T00:00:00Z", "A")],
+            vec![oauth_conn(
+                "google-calendar",
+                3,
+                "2026-05-10T00:00:00Z",
+                "A",
+            )],
         );
         let remote = manifest(
             "B",
-            vec![oauth_conn("gmail", 3, "2026-05-01T00:00:00Z", "B")],
+            vec![oauth_conn(
+                "google-calendar",
+                3,
+                "2026-05-01T00:00:00Z",
+                "B",
+            )],
         );
 
         let (merged, actions) = merge_manifests(&local, &remote, "A");
-        assert_eq!(actions, vec![ConnectionSyncAction::Skipped("gmail".into())]);
-        assert_eq!(merged.connections["gmail"].last_modified_by, "A");
+        assert_eq!(
+            actions,
+            vec![ConnectionSyncAction::Skipped("google-calendar".into())]
+        );
+        assert_eq!(merged.connections["google-calendar"].last_modified_by, "A");
     }
 
     #[test]
@@ -1130,7 +1169,7 @@ mod tests {
             "refresh_token": "r",
             OAUTH_REFRESH_GEN_FIELD: 7,
         });
-        let rec = make_oauth_record("gmail", &token, "machine-1", now_rfc3339());
+        let rec = make_oauth_record("google-calendar", &token, "machine-1", now_rfc3339());
         assert_eq!(rec.oauth_rev, 7);
         assert!(rec.is_oauth);
     }
@@ -1138,20 +1177,20 @@ mod tests {
     #[test]
     fn oauth_gen_highwater_is_monotonic() {
         let dir = TempDir::new().unwrap();
-        assert_eq!(read_oauth_gen_highwater(dir.path(), "gmail"), 0);
+        assert_eq!(read_oauth_gen_highwater(dir.path(), "google-calendar"), 0);
 
-        bump_oauth_gen_highwater(dir.path(), "gmail", 3);
-        assert_eq!(read_oauth_gen_highwater(dir.path(), "gmail"), 3);
+        bump_oauth_gen_highwater(dir.path(), "google-calendar", 3);
+        assert_eq!(read_oauth_gen_highwater(dir.path(), "google-calendar"), 3);
 
         // A lower (or equal) bump never regresses the mark.
-        bump_oauth_gen_highwater(dir.path(), "gmail", 2);
-        bump_oauth_gen_highwater(dir.path(), "gmail", 3);
-        assert_eq!(read_oauth_gen_highwater(dir.path(), "gmail"), 3);
+        bump_oauth_gen_highwater(dir.path(), "google-calendar", 2);
+        bump_oauth_gen_highwater(dir.path(), "google-calendar", 3);
+        assert_eq!(read_oauth_gen_highwater(dir.path(), "google-calendar"), 3);
 
         // Distinct keys are tracked independently; 0 is a no-op.
-        bump_oauth_gen_highwater(dir.path(), "gmail", 5);
+        bump_oauth_gen_highwater(dir.path(), "google-calendar", 5);
         bump_oauth_gen_highwater(dir.path(), "slack", 0);
-        assert_eq!(read_oauth_gen_highwater(dir.path(), "gmail"), 5);
+        assert_eq!(read_oauth_gen_highwater(dir.path(), "google-calendar"), 5);
         assert_eq!(read_oauth_gen_highwater(dir.path(), "slack"), 0);
     }
 
@@ -1197,14 +1236,14 @@ mod tests {
 
         let mut good = HashMap::new();
         good.insert(
-            "gmail".to_string(),
+            "google-calendar".to_string(),
             SavedConnection {
                 enabled: true,
                 credentials: Map::new(),
             },
         );
         write_connection_file(dir.path(), &good).expect("initial write");
-        assert!(read_connection_file(dir.path()).contains_key("gmail"));
+        assert!(read_connection_file(dir.path()).contains_key("google-calendar"));
 
         // Block the temp path so the replacement write cannot land.
         fs::create_dir(dir.path().join("connections.tmp")).unwrap();
@@ -1222,7 +1261,7 @@ mod tests {
         assert!(result.is_err(), "write into a blocked temp path must error");
         let reloaded = read_connection_file(dir.path());
         assert!(
-            reloaded.contains_key("gmail"),
+            reloaded.contains_key("google-calendar"),
             "existing connections must survive a failed write"
         );
         assert!(!reloaded.contains_key("outlook"));
@@ -1236,15 +1275,15 @@ mod tests {
         // direct write (which would overwrite); passes against the atomic one.
         let dir = TempDir::new().unwrap();
         let good = serde_json::json!({ "access_token": "good" });
-        write_oauth_token_file(dir.path(), "gmail", &good).expect("initial write");
+        write_oauth_token_file(dir.path(), "google-calendar", &good).expect("initial write");
 
-        let path = connection_oauth_file_path(dir.path(), "gmail");
+        let path = connection_oauth_file_path(dir.path(), "google-calendar");
         assert!(path.exists());
 
         fs::create_dir(path.with_extension("tmp")).unwrap();
 
         let replacement = serde_json::json!({ "access_token": "new" });
-        let result = write_oauth_token_file(dir.path(), "gmail", &replacement);
+        let result = write_oauth_token_file(dir.path(), "google-calendar", &replacement);
 
         assert!(result.is_err(), "write into a blocked temp path must error");
         let reloaded: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();

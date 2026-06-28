@@ -123,7 +123,13 @@ async function waitForEventLog(
   }, field)) as unknown[];
 }
 
-describe("Focus server", function () {
+// QUARANTINED (#4610): CI/env flake — triggers the main window indirectly over
+// HTTP (SCREENPIPE_FOCUS_PORT handoff) and depends on OS-level window realization
+// on headless runners ("Hosted CI can't reliably assert OS-level foreground focus",
+// per this file's own header). The real show_main_window() path is already covered
+// directly by main-window.spec.ts. Fix = deterministic port handoff + window-handle
+// retry-trap, then re-enable.
+describe.skip("Focus server", function () {
   this.timeout(150_000);
 
   before(async () => {

@@ -155,7 +155,7 @@ export function GoogleCalendarCard({ onConnected, onDisconnected }: { onConnecte
     }
   }, [connected, fetchEvents]);
 
-  // Connect flow — uses local OAuth (same as Gmail)
+  // Connect flow — uses local OAuth.
   const handleConnect = async () => {
     setIsConnecting(true);
     try {

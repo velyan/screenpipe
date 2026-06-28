@@ -55,6 +55,45 @@ fn stream_frame_limit(requested: Option<usize>) -> usize {
         .clamp(1, MAX_STREAM_FRAME_LIMIT)
 }
 
+/// Reduce an already-display-ordered list to at most `limit` items by keeping an
+/// evenly-spaced stride across the WHOLE list (both ends included), rather than
+/// `truncate`, which keeps only the head and silently drops the tail.
+///
+/// For the timeline that tail was the OLDEST frames: with the default
+/// newest-first order + a 10k cap, a dense or multi-monitor day exceeded the cap
+/// before the morning, so the morning was dropped from the view even though the
+/// frames existed in the DB (the agent, which bypasses this stream, still
+/// returned them). Down-sampling preserves the full time span — just sparser
+/// when dense; zooming to a narrower range restores full resolution. See #4569.
+/// Allocation-free: compacts the `limit` selected items toward the front with
+/// in-place swaps, then truncates. O(n), no heap allocation, runs once per
+/// stream request (never per-frame/per-scroll); the client still receives the
+/// same <= `limit` frames, so scroll/render cost is unchanged.
+fn downsample_in_place<T>(items: &mut Vec<T>, limit: usize) {
+    let n = items.len();
+    if limit == 0 {
+        items.clear();
+        return;
+    }
+    if n <= limit {
+        return;
+    }
+    for write in 0..limit {
+        // Map write in [0, limit-1] across [0, n-1]: write=0 keeps the first,
+        // write=limit-1 keeps the last, so both ends of the (already
+        // display-ordered) range survive. The map is strictly increasing with
+        // step > 1 (n > limit) and idx >= write always, so each source slot is
+        // read once and never from an already-compacted position.
+        let idx = if limit == 1 {
+            0
+        } else {
+            write * (n - 1) / (limit - 1)
+        };
+        items.swap(write, idx);
+    }
+    items.truncate(limit);
+}
+
 #[derive(Debug, Serialize)]
 pub struct StreamTimeSeriesResponse {
     pub timestamp: DateTime<Utc>,
@@ -324,7 +363,7 @@ async fn handle_stream_frames_socket(
                             if is_descending {
                                 sorted.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
                             }
-                            sorted.truncate(limit);
+                            downsample_in_place(&mut sorted, limit);
                             let initial_count = sorted.len();
 
                             // Record sent IDs first (fast, no async), then send
@@ -385,7 +424,7 @@ async fn handle_stream_frames_socket(
                                                     .frames
                                                     .sort_by_key(|a| (a.timestamp, a.offset_index));
                                             }
-                                            chunks.frames.truncate(backfill_limit);
+                                            downsample_in_place(&mut chunks.frames, backfill_limit);
                                             // Record sent IDs first, then drop lock
                                             // before sending frames. Previously the
                                             // lock was held across channel sends,
@@ -686,7 +725,7 @@ async fn fetch_and_process_frames_with_tracking(
     } else {
         chunks.frames.sort_by_key(|a| (a.timestamp, a.offset_index));
     }
-    chunks.frames.truncate(limit);
+    downsample_in_place(&mut chunks.frames, limit);
 
     // Record all sent IDs in one lock acquisition, then drop the lock
     // before sending frames through the channel. Acquiring the lock per-frame
@@ -884,6 +923,51 @@ mod tests {
             stream_frame_limit(Some(MAX_STREAM_FRAME_LIMIT + 1)),
             MAX_STREAM_FRAME_LIMIT
         );
+    }
+
+    // #4569: down-sampling must span the WHOLE range (keep both ends), not drop
+    // the tail like truncate did — otherwise the morning vanishes on dense days.
+    #[test]
+    fn downsample_keeps_both_ends_and_spans_range() {
+        let mut v: Vec<i32> = (0..100).collect();
+        downsample_in_place(&mut v, 10);
+        assert_eq!(v.len(), 10);
+        assert_eq!(*v.first().unwrap(), 0, "first (oldest) must survive");
+        assert_eq!(*v.last().unwrap(), 99, "last (newest) must survive");
+        // strictly increasing subset of the original order
+        assert!(v.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn downsample_preserves_descending_order() {
+        // Mirrors the timeline's default newest-first ordering.
+        let mut v: Vec<i32> = (0..100).rev().collect(); // 99..=0
+        downsample_in_place(&mut v, 5);
+        assert_eq!(v.len(), 5);
+        assert_eq!(*v.first().unwrap(), 99);
+        assert_eq!(*v.last().unwrap(), 0);
+        assert!(v.windows(2).all(|w| w[0] > w[1]));
+    }
+
+    #[test]
+    fn downsample_noop_when_under_limit() {
+        let mut v: Vec<i32> = (0..5).collect();
+        downsample_in_place(&mut v, 10);
+        assert_eq!(v, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn downsample_limit_one_keeps_head_without_panicking() {
+        let mut v: Vec<i32> = (0..100).collect();
+        downsample_in_place(&mut v, 1);
+        assert_eq!(v, vec![0]);
+    }
+
+    #[test]
+    fn downsample_limit_zero_clears() {
+        let mut v: Vec<i32> = (0..10).collect();
+        downsample_in_place(&mut v, 0);
+        assert!(v.is_empty());
     }
 
     #[test]

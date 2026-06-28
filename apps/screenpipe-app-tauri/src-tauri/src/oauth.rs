@@ -459,7 +459,8 @@ pub async fn oauth_connect(
     // Auto-derive the instance name (the account's own identity, e.g. its
     // email) from the token response. Storing every account under its own
     // `oauth:{id}:{email}` slot is what lets multiple accounts of the same
-    // provider coexist — connecting a second Gmail must not clobber the first.
+    // provider coexist — connecting a second Google account must not clobber
+    // the first.
     // We only fall back to the default slot (None) when the provider hands us
     // no identity to key on (e.g. Notion/QuickBooks/Jira, which key on
     // workspace metadata instead and stay single-account here).
@@ -474,7 +475,8 @@ pub async fn oauth_connect(
     // default-slot (`oauth:{id}`) entry. An older single-account build parked
     // the *first* account in the default slot, and the previous cleanup here
     // blindly deleted that slot after every instanced save — which is exactly
-    // how "connecting a 2nd Gmail wiped the 1st" happened. Reconciliation still
+    // how "connecting a 2nd Google account wiped the 1st" happened.
+    // Reconciliation still
     // drops a stale/duplicate or unrecoverable default slot (the zombie-token
     // cleanup we need), but promotes a *distinct, still-valid* account into its
     // own named slot first so it survives alongside the account we just saved.

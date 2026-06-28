@@ -265,9 +265,12 @@ export const RECOMMENDED_SERVERS: RegistryServer[] = [
   {
     name: "app.linear/linear",
     title: "Linear",
-    description: "Create and manage Linear issues, projects and cycles. OAuth sign-in.",
+    description: "Create and manage Linear issues, projects and cycles. OAuth sign-in — no API key.",
     repository: { url: "https://linear.app/docs/mcp" },
-    remotes: [{ type: "sse", url: "https://mcp.linear.app/sse" }],
+    // Streamable-HTTP endpoint (/mcp), NOT the legacy /sse transport — the
+    // engine's MCP client only drives streamable HTTP. OAuth here uses
+    // Dynamic Client Registration, so there's no client_id/secret to create.
+    remotes: [{ type: "streamable-http", url: "https://mcp.linear.app/mcp" }],
   },
   {
     name: "com.monday/monday.com",

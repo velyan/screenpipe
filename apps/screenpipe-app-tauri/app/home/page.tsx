@@ -565,6 +565,13 @@ function HomeContent() {
     return () => { unlisten?.(); };
   }, [refreshRecordingDevices]);
 
+  const pauseRecording = useCallback(async () => {
+    await emit("shortcut-stop-recording", {});
+    window.setTimeout(() => {
+      void refreshRecordingDevices();
+    }, 500);
+  }, [refreshRecordingDevices]);
+
   // Active meeting state — lights up the phone icon for ANY active meeting
   // (manual OR auto-detected: Teams, Zoom, etc.).
   const [meetingState, setMeetingState] = useState<MeetingStatusResponse & {
@@ -1001,6 +1008,7 @@ function HomeContent() {
               meetingApp={meetingState.meetingApp}
               meetingLoading={meetingLoading}
               onToggleMeeting={() => void toggleMeeting()}
+              onPauseRecording={pauseRecording}
               isTranslucent={isTranslucent}
               floatingOverMedia={sidebarCollapsed && activeSection === "timeline"}
             />

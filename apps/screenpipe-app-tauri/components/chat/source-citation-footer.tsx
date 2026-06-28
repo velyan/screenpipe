@@ -71,8 +71,6 @@ const CONNECTION_SOURCE_ICON_PATHS: Array<[string, string]> = [
   ["google calendar", "/images/google-calendar.svg"],
   ["google-docs", "/images/google-docs.svg"],
   ["google docs", "/images/google-docs.svg"],
-  ["google-sheets", "/images/google-sheets.svg"],
-  ["google sheets", "/images/google-sheets.svg"],
   ["granola", "/images/granola.png"],
   ["hubspot", "/images/hubspot.png"],
   ["jira", "/images/jira.png"],

@@ -283,7 +283,7 @@ type CardState = "idle" | "connecting" | "connected" | "error";
 
 // ─── Integration list ─────────────────────────────────────────────────────────
 //
-// Notion is the only paid integration shown in onboarding. Gmail / Google
+// Notion is the only paid integration shown in onboarding. Google
 // Calendar were removed: the Google Workspace OAuth verification process
 // blocks shipping them broadly, and consumer-pro upsell is no longer the
 // revenue engine (enterprise contracts are). Codex + Obsidian replace

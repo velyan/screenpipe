@@ -121,7 +121,13 @@ async function fetchWithTimeout(
   }
 }
 
-describe('Pipes: discover → install → play', function () {
+// QUARANTINED (#4610): the install→play flow blocks on a REAL remote install
+// (POST /pipes/store/install downloads from the live store) — that's the 600s
+// hang on intercom-to-notion / meeting-summary in CI, after which the auto-switch
+// to "My Pipes" never fires. Fix = install a local fixture pipe (POST /pipes/install
+// {source: filepath}, as pipes-mcp-connections.spec.ts does) so the flow is
+// hermetic; keep the remote-store smoke separate. Then re-enable.
+describe.skip('Pipes: discover → install → play', function () {
   this.timeout(120_000);
 
   before(async () => {

@@ -614,8 +614,6 @@ const STATIC_APP_ICONS: Record<string, string> = {
   "google calendar": "/images/google-calendar.svg",
   "google-docs": "/images/google-docs.svg",
   "google docs": "/images/google-docs.svg",
-  "google-sheets": "/images/google-sheets.svg",
-  "google sheets": "/images/google-sheets.svg",
   logseq: "/images/logseq.png",
   loops: "/images/loops.svg",
   make: "/images/make.png",
@@ -713,17 +711,6 @@ export function ConnectionToolIcon({ name }: { name: string }) {
   }
   if (key === "windows-calendar") {
     return <Calendar className="w-3.5 h-3.5 text-muted-foreground" aria-label="Windows Calendar" />;
-  }
-  if (key === "gmail") {
-    return (
-      <svg viewBox="0 0 999.517 749.831" className="w-3.5 h-3.5" aria-label="Gmail">
-        <path fill="#4285F4" d="M68.149 749.831h159.014V363.654L0 193.282v488.4C0 719.391 30.553 749.831 68.149 749.831"/>
-        <path fill="#34A853" d="M772.354 749.831h159.014c37.709 0 68.149-30.553 68.149-68.149v-488.4L772.354 363.654"/>
-        <path fill="#FBBC04" d="M772.354 68.342v295.312l227.163-170.372V102.417c0-84.277-96.203-132.322-163.557-81.779"/>
-        <path fill="#EA4335" d="M227.163 363.654V68.342l272.595 204.447 272.595-204.447v295.312L499.758 568.1"/>
-        <path fill="#C5221F" d="M0 102.417v90.865l227.163 170.372V68.342L163.557 20.638C96.09-29.906 0 18.139 0 102.417"/>
-      </svg>
-    );
   }
   if (key === "microsoft365" || key === "microsoft-365" || key === "office365" || key === "outlook") {
     return (

@@ -21,7 +21,7 @@ import { cn } from "@/lib/utils";
 import { commands } from "@/lib/utils/tauri";
 import { showChatWithPrefill } from "@/lib/chat-utils";
 import { ThumbnailHighlightOverlay } from "./thumbnail-highlight-overlay";
-import { localFetch, getApiBaseUrl } from "@/lib/api";
+import { localFetch, getApiBaseUrl, appendAuthToken } from "@/lib/api";
 import { buildBoundedFacetSql, sanitizeFts5Query } from "@/lib/search/facet-sql";
 
 interface SpeakerResult {
@@ -148,7 +148,7 @@ function useSuggestions(isOpen: boolean) {
     let cancelled = false;
     setIsLoading(true);
 
-    (async () => {
+    const run = async () => {
       try {
         const now = new Date();
         const oneDayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
@@ -246,10 +246,31 @@ function useSuggestions(isOpen: boolean) {
       } catch {
         if (!cancelled) setIsLoading(false);
       }
-    })();
+    };
+
+    // Defer the 24h OCR scan off the open/first-paint path so this cosmetic
+    // suggestion query (empty-state chips) doesn't compete with the initial
+    // render + first keyword search for the engine's heavy-read slots when the
+    // modal opens. Runs when the main thread next goes idle (or after a short
+    // fallback delay where requestIdleCallback is unavailable).
+    const w = window as unknown as {
+      requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+      cancelIdleCallback?: (handle: number) => void;
+    };
+    let idleHandle = 0;
+    let timeoutHandle = 0;
+    if (typeof w.requestIdleCallback === "function") {
+      idleHandle = w.requestIdleCallback(() => void run(), { timeout: 1500 });
+    } else {
+      timeoutHandle = window.setTimeout(() => void run(), 200);
+    }
 
     return () => {
       cancelled = true;
+      if (idleHandle && typeof w.cancelIdleCallback === "function") {
+        w.cancelIdleCallback(idleHandle);
+      }
+      if (timeoutHandle) window.clearTimeout(timeoutHandle);
     };
   }, [isOpen]);
 
@@ -260,11 +281,16 @@ function useSuggestions(isOpen: boolean) {
 const FrameThumbnail = ({ frameId, alt }: { frameId: number; alt: string }) => {
   const [isLoading, setIsLoading] = useState(true);
   const [hasError, setHasError] = useState(false);
-  const [src, setSrc] = useState(`${getApiBaseUrl()}/frames/${frameId}`);
+  // <img> can't send an Authorization header, so when API auth is enabled we
+  // pass the key as a ?token= query param (server accepts header/cookie/token).
+  // Without this every thumbnail 403s and shows "unavailable" on packaged
+  // builds, where the webview origin (tauri://localhost) differs from the API
+  // host (localhost:3030) so the screenpipe_auth cookie isn't sent.
+  const [src, setSrc] = useState(appendAuthToken(`${getApiBaseUrl()}/frames/${frameId}`));
   const retryCount = useRef(0);
 
   useEffect(() => {
-    setSrc(`${getApiBaseUrl()}/frames/${frameId}`);
+    setSrc(appendAuthToken(`${getApiBaseUrl()}/frames/${frameId}`));
     setIsLoading(true);
     setHasError(false);
     retryCount.current = 0;
@@ -298,7 +324,7 @@ const FrameThumbnail = ({ frameId, alt }: { frameId: number; alt: string }) => {
             if (retryCount.current < 3) {
               retryCount.current += 1;
               setTimeout(() => {
-                setSrc(`${getApiBaseUrl()}/frames/${frameId}?retry=${retryCount.current}`);
+                setSrc(appendAuthToken(`${getApiBaseUrl()}/frames/${frameId}?retry=${retryCount.current}`));
               }, 1000 * retryCount.current);
             } else {
               setIsLoading(false);

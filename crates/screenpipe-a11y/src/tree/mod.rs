@@ -716,8 +716,12 @@ mod tests {
         TreeSnapshot {
             app_name: "Safari".into(),
             window_name: "Test".into(),
+            window_id: None,
+            process_id: None,
+            window_bounds: None,
             text_content: "hello".into(),
             nodes: Vec::new(),
+            focused_element: None,
             browser_url: url.map(|u| u.to_string()),
             document_path: None,
             timestamp: Utc::now(),

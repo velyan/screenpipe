@@ -1,7 +1,7 @@
 ---
-title: "connect Slack, Notion, Gmail, and more apps to screenpipe"
+title: "connect Slack, Notion, Google Calendar, and more apps to screenpipe"
 sidebarTitle: "connections"
-description: "Connect apps to screenpipe — Slack, Notion, Gmail, Obsidian, HubSpot, Salesforce, Zoom, PostHog, and Sentry — to give AI agents structured context."
+description: "Connect apps to screenpipe — Slack, Notion, Google Calendar, Obsidian, HubSpot, Salesforce, Zoom, PostHog, and Sentry — to give AI agents structured context."
 icon: "plug"
 ---
 
@@ -31,7 +31,7 @@ for integrations that require API keys or other credentials, screenpipe provides
 
 this takes you straight to where you need to be — no more hunting through docs.
 
-**oauth integrations** (Slack, Notion, Gmail, etc.) skip the API key step entirely — just click the big "Connect with [App]" button and approve access in your browser.
+**oauth integrations** (Slack, Notion, Google Calendar, etc.) skip the API key step entirely — just click the big "Connect with [App]" button and approve access in your browser.
 
 <Tip>some pipes require specific connections. when you install a pipe that needs a connection (like Notion or Toggl), screenpipe will prompt you to configure it automatically.</Tip>
 
@@ -45,7 +45,6 @@ this takes you straight to where you need to be — no more hunting through docs
 | **Slack** | access messages, channels, and threads |
 | **Discord** | access server messages and channels |
 | **Email** | connect your email for context |
-| **Gmail** | OAuth connection to your Google email |
 | **Telegram** | access Telegram messages |
 | **WhatsApp** | access WhatsApp conversations |
 | **Microsoft Teams** | access Teams messages and channels |
@@ -58,7 +57,6 @@ this takes you straight to where you need to be — no more hunting through docs
 | **Obsidian** | sync daily logs, meeting notes, and journals to your vault |
 | **Google Calendar** | enrich meetings with attendees and schedule context |
 | **Google Docs** | read and write Google Docs through OAuth |
-| **Google Sheets** | query spreadsheet metadata and values |
 | **Linear** | access issues and projects |
 | **Todoist** | manage tasks and projects |
 | **Asana** | access tasks and projects |
@@ -147,7 +145,7 @@ this is configured in the connections UI when adding a new integration.
 connections can expose a local proxy endpoint so pipes can call third-party APIs without putting secrets in the prompt:
 
 ```bash
-curl "http://localhost:3030/connections/gmail/proxy/users/me/profile"
+curl "http://localhost:3030/connections/google-calendar/events?hours_ahead=8"
 curl "http://localhost:3030/connections/hubspot/proxy/crm/v3/objects/contacts?limit=1"
 curl "http://localhost:3030/connections/notion/proxy/v1/users/me"
 ```
@@ -166,7 +164,7 @@ these are different from app connections — they let you use screenpipe's data 
 | **ChatGPT** | use your ChatGPT subscription in screenpipe chat + pipes | [guide →](/chatgpt) |
 | **Ollama** | use local models for complete privacy | [guide →](/ollama) |
 
-<Tip>you can use both app connections AND AI tool connections at the same time. connect Gmail + Obsidian as data sources, AND connect Claude Desktop to query everything.</Tip>
+<Tip>you can use both app connections AND AI tool connections at the same time. connect Google Calendar + Obsidian as data sources, AND connect Claude Desktop to query everything.</Tip>
 
 ## why connect apps?
 
@@ -174,7 +172,6 @@ without connections, screenpipe captures what's visible on your screen. with con
 
 | without connections | with connections |
 |---|---|
-| sees email text through accessibility capture when Gmail is open | gets full email threads, senders, timestamps via API |
 | sees calendar when you look at it | knows your full schedule, upcoming meetings, attendees |
 | sees Notion pages via screen capture | reads and writes to Notion databases directly |
 | sees CRM data when you open it | auto-syncs contacts and deals after every call |
@@ -185,7 +182,7 @@ this makes pipes significantly more accurate and useful.
 
 ### Google OAuth: "app isn't verified" or "unsafe"
 
-when connecting Gmail, Google Calendar, or Google Docs, you may see a warning that says the app is "unverified" or "unsafe." this is normal — screenpipe is a local app and Google requires additional verification steps for third-party apps.
+when connecting Google Calendar or Google Docs, you may see a warning that says the app is "unverified" or "unsafe." this is normal — screenpipe is a local app and Google requires additional verification steps for third-party apps.
 
 **how to proceed:**
 1. on the Google warning screen, click **Advanced** (bottom-left corner)

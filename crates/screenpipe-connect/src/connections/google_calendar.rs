@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use screenpipe_secrets::SecretStore;
 use serde_json::{Map, Value};
 
-// Same GCP project as Gmail but different OAuth client.
+// Same GCP project as the other Google integrations but different OAuth client.
 // Register redirect URI http://localhost:3030/connections/oauth/callback
 // in the Google Cloud Console for this client.
 static OAUTH: OAuthConfig = OAuthConfig {

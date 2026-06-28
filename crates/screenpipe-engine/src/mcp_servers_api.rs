@@ -14,6 +14,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
+
+use crate::oauth_result_page::render_oauth_result_page;
 use screenpipe_connect::mcp_servers::{
     McpAuthMode, McpHeader, McpServerConfig, McpServerStore, McpTransport,
 };
@@ -679,23 +681,23 @@ fn not_found(id: &str) -> Response {
 }
 
 fn html_response(status: StatusCode, message: &str) -> Response {
+    let ok = status.is_success();
+    let title = if ok {
+        "MCP connected"
+    } else {
+        "Connection needs attention"
+    };
+    let detail = if ok {
+        "screenpipe can now use this MCP server."
+    } else {
+        "screenpipe could not finish the MCP OAuth flow."
+    };
     (
         status,
         [("content-type", "text/html; charset=utf-8")],
-        format!(
-            "<!doctype html><html><head><title>screenpipe MCP OAuth</title></head><body><p>{}</p></body></html>",
-            html_escape(message)
-        ),
+        render_oauth_result_page("screenpipe MCP OAuth", title, detail, message, ok),
     )
         .into_response()
-}
-
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 fn url_path_segment(value: &str) -> String {

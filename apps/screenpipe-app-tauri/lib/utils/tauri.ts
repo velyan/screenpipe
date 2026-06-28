@@ -843,6 +843,14 @@ async listCacheFiles() : Promise<Result<CacheFile[], string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async listChatEntriesByMtime(dir: string) : Promise<Result<ChatDirEntry[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("list_chat_entries_by_mtime", { dir }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 /**
  * List skills currently in the screenpipe store.
  */
@@ -2308,6 +2316,7 @@ endDisplay: string; attendees: string[]; location: string | null; meetingUrl: st
  */
 source?: string }
 export type CalendarStatus = { available: boolean; authorized: boolean; authorizationStatus: string; calendarCount: number }
+export type ChatDirEntry = { name: string; mtime_ms: number }
 export type ChatGptOAuthStatus = { logged_in: boolean }
 export type Credits = { amount: number }
 /**

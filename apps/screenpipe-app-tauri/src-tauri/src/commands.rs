@@ -375,9 +375,39 @@ fn emit_meeting_note_route_with_retries(app: &tauri::AppHandle, deeplink_url: &s
 mod tests {
     use super::{
         fallback_local_api_config, is_login_callback_scheme, notification_copy_value,
-        notification_source_url, parse_meeting_deeplink,
+        notification_source_url, parse_meeting_deeplink, scan_chat_entries_by_mtime,
     };
     use serde_json::json;
+
+    #[test]
+    fn chat_entries_missing_dir_is_empty() {
+        // First run (no chats dir yet) must be a clean empty list, not an error.
+        let res =
+            scan_chat_entries_by_mtime("/definitely/not/a/real/screenpipe/chats/path").unwrap();
+        assert!(res.is_empty());
+    }
+
+    #[test]
+    fn chat_entries_filters_non_json_and_orders_newest_first() {
+        use std::time::{Duration, SystemTime};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+
+        let a = std::fs::File::create(p.join("a.json")).unwrap();
+        a.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(1_000))
+            .unwrap();
+        let b = std::fs::File::create(p.join("b.json")).unwrap();
+        b.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(2_000))
+            .unwrap();
+        // Non-.json must be ignored.
+        std::fs::File::create(p.join("notes.txt")).unwrap();
+
+        let res = scan_chat_entries_by_mtime(p.to_str().unwrap()).unwrap();
+        let names: Vec<&str> = res.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["b.json", "a.json"]); // newest first
+        assert!(res.iter().all(|e| e.name.ends_with(".json")));
+        assert!(res[0].mtime_ms >= res[1].mtime_ms);
+    }
 
     #[test]
     fn parses_meeting_deeplink_path_id() {
@@ -2463,6 +2493,67 @@ pub async fn get_keychain_status() -> Result<KeychainStatus, String> {
     Ok(KeychainStatus {
         state: state.to_string(),
     })
+}
+
+/// One conversation file with its modified time (epoch millis). Returned by
+/// [`list_chat_entries_by_mtime`].
+#[derive(serde::Serialize, specta::Type)]
+pub struct ChatDirEntry {
+    pub name: String,
+    pub mtime_ms: f64,
+}
+
+/// List `*.json` conversation files in `dir`, newest-first by mtime, in a SINGLE
+/// native directory scan.
+///
+/// The chat list/search previously sorted by firing one `stat()` IPC call per
+/// file via `Promise.all` — with 15k+ conversations that's 15k Tauri round-trips
+/// on every cold open, which (alongside the webview cold-boot) froze the search
+/// modal for seconds before the input was usable. Doing the readdir + metadata
+/// pass in Rust collapses it to one call (~40ms for 15k files).
+///
+/// A missing dir (first run) returns an empty list, not an error.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_chat_entries_by_mtime(dir: String) -> Result<Vec<ChatDirEntry>, String> {
+    scan_chat_entries_by_mtime(&dir)
+}
+
+/// Sync core of [`list_chat_entries_by_mtime`] (testable without a Tauri runtime).
+fn scan_chat_entries_by_mtime(dir: &str) -> Result<Vec<ChatDirEntry>, String> {
+    let read_dir = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read_dir {dir}: {e}")),
+    };
+
+    let mut entries: Vec<ChatDirEntry> = Vec::new();
+    for entry in read_dir.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.ends_with(".json") {
+            continue;
+        }
+        // mtime is best-effort; fall back to 0 (sorted last) if unavailable.
+        let mtime_ms = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as f64)
+            .unwrap_or(0.0);
+        entries.push(ChatDirEntry { name, mtime_ms });
+    }
+
+    // Newest first; tiebreak by name descending to match the TS ordering
+    // (`b.sortTime - a.sortTime || b.name.localeCompare(a.name)`).
+    entries.sort_by(|a, b| {
+        b.mtime_ms
+            .partial_cmp(&a.mtime_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.name.cmp(&a.name))
+    });
+
+    Ok(entries)
 }
 
 #[tauri::command]

@@ -460,6 +460,8 @@ pub enum EnterpriseSyncError {
     Ingest(String),
     #[error("ingest auth rejected (license invalid / revoked)")]
     IngestAuthRejected,
+    #[error("centralized data not enabled for this org")]
+    CentralizedDataDisabled,
     #[error("ingest server error: status {0}")]
     IngestServerError(u16),
     #[error("control-plane network error: {0}")]
@@ -631,7 +633,15 @@ pub async fn post_jsonl(
     if status.is_success() {
         return Ok(());
     }
-    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+    if status == reqwest::StatusCode::FORBIDDEN {
+        // 403 = the license is valid, but centralized data is OFF for the org,
+        // so the ingest endpoint refuses (privacy-by-default). NOT a license
+        // problem — an admin must enable centralized data in the dashboard
+        // before any device can upload. Distinct from 401 so it isn't
+        // misreported as "license rejected".
+        return Err(EnterpriseSyncError::CentralizedDataDisabled);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err(EnterpriseSyncError::IngestAuthRejected);
     }
     if status.is_server_error() {
@@ -1304,10 +1314,10 @@ async fn submit_stall_logs(cfg: &EnterpriseSyncConfig, http: &reqwest::Client) {
 
     // 3. confirm (this is what files it for support)
     let feedback = format!(
-        "auto: enterprise device recording but not landing data in org storage (license {}, device {}, mode {:?})",
+        "auto: enterprise device recording but not landing data in org storage (license {}, device {}, mode {})",
         cfg.license_key,
         cfg.device_id,
-        std::mem::discriminant(&cfg.upload_mode)
+        cfg.upload_mode.label()
     );
     let _ = http
         .post(format!("{base}/api/logs/confirm"))
@@ -1420,7 +1430,20 @@ pub async fn run(
             }
             Err(EnterpriseSyncError::IngestAuthRejected) => {
                 error!(
-                    "enterprise sync: license rejected by ingest endpoint, sleeping {}s",
+                    "enterprise sync: license rejected by ingest endpoint (license invalid / revoked), sleeping {}s",
+                    RETRY_AFTER_AUTH_FAIL.as_secs()
+                );
+                if sleep_or_shutdown(RETRY_AFTER_AUTH_FAIL, &mut shutdown).await {
+                    break;
+                }
+                continue;
+            }
+            Err(EnterpriseSyncError::CentralizedDataDisabled) => {
+                // The device is recording but the org hasn't turned on
+                // centralized data, so nothing can upload. Say exactly that —
+                // the fix is an admin toggle in the dashboard, not a license issue.
+                error!(
+                    "enterprise sync: centralized data is NOT enabled for this org — an admin must enable it in the dashboard before devices can upload; pausing {}s",
                     RETRY_AFTER_AUTH_FAIL.as_secs()
                 );
                 if sleep_or_shutdown(RETRY_AFTER_AUTH_FAIL, &mut shutdown).await {

@@ -15,7 +15,7 @@ export const searchIndex: SettingsField[] = [
   { label: "Screenpipe Pro", keywords: ["subscription", "billing", "plan", "pro", "upgrade", "manage"] },
   { label: "pipe sync across devices", keywords: ["pipe sync", "sync"] },
   { label: "memories sync across devices", keywords: ["memories sync", "sync", "facts"] },
-  { label: "connection sync across devices", keywords: ["connection sync", "sync", "gmail", "slack", "notion"] },
+  { label: "connection sync across devices", keywords: ["connection sync", "sync", "slack", "notion"] },
   { label: "Refer a friend", keywords: ["referral", "invite", "free month"] },
 ];
 import { Button } from "@/components/ui/button";
@@ -452,7 +452,7 @@ export function AccountSection() {
               <div>
                 <p className="text-sm font-medium">connection sync across devices</p>
                 <p className="text-xs text-muted-foreground">
-                  sync connected accounts (gmail, slack, notion…) to your devices — credentials are end-to-end encrypted
+                  sync connected accounts (slack, notion…) to your devices — credentials are end-to-end encrypted
                 </p>
               </div>
               <div className="flex items-center gap-3">

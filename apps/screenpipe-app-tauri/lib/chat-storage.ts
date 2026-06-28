@@ -19,12 +19,19 @@ import type {
   PipeContext,
 } from "@/lib/hooks/use-settings";
 import { deleteCachedBrowserState } from "@/lib/browser-state-cache";
+import { commands } from "@/lib/utils/tauri";
 import {
   CHAT_PROCESSING_PLACEHOLDER,
   CONVERSATION_DEDUP_WINDOW_MS,
   conversationDedupKey,
   messagesHaveCompletedReply,
 } from "@/lib/chat-dedup";
+
+// Cap on how many (most-recent) conversation files a content search will open
+// and scan. Title matches are cheap over the full ordered list; only the
+// message-body scan is bounded so a rare/no-match query can't read all 15k+
+// files (each a Tauri IPC round-trip) and hang the search modal.
+export const CHAT_CONTENT_SEARCH_SCAN_LIMIT = 500;
 
 let _chatsDir: string | null = null;
 let _orderedEntriesCacheDir: string | null = null;
@@ -280,7 +287,22 @@ async function orderedConversationEntries(dir: string): Promise<ConversationEntr
     return _orderedEntriesCache;
   }
 
-  const ordered = await orderEntriesByMtime(await listConversationEntries(dir));
+  let ordered: ConversationEntry[];
+  try {
+    // One native readdir+metadata pass in Rust, already sorted newest-first.
+    // Replaces a `stat()` IPC round-trip per file (~15k on large histories),
+    // which froze the search modal on cold open. The specta binding wraps the
+    // Rust `Result` in a `{ status, data | error }` union — unwrap it here.
+    const res = await commands.listChatEntriesByMtime(dir);
+    if (res.status !== "ok") throw new Error(res.error);
+    ordered = res.data
+      .filter((r) => r.name.endsWith(".json"))
+      .map((r) => ({ name: r.name, path: `${dir}/${r.name}` }));
+  } catch {
+    // Fallback: enumerate + stat() per file (slow but correct) when the command
+    // is unavailable (older engine / bindings drift / non-Tauri test env).
+    ordered = await orderEntriesByMtime(await listConversationEntries(dir));
+  }
   _orderedEntriesCacheDir = dir;
   _orderedEntriesCache = ordered;
   return ordered;
@@ -508,7 +530,12 @@ export async function searchConversations(
   const limit = normalizeLimit(options.limit ?? CHAT_SEARCH_RESULT_LIMIT);
   const offset = Math.max(0, Math.floor(options.offset ?? 0));
   if (limit === 0) return [];
-  const entries = await orderedConversationEntries(dir);
+  // Bound the body scan to the most-recent N conversations. Entries are sorted
+  // newest-first, so this searches recent chats and caps a rare/no-match query
+  // at N file reads instead of all 15k+ (each a Tauri IPC round-trip that froze
+  // the modal). Older conversations are intentionally not body-searched here.
+  const allEntries = await orderedConversationEntries(dir);
+  const entries = allEntries.slice(0, CHAT_CONTENT_SEARCH_SCAN_LIMIT);
   const candidates: ConversationDedupCandidate[] = [];
   let skipped = 0;
 

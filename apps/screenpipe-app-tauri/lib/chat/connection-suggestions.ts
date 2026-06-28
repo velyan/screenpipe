@@ -169,47 +169,10 @@ async function fetchCalendarPreviewSuggestion(connection: ConnectedIntegration):
   }
 }
 
-function cleanEmailSubject(subject: string): string {
-  return compactSuggestionPart(
-    subject
-      .replace(/^\s*(re|fwd?):\s*/i, "")
-      .replace(/\s+/g, " ")
-      .trim(),
-    48
-  );
-}
-
-async function fetchGmailPreviewSuggestion(connection: ConnectedIntegration): Promise<Suggestion | null> {
-  try {
-    const query = encodeURIComponent("newer_than:14d (invite OR kickoff OR prep OR meeting)");
-    const listRes = await localFetch(`/connections/gmail/messages?maxResults=3&q=${query}`);
-    if (!listRes.ok) return null;
-    const listBody = await listRes.json();
-    const firstId = listBody?.data?.messages?.[0]?.id;
-    if (!firstId) return null;
-
-    const detailRes = await localFetch(`/connections/gmail/messages/${encodeURIComponent(firstId)}`);
-    if (!detailRes.ok) return null;
-    const detailBody = await detailRes.json();
-    const subject = detailBody?.data?.subject || detailBody?.data?.snippet;
-    if (!subject) return null;
-
-    return {
-      text: `Turn "${cleanEmailSubject(String(subject))}" into concrete prep notes`,
-      preview: `from ${connection.name}`,
-      priority: 2,
-      connectionIcon: connection.icon || connection.id,
-    };
-  } catch {
-    return null;
-  }
-}
-
 export async function fetchConnectionPreviewSuggestions(connections: ConnectedIntegration[]): Promise<Suggestion[]> {
   const tasks = connections.map((connection) => {
     const lower = `${connection.id} ${connection.name}`.toLowerCase();
     if (lower.includes("calendar")) return fetchCalendarPreviewSuggestion(connection);
-    if (lower.includes("gmail")) return fetchGmailPreviewSuggestion(connection);
     return Promise.resolve(null);
   });
   const suggestions = await Promise.all(tasks);
@@ -231,7 +194,7 @@ function suggestionForConnection(connection: ConnectedIntegration): Suggestion |
   if (lower.includes("calendar")) {
     return { ...base, text: `Prep upcoming meeting briefs from ${name}`, priority: 1 };
   }
-  if (lower.includes("gmail") || lower.includes("email") || lower.includes("outlook") || lower.includes("microsoft365") || lower.includes("microsoft 365")) {
+  if (lower.includes("email") || lower.includes("outlook") || lower.includes("microsoft365") || lower.includes("microsoft 365")) {
     return { ...base, text: `Turn recent ${name} invites into concrete prep notes` };
   }
   if (lower.includes("docs") || lower.includes("sheets") || lower.includes("notion") || lower.includes("obsidian") || lower.includes("logseq")) {
@@ -305,7 +268,7 @@ export function mergeConnectionSuggestions(
 
 function setupDescriptionForConnection(connection: ConnectionListItem): string {
   const lower = `${connection.id} ${connection.name} ${connection.category ?? ""}`.toLowerCase();
-  if (lower.includes("gmail") || lower.includes("email")) return "Bring email into chat";
+  if (lower.includes("email")) return "Bring email into chat";
   if (lower.includes("slack")) return "Search team threads";
   if (lower.includes("github")) return "Use repos and issues";
   if (lower.includes("linear") || lower.includes("jira")) return "Track project work";
@@ -320,7 +283,6 @@ export function buildConnectionSetupSuggestions(
   appItems: ActivityAppItem[]
 ): ConnectionSetupSuggestion[] {
   const fallbackConnectionOrder = [
-    "gmail",
     "slack",
     "github",
     "github-issues",
@@ -330,7 +292,6 @@ export function buildConnectionSetupSuggestions(
     "google-docs",
     "obsidian",
     "jira",
-    "google-sheets",
   ];
 
   const fallbackRank = (connection: ConnectionListItem) => {

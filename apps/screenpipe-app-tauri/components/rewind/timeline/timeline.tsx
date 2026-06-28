@@ -19,7 +19,7 @@ import { type TemplatePipe } from "@/lib/hooks/use-pipes";
 import { AppContextPopover } from "./app-context-popover";
 import { TimelineTagToolbar } from "./timeline-tag-toolbar";
 import { extractDomain, FaviconImg } from "./favicon-utils";
-import { localFetch, getApiBaseUrl } from "@/lib/api";
+import { localFetch, getApiBaseUrl, appendAuthToken } from "@/lib/api";
 
 // Global cache: preloads app-icon images so they render instantly on scroll.
 // Maps app name → "loaded" | "error" | Promise (in-flight).
@@ -1962,7 +1962,7 @@ export const TimelineSlider = ({
 														<div className="mb-2 w-64 aspect-video rounded-md overflow-hidden bg-muted border border-border/40">
 															{/* eslint-disable-next-line @next/next/no-img-element */}
 															<img
-																src={`${getApiBaseUrl()}/frames/${frameId}`}
+																src={appendAuthToken(`${getApiBaseUrl()}/frames/${frameId}`)}
 																alt="frame preview"
 																className="w-full h-full object-cover select-none"
 																loading="lazy"

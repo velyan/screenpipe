@@ -84,7 +84,7 @@ this FAQ is organized around the questions people ask support most often: what t
 ## basics & compatibility
 
 <Expandable title="is screenpipe open source?">
-  yes. the core engine is open source on GitHub at [github.com/screenpipe/screenpipe](https://github.com/screenpipe/screenpipe). the desktop app, cloud features, and some integrations have commercial licensing on top.
+  screenpipe is source-available and auditable on GitHub at [github.com/screenpipe/screenpipe](https://github.com/screenpipe/screenpipe). the core local capture stack can be inspected and self-hosted, while the prebuilt desktop app, cloud features, team features, and some integrations have commercial licensing on top.
 
   you can self-host the CLI, audit the capture and storage code, and run screenpipe fully offline. enterprise customers can request source access for compliance review.
 </Expandable>
@@ -92,11 +92,11 @@ this FAQ is organized around the questions people ask support most often: what t
 <Expandable title="can I use screenpipe for free?">
   yes, three ways:
 
-  1. **CLI (free, open source)**: `npx -y screenpipe@latest record` — full recording, search, and API. runs in your terminal. completely free and open source.
-  2. **Tauri desktop app (free, open source)**: clone [github.com/screenpipe/screenpipe](https://github.com/screenpipe/screenpipe) and build the app from source (`pnpm build` in `apps/screenpipe-app-tauri`). adds a visual timeline and UI on top of the CLI.
-  3. **Paid desktop app (commercial)**: download from [screenpi.pe/onboarding](https://screenpi.pe/onboarding). includes support, auto-updates, and pre-built distribution ($60-300/year depending on features).
+  1. **CLI**: `npx -y screenpipe@latest record` gives you local recording, search, and API access from the terminal.
+  2. **local source build**: clone [github.com/screenpipe/screenpipe](https://github.com/screenpipe/screenpipe) and build the desktop app locally for a visual timeline and UI on top of the CLI.
+  3. **paid desktop app**: download from [screenpi.pe/onboarding](https://screenpi.pe/onboarding) for the current packaged app, support, auto-updates, and paid features.
 
-  most users start with the CLI and upgrade to the paid app later for the visual timeline and features. the codebase is shared across all three, so open-source security audits apply to all versions.
+  current plan details can change, so use the [pricing/download page](https://screenpi.pe/onboarding) as the source of truth before purchasing.
 </Expandable>
 
 <Expandable title="does screenpipe work offline?">
@@ -750,7 +750,7 @@ this FAQ is organized around the questions people ask support most often: what t
 </Expandable>
 
 <Expandable title="can I store screenpipe team data in my own Azure Blob or S3 bucket?">
-  yes. enterprise deployments can point team data at your own Azure Blob Storage container (one-click OAuth) or your own Amazon S3 bucket — including any S3-compatible store such as MinIO, Cloudflare R2, or Wasabi via a custom endpoint. devices upload directly to your storage with short-lived signed URLs; screenpipe cloud only sees upload manifests, not the data bodies. Google Cloud Storage is coming soon.
+  yes. enterprise deployments can point team data at your own Azure Blob Storage container (one-click OAuth) or your own Amazon S3 bucket — including any S3-compatible store such as MinIO, Cloudflare R2, or Wasabi via a custom endpoint. devices upload directly to your storage with short-lived signed URLs; screenpipe cloud only sees upload manifests, not the data bodies.
 
   configure it on the web dashboard: **screenpi.pe → account → workspace → storage**, pick the backend, and follow the setup (Azure: connect OAuth and choose a container; S3: paste bucket, region, and access keys — a write-only IAM policy is supported). activation runs a test upload through the exact path devices will use before turning anything on.
 </Expandable>

@@ -1467,104 +1467,11 @@ impl ShowRewindWindow {
                 window
             }
             ShowRewindWindow::Search { query } => {
-                let mut url = "/search".to_string();
                 info!("query: {:?}", query);
-                if let Some(q) = query {
-                    url.push_str(&format!("{}", q));
-                }
-
-                // Raycast-style floating search bar — compact, centered, no chrome
-                // Start thin (just the input row), JS will resize as results appear
-                let bar_w = 680.0_f64;
-                let bar_h = 80.0; // input row + footer
-                let (x, y) = if let Ok(Some(monitor)) = app.primary_monitor() {
-                    let logical: LogicalSize<f64> =
-                        monitor.size().to_logical(monitor.scale_factor());
-                    let pos = monitor.position();
-                    let scale = monitor.scale_factor();
-                    let origin_x = pos.x as f64 / scale;
-                    let origin_y = pos.y as f64 / scale;
-                    (
-                        origin_x + (logical.width - bar_w.min(logical.width - 40.0)) / 2.0,
-                        origin_y + logical.height * 0.22, // ~22% from top
-                    )
-                } else {
-                    (200.0, 140.0)
-                };
-                let bar_w = if let Ok(Some(monitor)) = app.primary_monitor() {
-                    let logical: LogicalSize<f64> =
-                        monitor.size().to_logical(monitor.scale_factor());
-                    bar_w.min(logical.width - 40.0)
-                } else {
-                    bar_w
-                };
-
-                let builder =
-                    WebviewWindow::builder(app, self.id().label(), WebviewUrl::App(url.into()))
-                        .title("")
-                        .visible(false) // show after panel conversion
-                        .accept_first_mouse(true)
-                        .shadow(true)
-                        .decorations(false)
-                        .transparent(true)
-                        .always_on_top(true)
-                        .visible_on_all_workspaces(true)
-                        .inner_size(bar_w, bar_h)
-                        .min_inner_size(400.0, 56.0)
-                        .position(x, y)
-                        .focused(true)
-                        .resizable(true);
-
-                let window = super::finalize_webview_window(builder.build()?);
-
-                // Skip NSPanel conversion for search — it causes SIGSEGV crashes
-                // in objc_autoreleasePoolPop on macOS 26. Use raw NSWindow level
-                // instead to float above fullscreen apps without NSPanel.
-                #[cfg(target_os = "macos")]
-                {
-                    let window_clone = window.clone();
-                    run_on_main_thread_safe(app, move || {
-                        use objc::{msg_send, sel, sel_impl};
-                        use tauri_nspanel::cocoa::base::id;
-                        use tauri_nspanel::objc_foundation::INSObject;
-                        use tauri_nspanel::raw_nspanel::object_setClass;
-                        if let Ok(ns_win) = window_clone.ns_window() {
-                            let ns_win = ns_win as id;
-                            unsafe {
-                                // Swizzle NSWindow → NSPanel class for non-activating behavior
-                                // Do NOT use to_panel() — its Id::from_retained_ptr causes
-                                // use-after-free on window.close() → SIGSEGV
-                                let nspanel_class: id = msg_send![
-                                    tauri_nspanel::raw_nspanel::RawNSPanel::class(),
-                                    class
-                                ];
-                                object_setClass(ns_win, nspanel_class);
-
-                                // Level 1002 — above fullscreen (CGShieldingWindowLevel+2)
-                                let _: () = msg_send![ns_win, setLevel: 1002_i64];
-
-                                // NSNonactivatingPanelMask (128) — appear over fullscreen
-                                // without triggering Space switch
-                                let current: i32 = msg_send![ns_win, styleMask];
-                                let _: () = msg_send![ns_win, setStyleMask: current | 128];
-
-                                // CanJoinAllSpaces (1) + FullScreenAuxiliary (256)
-                                let _: () = msg_send![ns_win, setCollectionBehavior: 257_u64];
-
-                                let _: () = msg_send![ns_win, setHidesOnDeactivate: false];
-                                let _: () = msg_send![ns_win, orderFrontRegardless];
-                                let _: () = msg_send![ns_win, makeKeyWindow];
-                            }
-                        }
-                    });
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    let _ = window.show();
-                    window.set_focus().ok();
-                }
-
-                window
+                // Build the floating search bar and bring it to front (focus=true).
+                // The hidden pre-warm path (prewarm_search) reuses the same builder
+                // with focus=false so startup doesn't steal focus.
+                Self::create_search_window(app, query.as_deref(), true)?
             }
             ShowRewindWindow::Onboarding => {
                 if onboarding_store.is_completed {
@@ -1737,6 +1644,144 @@ impl ShowRewindWindow {
         setup_content_process_handler(&window);
 
         Ok(window)
+    }
+
+    /// Build the floating search bar (Raycast-style). When `focus` is true the
+    /// window is brought to front and made key (the normal open). When false it
+    /// is created hidden and NOT activated — used by `prewarm_search` so startup
+    /// doesn't steal focus, while the FIRST real open reuses this warm webview
+    /// (show()'s existing-window branch) instead of paying a multi-second
+    /// Next.js cold-boot during which the input is unresponsive.
+    fn create_search_window(
+        app: &AppHandle,
+        query: Option<&str>,
+        focus: bool,
+    ) -> tauri::Result<WebviewWindow> {
+        let mut url = "/search".to_string();
+        if let Some(q) = query {
+            url.push_str(q);
+        }
+
+        // Compact, centered, no chrome. Start thin (just the input row); JS
+        // resizes as results appear.
+        let default_bar_w = 680.0_f64;
+        let bar_h = 80.0; // input row + footer
+        let (x, y, bar_w) = if let Ok(Some(monitor)) = app.primary_monitor() {
+            let logical: LogicalSize<f64> = monitor.size().to_logical(monitor.scale_factor());
+            let pos = monitor.position();
+            let scale = monitor.scale_factor();
+            let origin_x = pos.x as f64 / scale;
+            let origin_y = pos.y as f64 / scale;
+            let w = default_bar_w.min(logical.width - 40.0);
+            (
+                origin_x + (logical.width - w) / 2.0,
+                origin_y + logical.height * 0.22, // ~22% from top
+                w,
+            )
+        } else {
+            (200.0, 140.0, default_bar_w)
+        };
+
+        let builder = WebviewWindow::builder(
+            app,
+            RewindWindowId::Search.label(),
+            WebviewUrl::App(url.into()),
+        )
+        .title("")
+        .visible(false) // shown after panel conversion (and only when `focus`)
+        .accept_first_mouse(true)
+        .shadow(true)
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .visible_on_all_workspaces(true)
+        .inner_size(bar_w, bar_h)
+        .min_inner_size(400.0, 56.0)
+        .position(x, y)
+        .focused(focus)
+        .resizable(true);
+
+        let window = super::finalize_webview_window(builder.build()?);
+
+        // Skip tauri-nspanel to_panel() — it causes SIGSEGV in
+        // objc_autoreleasePoolPop on macOS 26. Swizzle the raw NSWindow class
+        // instead so it floats above fullscreen apps without NSPanel. The
+        // class/level/style/collection setup runs for BOTH paths so a pre-warmed
+        // (hidden) window is already a configured panel; only the
+        // order-front/make-key activation is gated on `focus`.
+        #[cfg(target_os = "macos")]
+        {
+            let window_clone = window.clone();
+            run_on_main_thread_safe(app, move || {
+                use objc::{msg_send, sel, sel_impl};
+                use tauri_nspanel::cocoa::base::id;
+                use tauri_nspanel::objc_foundation::INSObject;
+                use tauri_nspanel::raw_nspanel::object_setClass;
+                if let Ok(ns_win) = window_clone.ns_window() {
+                    let ns_win = ns_win as id;
+                    unsafe {
+                        let nspanel_class: id =
+                            msg_send![tauri_nspanel::raw_nspanel::RawNSPanel::class(), class];
+                        object_setClass(ns_win, nspanel_class);
+
+                        // Level 1002 — above fullscreen (CGShieldingWindowLevel+2)
+                        let _: () = msg_send![ns_win, setLevel: 1002_i64];
+
+                        // NSNonactivatingPanelMask (128) — appear over fullscreen
+                        // without triggering a Space switch
+                        let current: i32 = msg_send![ns_win, styleMask];
+                        let _: () = msg_send![ns_win, setStyleMask: current | 128];
+
+                        // CanJoinAllSpaces (1) + FullScreenAuxiliary (256)
+                        let _: () = msg_send![ns_win, setCollectionBehavior: 257_u64];
+
+                        let _: () = msg_send![ns_win, setHidesOnDeactivate: false];
+
+                        // Only activate for a real open. Pre-warm leaves the
+                        // window ordered-out so startup never steals focus.
+                        if focus {
+                            let _: () = msg_send![ns_win, orderFrontRegardless];
+                            let _: () = msg_send![ns_win, makeKeyWindow];
+                        }
+                    }
+                }
+            });
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            if focus {
+                let _ = window.show();
+                window.set_focus().ok();
+            }
+            // Pre-warm (focus=false): leave hidden (visible(false)). The
+            // existing-window branch in show() shows()+focuses on first open.
+        }
+
+        Ok(window)
+    }
+
+    /// Pre-warm the floating search window at startup: create it hidden and
+    /// unfocused so the FIRST user-triggered open reuses this warm webview
+    /// (instant) instead of cold-booting Next.js for several seconds (the
+    /// "search bar frozen ~10s before you can type" bug). No-op if the window
+    /// already exists or the UI is suppressed (enterprise hidden mode).
+    pub fn prewarm_search(app: &AppHandle) -> tauri::Result<()> {
+        if crate::enterprise_policy::is_app_ui_hidden() {
+            return Ok(());
+        }
+        if app
+            .get_webview_window(RewindWindowId::Search.label())
+            .is_some()
+        {
+            return Ok(());
+        }
+        let window = Self::create_search_window(app, None, false)?;
+        #[cfg(target_os = "macos")]
+        setup_content_process_handler(&window);
+        #[cfg(not(target_os = "macos"))]
+        let _ = &window;
+        info!("search window pre-warmed (hidden, unfocused)");
+        Ok(())
     }
 
     /// Hide Main panel without restoring the previous frontmost app.

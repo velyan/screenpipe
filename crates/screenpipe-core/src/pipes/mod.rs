@@ -2257,7 +2257,47 @@ impl PipeManager {
     }
 
     /// Get recent logs for a pipe.
+    ///
+    /// Prefers the persistent `pipe_executions` DB table so logs survive
+    /// process restarts. Falls back to the in-memory ring buffer when no
+    /// DB store is configured (CLI mode) or on DB errors.
     pub async fn get_logs(&self, name: &str) -> Vec<PipeRunLog> {
+        // Prefer database — it is the persistent source of truth and
+        // survives process restarts (the in-memory HashMap does not).
+        if let Some(ref store) = self.store {
+            if let Ok(executions) = store.get_executions(name, 50).await {
+                let db_logs: Vec<PipeRunLog> = executions
+                    .into_iter()
+                    .filter(|e| e.status != "queued" && e.status != "running")
+                    .filter_map(|e| {
+                        let started = e
+                            .started_at
+                            .as_deref()
+                            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                            .map(|dt| dt.with_timezone(&Utc))?;
+                        let finished = e
+                            .finished_at
+                            .as_deref()
+                            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .unwrap_or_else(Utc::now);
+                        Some(PipeRunLog {
+                            pipe_name: e.pipe_name,
+                            started_at: started,
+                            finished_at: finished,
+                            success: e.status == "completed",
+                            stdout: e.stdout,
+                            stderr: e.stderr,
+                        })
+                    })
+                    .collect();
+                if !db_logs.is_empty() {
+                    return db_logs;
+                }
+            }
+        }
+
+        // Fallback: in-memory ring buffer (CLI mode or DB error).
         let logs = self.logs.lock().await;
         logs.get(name)
             .map(|l| l.iter().cloned().collect())
@@ -6822,16 +6862,16 @@ mod tests {
         // Wall-clock cron only fires when we're actually inside the scheduled
         // slot (within CRON_GRACE_WINDOW). Anchor to the current hour:minute
         // so the slot is "right now" regardless of when the test runs.
-        let now = Utc::now();
+        let now = Local::now();
         let cron_str = format!("0 {} {} * * * *", now.minute(), now.hour());
-        let yesterday = now - chrono::Duration::hours(25);
+        let yesterday = now.with_timezone(&Utc) - chrono::Duration::hours(25);
         // Last run was yesterday, current minute's slot just passed → fire.
         assert!(should_run(&cron_str, yesterday));
 
         // Same cron, but last_run is "right now" (this slot already claimed) →
         // don't re-fire. `cron.after(last_run)` is strictly after, so the next
         // candidate is tomorrow's slot.
-        assert!(!should_run(&cron_str, now));
+        assert!(!should_run(&cron_str, now.with_timezone(&Utc)));
     }
 
     #[test]
@@ -6840,7 +6880,7 @@ mod tests {
         // just because today's cron slot already passed. Should wait until the
         // next future slot. Regression test: a user reported creating an
         // "every day at 7am" pipe at 5:39pm that fired 12 seconds later.
-        let now = Utc::now();
+        let now = Local::now();
         // Pick an hour that's unambiguously outside the grace window from now
         // (6h away in either direction).
         let safe_hour = (now.hour() + 6) % 24;
@@ -6856,10 +6896,10 @@ mod tests {
     fn test_should_run_cron_stale_last_run_waits() {
         // App was off for days. On restart, a daily cron whose slot passed
         // hours ago must NOT fire immediately — wait for the next slot.
-        let now = Utc::now();
+        let now = Local::now();
         let safe_hour = (now.hour() + 6) % 24;
         let cron_str = format!("0 0 {} * * * *", safe_hour);
-        let three_days_ago = now - chrono::Duration::days(3);
+        let three_days_ago = now.with_timezone(&Utc) - chrono::Duration::days(3);
         assert!(
             !should_run(&cron_str, three_days_ago),
             "after extended downtime, cron must wait for the next slot \
@@ -6871,9 +6911,9 @@ mod tests {
     fn test_should_run_cron_within_grace_fires() {
         // Slot was hit moments ago (typical: scheduler tick lag, brief sleep).
         // Within grace → fire even though last_run is far in the past.
-        let now = Utc::now();
+        let now = Local::now();
         let cron_str = format!("0 {} {} * * * *", now.minute(), now.hour());
-        let yesterday = now - chrono::Duration::hours(25);
+        let yesterday = now.with_timezone(&Utc) - chrono::Duration::hours(25);
         assert!(should_run(&cron_str, yesterday));
     }
 
@@ -6884,11 +6924,11 @@ mod tests {
         // wait until tomorrow. Reproduces the "morning-brief didn't run" report where
         // the app started at 7:12am after missing the 7am slot.
         use chrono::Timelike;
-        let now = Utc::now();
+        let now = Local::now();
         // Build a cron expression whose last slot was ~12 minutes ago
         let slot_time = now - chrono::Duration::minutes(12);
         let cron_str = format!("0 {} {} * * * *", slot_time.minute(), slot_time.hour());
-        let last_run = now - chrono::Duration::hours(25); // ran yesterday
+        let last_run = now.with_timezone(&Utc) - chrono::Duration::hours(25); // ran yesterday
         assert!(
             should_run(&cron_str, last_run),
             "pipe whose slot passed 12 minutes ago must fire on app restart, not wait until tomorrow"
@@ -7804,7 +7844,7 @@ mod tests {
 
     #[test]
     fn test_no_duplicate_keys_all_fields() {
-        let content = "---\nschedule: every 2h\nenabled: true\nmodel: claude-haiku-4-5\nprovider: openai\npreset: my-preset\nconnections:\n  - slack\n  - gmail\ntimeout: 600\ntrigger:\n  events:\n    - test_event\nsource_slug: my-pipe\ninstalled_version: 5\nsource_hash: abc123\n---\n\nFull config";
+        let content = "---\nschedule: every 2h\nenabled: true\nmodel: claude-haiku-4-5\nprovider: openai\npreset: my-preset\nconnections:\n  - slack\n  - google-calendar\ntimeout: 600\ntrigger:\n  events:\n    - test_event\nsource_slug: my-pipe\ninstalled_version: 5\nsource_hash: abc123\n---\n\nFull config";
         let (config, body) = parse_frontmatter(content).unwrap();
 
         let serialized = serialize_pipe(&config, &body).unwrap();

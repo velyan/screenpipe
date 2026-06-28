@@ -51,7 +51,20 @@ vi.mock("@tauri-apps/plugin-fs", () => ({
   }),
 }));
 
+vi.mock("@/lib/utils/tauri", () => ({
+  commands: {
+    // Default: pretend the native bulk command is unavailable so the existing
+    // tests exercise the stat() fallback (mirrors a non-Tauri test env).
+    // Individual tests override this with mockImplementation/mockRejectedValue.
+    listChatEntriesByMtime: vi.fn(async () => {
+      throw new Error("no tauri runtime");
+    }),
+  },
+}));
+
+import { commands } from "@/lib/utils/tauri";
 import {
+  CHAT_CONTENT_SEARCH_SCAN_LIMIT,
   CHAT_HISTORY_INITIAL_LIMIT,
   CONVERSATION_DEDUP_WINDOW_MS,
   __resetChatStorageCachesForTests,
@@ -458,5 +471,83 @@ describe("listConversations duplicate collapsing", () => {
 
     const rows = await listConversations({ limit: CHAT_HISTORY_INITIAL_LIMIT });
     expect(rows.map((r) => r.id).sort()).toEqual(["evening", "morning"]);
+  });
+});
+
+describe("chat-storage native mtime listing + bounded search", () => {
+  // Returns all conversation files sorted newest-first, mirroring the Rust
+  // `list_chat_entries_by_mtime` command. The specta binding wraps the result in
+  // a `{ status: "ok"; data }` union, so the mock must too (catches the
+  // unwrap-the-Result contract that a bare-array mock would miss).
+  const nativeListing = async (dir: string) => ({
+    status: "ok" as const,
+    data: Array.from(fsMock.files.keys())
+      .filter((path) => path.startsWith(`${dir}/`) && path.endsWith(".json"))
+      .map((path) => ({
+        name: path.slice(dir.length + 1),
+        mtime_ms: fsMock.files.get(path)?.mtime ?? 0,
+      }))
+      .sort((a, b) => b.mtime_ms - a.mtime_ms || b.name.localeCompare(a.name)),
+  });
+
+  beforeEach(() => {
+    fsMock.files.clear();
+    fsMock.reads.length = 0;
+    fsMock.stats.length = 0;
+    __resetChatStorageCachesForTests();
+    vi.mocked(commands.listChatEntriesByMtime).mockReset();
+  });
+
+  it("uses the native bulk command (no per-file stat storm) when available", async () => {
+    for (let i = 0; i < 60; i += 1) putConversation(`chat-${i}`, { updatedAt: i + 1 });
+    vi.mocked(commands.listChatEntriesByMtime).mockImplementation(nativeListing);
+
+    const rows = await listConversations({ limit: CHAT_HISTORY_INITIAL_LIMIT });
+
+    expect(rows).toHaveLength(50);
+    expect(rows[0].id).toBe("chat-59");
+    expect(fsMock.stats).toHaveLength(0); // the 15k-file stat() storm is gone
+    expect(fsMock.reads).toHaveLength(50);
+  });
+
+  it("falls back to stat() when the native command errors", async () => {
+    for (let i = 0; i < 5; i += 1) putConversation(`chat-${i}`, { updatedAt: i + 1 });
+    vi.mocked(commands.listChatEntriesByMtime).mockRejectedValue(new Error("boom"));
+
+    const rows = await listConversations({ limit: CHAT_HISTORY_INITIAL_LIMIT });
+
+    expect(rows).toHaveLength(5);
+    expect(fsMock.stats.length).toBeGreaterThan(0); // used the fallback path
+  });
+
+  it("caps the content scan to the most-recent N conversations", async () => {
+    // Needle lives only in the OLDEST chat, beyond the recent-N scan window.
+    for (let i = 0; i < CHAT_CONTENT_SEARCH_SCAN_LIMIT + 100; i += 1) {
+      putConversation(`chat-${i}`, {
+        updatedAt: i + 1,
+        content: i === 0 ? "needle-in-old-chat" : "ordinary",
+      });
+    }
+    vi.mocked(commands.listChatEntriesByMtime).mockImplementation(nativeListing);
+
+    const rows = await searchConversations("needle-in-old-chat", { limit: 50 });
+
+    expect(rows).toHaveLength(0); // oldest is past the cap → not body-searched
+    expect(fsMock.reads.length).toBe(CHAT_CONTENT_SEARCH_SCAN_LIMIT);
+  });
+
+  it("finds matches within the most-recent N", async () => {
+    const newest = CHAT_CONTENT_SEARCH_SCAN_LIMIT + 99;
+    for (let i = 0; i <= newest; i += 1) {
+      putConversation(`chat-${i}`, {
+        updatedAt: i + 1,
+        content: i === newest ? "fresh-needle" : "ordinary",
+      });
+    }
+    vi.mocked(commands.listChatEntriesByMtime).mockImplementation(nativeListing);
+
+    const rows = await searchConversations("fresh-needle", { limit: 50 });
+
+    expect(rows.map((r) => r.id)).toEqual([`chat-${newest}`]);
   });
 });

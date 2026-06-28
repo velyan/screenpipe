@@ -470,6 +470,7 @@ jobs:
             echo "Patching $APPIMAGE to remove bundled GLib"
             chmod +x "$APPIMAGE"
             "$APPIMAGE" --appimage-extract
+            "${GITHUB_WORKSPACE}/.github/scripts/linux/bundle-appimage-runtime-deps.sh" squashfs-root
             rm -f squashfs-root/usr/lib/libglib-2.0.so* \
                   squashfs-root/usr/lib/libgobject-2.0.so* \
                   squashfs-root/usr/lib/libgio-2.0.so* \

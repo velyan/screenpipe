@@ -32,6 +32,7 @@ pub mod meeting_export;
 pub mod meeting_persister;
 mod meeting_telemetry;
 pub mod meeting_watcher;
+mod oauth_result_page;
 pub mod permission_monitor;
 pub mod pipe_permissions_middleware;
 pub mod pipe_store;

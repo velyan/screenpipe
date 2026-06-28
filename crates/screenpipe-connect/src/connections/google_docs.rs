@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use screenpipe_secrets::SecretStore;
 use serde_json::{Map, Value};
 
-// Same GCP project as Gmail/Sheets/Calendar. Docs + Drive APIs enabled.
+// Same GCP project as Calendar. Docs + Drive APIs enabled.
 // Redirect URI registered: http://localhost:3030/connections/oauth/callback
 static OAUTH: OAuthConfig = OAuthConfig {
     auth_url: "https://accounts.google.com/o/oauth2/v2/auth",

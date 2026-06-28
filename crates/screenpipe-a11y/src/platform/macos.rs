@@ -1926,10 +1926,7 @@ fn get_clipboard() -> Option<String> {
     // case is we don't detect a crash next startup.
     let _ = std::fs::write(&inflight, std::process::id().to_string());
 
-    // dispatch_sync onto the main queue — the only thread where NSPasteboard
-    // is documented to behave. AppKit serializes pasteboard observers on
-    // main, so this side-steps the cache-invalidation race entirely.
-    let result = cidre::dispatch::Queue::main().sync_once(|| {
+    fn read_clipboard_text() -> Option<String> {
         let mut clipboard = arboard::Clipboard::new().ok()?;
         let text = clipboard.get_text().ok()?;
         if text.is_empty() {
@@ -1937,7 +1934,20 @@ fn get_clipboard() -> Option<String> {
         } else {
             Some(text)
         }
-    });
+    }
+
+    // Cargo's unit-test harness has no AppKit run loop to drain the main queue,
+    // so dispatch_sync can hang there. Production non-main callers still hop to
+    // main for NSPasteboard safety.
+    #[cfg(test)]
+    let result = read_clipboard_text();
+
+    #[cfg(not(test))]
+    let result = if unsafe { pthread_main_np() != 0 } {
+        read_clipboard_text()
+    } else {
+        cidre::dispatch::Queue::main().sync_once(read_clipboard_text)
+    };
 
     let _ = std::fs::remove_file(&inflight);
     result
@@ -2326,6 +2336,15 @@ extern "C" fn activity_only_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    static CLIPBOARD_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn clipboard_test_guard() -> MutexGuard<'static, ()> {
+        CLIPBOARD_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     #[test]
     fn test_permission_check() {
@@ -2380,6 +2399,7 @@ mod tests {
 
     #[test]
     fn test_get_clipboard_returns_option() {
+        let _guard = clipboard_test_guard();
         // Should not panic regardless of clipboard state
         let result = get_clipboard();
         // Result is either Some(non-empty string) or None
@@ -2393,6 +2413,7 @@ mod tests {
 
     #[test]
     fn test_get_clipboard_no_subprocess() {
+        let _guard = clipboard_test_guard();
         // Verify arboard doesn't spawn pbpaste by checking it completes fast.
         // pbpaste fork+exec takes >1ms; native NSPasteboard is <0.5ms.
         let start = std::time::Instant::now();
@@ -2411,6 +2432,7 @@ mod tests {
 
     #[test]
     fn test_get_clipboard_set_and_read() {
+        let _guard = clipboard_test_guard();
         // Round-trip: set clipboard text, then read it back
         let test_text = "screenpipe_clipboard_test_12345";
         {
@@ -2423,6 +2445,7 @@ mod tests {
 
     #[test]
     fn test_get_clipboard_empty_returns_none() {
+        let _guard = clipboard_test_guard();
         // Set clipboard to empty string, should return None
         {
             let mut clipboard = arboard::Clipboard::new().expect("clipboard init");
@@ -2434,6 +2457,7 @@ mod tests {
 
     #[test]
     fn test_get_clipboard_unicode() {
+        let _guard = clipboard_test_guard();
         let unicode_text = "日本語テスト 🎉 émojis ñ";
         {
             let mut clipboard = arboard::Clipboard::new().expect("clipboard init");
@@ -2447,6 +2471,7 @@ mod tests {
 
     #[test]
     fn test_get_clipboard_large_content() {
+        let _guard = clipboard_test_guard();
         // 100KB of text — should not OOM or hang
         let large_text: String = "x".repeat(100_000);
         {

@@ -9,7 +9,6 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::Html;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use screenpipe_connect::connections::{bee, ConnectionManager};
 use screenpipe_connect::oauth::{self as oauth_store, PENDING_OAUTH};
 use screenpipe_connect::whatsapp::WhatsAppGateway;
@@ -23,6 +22,7 @@ use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
+use crate::oauth_result_page::render_oauth_result_page;
 use crate::routes::browser::BrowserBridge;
 use screenpipe_connect::connections::browser::{BrowserRegistry, BrowserSummary, EvalError};
 
@@ -293,6 +293,84 @@ pub struct WhatsAppPairRequest {
     pub bun_path: String,
 }
 
+/// Canonical one-click MCP-OAuth providers (#4580). Maps a connector id to the
+/// provider's remote MCP URL. Keep in sync with `MCP_OAUTH_PROVIDERS` in
+/// `apps/screenpipe-app-tauri/components/settings/connections-section.tsx`.
+///
+/// When a user connects one of these via one-click MCP OAuth, the connection is
+/// persisted in the MCP server store (keyed by a *random* server id + this URL)
+/// — not the connector secret store — so the connector's own `connected` flag
+/// stays false and the in-app agent reports it "not connected". We match a
+/// live, oauth-connected MCP server back to its connector by URL.
+const MCP_OAUTH_PROVIDER_URLS: &[(&str, &str)] = &[
+    ("linear", "https://mcp.linear.app/mcp"),
+    ("stripe", "https://mcp.stripe.com"),
+    ("sentry", "https://mcp.sentry.dev/mcp"),
+    ("intercom", "https://mcp.intercom.com/mcp"),
+    ("asana", "https://mcp.asana.com/mcp"),
+    ("monday", "https://mcp.monday.com/mcp"),
+    ("clickup", "https://mcp.clickup.com/mcp"),
+    ("airtable", "https://mcp.airtable.com/mcp"),
+    ("confluence", "https://mcp.atlassian.com/v1/mcp"),
+    ("jira", "https://mcp.atlassian.com/v1/mcp"),
+    ("notion", "https://mcp.notion.com/mcp"),
+];
+
+fn normalize_mcp_url(url: &str) -> &str {
+    url.trim_end_matches('/')
+}
+
+/// Resolve an MCP server URL to the connector id it belongs to (trailing-slash
+/// insensitive, mirroring the frontend's matching). `None` if it isn't one of
+/// the known one-click providers.
+fn connector_id_for_mcp_url(url: &str) -> Option<&'static str> {
+    let normalized = normalize_mcp_url(url);
+    MCP_OAUTH_PROVIDER_URLS
+        .iter()
+        .find(|(_, provider_url)| normalize_mcp_url(provider_url) == normalized)
+        .map(|(id, _)| *id)
+}
+
+/// Connector ids currently connected via one-click MCP OAuth (#4580). Reads the
+/// MCP server store and matches each enabled, oauth-connected server back to its
+/// connector by URL. Best-effort: any read error yields an empty set so the
+/// connections list degrades to the pre-existing behavior.
+async fn mcp_oauth_connected_ids(
+    screenpipe_dir: &std::path::Path,
+    secret_store: Option<Arc<SecretStore>>,
+) -> std::collections::HashSet<String> {
+    use screenpipe_connect::mcp_servers::McpServerStore;
+    let mut connected = std::collections::HashSet::new();
+    let store = McpServerStore::new(screenpipe_dir.to_path_buf(), secret_store);
+    let servers = match store.list().await {
+        Ok(servers) => servers,
+        Err(err) => {
+            tracing::warn!("[connections] failed to read mcp servers for connection status: {err}");
+            return connected;
+        }
+    };
+    for server in servers {
+        if !server.enabled {
+            continue;
+        }
+        let Some(conn_id) = connector_id_for_mcp_url(&server.url) else {
+            continue;
+        };
+        if connected.contains(conn_id) {
+            continue;
+        }
+        let is_connected = store
+            .oauth_status(&server.id)
+            .await
+            .map(|status| status.connected)
+            .unwrap_or(false);
+        if is_connected {
+            connected.insert(conn_id.to_string());
+        }
+    }
+    connected
+}
+
 /// GET /connections — list all integrations with connection status.
 async fn list_connections(State(state): State<ConnectionsState>) -> Json<Value> {
     let mgr = state.cm.lock().await;
@@ -324,7 +402,35 @@ async fn list_connections(State(state): State<ConnectionsState>) -> Json<Value> 
     };
 
     let mut data = serde_json::to_value(&list).unwrap_or(json!([]));
+
+    // One-click MCP-OAuth connectors (#4580) persist their connection in the
+    // MCP server store (random id + provider URL), not the connector secret
+    // store — so the base entry above reports connected=false even after the
+    // user signs in, and the in-app agent that reads this list says "Linear is
+    // not connected". Reflect a live MCP-OAuth connection back onto its
+    // connector so both the list and the agent see the truth.
+    let mcp_connected_ids =
+        mcp_oauth_connected_ids(&state.screenpipe_dir, state.secret_store.clone()).await;
+
     if let Some(arr) = data.as_array_mut() {
+        if !mcp_connected_ids.is_empty() {
+            for entry in arr.iter_mut() {
+                let is_mcp_connected = entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| mcp_connected_ids.contains(id))
+                    .unwrap_or(false);
+                if is_mcp_connected {
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.insert("connected".to_string(), json!(true));
+                        // Mark *how* it's connected so the agent/frontend knows
+                        // to drive it over MCP, not the /connections/:id/proxy.
+                        obj.insert("mcp".to_string(), json!(true));
+                    }
+                }
+            }
+        }
+
         // Native calendar — macOS only (EventKit). Windows/Linux have no equivalent.
         #[cfg(target_os = "macos")]
         {
@@ -934,316 +1040,7 @@ async fn ics_calendar_events(
 }
 
 // ---------------------------------------------------------------------------
-// Gmail-specific routes
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-pub struct GmailMessagesQuery {
-    pub q: Option<String>,
-    #[serde(rename = "maxResults")]
-    pub max_results: Option<u32>,
-    #[serde(rename = "pageToken")]
-    pub page_token: Option<String>,
-    pub instance: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct GmailInstanceQuery {
-    pub instance: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct GmailSendRequest {
-    pub to: String,
-    pub subject: String,
-    pub body: String,
-    pub from: Option<String>,
-    pub instance: Option<String>,
-}
-
-/// GET /connections/gmail/messages — list or search Gmail messages.
-async fn gmail_list_messages(
-    State(state): State<ConnectionsState>,
-    Query(params): Query<GmailMessagesQuery>,
-) -> (StatusCode, Json<Value>) {
-    let client = reqwest::Client::new();
-    let instance = params.instance.clone();
-    match gmail_list_messages_inner(&client, params, instance.as_deref(), &state.secret_store).await
-    {
-        Ok(data) => (StatusCode::OK, Json(json!({ "data": data }))),
-        Err(e) => gmail_err(e),
-    }
-}
-
-async fn gmail_list_messages_inner(
-    client: &reqwest::Client,
-    params: GmailMessagesQuery,
-    instance: Option<&str>,
-    secret_store: &Option<Arc<SecretStore>>,
-) -> anyhow::Result<Value> {
-    let token = gmail_token(client, instance, secret_store).await?;
-    let max_results = params.max_results.unwrap_or(20).min(500);
-    let mut url =
-        reqwest::Url::parse("https://gmail.googleapis.com/gmail/v1/users/me/messages").unwrap();
-    {
-        let mut pairs = url.query_pairs_mut();
-        pairs.append_pair("maxResults", &max_results.to_string());
-        if let Some(q) = &params.q {
-            pairs.append_pair("q", q);
-        }
-        if let Some(pt) = &params.page_token {
-            pairs.append_pair("pageToken", pt);
-        }
-    }
-    let resp = client.get(url).bearer_auth(&token).send().await?;
-    gmail_json_or_upstream(resp).await
-}
-
-/// GET /connections/gmail/messages/:id — read a full Gmail message.
-async fn gmail_get_message(
-    State(state): State<ConnectionsState>,
-    Path(id): Path<String>,
-    Query(q): Query<GmailInstanceQuery>,
-) -> (StatusCode, Json<Value>) {
-    let client = reqwest::Client::new();
-    match gmail_get_message_inner(&client, &id, q.instance.as_deref(), &state.secret_store).await {
-        Ok(data) => (StatusCode::OK, Json(json!({ "data": data }))),
-        Err(e) => gmail_err(e),
-    }
-}
-
-async fn gmail_get_message_inner(
-    client: &reqwest::Client,
-    id: &str,
-    instance: Option<&str>,
-    secret_store: &Option<Arc<SecretStore>>,
-) -> anyhow::Result<Value> {
-    let token = gmail_token(client, instance, secret_store).await?;
-    let url = format!(
-        "https://gmail.googleapis.com/gmail/v1/users/me/messages/{}?format=full",
-        id
-    );
-    let resp = client.get(&url).bearer_auth(&token).send().await?;
-    let msg = gmail_json_or_upstream(resp).await?;
-    Ok(parse_gmail_message(&msg))
-}
-
-/// POST /connections/gmail/send — send an email via Gmail.
-async fn gmail_send(
-    State(state): State<ConnectionsState>,
-    Json(body): Json<GmailSendRequest>,
-) -> (StatusCode, Json<Value>) {
-    let client = reqwest::Client::new();
-    let instance = body.instance.clone();
-    match gmail_send_inner(&client, body, instance.as_deref(), &state.secret_store).await {
-        Ok(data) => (StatusCode::OK, Json(json!({ "data": data }))),
-        Err(e) => gmail_err(e),
-    }
-}
-
-async fn gmail_send_inner(
-    client: &reqwest::Client,
-    body: GmailSendRequest,
-    instance: Option<&str>,
-    secret_store: &Option<Arc<SecretStore>>,
-) -> anyhow::Result<Value> {
-    let token = gmail_token(client, instance, secret_store).await?;
-    let from = body.from.unwrap_or_default();
-    let raw = build_rfc2822_message(&from, &body.to, &body.subject, &body.body);
-    let encoded = URL_SAFE_NO_PAD.encode(raw.as_bytes());
-    let resp = client
-        .post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send")
-        .bearer_auth(&token)
-        .json(&json!({ "raw": encoded }))
-        .send()
-        .await?;
-    gmail_json_or_upstream(resp).await
-}
-
-/// Retrieve a valid Gmail OAuth token or return an error. Distinguishes
-/// "not connected" from "ambiguous, multiple accounts connected" so the
-/// caller (AI tool, pipe, user) gets actionable context instead of an
-/// always-wrong "reconnect Gmail" string.
-async fn gmail_token(
-    client: &reqwest::Client,
-    instance: Option<&str>,
-    secret_store: &Option<Arc<SecretStore>>,
-) -> anyhow::Result<String> {
-    let store = secret_store.as_deref();
-    if let Some(token) =
-        oauth_store::get_valid_token_instance(store, client, "gmail", instance).await
-    {
-        return Ok(token);
-    }
-    Err(anyhow::anyhow!(
-        oauth_store::describe_oauth_error(store, "gmail", "Gmail", instance).await
-    ))
-}
-
-/// GET /connections/gmail/instances — list all connected Gmail accounts.
-async fn gmail_list_instances(State(state): State<ConnectionsState>) -> (StatusCode, Json<Value>) {
-    let instances = oauth_store::list_oauth_instances(state.secret_store.as_deref(), "gmail").await;
-    let mut accounts = Vec::new();
-    for inst in instances {
-        let email =
-            oauth_store::load_oauth_json(state.secret_store.as_deref(), "gmail", inst.as_deref())
-                .await
-                .and_then(|v| v["email"].as_str().map(String::from));
-        accounts.push(json!({
-            "instance": inst,
-            "email": email,
-        }));
-    }
-    (StatusCode::OK, Json(json!({ "data": accounts })))
-}
-
-/// Carries the upstream Gmail API status + body so [`gmail_err`] can
-/// surface a meaningful status to the caller instead of collapsing every
-/// failure to 500. Without this, a stale OAuth token (401) is
-/// indistinguishable from a real internal bug from the chat UI.
-#[derive(Debug)]
-struct GmailUpstreamError {
-    status: reqwest::StatusCode,
-    body: String,
-}
-
-impl std::fmt::Display for GmailUpstreamError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "gmail api {}: {}", self.status.as_u16(), self.body)
-    }
-}
-
-impl std::error::Error for GmailUpstreamError {}
-
-/// Parse a Gmail API response, preserving the upstream status/body when
-/// the call fails. Replaces ad-hoc `error_for_status()?` + `json()` chains
-/// that swallowed the response body before anyone could read it.
-async fn gmail_json_or_upstream(resp: reqwest::Response) -> anyhow::Result<Value> {
-    let status = resp.status();
-    if status.is_success() {
-        let v: Value = resp.json().await?;
-        return Ok(v);
-    }
-    let body = resp.text().await.unwrap_or_default();
-    Err(GmailUpstreamError { status, body }.into())
-}
-
-/// Convert an anyhow error into the standard `(StatusCode, Json)` handler
-/// return, forwarding the upstream Gmail status when present.
-fn gmail_err(e: anyhow::Error) -> (StatusCode, Json<Value>) {
-    if let Some(up) = e.downcast_ref::<GmailUpstreamError>() {
-        let status = StatusCode::from_u16(up.status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        return (
-            status,
-            Json(json!({
-                "error": up.body,
-                "upstream_status": up.status.as_u16(),
-            })),
-        );
-    }
-    (
-        StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json!({ "error": e.to_string() })),
-    )
-}
-
-/// Build a minimal RFC 2822 email message string.
-fn build_rfc2822_message(from: &str, to: &str, subject: &str, body: &str) -> String {
-    let mut msg = String::new();
-    if !from.is_empty() {
-        msg.push_str(&format!("From: {}\r\n", from));
-    }
-    msg.push_str(&format!("To: {}\r\n", to));
-    msg.push_str(&format!("Subject: {}\r\n", subject));
-    msg.push_str("MIME-Version: 1.0\r\n");
-    msg.push_str("Content-Type: text/plain; charset=utf-8\r\n");
-    msg.push_str("\r\n");
-    msg.push_str(body);
-    msg
-}
-
-/// Extract useful fields from a raw Gmail API message object.
-fn parse_gmail_message(msg: &Value) -> Value {
-    let id = msg["id"].as_str().unwrap_or("").to_string();
-    let thread_id = msg["threadId"].as_str().unwrap_or("").to_string();
-    let snippet = msg["snippet"].as_str().unwrap_or("").to_string();
-
-    let headers = msg["payload"]["headers"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-
-    let get_header = |name: &str| -> String {
-        headers
-            .iter()
-            .find(|h| {
-                h["name"]
-                    .as_str()
-                    .map(|n| n.eq_ignore_ascii_case(name))
-                    .unwrap_or(false)
-            })
-            .and_then(|h| h["value"].as_str())
-            .unwrap_or("")
-            .to_string()
-    };
-
-    let from = get_header("From");
-    let to = get_header("To");
-    let subject = get_header("Subject");
-    let date = get_header("Date");
-
-    // Extract plain text body — try payload.body.data first, then parts
-    let body = extract_text_body(&msg["payload"]);
-
-    json!({
-        "id": id,
-        "threadId": thread_id,
-        "from": from,
-        "to": to,
-        "subject": subject,
-        "date": date,
-        "snippet": snippet,
-        "body": body,
-    })
-}
-
-/// Recursively extract plain-text body from a Gmail payload part.
-fn extract_text_body(payload: &Value) -> String {
-    // Try direct body.data first (single-part messages)
-    if let Some(text) = decode_base64url(payload["body"]["data"].as_str()) {
-        return text;
-    }
-    // Walk parts (multipart/mixed, multipart/alternative, etc.)
-    let parts = payload["parts"]
-        .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
-    for part in parts {
-        let mime = part["mimeType"].as_str().unwrap_or("");
-        if mime == "text/plain" {
-            if let Some(text) = decode_base64url(part["body"]["data"].as_str()) {
-                return text;
-            }
-        }
-        let nested = extract_text_body(part);
-        if !nested.is_empty() {
-            return nested;
-        }
-    }
-    String::new()
-}
-
-fn decode_base64url(data: Option<&str>) -> Option<String> {
-    let text = String::from_utf8(URL_SAFE_NO_PAD.decode(data?).ok()?).ok()?;
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Google Calendar routes (local OAuth, same pattern as Gmail)
+// Google Calendar routes (local OAuth)
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -1298,8 +1095,8 @@ fn gcal_events_error_response(e: &anyhow::Error) -> (StatusCode, Json<Value>) {
     )
 }
 
-/// Retrieve a valid Google Calendar OAuth token or return an error. See
-/// [`gmail_token`] for why "not connected" is split into distinct cases.
+/// Retrieve a valid Google Calendar OAuth token or return an error. The
+/// explicit auth error keeps "not connected" separate from upstream failures.
 async fn gcal_token(
     client: &reqwest::Client,
     instance: Option<&str>,
@@ -1653,22 +1450,23 @@ pub struct OAuthCallbackQuery {
 /// via the `PENDING_OAUTH` channel map, then delivers the `code` through the channel.
 async fn oauth_callback(Query(params): Query<OAuthCallbackQuery>) -> (StatusCode, Html<String>) {
     if let Some(err) = params.error {
-        let html = format!(
-            "<html><body style=\"font-family:system-ui;text-align:center;padding:60px\">\
-            <h2>Connection failed</h2><p>{}</p></body></html>",
-            err
+        return oauth_callback_page(
+            StatusCode::BAD_REQUEST,
+            "Connection failed",
+            "screenpipe could not finish the OAuth flow.",
+            &err,
         );
-        return (StatusCode::BAD_REQUEST, Html(html));
     }
 
     let (code, state) = match (params.code, params.state) {
         (Some(c), Some(s)) => (c, s),
         _ => {
-            let html =
-                "<html><body style=\"font-family:system-ui;text-align:center;padding:60px\">\
-                <h2>Invalid callback</h2><p>Missing code or state parameter.</p></body></html>"
-                    .to_string();
-            return (StatusCode::BAD_REQUEST, Html(html));
+            return oauth_callback_page(
+                StatusCode::BAD_REQUEST,
+                "Invalid callback",
+                "screenpipe could not verify this authorization response.",
+                "Missing code or state parameter.",
+            );
         }
     };
 
@@ -1686,24 +1484,38 @@ async fn oauth_callback(Query(params): Query<OAuthCallbackQuery>) -> (StatusCode
                 None => code,
             };
             let _ = pending.sender.send(payload);
-            let html =
-                "<html><body style=\"font-family:system-ui;text-align:center;padding:60px\">\
-                <h2>Connected!</h2>\
-                <p>You can close this tab and return to screenpipe.</p>\
-                <script>window.close()</script>\
-                </body></html>"
-                    .to_string();
-            (StatusCode::OK, Html(html))
+            oauth_callback_page(
+                StatusCode::OK,
+                "Connected",
+                "screenpipe can now use this connection.",
+                "You can close this tab and return to screenpipe.",
+            )
         }
-        None => {
-            let html = "<html><body style=\"font-family:system-ui;text-align:center;padding:60px\">\
-                <h2>Session expired</h2>\
-                <p>The authorization session was not found or already completed. Please try again.</p>\
-                </body></html>"
-                .to_string();
-            (StatusCode::BAD_REQUEST, Html(html))
-        }
+        None => oauth_callback_page(
+            StatusCode::BAD_REQUEST,
+            "Session expired",
+            "screenpipe could not find the waiting app session.",
+            "The authorization session was not found or already completed. Please try again.",
+        ),
     }
+}
+
+fn oauth_callback_page(
+    status: StatusCode,
+    title: &str,
+    detail: &str,
+    message: &str,
+) -> (StatusCode, Html<String>) {
+    (
+        status,
+        Html(render_oauth_result_page(
+            "screenpipe OAuth",
+            title,
+            detail,
+            message,
+            status.is_success(),
+        )),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1997,7 +1809,7 @@ async fn connection_proxy(
             id,
             instance_ref
         );
-        // For OAuth-style integrations (Google Docs/Sheets, etc.) the
+        // For OAuth-style integrations (Google Docs, etc.) the
         // generic "no stored credentials" message is wrong when the real
         // problem is multi-account ambiguity — the user *is* connected,
         // they just need to pick which account. `describe_oauth_error`
@@ -3304,11 +3116,6 @@ where
             "/google-calendar/disconnect",
             axum::routing::delete(gcal_disconnect),
         )
-        // Gmail-specific routes (must be before /:id to avoid conflict)
-        .route("/gmail/instances", get(gmail_list_instances))
-        .route("/gmail/messages", get(gmail_list_messages))
-        .route("/gmail/messages/:id", get(gmail_get_message))
-        .route("/gmail/send", post(gmail_send))
         // Slack-specific send route (must be before /:id to avoid conflict)
         .route("/slack/send", post(slack_send))
         .route("/slack/search", get(slack_search))
@@ -3344,6 +3151,73 @@ where
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod mcp_oauth_connector_tests {
+    use super::*;
+
+    #[test]
+    fn resolves_known_providers_trailing_slash_insensitive() {
+        assert_eq!(
+            connector_id_for_mcp_url("https://mcp.linear.app/mcp"),
+            Some("linear")
+        );
+        // trailing slash must still match (frontend stores either form)
+        assert_eq!(
+            connector_id_for_mcp_url("https://mcp.linear.app/mcp/"),
+            Some("linear")
+        );
+        assert_eq!(
+            connector_id_for_mcp_url("https://mcp.notion.com/mcp"),
+            Some("notion")
+        );
+        // stripe has no /mcp path suffix
+        assert_eq!(
+            connector_id_for_mcp_url("https://mcp.stripe.com"),
+            Some("stripe")
+        );
+    }
+
+    #[test]
+    fn unknown_url_resolves_to_none() {
+        assert_eq!(connector_id_for_mcp_url("https://example.com/mcp"), None);
+        assert_eq!(connector_id_for_mcp_url(""), None);
+    }
+
+    #[test]
+    fn enriches_only_matching_connector_entries() {
+        // Simulate the post-list enrichment with a known connected id.
+        let mut data = json!([
+            { "id": "linear", "name": "Linear", "connected": false, "is_oauth": false },
+            { "id": "notion", "name": "Notion", "connected": true, "is_oauth": true },
+        ]);
+        let mut mcp_connected = std::collections::HashSet::new();
+        mcp_connected.insert("linear".to_string());
+
+        if let Some(arr) = data.as_array_mut() {
+            for entry in arr.iter_mut() {
+                let hit = entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(|id| mcp_connected.contains(id))
+                    .unwrap_or(false);
+                if hit {
+                    if let Some(obj) = entry.as_object_mut() {
+                        obj.insert("connected".to_string(), json!(true));
+                        obj.insert("mcp".to_string(), json!(true));
+                    }
+                }
+            }
+        }
+
+        // linear flips to connected + gains the mcp marker
+        assert_eq!(data[0]["connected"], json!(true));
+        assert_eq!(data[0]["mcp"], json!(true));
+        // notion (not in the MCP set) is untouched — no spurious mcp marker
+        assert_eq!(data[1]["connected"], json!(true));
+        assert!(data[1].get("mcp").is_none());
+    }
+}
 
 #[cfg(test)]
 mod gcal_merge_tests {

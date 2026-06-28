@@ -494,7 +494,7 @@ async fn list_recoverable_named_oauth_instances(
 /// `(integration_id, instance)`. Without this, every miss collapses to the
 /// same "not connected" string — which is wrong (and infuriating) when the
 /// user *is* connected and the real problem is multi-account ambiguity, the
-/// shape that hit Gmail when two accounts were authorized.
+/// shape that hit Google integrations when two accounts were authorized.
 ///
 /// Four cases the caller cares about:
 /// - no instances at all                       → "not connected, please connect"
@@ -799,8 +799,9 @@ pub async fn sweep_shadowed_default_slots(store: &SecretStore) -> Result<usize> 
     let keys = store.list("oauth:").await?;
 
     // Per integration id: whether a default slot exists, and the set of named
-    // instance keys present. A key like `oauth:gmail` has no colon after the
-    // prefix → default slot. `oauth:gmail:alice@x.com` → named instance.
+    // instance keys present. A key like `oauth:google-calendar` has no colon
+    // after the prefix → default slot.
+    // `oauth:google-calendar:alice@x.com` → named instance.
     let mut has_default: HashSet<String> = HashSet::new();
     let mut named: HashMap<String, HashSet<String>> = HashMap::new();
     for key in &keys {
@@ -895,7 +896,7 @@ pub async fn sweep_shadowed_default_slots(store: &SecretStore) -> Result<usize> 
 /// Older single-account builds parked the *first* connected account in the
 /// default slot. When the user later connected a *second* account, the
 /// post-save cleanup used to blindly delete that default slot — silently
-/// wiping the first account ("adding a 2nd Gmail overwrote the 1st"). This
+/// wiping the first account ("adding a 2nd Google account overwrote the 1st"). This
 /// keeps both:
 ///
 /// - default slot is empty, unrecoverable, or the *same* account as the one
@@ -1241,7 +1242,7 @@ mod tests {
     // in `load_oauth_json_exact` (which scans `~/.screenpipe/{id}*-oauth.json`)
     // never matches a real stored file on the developer's machine. Without
     // this, tests would pass/fail based on whether the tester happens to have
-    // gmail connected locally.
+    // Google Calendar connected locally.
 
     #[tokio::test]
     async fn get_valid_token_with_no_stored_token_returns_none_without_refresh() {
@@ -1761,7 +1762,7 @@ mod tests {
         // account is left in the default slot beside a named one (e.g. a connect
         // reconcile that didn't finish), the startup sweep must PROMOTE it to its
         // own slot, not delete it. This is what used to silently drop the first
-        // Gmail account.
+        // Google account.
         let store = mem_store().await;
         let id = "_t_sweep_promote";
         store
@@ -1811,7 +1812,7 @@ mod tests {
 
     // ---- reconcile_default_slot_after_instanced_save ------------------
     //
-    // The "connecting a 2nd Gmail wiped the 1st" bug: the first account used to
+    // The "connecting a 2nd Google account wiped the 1st" bug: the first account used to
     // live in the default slot, and saving a second account deleted it.
 
     #[tokio::test]

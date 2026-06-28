@@ -226,4 +226,24 @@ describe("RECOMMENDED_SERVERS", () => {
       expect(displayName(s)).toBe(s.title);
     }
   });
+
+  it("only lists remotes the engine can drive (streamable HTTP, no legacy /sse)", () => {
+    // The engine's MCP client speaks streamable HTTP + stdio only. A legacy
+    // /sse endpoint would pass installKind() but fail at connect/OAuth time.
+    for (const s of RECOMMENDED_SERVERS) {
+      const remote = pickHttpRemote(s);
+      if (!remote) continue;
+      expect(
+        normalizeUrl(remote.url).endsWith("/sse"),
+        `${s.name} points at a legacy /sse endpoint`,
+      ).toBe(false);
+    }
+  });
+
+  it("maps Linear to its streamable-http MCP endpoint", () => {
+    const linear = RECOMMENDED_SERVERS.find((s) => s.title === "Linear")!;
+    const draft = mapRegistryEntryToDraft(linear, () => "id", () => 0)!;
+    expect(draft.server.url).toBe("https://mcp.linear.app/mcp");
+    expect(draft.server.transport).toBe("http");
+  });
 });

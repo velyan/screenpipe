@@ -211,7 +211,7 @@ Or set env vars instead of flags: `SCREENPIPE_REMOTE_HOST`, `SCREENPIPE_REMOTE_U
 
 On the OpenClaw machine, point its skill at the synced directory or run a local screenpipe pointing to the same data dir — OpenClaw can then query `localhost:3030` as if the data were captured locally.
 
-> The deprecated **cloud sync** flow (Settings → Cloud, screenpipe-cloud account) is being phased out in favor of self-hosted remote sync. Use `npx -y screenpipe@latest sync remote` for new setups.
+> The old **Settings → Cloud** sync flow is being phased out in favor of explicit remote sync setups. Use `npx -y screenpipe@latest sync remote` for new setups where you control the destination.
 
 ## available MCP tools
 

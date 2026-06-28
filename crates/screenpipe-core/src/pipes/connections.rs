@@ -25,7 +25,7 @@ mod tests {
         assert_eq!(parse_mcp_connection_id("mcp:brave"), Some("brave"));
         assert_eq!(parse_mcp_connection_id(" mcp: linear "), Some("linear"));
         assert_eq!(parse_mcp_connection_id("mcp:"), None);
-        assert_eq!(parse_mcp_connection_id("gmail"), None);
+        assert_eq!(parse_mcp_connection_id("google-calendar"), None);
         assert_eq!(parse_mcp_connection_id("notion:crm"), None);
     }
 }

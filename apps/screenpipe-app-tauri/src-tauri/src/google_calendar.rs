@@ -9,7 +9,7 @@
 //! the native EventKit and ICS publishers feed. Meeting detection and the
 //! prewarm logic in screenpipe-events::meetings consume that single topic,
 //! so adding this publisher is what makes the 2–3 min prewarm toast work
-//! for gmail/gcal users (who otherwise have no background calendar feed).
+//! for Google Calendar users (who otherwise have no background calendar feed).
 //!
 //! Skips silently when the Google Calendar OAuth is not connected
 //! (endpoint returns 401) so this loop is a safe no-op for users who

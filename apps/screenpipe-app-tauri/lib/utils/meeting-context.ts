@@ -545,7 +545,7 @@ export function buildMeetingSummarizeInstructions(
   if (options?.followUpAsk) {
     lines.push(
       ``,
-      `after the PUT, offer to push the summary into one of the user's *connected* apps — ask first, never push on your own. don't guess at the integration list: GET http://localhost:3030/connections and keep only the ones with "connected": true, then ask in one short message which of those (if any) to push to. rank them by relevance — an app used during the meeting (see "apps used during meeting" / "tabs/docs visited") comes first. if nothing is connected, say so in one line (connecting Notion/Slack/Telegram/… would let you push next time) and stop. when they pick one, push via that connection's endpoint (POST /connections/<id>/send for slack/gmail/telegram/discord, POST /connections/<id>/proxy/... for notion/linear/etc.) and confirm specifics (channel, parent page) before anything leaves the machine.`,
+      `after the PUT, offer to push the summary into one of the user's *connected* apps — ask first, never push on your own. don't guess at the integration list: GET http://localhost:3030/connections and keep only the ones with "connected": true, then ask in one short message which of those (if any) to push to. rank them by relevance — an app used during the meeting (see "apps used during meeting" / "tabs/docs visited") comes first. if nothing is connected, say so in one line (connecting Notion/Slack/Telegram/… would let you push next time) and stop. when they pick one, push via that connection's endpoint (POST /connections/<id>/send for slack/telegram/discord, POST /connections/<id>/proxy/... for notion/linear/etc.) and confirm specifics (channel, parent page) before anything leaves the machine.`,
     );
   }
 

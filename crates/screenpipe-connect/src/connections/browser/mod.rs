@@ -10,7 +10,7 @@
 //! They live side-by-side in a [`BrowserRegistry`] keyed by id, and the
 //! agent picks one by reading the descriptions exposed at
 //! `GET /connections/browsers`. No hardcoded routing rules; the LLM picks
-//! the same way it picks between two Gmail accounts.
+//! the same way it picks between two Google Calendar accounts.
 //!
 //! Submodules:
 //! - [`bridge`] — protocol state for extension-driven browsers

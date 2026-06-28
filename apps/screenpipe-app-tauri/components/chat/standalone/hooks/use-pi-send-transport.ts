@@ -8,6 +8,7 @@ import { toast } from "@/components/ui/use-toast";
 import { commands } from "@/lib/utils/tauri";
 import { isPlaceholderConversationTitle } from "@/lib/chat/message-rendering";
 import { buildProviderErrorMessage, preflightChatProvider } from "@/lib/chat/provider-errors";
+import { queuedPreviewForText } from "@/lib/chat/queued-display";
 import { useChatStore } from "@/lib/stores/chat-store";
 import { createPiMessageQueueTransport } from "@/components/chat/standalone/hooks/use-pi-message-queue-transport";
 import { usePiLiveSendControls } from "@/components/chat/standalone/hooks/use-pi-live-send";
@@ -419,11 +420,12 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
       }
 
       // Send prompt — abort/new_session now await completion, so no retry needed
+      const displayPreview = queuedPreviewForText(displayLabel ?? userMessage);
       let result = await commands.piPrompt(
         piSessionIdRef.current,
         promptMessage,
         piImages.length > 0 ? piImages : null,
-        null,
+        displayPreview,
       );
 
       // Race: user hit "+ NEW" before Pi finished registering the new session
@@ -451,7 +453,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
               piSessionIdRef.current,
               promptMessage,
               piImages.length > 0 ? piImages : null,
-              null,
+              displayPreview,
             );
           }
         } catch (e) {

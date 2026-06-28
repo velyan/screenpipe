@@ -76,7 +76,7 @@ so you don't pull too much. if screenpipe skills are available, load them first.
 
 1. SEGMENT — pull my activity since you last ran and split it into distinct work
    sessions. a session is a coherent block of related activity (e.g. "45 min in cursor
-   refactoring auth", "30 min in gmail answering investor emails", "1h call about X").
+   refactoring auth", "30 min reviewing investor follow-ups", "1h call about X").
    note the app(s), the time range, what i was actually trying to do, and the goal.
 
 2. SUMMARIZE — for each session write a short summary of the *process*: the steps i

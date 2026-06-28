@@ -23,8 +23,7 @@ export interface RecorderOptions {
    * video pipeline:
    *
    * - `undefined` (default) — record every attached monitor, one MP4
-   *   per display. Same intelligent-focus stance as paired capture:
-   *   the user's full multi-screen session is in the recording.
+   *   per display.
    * - `[id, id, ...]` — pin MP4 to exactly these IDs.
    * - `[]` — disable MP4 entirely while still letting paired capture
    *   run (no ffmpeg process is started).
@@ -32,10 +31,7 @@ export interface RecorderOptions {
    * When more than one monitor is recorded, `output` is treated as a
    * path template. If it contains the literal substring
    * `{monitor_id}`, that's substituted per monitor. Otherwise the
-   * recorder auto-suffixes `-monitor-{id}` before the file extension,
-   * e.g. `/tmp/session.mp4` → `/tmp/session-monitor-1.mp4` +
-   * `/tmp/session-monitor-2.mp4`. Single-monitor recordings use
-   * `output` verbatim.
+   * recorder auto-suffixes `-monitor-{id}` before the file extension.
    */
   mp4Monitors?: Array<number>
   /** Reserved for future MP4 audio muxing. Accepted today but not recorded. */
@@ -46,7 +42,7 @@ export interface RecorderOptions {
    * Substring patterns matched against the focused app name and window title
    * (case-insensitive). While a matching window is in focus, the recorder
    * skips writing frames — the MP4 contains a hard cut over the filtered
-   * period. Mirrors the engine's `--ignored-windows` CLI flag.
+   * period.
    *
    * Each pattern may use an optional `App::Title` scope: `"Slack::#hr"`
    * skips only the #hr window inside Slack and leaves other Slack channels
@@ -58,7 +54,6 @@ export interface RecorderOptions {
   /**
    * Substring whitelist. If non-empty, frames are written ONLY while the
    * focused app name or window title matches at least one pattern.
-   * Mirrors the engine's `--included-windows` CLI flag.
    *
    * Scoped entries (`"Greenhouse::Candidates"`) create a per-app whitelist
    * — other apps stay unaffected, so this whitelists only that window
@@ -69,7 +64,7 @@ export interface RecorderOptions {
   /**
    * URL patterns to skip (case-insensitive, domain-aware matching).
    * When the focused window is a browser navigated to a matching URL,
-   * the recorder skips writing frames. Mirrors `--ignored-urls`.
+   * the recorder skips writing frames.
    */
   ignoredUrls?: Array<string>
   /**
@@ -79,55 +74,26 @@ export interface RecorderOptions {
    * baseline fire `paired_capture()` against a SQLite at
    * `{dataDir}/db.sqlite`. JPEG snapshots are written under
    * `{dataDir}/data/`. Same DB schema and trigger taxonomy the
-   * screenpipe CLI writes, so an SDK-recorded session is queryable by
-   * the existing `screenpipe-js` REST client or any tool that reads the
-   * CLI's DB.
-   *
-   * When omitted, the recorder is video-only — no DB is opened, no
-   * snapshots are written, and the focus-watcher result is consumed only
-   * to gate MP4 frames (the historical SDK behavior).
+   * screenpipe CLI writes.
    */
   dataDir?: string
   /**
    * Which monitors to record paired captures from. Only meaningful when
    * `dataDir` is set.
-   *
-   * - `undefined` (default) — record paired captures from **every
-   *   attached monitor**, matching the screenpipe CLI which spins up
-   *   one capture loop per monitor and tags each row with its
-   *   `monitor_id`. UI events fan out to all monitor loops so a click
-   *   on monitor 1 produces a row on every monitor (with the same
-   *   `capture_trigger`) — i.e. "what was on every screen the moment
-   *   the user did X". Same behavior the CLI ships.
-   * - `[id, id, ...]` — pin paired-capture to this exact set of
-   *   monitor IDs. Use when you only care about one display or need
-   *   to cap DB volume on a 4-monitor workstation.
-   *
-   * `monitorId` (above) still controls only the MP4 writer — that's
-   * independent of paired capture and remains single-monitor.
    */
   pairedMonitors?: Array<number>
   /**
    * Per-event-type toggles for the platform UI hooks that feed
-   * paired-capture triggers. When `undefined`, uses the same defaults
-   * `screenpipe-a11y`'s `UiCaptureConfig::default()` ships with
+   * paired-capture triggers. When `undefined`, uses the SDK's defaults
    * (clicks, typing pauses, app switches, clipboard ON; keystrokes,
-   * scroll, mouse-move, window-focus OFF — the privacy/volume-friendly
-   * set). Only meaningful when `dataDir` is set.
-   *
-   * Enabling `captureScroll` is required for `scroll_stop` triggers
-   * to fire. Enabling `captureKeystrokes` is required for `key_press`
-   * triggers — note the privacy implication: individual keystrokes
-   * hit the platform hook stream and may surface in event logs.
+   * scroll, mouse-move, window-focus OFF).
    */
   uiCapture?: UiCaptureOptions
 }
 /**
- * Per-event-type toggles passed through to the platform UI hooks. Maps
- * 1-to-1 onto `screenpipe_a11y::config::UiCaptureConfig`. Each field
- * defaults to the corresponding `UiCaptureConfig::default()` value when
- * left undefined, so callers can override one knob without restating the
- * others. See the field doc on each toggle for trigger implications.
+ * Per-event-type toggles passed through to the platform UI hooks. Each
+ * field defaults to the SDK's default when left undefined, so callers
+ * can override one knob without restating the others.
  */
 export interface UiCaptureOptions {
   /**
@@ -143,60 +109,35 @@ export interface UiCaptureOptions {
   /**
    * Capture individual keystrokes. Default: false.
    * HIGH PRIVACY RISK — individual key events stream through the hook.
-   * Required to enable the `key_press` capture trigger.
    */
   captureKeystrokes?: boolean
-  /**
-   * Capture app-switch events. Default: true.
-   * Drives the `app_switch` capture trigger.
-   */
+  /** Capture app-switch events. Default: true. */
   captureAppSwitch?: boolean
-  /**
-   * Capture window-focus changes within the same app. Default: false.
-   * High volume on workflows with lots of tab/window switching.
-   * Required to enable the `window_focus` capture trigger.
-   */
+  /** Capture window-focus changes within the same app. Default: false. */
   captureWindowFocus?: boolean
   /**
    * Capture scroll events. Default: false.
-   * Very high volume — every wheel tick produces an event.
    * Required to enable the `scroll_stop` capture trigger.
    */
   captureScroll?: boolean
-  /**
-   * Capture clipboard operations. Default: true.
-   * Drives the `clipboard` capture trigger.
-   */
+  /** Capture clipboard operations. Default: true. */
   captureClipboard?: boolean
   /**
    * Include clipboard content in the event payload. Default: true.
    * PRIVACY RISK — clipboard text may include passwords/tokens.
    */
   captureClipboardContent?: boolean
-  /**
-   * Resolve accessibility-element context on each click. Default: true.
-   * Slightly slower but produces richer DB rows.
-   */
+  /** Resolve accessibility-element context on each click. Default: true. */
   captureContext?: boolean
-  /**
-   * Capture mouse-move events. Default: false.
-   * Extreme volume — every pixel of motion. Almost never useful as a
-   * capture trigger; supported for analytics use cases.
-   */
+  /** Capture mouse-move events. Default: false. */
   captureMouseMove?: boolean
 }
 /** Permission status returned by `requestPermissions`. */
 export interface PermissionStatus {
-  /** Screen recording permission granted. */
   screen: boolean
-  /** Microphone permission granted. */
   microphone: boolean
 }
-/**
- * Lightweight snapshot of the user's focused window. Returned by
- * `Recorder.focusedApp()`. All fields are best-effort — on some
- * platforms/apps only `appName` is reliably populated.
- */
+/** Lightweight snapshot of the user's focused window. */
 export interface FocusedApp {
   appName: string
   windowTitle: string
@@ -204,14 +145,7 @@ export interface FocusedApp {
   nodeCount: number
   walkMs: number
 }
-/**
- * Current state of the window/URL filter. Returned by
- * `Recorder.filterStatus()`. When `paused` is true, the capture loop is
- * dropping frames — `reason` is a short tag identifying which rule fired
- * (`"ignored_window"`, `"included_window_mismatch"`, `"ignored_url"`,
- * `"incognito"`, `"excluded_app"`). Both fields are `null`/`false` when
- * no filter is configured or when a11y permission has not been granted.
- */
+/** Current state of the window/URL filter. */
 export interface FilterStatus {
   paused: boolean
   reason?: string
@@ -221,7 +155,7 @@ export interface FilterStatus {
  * Any field omitted (or sent as `null`) clears that list. All three fields
  * follow the same matching semantics as the matching `RecorderOptions`
  * fields — including the `App::Title` scope convention on
- * `ignoredWindows` / `includedWindows`.
+ * `ignored_windows` / `included_windows`.
  */
 export interface FilterPatch {
   ignoredWindows?: Array<string>
@@ -232,8 +166,6 @@ export interface FilterPatch {
  * Prompt the OS for screen recording + microphone permissions if not already
  * granted. On macOS this triggers the TCC dialog the first time; on
  * subsequent calls it just reports current state.
- *
- * Returns `{ screen, microphone }` booleans.
  */
 export declare function requestPermissions(): Promise<PermissionStatus>
 /**
@@ -257,54 +189,37 @@ export declare class Recorder {
    */
   start(): Promise<void>
   /**
-   * Stop capture. Flushes the MP4 trailer and closes the file. Idempotent
-   * (safe to call twice).
+   * Stop capture. Flushes the MP4 trailer and closes the file.
+   * Idempotent (safe to call twice).
    */
   stop(): Promise<void>
   /**
    * Capture a single frame of the recorder's monitor as a JPEG buffer.
-   * Works whether or not `start()` has been called — useful for live
-   * thumbnail previews in UIs embedding the SDK.
+   * Works whether or not `start()` has been called.
    */
   snapshot(): Promise<Buffer>
   /**
-   * Number of frames written to the MP4 since `start()`. Useful for
-   * live UI stats. Returns 0 if not recording.
+   * Number of frames written to the MP4 since `start()`. Returns 0
+   * if not recording.
    */
   framesWritten(): Promise<number>
   /**
    * Current microphone input level in [0, 1] (smoothed linear RMS).
    * The first call starts a persistent capture on the default input
    * device and triggers the macOS Microphone TCC prompt if not yet
-   * granted. Independent of `start()` — works as a pre-flight meter.
+   * granted. Independent of `start()`.
    */
   audioLevel(): Promise<number>
-  /**
-   * Current state of the window/URL filter — see `FilterStatus`.
-   * Polled by host integrations to drive UI ("⏸ paused — banking site")
-   * or to count skipped frames. Returns `{ paused: false, reason: null }`
-   * when no filter is configured.
-   */
+  /** Current state of the window/URL filter. */
   filterStatus(): Promise<FilterStatus>
-  /**
-   * Replace the active filter lists at runtime. Each field in `patch`
-   * either provides a new list or — when omitted/`null` — clears that
-   * list. The next focus-watcher tick (≤ 1 s later) re-evaluates the
-   * current focused window against the updated rules.
-   *
-   * Use this for "Pause on banking" toggles, per-session overrides, or
-   * any flow where the filter set isn't known at construction time.
-   */
+  /** Replace the active filter lists at runtime. */
   setFilters(patch: FilterPatch): Promise<void>
   /**
    * Snapshot of the currently focused window via accessibility APIs.
    * Returns `null` when no focused window is detected or the window
-   * is on the skip-list (incognito, excluded app).
+   * is on the skip-list.
    *
-   * macOS: requires Accessibility permission (System Settings →
-   * Privacy & Security → Accessibility). The first call may silently
-   * return `null` until the user grants it — the SDK does not raise
-   * the dialog itself on macOS, callers should prompt out of band.
+   * macOS: requires Accessibility permission.
    */
   focusedApp(): Promise<FocusedApp | null>
 }
