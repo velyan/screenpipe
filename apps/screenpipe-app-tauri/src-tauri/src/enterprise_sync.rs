@@ -492,7 +492,14 @@ mod imp {
         use tauri::Manager;
 
         let app_data_dir = app.path().app_data_dir().ok()?;
-        let device_id = resolve_device_id(&app_data_dir);
+        // Use the same device id the heartbeat reports under (settings `deviceId`)
+        // so a machine is a single enterprise_devices row, not two.
+        let settings_device_id = crate::store::SettingsStore::get(app)
+            .ok()
+            .flatten()
+            .map(|s| s.device_id)
+            .filter(|s| !s.trim().is_empty());
+        let device_id = resolve_device_id(settings_device_id.as_deref(), &app_data_dir);
         let device_label = hostname::get()
             .ok()
             .and_then(|h| h.into_string().ok())
@@ -574,17 +581,36 @@ mod imp {
         Some(tx)
     }
 
-    /// Stable device id, persisted in app data dir on first call. Format is
-    /// `dev-<uuid v4>`. We deliberately don't read the OS hardware UUID — that
-    /// would let an admin correlate across orgs, which is a privacy regression
-    /// vs a local random uuid scoped to this install.
-    fn resolve_device_id(app_data_dir: &std::path::Path) -> String {
-        let path = app_data_dir.join("enterprise_device_id");
-        if let Ok(existing) = std::fs::read_to_string(&path) {
-            let trimmed = existing.trim();
-            if !trimmed.is_empty() {
-                return trimmed.to_string();
+    /// Pure: pick the canonical enterprise device id from the candidates, in
+    /// priority order. The settings `deviceId` wins — that's the id the
+    /// heartbeat reports under (`use-enterprise-policy.ts`), so sync and
+    /// heartbeat register the SAME `enterprise_devices` row. Before this, sync
+    /// minted its own `dev-<uuid>`, so every machine showed up as TWO rows
+    /// (version/recording-status on the heartbeat row, uploads on the sync row),
+    /// which also double-counted devices toward the seat total. Returns None
+    /// when no usable id exists yet (caller mints a fresh one).
+    fn choose_device_id(settings_device_id: Option<&str>, legacy_file_id: Option<&str>) -> Option<String> {
+        for cand in [settings_device_id, legacy_file_id] {
+            if let Some(c) = cand {
+                let c = c.trim();
+                if !c.is_empty() {
+                    return Some(c.to_string());
+                }
             }
+        }
+        None
+    }
+
+    /// Stable device id. Prefers the settings `deviceId` (shared with the
+    /// heartbeat) so a machine is ONE device row; falls back to the legacy
+    /// `dev-<uuid>` persisted in app data dir, then a fresh `dev-<uuid>`. We
+    /// deliberately don't read the OS hardware UUID — that would let an admin
+    /// correlate across orgs, a privacy regression vs a local random uuid.
+    fn resolve_device_id(settings_device_id: Option<&str>, app_data_dir: &std::path::Path) -> String {
+        let path = app_data_dir.join("enterprise_device_id");
+        let legacy = std::fs::read_to_string(&path).ok();
+        if let Some(id) = choose_device_id(settings_device_id, legacy.as_deref()) {
+            return id;
         }
         let id = format!("dev-{}", uuid::Uuid::new_v4());
         // Best-effort persist; on failure we just regenerate next launch (the
@@ -596,6 +622,33 @@ mod imp {
             warn!("enterprise sync: could not persist device_id: {}", e);
         }
         id
+    }
+
+    #[cfg(test)]
+    mod device_id_tests {
+        use super::choose_device_id;
+
+        #[test]
+        fn settings_id_wins_so_sync_matches_heartbeat() {
+            // the whole point: prefer the settings deviceId (heartbeat's id) over
+            // the legacy dev- id, so a machine is one row not two.
+            assert_eq!(
+                choose_device_id(Some("11112222-aaaa"), Some("dev-legacy")).as_deref(),
+                Some("11112222-aaaa")
+            );
+        }
+
+        #[test]
+        fn falls_back_to_legacy_then_none() {
+            assert_eq!(choose_device_id(None, Some("dev-legacy")).as_deref(), Some("dev-legacy"));
+            assert_eq!(choose_device_id(None, None), None);
+        }
+
+        #[test]
+        fn blank_candidates_are_skipped() {
+            assert_eq!(choose_device_id(Some("   "), Some("dev-legacy")).as_deref(), Some("dev-legacy"));
+            assert_eq!(choose_device_id(Some(""), None), None);
+        }
     }
 }
 

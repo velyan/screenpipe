@@ -31,13 +31,13 @@ type Pipe = {
 const PIPES: Pipe[] = [
   {
     slug: "digital-clone",
-    title: "digital-clone",
-    subtitle: "your AI you",
+    title: "Your AI twin",
+    subtitle: "writes and acts like you",
     defaultOn: true,
   },
   {
     slug: "personal-crm",
-    title: "personal-crm",
+    title: "People memory",
     subtitle: "remember everyone you meet",
     defaultOn: true,
   },
@@ -259,7 +259,7 @@ export default function PickPipe() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            title: `🚀 ${slugs.length} pipe${slugs.length === 1 ? "" : "s"} enabled`,
+            title: "🚀 You're all set",
             body: "Screenpipe is set up. Your first results arrive shortly.",
           }),
         });
@@ -268,7 +268,7 @@ export default function PickPipe() {
       const msg =
         (err as Error)?.stack ?? (err as Error)?.message ?? String(err);
       console.error("failed to enable pipes:", msg);
-      setError("Couldn't install all pipes — try again or skip");
+      setError("Couldn't set everything up — try again or skip");
       setPhase("choose");
       // Release guard on failure so retry works; success path keeps it set
       // because onboarding completion will close the window.
@@ -361,7 +361,7 @@ export default function PickPipe() {
           disabled={count === 0}
           className="w-full border border-foreground p-3 font-mono text-sm font-semibold disabled:opacity-30 disabled:cursor-not-allowed hover:bg-foreground hover:text-background transition-colors"
         >
-          install {count} pipe{count === 1 ? "" : "s"} →
+          turn {count === 1 ? "it" : "them"} on →
         </button>
 
         <AnimatePresence>
@@ -392,7 +392,7 @@ export default function PickPipe() {
         </AnimatePresence>
 
         <p className="font-mono text-[9px] text-muted-foreground/30 text-center">
-          you can add more from the pipe store anytime.
+          you can add more anytime.
         </p>
       </motion.div>
     </div>

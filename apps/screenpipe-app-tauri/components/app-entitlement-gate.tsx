@@ -258,7 +258,7 @@ export function AppEntitlementGate({ children }: { children: React.ReactNode }) 
 
   const openLogin = useCallback(() => {
     posthog.capture("app_entitlement_login_clicked");
-    commands.openLoginWindow();
+    commands.openLoginWindow(null);
   }, []);
 
   const refreshUser = useCallback(async () => {

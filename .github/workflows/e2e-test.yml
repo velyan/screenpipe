@@ -23,7 +23,16 @@ jobs:
   windows-e2e-test:
     name: Windows E2E Tests
     runs-on: windows-2022
-    timeout-minutes: 90
+    # NOT RUN ON PUSH/PR: build + 58-spec suite exceeds even a 120-min budget on
+    # windows-2022 runners (ran 2:01:09 → killed by the timeout), so it was
+    # CANCELLED on every run. continue-on-error does NOT cover timeout-cancellation,
+    # so it kept reddening E2E on every commit while never once completing or
+    # gating anything. Gated to manual workflow_dispatch until it's sharded/sped
+    # up (#4650); macOS + Linux are the required E2E gates. continue-on-error +
+    # timeout kept so a manual dispatch still won't hard-fail.
+    if: github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    timeout-minutes: 120
     steps:
     - uses: actions/checkout@v4
 

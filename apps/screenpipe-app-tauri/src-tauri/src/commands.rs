@@ -757,6 +757,54 @@ fn persist_api_auth_key_to_settings(
     Ok(())
 }
 
+/// True when `dir` contains at least one `*.json` conversation file.
+fn dir_has_conversations(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir)
+        .ok()
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .any(|e| e.path().extension().is_some_and(|x| x == "json"))
+        })
+        .unwrap_or(false)
+}
+
+/// Resolve the chat-conversations directory under the *active* screenpipe data
+/// dir (honors `SCREENPIPE_DATA_DIR` / a relocated data dir), creating it if
+/// needed. The frontend previously hardcoded `~/.screenpipe/chats` via
+/// `homeDir()`, which (a) ignored a relocated data dir and (b) leaked the
+/// developer's real chats into isolated e2e runs.
+///
+/// One-time migration: for a relocated data dir whose `chats/` is still empty,
+/// copy conversations from the legacy `~/.screenpipe/chats` so history isn't
+/// orphaned. Skipped under e2e (`SCREENPIPE_E2E_SEED` set) so isolated runs
+/// stay empty.
+#[tauri::command]
+#[specta::specta]
+pub fn get_chats_dir() -> Result<String, String> {
+    let data_dir = screenpipe_core::paths::default_screenpipe_data_dir();
+    let chats = data_dir.join("chats");
+    std::fs::create_dir_all(&chats).map_err(|e| e.to_string())?;
+
+    let is_e2e = std::env::var("SCREENPIPE_E2E_SEED").is_ok();
+    if !is_e2e {
+        if let Some(home) = dirs::home_dir() {
+            let legacy = home.join(".screenpipe").join("chats");
+            if legacy != chats
+                && legacy.is_dir()
+                && !dir_has_conversations(&chats)
+                && dir_has_conversations(&legacy)
+            {
+                match screenpipe_core::paths::copy_dir_all(&legacy, &chats) {
+                    Ok(()) => info!("migrated chats from {:?} to {:?}", legacy, chats),
+                    Err(e) => warn!("chats migration {:?} -> {:?} failed: {}", legacy, chats, e),
+                }
+            }
+        }
+    }
+
+    Ok(chats.to_string_lossy().to_string())
+}
+
 /// Toggle the "Cloud audio + video + image analysis" capability
 /// in the screenpipe-api skill that Pi installs on every run.
 ///

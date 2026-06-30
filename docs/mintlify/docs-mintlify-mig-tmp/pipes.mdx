@@ -523,6 +523,25 @@ rule types: `Api(METHOD /path)`, `App(name)`, `Window(glob)`, `Content(type)`. d
 
 <Tip>if your pipe doesn't need to write data, add `permissions: reader` — it prevents accidental side effects like ending a meeting or deleting data.</Tip>
 
+### protecting api keys & credentials
+
+if you worry that an agent could access API keys or passwords visible on screen, use `.env` files (never put secrets in `pipe.md` itself):
+
+```bash
+# store secrets safely in .env (not visible to screenpipe or agents)
+echo "GITHUB_TOKEN=ghp_..." > ~/.screenpipe/pipes/my-pipe/.env
+echo "SLACK_API_KEY=xoxb-..." >> ~/.screenpipe/pipes/my-pipe/.env
+```
+
+then reference them in your pipe prompt:
+```bash
+source .env && curl -H "Authorization: Bearer $GITHUB_TOKEN" https://api.github.com/...
+```
+
+**why this is safe**: `.env` files live on disk outside screenpipe's recording scope — agents execute shell commands with access to `source .env`, but screenpipe never captures the secrets on screen. credentials are only visible in pipe logs (which you control) and memory, not in screen recordings.
+
+to further restrict what an agent can do, use `permissions: reader` — pipes with read-only access cannot make API calls to external services, only query your screen data.
+
 see the full reference: [pipe permissions →](/pipe-permissions)
 
 ## built-in pipes

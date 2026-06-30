@@ -112,10 +112,17 @@ async function emitUntargetedAutoSendPrefill(prompt: string): Promise<void> {
   );
 }
 
-describe("Chat prefill cross-window duplication", function () {
+// QUARANTINED (#4610): the autoSend→pi→auto-save persist precondition (a
+// conversation must reach disk before we can count it) is racy in CI — it
+// times out with "no conversation persisted" (0 conversations, NOT the
+// duplicate=2 it guards against) ~100% on Linux AND ~33% on macOS. So it's
+// CI-hostile on every platform, not just Linux. Re-enable once the test seeds
+// the persisted conversation deterministically instead of depending on a live
+// model/streaming round-trip.
+describe.skip("Chat prefill cross-window duplication", function () {
   this.timeout(180_000);
 
-  before(async () => {
+  before(async function () {
     await waitForAppReady();
     await openHomeWindow();
     // Open the chat overlay so BOTH windows have a live prefill listener —

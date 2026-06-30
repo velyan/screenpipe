@@ -1262,9 +1262,13 @@ async fn collect_log_text(dirs: &[PathBuf]) -> String {
 
 /// Best-effort: ship the device's app logs to support via the same public
 /// endpoint the in-app "send logs" button uses. No UI required, so it works on
-/// "run hidden" managed devices. Never panics; failures just warn and are
-/// retried next cooldown.
-async fn submit_stall_logs(cfg: &EnterpriseSyncConfig, http: &reqwest::Client) {
+/// "run hidden" managed devices. Returns the uploaded storage path on success.
+/// Never panics; failures just warn.
+async fn submit_device_logs(
+    cfg: &EnterpriseSyncConfig,
+    http: &reqwest::Client,
+    feedback: &str,
+) -> Option<String> {
     let base = logs_base_url(&cfg.ingest_url);
     let identifier = stall_log_identifier(&cfg.device_id);
 
@@ -1279,13 +1283,13 @@ async fn submit_stall_logs(cfg: &EnterpriseSyncConfig, http: &reqwest::Client) {
         Ok(r) => match r.json().await {
             Ok(v) => v,
             Err(e) => {
-                warn!("enterprise sync: stall-log url decode failed: {e}");
-                return;
+                warn!("enterprise sync: device-log url decode failed: {e}");
+                return None;
             }
         },
         Err(e) => {
-            warn!("enterprise sync: stall-log url request failed: {e}");
-            return;
+            warn!("enterprise sync: device-log url request failed: {e}");
+            return None;
         }
     };
     let signed_url = signed["data"]["signedUrl"].as_str();
@@ -1293,8 +1297,8 @@ async fn submit_stall_logs(cfg: &EnterpriseSyncConfig, http: &reqwest::Client) {
     let (signed_url, path) = match (signed_url, path) {
         (Some(u), Some(p)) => (u.to_string(), p.to_string()),
         _ => {
-            warn!("enterprise sync: stall-log url response missing fields");
-            return;
+            warn!("enterprise sync: device-log url response missing fields");
+            return None;
         }
     };
 
@@ -1308,18 +1312,12 @@ async fn submit_stall_logs(cfg: &EnterpriseSyncConfig, http: &reqwest::Client) {
         .await
         .and_then(|r| r.error_for_status())
     {
-        warn!("enterprise sync: stall-log upload failed: {e}");
-        return;
+        warn!("enterprise sync: device-log upload failed: {e}");
+        return None;
     }
 
     // 3. confirm (this is what files it for support)
-    let feedback = format!(
-        "auto: enterprise device recording but not landing data in org storage (license {}, device {}, mode {})",
-        cfg.license_key,
-        cfg.device_id,
-        cfg.upload_mode.label()
-    );
-    let _ = http
+    if let Err(e) = http
         .post(format!("{base}/api/logs/confirm"))
         .json(&serde_json::json!({
             "path": path,
@@ -1331,8 +1329,110 @@ async fn submit_stall_logs(cfg: &EnterpriseSyncConfig, http: &reqwest::Client) {
             "feedback_text": feedback,
         }))
         .send()
+        .await
+        .and_then(|r| r.error_for_status())
+    {
+        warn!("enterprise sync: device-log confirm failed: {e}");
+        return None;
+    }
+    Some(path)
+}
+
+/// Auto-submit on the stalled-upload watchdog (device enrolled but not landing
+/// data). Thin wrapper over [`submit_device_logs`] with the stall reason.
+async fn submit_stall_logs(cfg: &EnterpriseSyncConfig, http: &reqwest::Client) {
+    let feedback = format!(
+        "auto: enterprise device recording but not landing data in org storage (license {}, device {}, mode {})",
+        cfg.license_key,
+        cfg.device_id,
+        cfg.upload_mode.label()
+    );
+    if submit_device_logs(cfg, http, &feedback).await.is_some() {
+        info!("enterprise sync: auto-submitted diagnostic logs (device enrolled but not uploading)");
+    }
+}
+
+/// Server's answer to the device's log-request poll.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LogRequestsResponse {
+    /// True when an admin's request is newer than this device's last ack.
+    #[serde(default)]
+    pub requested: bool,
+    /// ISO-8601 timestamp of the admin request (echoed back on ack).
+    #[serde(default)]
+    pub requested_at: Option<String>,
+}
+
+/// Poll the control plane for an admin "collect logs" request and fulfill it by
+/// uploading the device's logs, then ack so the server clears the command.
+///
+/// Runs every tick regardless of telemetry sync outcome — including on devices
+/// that can't ingest (centralized-data-off / auth-rejected), which are exactly
+/// the ones an admin most needs logs from. Lives in the Rust loop (not the
+/// webview) so it works while the app is unfocused / minimized / run-hidden.
+///
+/// Returns the `requested_at` it just handled (so the caller can dedupe within
+/// a session even if the ack POST is lost); `None` when there was nothing new.
+/// Best-effort; never panics.
+async fn fulfill_log_requests(
+    cfg: &EnterpriseSyncConfig,
+    http: &reqwest::Client,
+    already_handled: Option<&str>,
+) -> Option<String> {
+    let base = control_plane_base(&cfg.ingest_url)?;
+    let url = format!("{base}/api/enterprise/log-requests");
+
+    let resp = match http
+        .get(&url)
+        .header("X-License-Key", &cfg.license_key)
+        .header("X-Device-Id", &cfg.device_id)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            debug!("log-requests: poll failed: {e}");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        debug!("log-requests: GET {} -> {}", url, resp.status());
+        return None;
+    }
+    let pending: LogRequestsResponse = match resp.json().await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("log-requests: bad payload: {e}");
+            return None;
+        }
+    };
+    let requested_at = match pending.requested_at {
+        Some(ts) if pending.requested && !ts.trim().is_empty() => ts,
+        _ => return None,
+    };
+    if already_handled == Some(requested_at.as_str()) {
+        return None; // already serviced this request this session
+    }
+
+    info!("enterprise sync: admin requested device logs — collecting + uploading");
+    let feedback = format!(
+        "admin-requested enterprise diagnostic logs (license {}, device {}, mode {})",
+        cfg.license_key,
+        cfg.device_id,
+        cfg.upload_mode.label()
+    );
+    let path = submit_device_logs(cfg, http, &feedback).await;
+
+    // Ack: echo requested_at back so the server's (requested_at > fulfilled_at)
+    // gate flips to done and the dashboard shows it collected.
+    let _ = http
+        .post(&url)
+        .header("X-License-Key", &cfg.license_key)
+        .header("X-Device-Id", &cfg.device_id)
+        .json(&serde_json::json!({ "requested_at": requested_at, "path": path }))
+        .send()
         .await;
-    info!("enterprise sync: auto-submitted diagnostic logs (device enrolled but not uploading)");
+    Some(requested_at)
 }
 
 pub async fn run(
@@ -1360,6 +1460,9 @@ pub async fn run(
     let mut last_data_upload: Option<std::time::Instant> = None;
     let mut saw_failure_since_data = false;
     let mut last_auto_submit: Option<std::time::SystemTime> = load_last_auto_submit(&cfg);
+    // In-session dedup for admin-triggered log collection (the server gate
+    // handles cross-session; this stops re-upload if an ack POST is lost).
+    let mut last_log_req: Option<String> = None;
 
     loop {
         let result = run_one_sync(&cfg, &mut cursor, local.as_ref(), &http).await;
@@ -1395,6 +1498,15 @@ pub async fn run(
             let now = std::time::SystemTime::now();
             save_last_auto_submit(&cfg, now);
             last_auto_submit = Some(now);
+        }
+
+        // Admin-triggered on-demand log collection. Runs every tick — including
+        // on devices that can't ingest (centralized-data-off / auth-rejected),
+        // which are exactly the ones an admin needs logs from. Independent of
+        // the webview, so it works while the app is unfocused / minimized /
+        // run-hidden.
+        if let Some(handled) = fulfill_log_requests(&cfg, &http, last_log_req.as_deref()).await {
+            last_log_req = Some(handled);
         }
 
         match result {
@@ -1593,6 +1705,26 @@ mod tests {
         assert!(id.starts_with("enterprise-auto-"));
         assert!(id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-')));
         assert!(id.len() <= 128);
+    }
+
+    #[test]
+    fn log_requests_response_wire_contract() {
+        // pending request from the control plane
+        let pending: LogRequestsResponse =
+            serde_json::from_str(r#"{"requested":true,"requested_at":"2026-06-29T20:00:00Z"}"#)
+                .unwrap();
+        assert!(pending.requested);
+        assert_eq!(pending.requested_at.as_deref(), Some("2026-06-29T20:00:00Z"));
+
+        // nothing pending — both fields default cleanly
+        let idle: LogRequestsResponse = serde_json::from_str(r#"{"requested":false}"#).unwrap();
+        assert!(!idle.requested);
+        assert!(idle.requested_at.is_none());
+
+        // empty object (older/partial server) must not panic and reads as idle
+        let empty: LogRequestsResponse = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(!empty.requested);
+        assert!(empty.requested_at.is_none());
     }
 
     #[test]

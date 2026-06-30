@@ -25,6 +25,15 @@ pub struct NotificationHistoryEntry {
     pub source_url: Option<String>,
     pub timestamp: String,
     pub read: bool,
+    /// Action buttons carried by the notification (pipe / api / deeplink /
+    /// dismiss …). Persisted so the notification bell can re-offer the same
+    /// actions as the transient toast — a user who misses the ~20s toast can
+    /// still act from the center (e.g. approve an agent's "share this data?"
+    /// prompt, which fires the target pipe). `#[serde(default)]` keeps entries
+    /// written before this field shipped readable (they decode to an empty
+    /// list).
+    #[serde(default)]
+    pub actions: Vec<serde_json::Value>,
 }
 
 fn path() -> PathBuf {

@@ -239,6 +239,10 @@ pub struct AppState {
     /// configuration that doesn't run vision capture (e.g. headless
     /// `--disable-vision`).
     pub high_fps_controller: Option<Arc<crate::high_fps_controller::HighFpsController>>,
+    /// Shared VisionManager so the `/vision/device/*` routes can pause/resume
+    /// individual monitors from the recording popover. `None` when vision is
+    /// disabled or on headless configs that run no capture.
+    pub vision_manager: Option<Arc<crate::vision_manager::VisionManager>>,
 }
 
 pub struct SCServer {
@@ -298,6 +302,10 @@ pub struct SCServer {
     /// Shared high-FPS controller. Set before `start()` so AppState and
     /// the per-monitor capture loops point at the same instance.
     pub high_fps_controller: Option<Arc<crate::high_fps_controller::HighFpsController>>,
+    /// Shared VisionManager. Set before `start()` so the `/vision/device/*`
+    /// routes can pause/resume individual monitors. `None` on vision-disabled
+    /// or headless configs that run no capture.
+    pub vision_manager: Option<Arc<crate::vision_manager::VisionManager>>,
     /// When true, the timeline / rewind feature is disabled. The server skips
     /// warming the hot frame cache from the DB at startup (the cache is only
     /// read by the timeline streaming endpoint). Set before `start()`.
@@ -341,6 +349,7 @@ fn is_api_auth_exempt_path(path: &str) -> bool {
     path == "/health"
         || path == "/ws/health"
         || path == "/audio/device/status"
+        || path == "/vision/device/status"
         || path == "/connections/oauth/callback"
         || (path.starts_with("/mcp-servers/") && path.ends_with("/oauth/callback"))
         || path == "/connections/browser/pair/start"
@@ -395,6 +404,7 @@ impl SCServer {
             oauth_refresher: None,
             external_memory_sync: None,
             high_fps_controller: None,
+            vision_manager: None,
             timeline_disabled: false,
             advertise_mdns: should_advertise_mdns(addr),
         }
@@ -726,6 +736,7 @@ impl SCServer {
             cloud_token: self.cloud_token.clone(),
             secret_store: self.secret_store.clone(),
             high_fps_controller: self.high_fps_controller.clone(),
+            vision_manager: self.vision_manager.clone(),
         });
 
         // Populate the registry so /connections/browsers shows both kinds
@@ -820,6 +831,18 @@ impl SCServer {
             .post("/audio/device/start", start_audio_device)
             .post("/audio/device/stop", stop_audio_device)
             .get("/audio/device/status", audio_device_status)
+            .post(
+                "/vision/device/start",
+                crate::routes::vision::start_vision_device,
+            )
+            .post(
+                "/vision/device/stop",
+                crate::routes::vision::stop_vision_device,
+            )
+            .get(
+                "/vision/device/status",
+                crate::routes::vision::vision_device_status,
+            )
             .get("/elements", search_elements)
             .get("/frames/:frame_id/elements", get_frame_elements)
             .get("/activity-summary", get_activity_summary)

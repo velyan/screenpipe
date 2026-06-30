@@ -96,6 +96,20 @@ turn it off or decline the prompt when:
 - you do not want agent workflows to access logged-in sessions
 - you are on a shared device
 
+## agent and pipe security
+
+local agents and pipes can access your screenpipe data—screen text, OCR, accessibility tree, and transcripts. they cannot steal keyboard input or files, but they can see API keys, passwords, and secrets visible on screen.
+
+secure your setup:
+
+- **exclude sensitive windows** — add your password manager, banking site, or cloud console to **settings → recording → ignored windows**. agents won't see data from ignored apps.
+- **use connection proxies** — instead of pasting API keys into prompts, create a screenpipe connection so tokens are managed securely.
+- **trust only official pipes** — use pipes from the [official pipe store](https://screenpi.pe/pipe-store) or audit custom pipes before installing.
+- **scope tasks narrowly** — a pipe searching only "the last meeting" is lower-risk than one searching "all screen text."
+- **review logs** — use `screenpipe pipe logs <name>` to see what data a pipe accessed.
+
+if uncomfortable with agents accessing your screen data, disable the embedded agent browser and use CLI or API only.
+
 ## teams and admins
 
 team sharing is encrypted client-side. the server stores membership and encrypted blobs, but not the team encryption key. invite links contain the key, so share them through a trusted channel and treat them as sensitive.

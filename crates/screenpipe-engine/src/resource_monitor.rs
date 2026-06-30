@@ -18,6 +18,63 @@ use tracing::{error, info, warn};
 
 use crate::telemetry_context::TelemetryContext;
 
+/// Read this process's physical memory footprint (bytes) via
+/// `proc_pid_rusage(RUSAGE_INFO_V0)`. `ri_phys_footprint` is the exact value
+/// Activity Monitor reports under "Memory" — it includes compressed and
+/// swapped-out dirty pages, unlike resident set size. That makes it the metric
+/// that actually surfaces a cold-memory leak (pages written once then paged
+/// out), which RSS-based telemetry misses entirely. Returns `None` if the
+/// syscall fails (never panics; caller falls back to RSS).
+#[cfg(target_os = "macos")]
+fn macos_phys_footprint_bytes() -> Option<u64> {
+    // rusage_info_v0 layout from <sys/resource.h>. `ri_phys_footprint` is
+    // present from v0, so we don't need a newer flavor. Fields after it are
+    // included only to size the struct correctly for the kernel copy-out.
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct RUsageInfoV0 {
+        ri_uuid: [u8; 16],
+        ri_user_time: u64,
+        ri_system_time: u64,
+        ri_pkg_idle_wkups: u64,
+        ri_interrupt_wkups: u64,
+        ri_pageins: u64,
+        ri_wired_size: u64,
+        ri_resident_size: u64,
+        ri_phys_footprint: u64,
+        ri_proc_start_abstime: u64,
+        ri_proc_exit_abstime: u64,
+        ri_child_user_time: u64,
+        ri_child_system_time: u64,
+        ri_child_pkg_idle_wkups: u64,
+        ri_child_interrupt_wkups: u64,
+        ri_child_pageins: u64,
+        ri_child_elapsed_abstime: u64,
+        ri_diskio_bytesread: u64,
+        ri_diskio_byteswritten: u64,
+    }
+
+    extern "C" {
+        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut std::ffi::c_void) -> i32;
+    }
+    const RUSAGE_INFO_V0: i32 = 0;
+
+    let mut info = RUsageInfoV0::default();
+    let pid = std::process::id() as i32;
+    let rc = unsafe {
+        proc_pid_rusage(
+            pid,
+            RUSAGE_INFO_V0,
+            &mut info as *mut RUsageInfoV0 as *mut std::ffi::c_void,
+        )
+    };
+    if rc == 0 {
+        Some(info.ri_phys_footprint)
+    } else {
+        None
+    }
+}
+
 pub struct ResourceMonitor {
     start_time: Instant,
     resource_log_file: Option<String>, // analyse output here: https://colab.research.google.com/drive/1zELlGdzGdjChWKikSqZTHekm5XRxY-1r?usp=sharing
@@ -320,6 +377,7 @@ impl ResourceMonitor {
         total_memory_gb: f64,
         system_total_memory: f64,
         total_cpu: f32,
+        phys_footprint_gb: f64,
     ) {
         let Some(client) = &self.posthog_client else {
             return;
@@ -330,6 +388,10 @@ impl ResourceMonitor {
         properties.insert("distinct_id".to_string(), json!(&self.distinct_id));
         properties.insert("$lib".to_string(), json!("rust-reqwest"));
         properties.insert("total_memory_gb".to_string(), json!(total_memory_gb));
+        // Activity-Monitor "Memory" — surfaces cold/compressed/swapped leaks
+        // that resident set size (`total_memory_gb`) hides. See
+        // `macos_phys_footprint_bytes`.
+        properties.insert("phys_footprint_gb".to_string(), json!(phys_footprint_gb));
         properties.insert(
             "system_total_memory_gb".to_string(),
             json!(system_total_memory),
@@ -376,7 +438,7 @@ impl ResourceMonitor {
         }
     }
 
-    async fn collect_metrics(&self, sys: &System) -> (f64, f64, f64, f32, f64, Duration) {
+    async fn collect_metrics(&self, sys: &System) -> (f64, f64, f64, f32, f64, Duration, f64) {
         let pid = std::process::id();
         let mut total_memory = 0.0;
         let mut max_virtual_memory = 0.0; // Changed from total to max
@@ -408,6 +470,20 @@ impl ResourceMonitor {
         let memory_usage_percent = (total_memory / system_total_memory) * 100.0;
         let runtime = self.start_time.elapsed();
 
+        // Physical footprint = the "Memory" number Activity Monitor shows, and
+        // the one that actually tracks a leak: it counts compressed + swapped
+        // dirty pages, which `memory()` (resident set size) does NOT. A cold
+        // leak (pages written once, never re-read) gets compressed/swapped out,
+        // so RSS stays flat while footprint climbs to the GBs users report.
+        // On non-macOS we fall back to RSS (≈ footprint there, and `malloc_trim`
+        // keeps Linux RSS honest), so the field is always populated.
+        #[cfg(target_os = "macos")]
+        let phys_footprint_gb = macos_phys_footprint_bytes()
+            .map(|b| b as f64 / (1024.0 * 1024.0 * 1024.0))
+            .unwrap_or(total_memory);
+        #[cfg(not(target_os = "macos"))]
+        let phys_footprint_gb = total_memory;
+
         (
             total_memory,
             system_total_memory,
@@ -415,13 +491,14 @@ impl ResourceMonitor {
             total_cpu,
             max_virtual_memory,
             runtime,
+            phys_footprint_gb,
         )
     }
 
     /// Max resource log file size (10 MB). When exceeded the file is truncated.
     const MAX_RESOURCE_LOG_BYTES: u64 = 10 * 1024 * 1024;
 
-    async fn log_to_file(&self, metrics: (f64, f64, f64, f32, f64, Duration)) {
+    async fn log_to_file(&self, metrics: (f64, f64, f64, f32, f64, Duration, f64)) {
         let (
             total_memory_gb,
             system_total_memory,
@@ -429,6 +506,7 @@ impl ResourceMonitor {
             total_cpu,
             total_virtual_memory_gb,
             runtime,
+            phys_footprint_gb,
         ) = metrics;
 
         if let Some(ref filename) = self.resource_log_file {
@@ -440,6 +518,7 @@ impl ResourceMonitor {
                 "memory_usage_percent": memory_usage_percent,
                 "total_cpu_percent": total_cpu,
                 "total_virtual_memory_gb": total_virtual_memory_gb,
+                "phys_footprint_gb": phys_footprint_gb,
             });
 
             // Append-only JSONL: one JSON object per line, no read-back needed.
@@ -475,16 +554,18 @@ impl ResourceMonitor {
             total_cpu,
             total_virtual_memory_gb,
             runtime,
+            phys_footprint_gb,
         ) = metrics;
 
         // Log to console with virtual memory. Let tracing format lazily so
         // release builds with debug logging disabled avoid the String allocation.
         debug!(
-            "Runtime: {}s, Memory: {:.0}% ({:.2} GB / {:.2} GB), Virtual: {:.2} GB, CPU: {:.0}%",
+            "Runtime: {}s, Memory: {:.0}% ({:.2} GB / {:.2} GB), Footprint: {:.2} GB, Virtual: {:.2} GB, CPU: {:.0}%",
             runtime.as_secs(),
             memory_usage_percent,
             total_memory_gb,
             system_total_memory,
+            phys_footprint_gb,
             total_virtual_memory_gb,
             total_cpu
         );
@@ -495,7 +576,7 @@ impl ResourceMonitor {
         // Send to PostHog if enabled
         if self.posthog_enabled {
             tokio::select! {
-                _ = self.send_to_posthog(total_memory_gb, system_total_memory, total_cpu) => {},
+                _ = self.send_to_posthog(total_memory_gb, system_total_memory, total_cpu, phys_footprint_gb) => {},
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {
                     warn!("PostHog request timed out");
                 }
@@ -592,16 +673,18 @@ impl ResourceMonitor {
             total_cpu,
             total_virtual_memory_gb,
             runtime,
+            phys_footprint_gb,
         ) = metrics;
 
         // Log to console with virtual memory. Let tracing format lazily so
         // release builds with debug logging disabled avoid the String allocation.
         debug!(
-            "Runtime: {}s, Memory: {:.0}% ({:.2} GB / {:.2} GB), Virtual: {:.2} GB, CPU: {:.0}%",
+            "Runtime: {}s, Memory: {:.0}% ({:.2} GB / {:.2} GB), Footprint: {:.2} GB, Virtual: {:.2} GB, CPU: {:.0}%",
             runtime.as_secs(),
             memory_usage_percent,
             total_memory_gb,
             system_total_memory,
+            phys_footprint_gb,
             total_virtual_memory_gb,
             total_cpu
         );
@@ -620,5 +703,27 @@ impl ResourceMonitor {
         if self.posthog_client.is_some() {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Validates the `proc_pid_rusage` FFI: a live process always has a
+    /// non-zero physical footprint. Guards against a wrong `rusage_info_v0`
+    /// struct layout (which would silently read garbage / the wrong field).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn phys_footprint_is_plausible() {
+        let bytes = super::macos_phys_footprint_bytes()
+            .expect("proc_pid_rusage(RUSAGE_INFO_V0) should succeed for self");
+        // A running test process is comfortably above 1 MB and below 100 GB.
+        assert!(
+            bytes > 1024 * 1024,
+            "phys_footprint suspiciously small ({bytes} bytes) — struct layout likely wrong"
+        );
+        assert!(
+            bytes < 100 * 1024 * 1024 * 1024,
+            "phys_footprint suspiciously large ({bytes} bytes) — struct layout likely wrong"
+        );
     }
 }

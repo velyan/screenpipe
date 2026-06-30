@@ -554,6 +554,26 @@ async getCachedSuggestions() : Promise<Result<CachedSuggestions, string>> {
 }
 },
 /**
+ * Resolve the chat-conversations directory under the *active* screenpipe data
+ * dir (honors `SCREENPIPE_DATA_DIR` / a relocated data dir), creating it if
+ * needed. The frontend previously hardcoded `~/.screenpipe/chats` via
+ * `homeDir()`, which (a) ignored a relocated data dir and (b) leaked the
+ * developer's real chats into isolated e2e runs.
+ *
+ * One-time migration: for a relocated data dir whose `chats/` is still empty,
+ * copy conversations from the legacy `~/.screenpipe/chats` so history isn't
+ * orphaned. Skipped under e2e (`SCREENPIPE_E2E_SEED` set) so isolated runs
+ * stay empty.
+ */
+async getChatsDir() : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_chats_dir") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
  * Read the user's screenpipe cloud session JWT.
  *
  * #3943: the authoritative copy lives in the encrypted secret store and is
@@ -843,6 +863,18 @@ async listCacheFiles() : Promise<Result<CacheFile[], string>> {
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * List `*.json` conversation files in `dir`, newest-first by mtime, in a SINGLE
+ * native directory scan.
+ *
+ * The chat list/search previously sorted by firing one `stat()` IPC call per
+ * file via `Promise.all` — with 15k+ conversations that's 15k Tauri round-trips
+ * on every cold open, which (alongside the webview cold-boot) froze the search
+ * modal for seconds before the input was usable. Doing the readdir + metadata
+ * pass in Rust collapses it to one call (~40ms for 15k files).
+ *
+ * A missing dir (first run) returns an empty list, not an error.
+ */
 async listChatEntriesByMtime(dir: string) : Promise<Result<ChatDirEntry[], string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("list_chat_entries_by_mtime", { dir }) };
@@ -1030,13 +1062,14 @@ async openGoogleCalendarAuthWindow(authUrl: string) : Promise<Result<null, strin
 },
 /**
  * Open the screenpipe.com login page.
- * Windows: system browser + registered deep-link scheme handles the redirect.
  * macOS: ASWebAuthenticationSession (system-managed sheet, forwards callback).
- * Linux: in-app WebView that intercepts the screenpipe:// redirect.
- * Pass `freshSession` when switching accounts so the auth sheet/webview does
- * not reuse the previous browser session.
+ * Windows/Linux: in-app WebView that intercepts the screenpipe:// redirect.
+ *
+ * `fresh_session` is used by "use different account": macOS asks
+ * ASWebAuthenticationSession for an ephemeral browser session instead of
+ * reusing Safari cookies, and Windows/Linux use a throwaway webview profile.
  */
-async openLoginWindow(freshSession?: boolean) : Promise<Result<null, string>> {
+async openLoginWindow(freshSession: boolean | null) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("open_login_window", { freshSession }) };
 } catch (e) {
@@ -1452,6 +1485,23 @@ async readAudioExclusions() : Promise<Result<ExcludedApp[], string>> {
 async readViewerFile(path: string) : Promise<Result<ViewerContent, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("read_viewer_file", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Redact a feedback bundle for upload.
+ *
+ * `text` is the raw logs + chat (PII-dense chat first); `settings_json` is the
+ * raw settings store. Config secrets are stripped by field name, then the whole
+ * thing goes through the crate's redaction pipeline (enclave model under a time
+ * budget, regex for the overflow). Never returns `Err` — worst case is
+ * regex-only redaction — so feedback submission is never blocked.
+ */
+async redactPiiForFeedback(text: string, settingsJson: string) : Promise<Result<string, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("redact_pii_for_feedback", { text, settingsJson }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -2316,6 +2366,10 @@ endDisplay: string; attendees: string[]; location: string | null; meetingUrl: st
  */
 source?: string }
 export type CalendarStatus = { available: boolean; authorized: boolean; authorizationStatus: string; calendarCount: number }
+/**
+ * One conversation file with its modified time (epoch millis). Returned by
+ * [`list_chat_entries_by_mtime`].
+ */
 export type ChatDirEntry = { name: string; mtime_ms: number }
 export type ChatGptOAuthStatus = { logged_in: boolean }
 export type Credits = { amount: number }
@@ -2848,6 +2902,17 @@ usePiiRemoval: boolean;
  * `screenpipe-redact` for the full design.
  */
 asyncPiiRedaction?: boolean;
+/**
+ * Strip secrets from coding-agent (pi) session logs at rest. The
+ * agent persists full sessions — bash output, file reads, tool
+ * results — unredacted, so any credential it touches lands in
+ * plaintext on disk. When `true`, a background worker periodically
+ * runs a secrets-only regex scrub over `pi/sessions/*.jsonl` (idle
+ * files only, so a live run is never rewritten). Secrets-only and
+ * on-device — independent of `async_pii_redaction` (the
+ * model-backed text path). Off by default. See `screenpipe-redact`.
+ */
+redactAgentSessionSecrets?: boolean;
 /**
  * Enable image-PII redaction on captured screen frames. When
  * `true`, the `screenpipe_redact::image::worker` runs alongside

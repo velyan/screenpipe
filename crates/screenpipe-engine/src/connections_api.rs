@@ -1278,44 +1278,46 @@ async fn gcal_fetch_events(
     let items = resp["items"].as_array().cloned().unwrap_or_default();
     let events: Vec<Value> = items
         .into_iter()
-        .map(|item| {
-            let start = item["start"]["dateTime"]
-                .as_str()
-                .or_else(|| item["start"]["date"].as_str())
-                .unwrap_or("")
-                .to_string();
-            let end = item["end"]["dateTime"]
-                .as_str()
-                .or_else(|| item["end"]["date"].as_str())
-                .unwrap_or("")
-                .to_string();
-            let is_all_day = item["start"]["date"].is_string();
-
-            let attendees: Vec<String> = item["attendees"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|a| a["email"].as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let meeting_url = google_calendar_meeting_url(&item);
-
-            json!({
-                "id": item["id"].as_str().unwrap_or(""),
-                "title": item["summary"].as_str().unwrap_or("(No title)"),
-                "start": start,
-                "end": end,
-                "attendees": attendees,
-                "location": item["location"].as_str(),
-                "meetingUrl": meeting_url,
-                "calendarName": calendar_label,
-                "isAllDay": is_all_day,
-            })
-        })
+        .map(|item| google_calendar_event_json(&item, calendar_label))
         .collect();
 
     Ok(events)
+}
+
+fn google_calendar_event_json(item: &Value, calendar_label: &str) -> Value {
+    let start = item["start"]["dateTime"]
+        .as_str()
+        .or_else(|| item["start"]["date"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let end = item["end"]["dateTime"]
+        .as_str()
+        .or_else(|| item["end"]["date"].as_str())
+        .unwrap_or("")
+        .to_string();
+    let is_all_day = item["start"]["date"].is_string();
+
+    let attendees: Vec<String> = item["attendees"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| a["email"].as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let meeting_url = google_calendar_meeting_url(item);
+
+    json!({
+        "id": item["id"].as_str().unwrap_or(""),
+        "title": item["summary"].as_str().unwrap_or(""),
+        "start": start,
+        "end": end,
+        "attendees": attendees,
+        "location": item["location"].as_str(),
+        "meetingUrl": meeting_url,
+        "calendarName": calendar_label,
+        "isAllDay": is_all_day,
+    })
 }
 
 /// Merge per-account Google Calendar event lists into one timeline. An invite
@@ -3530,6 +3532,37 @@ mod tests {
             google_calendar_meeting_url(&item).as_deref(),
             Some("https://meet.google.com/abc-defg-hij")
         );
+    }
+
+    #[test]
+    fn google_calendar_event_without_summary_has_empty_title() {
+        let item = json!({
+            "id": "untitled",
+            "start": { "dateTime": "2026-06-11T09:00:00Z" },
+            "end": { "dateTime": "2026-06-11T09:30:00Z" },
+            "conferenceData": {
+                "entryPoints": [
+                    { "entryPointType": "video", "uri": "meet.google.com/abc-defg-hij" }
+                ]
+            }
+        });
+
+        let event = google_calendar_event_json(&item, "primary");
+        assert_eq!(event["title"], "");
+        assert_eq!(event["meetingUrl"], "https://meet.google.com/abc-defg-hij");
+    }
+
+    #[test]
+    fn google_calendar_event_preserves_literal_no_title_summary() {
+        let item = json!({
+            "id": "literal-no-title",
+            "summary": "No Title",
+            "start": { "dateTime": "2026-06-11T09:00:00Z" },
+            "end": { "dateTime": "2026-06-11T09:30:00Z" }
+        });
+
+        let event = google_calendar_event_json(&item, "primary");
+        assert_eq!(event["title"], "No Title");
     }
 
     // -- resolve_base_url ---------------------------------------------------

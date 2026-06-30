@@ -163,7 +163,7 @@ fn build_command_for_path(path: &str) -> Command {
         if let Some(bun) = find_bun_executable() {
             if let Some(js) = resolve_bun_global_entrypoint(path) {
                 info!("Resolved bun shim {} → JS entrypoint {}", path, js);
-                let mut cmd = Command::new(bun);
+                let mut cmd = bun_command(&bun);
                 cmd.arg(js);
                 return cmd;
             }
@@ -173,7 +173,7 @@ fn build_command_for_path(path: &str) -> Command {
             Command::new(path)
         }
     } else if let Some(bun) = find_bun_executable() {
-        let mut cmd = Command::new(bun);
+        let mut cmd = bun_command(&bun);
         cmd.arg(path);
         cmd
     } else {
@@ -186,7 +186,7 @@ fn build_command_for_path(path: &str) -> Command {
 #[cfg(not(windows))]
 fn build_command_for_path(path: &str) -> Command {
     if let Some(bun) = find_bun_executable() {
-        let mut cmd = Command::new(bun);
+        let mut cmd = bun_command(&bun);
         cmd.arg(path);
         cmd
     } else {
@@ -873,6 +873,15 @@ fn apply_no_window(_cmd: &mut Command) {
     }
 }
 
+fn bun_command(bun: &str) -> Command {
+    let mut cmd = Command::new(bun);
+    // Single source of truth in screenpipe-core: only strips LD_LIBRARY_PATH
+    // when running inside an AppImage (APPDIR set), so bun doesn't load the
+    // bundle's glibc/libstdc++ and crash.
+    screenpipe_core::agents::pi::scrub_bun_runtime_env(&mut cmd);
+    cmd
+}
+
 fn run_command_output(mut cmd: Command) -> Result<Output, String> {
     apply_no_window(&mut cmd);
     cmd.output().map_err(|e| format!("failed to spawn: {}", e))
@@ -950,7 +959,7 @@ fn run_pi_package_install(install_dir: &Path, bun: &str) -> Result<(), String> {
         screenpipe_core::agents::pi::bun_version_string(bun),
     );
 
-    let mut bun_cmd = Command::new(bun);
+    let mut bun_cmd = bun_command(bun);
     bun_cmd
         .current_dir(install_dir)
         .env("BUN_INSTALL_CACHE_DIR", &cache_dir)
@@ -3213,7 +3222,7 @@ mod tests {
     #[cfg(windows)]
     use super::parse_where_output;
     #[cfg(not(windows))]
-    use super::{find_bun_executable, find_pi_executable};
+    use super::{bun_command, find_bun_executable, find_pi_executable};
     use serde_json::{json, Value};
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};
@@ -3487,7 +3496,7 @@ error: InstallFailed extracting tarball"#;
     fn spawn_pi_rpc(provider: &str, model: &str) -> Option<std::process::Child> {
         let pi_path = find_pi_executable()?;
         let mut cmd = if let Some(bun) = find_bun_executable() {
-            let mut c = Command::new(bun);
+            let mut c = bun_command(&bun);
             c.arg(&pi_path);
             c
         } else {

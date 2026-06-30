@@ -4,13 +4,18 @@
 
 "use client";
 
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, Fragment, type ReactNode } from "react";
 import { Bell, Check, ChevronRight, ChevronDown, Copy, ExternalLink, MessageSquare, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import { notificationUrlTransform, openScreenpipeViewerLink } from "@/components/markdown";
 import remarkGfm from "remark-gfm";
 import posthog from "posthog-js";
 import { commands } from "@/lib/utils/tauri";
+import { cn } from "@/lib/utils";
+import {
+  executeNotificationAction,
+  type NotificationAction,
+} from "@/lib/notifications/actions";
 import {
   Popover,
   PopoverContent,
@@ -32,10 +37,34 @@ interface NotificationEntry {
   source_url?: string;
   timestamp: string;
   read: boolean;
+  actions?: NotificationAction[];
 }
 
 interface AppServerConfig {
   port: number;
+}
+
+// Actions worth rendering as buttons in the bell. `dismiss` is excluded — the
+// row's own "✕" already covers it; `copy`/`source` are excluded because the
+// expanded row already renders dedicated copy + source affordances. What's
+// left (pipe / api / deeplink / link / meeting_join) is the genuinely
+// actionable "needs you" set.
+function actionsFor(entry: NotificationEntry): NotificationAction[] {
+  return (entry.actions ?? []).filter(
+    (a) =>
+      a.label &&
+      a.type !== "dismiss" &&
+      a.type !== "copy" &&
+      a.type !== "source",
+  );
+}
+
+function SectionLabel({ children }: { children: ReactNode }) {
+  return (
+    <div className="px-3 pt-2 pb-1 text-[9px] tracking-wide text-muted-foreground/50">
+      {children}
+    </div>
+  );
 }
 
 let appServerBaseUrl: Promise<string> | null = null;
@@ -161,17 +190,62 @@ export function NotificationBell() {
     } catch {}
   };
 
-  const dismissOne = async (id: string) => {
+  const removeEntry = useCallback(async (id: string) => {
+    setHistory((prev) => prev.filter((n) => n.id !== id));
+    setExpandedId((prev) => (prev === id ? null : prev));
+    try {
+      await notificationFetch(`/notifications/${encodeURIComponent(id)}`, { method: "DELETE" });
+    } catch {}
+  }, []);
+
+  const dismissOne = (id: string) => {
     const entry = history.find((n) => n.id === id);
     posthog.capture("notification_bell_dismiss", {
       notification_type: entry?.type,
       pipe_name: entry?.pipe_name,
     });
-    setHistory((prev) => prev.filter((n) => n.id !== id));
-    if (expandedId === id) setExpandedId(null);
+    removeEntry(id);
+  };
+
+  const runAction = async (entry: NotificationEntry, action: NotificationAction) => {
+    posthog.capture("notification_bell_action", {
+      notification_type: entry.type,
+      pipe_name: entry.pipe_name,
+      action: action.action,
+      action_type: action.type,
+    });
+    // Navigating actions need the popover closed so the target surface (chat,
+    // a window) isn't hidden behind it.
+    if (
+      action.open_in_chat ||
+      action.type === "chat" ||
+      action.type === "deeplink" ||
+      action.type === "link" ||
+      action.type === "meeting_join"
+    ) {
+      setOpen(false);
+    }
     try {
-      await notificationFetch(`/notifications/${encodeURIComponent(id)}`, { method: "DELETE" });
-    } catch {}
+      await executeNotificationAction(action, {
+        pipeName: entry.pipe_name,
+        sourceId: entry.id,
+        sourceUrl: entry.source_url,
+      });
+    } catch (err) {
+      // Keep the row on failure — silently clearing a consequential action
+      // (e.g. "approve sharing this data", which fires a pipe) would tell the
+      // user it worked when the pipe never ran. Surface it instead.
+      console.error("notification action failed", { action: action.action, type: action.type }, err);
+      posthog.capture("notification_bell_action_error", {
+        notification_type: entry.type,
+        action: action.action,
+        action_type: action.type,
+        error: String(err),
+      });
+      return;
+    }
+    // Resolve in place: once acted on successfully, the row leaves the inbox.
+    removeEntry(entry.id);
   };
 
   const formatTime = (ts: string) => {
@@ -183,6 +257,12 @@ export function NotificationBell() {
     if (diff < 86400000) return `${Math.floor(diff / 3600000)}h ago`;
     return d.toLocaleDateString();
   };
+
+  // Float notifications that carry actions ("needs you") above passive ones
+  // ("earlier") — mirrors how Linear / Slack surface actionable items first.
+  const needsYou = history.filter((n) => actionsFor(n).length > 0);
+  const earlier = history.filter((n) => actionsFor(n).length === 0);
+  const displayed = [...needsYou, ...earlier];
 
   return (
     <Popover
@@ -248,14 +328,23 @@ export function NotificationBell() {
               no notifications yet
             </div>
           ) : (
-            history.map((entry) => {
+            displayed.map((entry, idx) => {
               const isExpanded = expandedId === entry.id;
+              const rowActions = actionsFor(entry);
               return (
-                <div
-                  key={entry.id}
-                  data-notification-id={entry.id}
-                  className="border-b border-border/50 last:border-0"
-                >
+                <Fragment key={entry.id}>
+                  {idx === 0 && needsYou.length > 0 && (
+                    <SectionLabel>needs you</SectionLabel>
+                  )}
+                  {idx === needsYou.length &&
+                    needsYou.length > 0 &&
+                    earlier.length > 0 && (
+                      <SectionLabel>earlier</SectionLabel>
+                    )}
+                  <div
+                    data-notification-id={entry.id}
+                    className="border-b border-border/50 last:border-0"
+                  >
                   <div
                     data-testid={`notification-bell-item-${entry.id}`}
                     role="button"
@@ -343,6 +432,28 @@ export function NotificationBell() {
                         </button>
                       </div>
                     </div>
+                    {rowActions.length > 0 && (
+                      <div
+                        className="flex flex-wrap items-center gap-1 mt-1.5 pl-4"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        {rowActions.map((action, i) => (
+                          <button
+                            key={action.id ?? action.action ?? i}
+                            data-testid={`notification-bell-action-${entry.id}-${i}`}
+                            onClick={() => runAction(entry, action)}
+                            className={cn(
+                              "text-[10px] px-2 py-0.5 rounded transition-colors",
+                              action.primary
+                                ? "bg-foreground text-background hover:bg-foreground/90"
+                                : "border border-border text-muted-foreground hover:text-foreground hover:bg-muted/40",
+                            )}
+                          >
+                            {action.label}
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   </div>
                   {isExpanded && (
                     <div
@@ -445,7 +556,8 @@ export function NotificationBell() {
                       </div>
                     </div>
                   )}
-                </div>
+                  </div>
+                </Fragment>
               );
             })
           )}

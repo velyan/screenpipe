@@ -462,6 +462,12 @@ jobs:
 
           bunx tauri build -v --target x86_64-unknown-linux-gnu --features enterprise-build,redact-onnx-cpu
 
+          # Strip bundled GLib/libmount/libblkid/libpcre2 (ABI mismatch on newer
+          # distros) plus libavif/libsharpyuv: linuxdeploy bundles the old Ubuntu
+          # 24.04 libsharpyuv but NOT libavif, so on Arch (libavif 1.4.2) the host
+          # libavif.so.16 loads against the stale bundled libsharpyuv and dies with
+          # "undefined symbol: SharpYuvConvertWithOptions". Strip both so the host's
+          # matched pair is used (the app already loads host libavif anyway).
           echo "Removing bundled system libraries to prevent ABI mismatch on newer distros..."
           curl -fsSL -o /tmp/appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x /tmp/appimagetool
@@ -477,7 +483,9 @@ jobs:
                   squashfs-root/usr/lib/libgmodule-2.0.so* \
                   squashfs-root/usr/lib/libmount.so* \
                   squashfs-root/usr/lib/libblkid.so* \
-                  squashfs-root/usr/lib/libpcre2-8.so*
+                  squashfs-root/usr/lib/libpcre2-8.so* \
+                  squashfs-root/usr/lib/libsharpyuv.so* \
+                  squashfs-root/usr/lib/libavif.so*
             echo "Removed bundled GLib libs, repacking AppImage..."
             ARCH=x86_64 /tmp/appimagetool squashfs-root "$APPIMAGE"
             rm -rf squashfs-root
@@ -877,11 +885,22 @@ jobs:
           for dmg in "${BUNDLE_DIR}"/dmg/*.dmg; do
             if [ -f "$dmg" ]; then
               echo "Notarizing: $(basename "$dmg")"
-              xcrun notarytool submit "$dmg" \
-                --apple-id "$APPLE_ID" \
-                --password "$APPLE_PASSWORD" \
-                --team-id "$APPLE_TEAM_ID" \
-                --wait --timeout 15m
+              # Retry transient Apple-notary failures (same class as the .pkg
+              # step below). `if xcrun ...; then` keeps `set -e` from aborting
+              # mid-retry; fail loudly only if all attempts fail.
+              dmg_ok=0
+              for attempt in 1 2 3; do
+                if xcrun notarytool submit "$dmg" \
+                  --apple-id "$APPLE_ID" \
+                  --password "$APPLE_PASSWORD" \
+                  --team-id "$APPLE_TEAM_ID" \
+                  --wait --timeout 15m; then
+                  dmg_ok=1; break
+                fi
+                echo "DMG notarization attempt $attempt/3 failed."
+                [ "$attempt" -lt 3 ] && sleep $((attempt * 30))
+              done
+              [ "$dmg_ok" -eq 1 ] || { echo "ERROR: DMG notarization failed after 3 attempts"; exit 1; }
 
               echo "Stapling: $(basename "$dmg")"
               xcrun stapler staple "$dmg"
@@ -956,14 +975,27 @@ jobs:
           echo "Distribution pkg created: $(basename "$PKG_OUTPUT")"
           pkgutil --check-signature "$PKG_OUTPUT"
 
-          # Notarize the .pkg
+          # Notarize the .pkg. Retry transient notary failures: Apple's service
+          # occasionally fast-fails a submission (enterprise v2.5.80, build
+          # 28389355122 — the DMG submit moments earlier in this same job
+          # succeeded, so creds/agreement were fine). The `if VAR=$(...)` form
+          # also keeps `set -e` from aborting at the assignment before we can
+          # print the output / retry; the "status: Accepted" gate below is final.
           echo "Notarizing .pkg..."
-          SUBMIT_OUT=$(xcrun notarytool submit "$PKG_OUTPUT" \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
-            --wait --timeout 15m 2>&1)
-          echo "$SUBMIT_OUT"
+          SUBMIT_OUT=""
+          for attempt in 1 2 3; do
+            if SUBMIT_OUT=$(xcrun notarytool submit "$PKG_OUTPUT" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait --timeout 15m 2>&1); then :; fi
+            echo "$SUBMIT_OUT"
+            if echo "$SUBMIT_OUT" | grep -q "status: Accepted"; then
+              break
+            fi
+            echo "Notarization attempt $attempt/3 did not return Accepted."
+            [ "$attempt" -lt 3 ] && { echo "Retrying in $((attempt * 30))s..."; sleep $((attempt * 30)); }
+          done
 
           # Extract submission ID and check result
           SUBMISSION_ID=$(echo "$SUBMIT_OUT" | grep "id:" | head -1 | awk '{print $2}' || true)

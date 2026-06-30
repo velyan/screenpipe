@@ -67,6 +67,18 @@ export interface ConversationListOptions {
 
 async function getChatsDir(): Promise<string> {
   if (_chatsDir) return _chatsDir;
+  // Resolve under the active data dir (honors SCREENPIPE_DATA_DIR / a relocated
+  // data dir, and keeps isolated e2e runs isolated). Falls back to the legacy
+  // default in non-Tauri contexts (tests, SSR).
+  try {
+    const res = await commands.getChatsDir();
+    if (res.status === "ok" && res.data) {
+      _chatsDir = res.data;
+      return _chatsDir;
+    }
+  } catch {
+    // not in a Tauri context — use the legacy default below
+  }
   const home = await homeDir();
   _chatsDir = await join(home, ".screenpipe", "chats");
   return _chatsDir;

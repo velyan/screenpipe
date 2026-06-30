@@ -59,7 +59,7 @@ export function PipeAdvisoryWatcher() {
     const startUpgrade = async () => {
       try {
         if (!token) {
-          await commands.openLoginWindow();
+          await commands.openLoginWindow(null);
           return;
         }
         const res = await fetch("https://screenpipe.com/api/cloud-sync/checkout", {

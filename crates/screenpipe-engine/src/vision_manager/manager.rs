@@ -5,7 +5,7 @@
 //! VisionManager - Core manager for per-monitor recording tasks
 
 use anyhow::Result;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use screenpipe_db::DatabaseManager;
 use screenpipe_screen::monitor::{get_monitor_by_id, list_monitors};
 use screenpipe_screen::PipelineMetrics;
@@ -112,6 +112,11 @@ pub struct VisionManager {
     /// Set when the user's monitor allowlist matched zero connected displays and
     /// we fell back to recording every monitor. Clears the filter for hot-plug too.
     stale_allowlist_fallback: Arc<AtomicBool>,
+    /// Monitor IDs the user explicitly paused from the recording popover.
+    /// `start_monitor` short-circuits for these and the monitor watcher skips
+    /// them on reconcile, so a paused display stays paused until the user
+    /// resumes it — mirrors the audio manager's user-disabled device set.
+    user_disabled: Arc<DashSet<u32>>,
 }
 
 impl VisionManager {
@@ -163,6 +168,7 @@ impl VisionManager {
             focus_controller,
             high_fps_controller: None,
             stale_allowlist_fallback: Arc::new(AtomicBool::new(false)),
+            user_disabled: Arc::new(DashSet::new()),
         }
     }
 
@@ -377,6 +383,13 @@ impl VisionManager {
 
     /// Start recording on a specific monitor
     pub async fn start_monitor(&self, monitor_id: u32) -> Result<()> {
+        // Honour an explicit user pause from the recording popover. Both
+        // `start()` and the monitor watcher funnel through here, so this single
+        // guard keeps a paused display paused without either path overriding it.
+        if self.user_disabled.contains(&monitor_id) {
+            debug!("Monitor {} is user-paused; skipping start", monitor_id);
+            return Ok(());
+        }
         // Check if already recording
         if self.recording_tasks.contains_key(&monitor_id) {
             debug!("Monitor {} is already recording", monitor_id);
@@ -657,6 +670,34 @@ impl VisionManager {
             .collect()
     }
 
+    /// Pause recording on a specific monitor in response to a user action
+    /// (the recording popover). Records the intent first — so the monitor
+    /// watcher won't auto-restart it on the next reconcile tick — then tears
+    /// down its capture task. Audio keeps recording independently.
+    pub async fn pause_monitor(&self, monitor_id: u32) -> Result<()> {
+        self.user_disabled.insert(monitor_id);
+        info!("user paused vision recording for monitor {}", monitor_id);
+        self.stop_monitor(monitor_id).await
+    }
+
+    /// Resume recording on a monitor the user previously paused. Clears the
+    /// paused flag first so `start_monitor`'s guard lets it through.
+    pub async fn resume_monitor(&self, monitor_id: u32) -> Result<()> {
+        self.user_disabled.remove(&monitor_id);
+        info!("user resumed vision recording for monitor {}", monitor_id);
+        self.start_monitor(monitor_id).await
+    }
+
+    /// True when the user has explicitly paused this monitor.
+    pub fn is_monitor_user_disabled(&self, monitor_id: u32) -> bool {
+        self.user_disabled.contains(&monitor_id)
+    }
+
+    /// Monitor IDs the user has explicitly paused from the recording popover.
+    pub fn user_disabled_monitors(&self) -> Vec<u32> {
+        self.user_disabled.iter().map(|entry| *entry).collect()
+    }
+
     /// Shutdown the VisionManager
     pub async fn shutdown(&self) -> Result<()> {
         info!("Shutting down VisionManager");
@@ -751,6 +792,35 @@ mod tests {
         );
         assert_eq!(vm.status().await, VisionManagerStatus::Stopped);
         assert_eq!(vm.recording_tasks.len(), 0);
+    }
+
+    /// A user-paused monitor is recorded as disabled, and `start_monitor`
+    /// short-circuits for it (so neither `start()` nor the monitor watcher can
+    /// override the pause). Resuming clears the flag. This guard runs before any
+    /// monitor lookup, so it's verifiable without a physical display.
+    #[tokio::test]
+    async fn user_pause_blocks_start_until_resumed() {
+        let vm = make_vm_with_monitor_ids(vec!["default".to_string()]).await;
+        let id = 4242; // an id no real monitor will have
+
+        assert!(!vm.is_monitor_user_disabled(id));
+
+        vm.pause_monitor(id).await.expect("pause records intent");
+        assert!(vm.is_monitor_user_disabled(id));
+        assert_eq!(vm.user_disabled_monitors(), vec![id]);
+
+        // start_monitor is a no-op while paused — returns Ok, starts no task.
+        vm.start_monitor(id).await.expect("guarded start is Ok");
+        assert!(
+            !vm.recording_tasks.contains_key(&id),
+            "paused monitor must not have a recording task"
+        );
+
+        // Resuming clears the flag (the actual start then fails only because the
+        // fake id has no monitor — the flag clear is what we assert here).
+        vm.user_disabled.remove(&id);
+        assert!(!vm.is_monitor_user_disabled(id));
+        assert!(vm.user_disabled_monitors().is_empty());
     }
 
     /// Verify that stop_monitor completes promptly when the task finishes normally.

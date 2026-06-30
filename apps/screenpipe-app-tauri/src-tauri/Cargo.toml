@@ -2,7 +2,7 @@
 
 [package]
 name = "screenpipe-app"
-version = "2.5.79"
+version = "2.5.82"
 description = "24/7 memory for your desktop. 100% local."
 authors = ["you"]
 license = ""
@@ -178,6 +178,7 @@ tauri-plugin-updater = "2.10.0"
 [target.'cfg(target_os = "macos")'.dependencies]
 tracing-oslog = "0.3.0"
 core-foundation = "0.10"
+core-foundation-sys = "0.8"
 cocoa = "0.26.0"
 objc = "0.2.7"
 block = "0.1"

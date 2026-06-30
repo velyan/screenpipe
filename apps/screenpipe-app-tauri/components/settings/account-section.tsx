@@ -124,7 +124,7 @@ export function AccountSection() {
 
   const handleCheckout = async () => {
     if (!settings.user?.id) {
-      await commands.openLoginWindow();
+      await commands.openLoginWindow(null);
       return;
     }
     if (!settings.user?.cloud_subscribed) {
@@ -275,7 +275,7 @@ export function AccountSection() {
             <Button
               variant="outline"
               size="sm"
-              onClick={() => commands.openLoginWindow()}
+              onClick={() => commands.openLoginWindow(null)}
             >
               login <ExternalLinkIcon className="w-3.5 h-3.5 ml-1.5" />
             </Button>
@@ -522,7 +522,7 @@ export function AccountSection() {
             <Button
               className="w-full max-w-xs bg-foreground text-background hover:bg-background hover:text-foreground transition-colors duration-150"
               size="lg"
-              onClick={() => commands.openLoginWindow()}
+              onClick={() => commands.openLoginWindow(null)}
             >
               Log in
               <ExternalLinkIcon className="w-4 h-4 ml-2" />
@@ -603,7 +603,7 @@ export function AccountSection() {
               <div className="flex items-center gap-2">
                 <Switch disabled checked={false} />
                 <button
-                  onClick={() => commands.openLoginWindow()}
+                  onClick={() => commands.openLoginWindow(null)}
                   className="text-xs bg-primary/10 text-primary px-2 py-0.5 rounded-full font-medium flex items-center gap-1 hover:bg-primary/20 transition-colors cursor-pointer"
                 >
                   <Lock className="h-3 w-3" />

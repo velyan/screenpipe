@@ -11,6 +11,10 @@ import { commands } from "@/lib/utils/tauri";
 import { useSettings } from "@/lib/hooks/use-settings";
 import { getClaudeConfigPath } from "@/lib/hooks/use-hardcoded-tiles";
 import { localFetch } from "@/lib/api";
+import {
+  classifyConnectError,
+  humanizeConnectError,
+} from "@/lib/connect-errors";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { readTextFile, writeFile, mkdir } from "@tauri-apps/plugin-fs";
 import { homeDir, join, dirname } from "@tauri-apps/api/path";
@@ -464,13 +468,24 @@ function IntegrationCard({
           ) : isLocked ? (
             null
           ) : isError ? (
-            <button
-              onClick={onConnect}
-              title={errorMessage ?? undefined}
-              className="font-mono text-[10px] text-red-400/70 hover:text-red-400 transition-colors text-left truncate max-w-full"
-            >
-              {errorMessage ? `failed — ${errorMessage}` : "failed — retry →"}
-            </button>
+            (() => {
+              // Never show the raw error string to a non-technical user —
+              // map it to a short, plain-language retry line. The full line is
+              // the tooltip so a truncated card is still readable on hover.
+              const friendly = humanizeConnectError(
+                { name: integration.name, type: integration.type },
+                errorMessage,
+              );
+              return (
+                <button
+                  onClick={onConnect}
+                  title={friendly}
+                  className="font-mono text-[10px] text-red-400/70 hover:text-red-400 transition-colors text-left truncate max-w-full"
+                >
+                  {friendly} →
+                </button>
+              );
+            })()
           ) : (
             <button
               onClick={onConnect}
@@ -592,7 +607,7 @@ export default function ConnectApps({ handleNextSlide }: ConnectAppsProps) {
 
   const handleUpgradeToPro = useCallback(async () => {
     if (!settings.user?.id || !settings.user?.token) {
-      await commands.openLoginWindow();
+      await commands.openLoginWindow(null);
       return;
     }
 
@@ -714,6 +729,16 @@ export default function ConnectApps({ handleNextSlide }: ConnectAppsProps) {
           setCardState(integration.cardKey, "idle");
         } else {
           const msg = err instanceof Error ? err.message : String(err);
+          // The card now shows a friendly, classified line instead of `msg`,
+          // so keep the raw error here for support/debugging.
+          posthog.capture("onboarding_integration_connect_failed", {
+            integration: integration.id,
+            error_kind: classifyConnectError(
+              { name: integration.name, type: integration.type },
+              msg,
+            ).kind,
+            error_message: msg,
+          });
           setErrorMessages((prev) => ({ ...prev, [integration.cardKey]: msg }));
           setCardState(integration.cardKey, "error");
           setTimeout(() => setCardState(integration.cardKey, "idle"), 4000);

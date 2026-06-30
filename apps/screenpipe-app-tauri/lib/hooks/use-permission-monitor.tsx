@@ -15,6 +15,10 @@ interface PermissionLostPayload {
   microphone: boolean;
   accessibility: boolean;
   browser_automation?: boolean;
+  // Diagnostic context from the engine emission site ("poll", or the raw
+  // ScreenCaptureKit error string for the eager path). Lets us tell a real
+  // revoke from an un-graced transient in telemetry. May be absent.
+  reason?: string | null;
 }
 
 interface PermissionNeededPayload {
@@ -38,7 +42,7 @@ export function usePermissionMonitor() {
     if (skipPaths.some((p) => pathname?.startsWith(p))) return;
 
     const unlisten = listen<PermissionLostPayload>("permission-lost", async (event) => {
-      const { screen_recording, microphone, accessibility, browser_automation } = event.payload;
+      const { screen_recording, microphone, accessibility, browser_automation, reason } = event.payload;
 
       if (hasShownRef.current) return;
 
@@ -54,6 +58,7 @@ export function usePermissionMonitor() {
         microphone_lost: microphone,
         accessibility_lost: accessibility,
         browser_automation_lost: browser_automation,
+        reason: reason ?? null,
       });
 
       try {

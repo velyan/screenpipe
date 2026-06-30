@@ -717,6 +717,33 @@ impl ServerCore {
         // stored on Self for `shutdown()` to fire on app quit.
         let redact_shutdown = Arc::new(Notify::new());
 
+        // Opt-in (Settings → Privacy → "redact secrets in agent logs", default
+        // off): strip secrets the pi agent persists into its session logs (bash
+        // output, tool args, connection strings) at rest. A sessions-only instance
+        // of the redaction `Worker` (no DB `tables`, just a `session_dir`), so it
+        // runs independently of the model-backed text-PII toggle below. Secrets-only
+        // + regex-based (no model download).
+        if config.redact_agent_session_secrets {
+            if let Ok(pi_dir) = screenpipe_core::agents::pi::pi_config_dir() {
+                use screenpipe_redact::worker::{Worker, WorkerConfig};
+                // A sessions-only worker (empty `tables`) never touches this
+                // redactor; the session scrub runs its own secrets-only regex
+                // pipeline. Passed only to satisfy `Worker::new`.
+                let placeholder = Arc::new(screenpipe_redact::Pipeline::regex_only())
+                    as Arc<dyn screenpipe_redact::Redactor>;
+                let cfg = WorkerConfig {
+                    tables: Vec::new(),
+                    session_dir: Some(pi_dir.join("sessions")),
+                    // sweep every 5 min — agent logs aren't latency-sensitive, and
+                    // the idle guard means only between-run files are ever rewritten
+                    poll_interval: std::time::Duration::from_secs(5 * 60),
+                    ..Default::default()
+                };
+                let _ = Worker::new(db.pool.clone(), placeholder, cfg)
+                    .spawn_with_shutdown(redact_shutdown.clone());
+            }
+        }
+
         if config.async_pii_redaction {
             use screenpipe_redact::adapters::onnx::{OnnxConfig, OnnxRedactor};
             use screenpipe_redact::adapters::opf::{OpfAdapter, OpfConfig};

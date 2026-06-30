@@ -191,7 +191,7 @@ function ReferralSection() {
           <div className="border border-border p-4 bg-card">
             <p className="text-sm text-muted-foreground mb-3">sign in to get your referral link</p>
             <button
-              onClick={() => commands.openLoginWindow()}
+              onClick={() => commands.openLoginWindow(null)}
               className="px-4 py-2 text-xs font-medium border border-border bg-background hover:bg-foreground hover:text-background transition-colors duration-150"
             >
               SIGN IN

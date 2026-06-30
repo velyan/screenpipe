@@ -241,7 +241,7 @@ describe('handleFileTranscription', () => {
 
       expect(response.status).toBe(200);
       const url = new URL(urls[0]);
-      expect(url.searchParams.getAll('detect_language')).toEqual(['en', 'hi']);
+      expect(url.searchParams.get('language')).toBe('multi');
     } finally {
       globalThis.fetch = originalFetch;
     }
@@ -277,7 +277,7 @@ describe('handleFileTranscription', () => {
 
       expect(response.status).toBe(200);
       const url = new URL(urls[0]);
-      expect(url.searchParams.getAll('detect_language')).toEqual(['en']);
+      expect(url.searchParams.get('language')).toBe('en');
     } finally {
       globalThis.fetch = originalFetch;
     }

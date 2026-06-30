@@ -122,7 +122,7 @@ You only need this for desktop-app work. If you're on the engine via the command
 Here's how you keep the two instances apart in practice. The one-liner runs a dev instance on its own port and data dir, isolated from `~/.screenpipe`:
 
 ```bash
-./target/release/screenpipe --port 3035 --data-dir "${TMPDIR:-/tmp}/sp"
+./target/release/screenpipe record --port 3035 --data-dir "${TMPDIR:-/tmp}/sp"
 ```
 
 That's the safety wall. A few details (also in `CONTRIBUTING.md` → "running dev + prod in the same time"):

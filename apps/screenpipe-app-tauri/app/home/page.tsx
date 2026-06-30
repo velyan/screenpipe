@@ -79,6 +79,7 @@ type MainSection = "home" | "timeline" | "brain" | "pipes" | "connections" | "me
 type ConnectionFocusRequest = {
   id: string | null;
   category: string | null;
+  scopeVariant: string | null;
   requestId: number;
 };
 
@@ -469,14 +470,21 @@ function HomeContent() {
     is_running: boolean;
     is_user_disabled?: boolean;
   }
+  interface VisionDeviceStatus {
+    id: number;
+    name: string;
+    active: boolean;
+    user_disabled: boolean;
+  }
   const [recordingDevices, setRecordingDevices] = useState<RecordingDevice[]>([]);
   const recordingDevicesSnapshotRef = useRef("");
 
   const refreshRecordingDevices = useCallback(async () => {
     try {
-      const [health, audioStatus]: [
+      const [health, audioStatus, visionStatus]: [
         { monitors?: string[]; device_status_details?: string } | null,
         AudioDeviceStatus[] | null,
+        VisionDeviceStatus[] | null,
       ] = await Promise.all([
         localFetch("/health")
           .then((r) => r.ok ? r.json() : null)
@@ -484,11 +492,29 @@ function HomeContent() {
         localFetch("/audio/device/status")
           .then((r) => r.ok ? r.json() : null)
           .catch(() => null),
+        localFetch("/vision/device/status")
+          .then((r) => r.ok ? r.json() : null)
+          .catch(() => null),
       ]);
 
       const devices: RecordingDevice[] = [];
-      // Parse monitors — filter to only those actually being recorded
-      if (health?.monitors) {
+      // Prefer /vision/device/status: it carries the numeric monitor id (so each
+      // display can be paused/resumed individually) and reflects user pauses.
+      // A display reads as "active" unless the user explicitly paused it, so a
+      // transient capture stall at boot doesn't flicker the row to "paused".
+      if (Array.isArray(visionStatus) && visionStatus.length > 0) {
+        for (const m of visionStatus) {
+          devices.push({
+            name: m.name,
+            fullName: m.name,
+            kind: "monitor",
+            active: !m.user_disabled,
+            id: m.id,
+          });
+        }
+      } else if (health?.monitors) {
+        // Fallback for older sidecars without /vision/device/status: monitors are
+        // display-only (no id → no pause control).
         const monitorIds: string[] = settings.monitorIds ?? ["default"];
         const useAll = settings.useAllMonitors ?? true;
         for (const name of health.monitors) {
@@ -793,6 +819,7 @@ function HomeContent() {
         setConnectionFocusRequest({
           id: typeof detail?.connectionId === "string" ? detail.connectionId : null,
           category: typeof detail?.category === "string" ? detail.category : null,
+          scopeVariant: typeof detail?.scopeVariant === "string" ? detail.scopeVariant : null,
           requestId: Date.now(),
         });
         setActiveSection("connections");
@@ -842,6 +869,7 @@ function HomeContent() {
           <ConnectionsSection
             focusConnectionId={connectionFocusRequest?.id ?? null}
             focusCategory={connectionFocusRequest?.category ?? null}
+            focusScopeVariant={connectionFocusRequest?.scopeVariant ?? null}
             focusRequestId={connectionFocusRequest?.requestId ?? 0}
             onFocusRequestConsumed={clearConnectionFocusRequest}
           />

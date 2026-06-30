@@ -1830,13 +1830,23 @@ fn terminal_ocr_throttled(app_name: &str) -> bool {
         Err(_) => return false,
     };
     let now = Instant::now();
-    match guard.get(&app_key) {
+    let throttled = match guard.get(&app_key) {
         Some(&last) if now.duration_since(last) < INTERVAL => true,
         _ => {
             guard.insert(app_key, now);
             false
         }
+    };
+
+    // Bound the map: keys are app names, so in practice this is the small
+    // `is_ocr_heavy_app` allow-list — but it's a process-lifetime static, so
+    // drop entries older than INTERVAL (they're stale and can't throttle
+    // anything anymore) before it can grow without limit.
+    if guard.len() > 64 {
+        guard.retain(|_, &mut last| now.duration_since(last) < INTERVAL);
     }
+
+    throttled
 }
 
 /// Apps whose accessibility tree tends to be thin, making OCR fallback expensive.

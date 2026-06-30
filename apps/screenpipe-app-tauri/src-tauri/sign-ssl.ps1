@@ -105,6 +105,17 @@ while (-not $signed -and $attempt -lt $maxAttempts) {
     }
 
     Push-Location $env:CODESIGNTOOL_PATH
+    # GitHub's `shell: powershell` injects `$ErrorActionPreference = 'Stop'`.
+    # When CodeSignTool's java writes the transient "Unexpected character (<)
+    # at position 0" (HTML-instead-of-JSON from SSL.com) to stderr, the `2>&1`
+    # merge turns it into a TERMINATING NativeCommandError under 'Stop' — which
+    # aborts this script on attempt 1 and BYPASSES the retry loop entirely (the
+    # exact transient this loop exists to ride out; confirmed on enterprise
+    # v2.5.80, build 28389355122 — no "Sign attempt 2/5" ever logged). Drop to
+    # 'Continue' just for the native call so its stderr is captured as data;
+    # control flow stays governed by the explicit $signExit / Test-Path checks.
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     # Capture stdout+stderr so we can detect SSL.com QuotaExceededError
     # and fail fast — burning 5 retries × exponential backoff (~7.5 min)
     # on a quota wall is pure waste; the next attempt fails the same way.
@@ -122,6 +133,7 @@ while (-not $signed -and $attempt -lt $maxAttempts) {
         "-input_file_path=$FilePath" `
         "-output_dir_path=$signedDir" 2>&1
     $signExit = $LASTEXITCODE
+    $ErrorActionPreference = $prevEAP
     Pop-Location
 
     # Mirror output to the build log so we keep the existing visibility.

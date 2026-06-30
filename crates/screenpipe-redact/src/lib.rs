@@ -75,6 +75,7 @@ pub mod image;
 pub mod pipeline;
 pub mod pseudonym;
 pub mod redaction_map;
+pub mod sessions;
 pub mod tree_json;
 pub mod worker;
 

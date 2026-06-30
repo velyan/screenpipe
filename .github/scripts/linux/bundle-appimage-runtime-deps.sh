@@ -10,6 +10,11 @@ LIBDIR="${APPDIR}/usr/lib"
 
 mkdir -p "${LIBDIR}"
 
+for launcher in "${APPDIR}/AppRun" "${APPDIR}/AppRun.wrapped"; do
+  [ -e "${launcher}" ] || continue
+  chmod +x "${launcher}" || true
+done
+
 should_skip_lib() {
   local base
   base="$(basename "$1")"

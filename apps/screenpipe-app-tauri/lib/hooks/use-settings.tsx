@@ -10,6 +10,7 @@ import { Store } from "@tauri-apps/plugin-store";
 import { emit, listen } from "@tauri-apps/api/event";
 import React, { createContext, useContext, useEffect, useRef, useState } from "react";
 import posthog from "posthog-js";
+import { cacheAnalyticsId } from "@/lib/analytics-id";
 import { User } from "../utils/tauri";
 import { SettingsStore } from "../utils/tauri";
 import { installAuthInterceptor } from "../auth-guard";
@@ -1240,6 +1241,12 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 	// the clerk_id so prior anonymous app events also merge forward.
 	useEffect(() => {
 		if (!settings.analyticsId) return;
+
+		// Cache the stable per-install id so posthog.init() in providers.tsx can
+		// bootstrap with it on the next launch/window — before this effect runs —
+		// keeping every window (esp. the floating search overlay) on one durable
+		// person instead of a fresh per-webview anonymous id. See lib/analytics-id.
+		cacheAnalyticsId(settings.analyticsId);
 
 		const clerkId = settings.user?.clerk_id || undefined;
 		const distinctId = clerkId || settings.analyticsId;

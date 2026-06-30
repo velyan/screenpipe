@@ -483,6 +483,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
   const recentChatRequestRef = useRef(0);
   // Recent chats shown in the suggestions area (loaded on open, independent of chats tab)
   const [recentChats, setRecentChats] = useState<ConversationMeta[]>([]);
+  const visibleRecentChats = contentFilter === "all" ? recentChats : [];
 
   // App filter (for screen results and speaker drill-down)
   const [appFilter, setAppFilter] = useState<string | null>(null);
@@ -1456,7 +1457,12 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
           )}
 
           {filteredSpeakerTranscriptions.length > 0 && (
-            <div className="grid grid-cols-3 gap-3">
+            <div
+                className="grid gap-3"
+                style={{
+                  gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                }}
+              >
               {filteredSpeakerTranscriptions.map((t, index) => {
                 const frameInfo = transcriptionFrames.get(t.timestamp);
                 const frameId = frameInfo?.frame_id;
@@ -1531,7 +1537,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
               ] as const).map(({ key, label, icon: Icon }) => (
                 <button
                   key={key}
-                  onClick={() => { setContentFilter(key); setSelectedIndex(0); setSelectedChatIndex(0); }}
+                  onClick={() => { setContentFilter(key); setSelectedIndex(0); setSelectedChatIndex(0); setHoveredIndex(null); }}
                   className={cn(
                     "inline-flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-full border transition-colors",
                     contentFilter === key
@@ -1586,7 +1592,12 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
 
           {/* Tag timeline entries — thumbnail grid */}
           {isTagSearch && tagResults.length > 0 && (
-            <div className="grid grid-cols-3 gap-3">
+            <div
+                className="grid gap-3"
+                style={{
+                  gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                }}
+              >
               {tagResults.map((frame) => (
                 <div
                   key={frame.frame_id}
@@ -1678,7 +1689,12 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                 ))}
               </div>
               {/* Skeleton thumbnail grid */}
-              <div className="grid grid-cols-3 gap-3">
+              <div
+                className="grid gap-3"
+                style={{
+                  gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                }}
+              >
                 {Array.from({ length: 6 }).map((_, i) => (
                   <div key={i} className="bg-muted animate-pulse rounded overflow-hidden">
                     <div className="aspect-video" />
@@ -1719,7 +1735,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
           )}
 
           {/* Inline chat section in "All" view — appears instantly (in-memory filter) while screen results load */}
-          {contentFilter !== "chats" && debouncedQuery.trim().length >= 1 && filteredChats.length > 0 && !isTagSearch && !isPeopleSearch && (
+          {contentFilter === "all" && debouncedQuery.trim().length >= 1 && filteredChats.length > 0 && !isTagSearch && !isPeopleSearch && (
             <div className="mb-4">
               <p className="text-xs text-muted-foreground mb-2 flex items-center gap-1.5">
                 <MessageSquare className="w-3 h-3" />
@@ -1820,7 +1836,12 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                 <Monitor className="w-3 h-3" />
                 screen
               </p>
-              <div className="grid grid-cols-3 gap-3">
+              <div
+                className="grid gap-3"
+                style={{
+                  gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                }}
+              >
                 {Array.from({ length: 6 }).map((_, i) => (
                   <div key={i} className="bg-muted animate-pulse rounded overflow-hidden">
                     <div className="aspect-video" />
@@ -1837,10 +1858,12 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
           {/* UI event results — shown above screen results so infinite scroll doesn't push them away */}
           {uiEventResults.length > 0 && contentFilter !== "screen" && contentFilter !== "chats" && (
             <div className={cn(contentFilter === "all" && "mb-4")}>
-              <p className="text-xs text-muted-foreground mb-2 flex items-center gap-1.5">
-                <Keyboard className="w-3 h-3" />
-                keyboard & clipboard
-              </p>
+              {contentFilter === "all" && (
+                <p className="text-xs text-muted-foreground mb-2 flex items-center gap-1.5">
+                  <Keyboard className="w-3 h-3" />
+                  keyboard & clipboard
+                </p>
+              )}
               <div className="flex flex-col gap-2">
                 {(contentFilter === "all" ? uiEventResults.slice(0, 5) : uiEventResults).map((evt) => (
                   <UiEventItem
@@ -1997,7 +2020,12 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                 </div>
               )}
 
-              <div className="grid grid-cols-3 gap-3">
+              <div
+                className="grid gap-3"
+                style={{
+                  gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))",
+                }}
+              >
                 {filteredResults.map((result, index) => {
                   const isActive = index === activeIndex;
                   const group = filteredGroups[index];
@@ -2065,7 +2093,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
               </div>
 
               {/* Load more indicator */}
-              {(isLoadingMore || (hasMoreOcr && filteredResults.length > 0)) && (
+              {(isLoadingMore || (hasMoreOcr && filteredResults.length > 0 && searchResults.length >= OCR_PAGE_SIZE)) && (
                 <div className="flex justify-center py-4">
                   {isLoadingMore ? (
                     <Loader2 className="w-4 h-4 animate-spin text-muted-foreground" />
@@ -2082,14 +2110,14 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
           {!debouncedQuery && !isSearching && contentFilter !== "chats" && (
             <div className="py-4 px-2 space-y-4">
               {/* Recent chats — list with timestamps */}
-              {recentChats.length > 0 && (
+              {visibleRecentChats.length > 0 && (
                 <div>
                   <p className="text-xs text-muted-foreground/60 mb-1 flex items-center gap-1.5">
                     <MessageSquare className="w-3 h-3" />
                     recent chats
                   </p>
                   <div className="flex flex-col">
-                    {recentChats.map((chat) => {
+                    {visibleRecentChats.map((chat) => {
                       const ts = new Date(chat.lastUserMessageAt ?? chat.updatedAt).toISOString();
                       return (
                         <button
@@ -2127,7 +2155,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
                   </div>
                 </div>
               )}
-              {!recentChats.length && !suggestionsLoading && (
+              {!visibleRecentChats.length && !suggestionsLoading && (
                 <div className="text-center text-sm text-muted-foreground py-4">
                   type to search your screen history
                 </div>
@@ -2192,6 +2220,7 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
         {/* Results area — only shown when there's content */}
         {hasContent && (
           <div
+            key={contentFilter}
             ref={gridRef}
             className={cn(
               "flex-1 min-h-0 overflow-y-auto overscroll-contain touch-pan-y",
@@ -2301,8 +2330,14 @@ export function SearchModal({ isOpen, onClose, onNavigateToTimestamp, embedded =
 
         {/* Results area - isolate scroll to prevent timeline from scrolling */}
         <div
+          key={contentFilter}
           ref={gridRef}
-          className="max-h-[60vh] overflow-y-auto p-4 overscroll-contain touch-pan-y"
+          className={cn(
+            "overflow-y-auto p-4 overscroll-contain touch-pan-y",
+            // Standalone search window: fill the window instead of leaving
+            // ~40vh of dead space below the list. Embedded dialog keeps a cap.
+            standalone ? "flex-1 min-h-0" : "max-h-[60vh]",
+          )}
           onWheel={(e) => {
             e.stopPropagation();
             const target = e.currentTarget;

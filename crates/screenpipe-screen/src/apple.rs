@@ -373,4 +373,103 @@ mod tests {
         assert_eq!(r[2].0, 5);
         assert_eq!(r[2].1, 1);
     }
+
+    /// Reproduction for the macOS slow memory leak reported 2026-06-29
+    /// (user `ingvar2424`, screenpipe v2.5.79 at 19.6 GB RSS after weeks of
+    /// idle background running on DEFAULT settings → ~1 GB/day steady growth).
+    ///
+    /// Hypothesis under test: the per-frame **Apple Vision OCR** path
+    /// (`perform_ocr_apple`) leaks native memory each call. Apple's Vision
+    /// (`VNRecognizeTextRequest`) is a known source of CoreFoundation / MLModel
+    /// buffer growth; such CF (Create-rule) allocations are NOT reclaimed by the
+    /// `cidre::objc::ar_pool(...)` wrapper, which only drains *autoreleased*
+    /// objects. Screen capture runs OCR continuously at the default cadence, so
+    /// even a small per-call leak compounds to GB-scale over weeks.
+    ///
+    /// This drives `perform_ocr_apple` in a tight loop on a fresh synthetic
+    /// 1280x800 frame each iteration and prints peak RSS (`ru_maxrss`) at
+    /// checkpoints. Interpretation:
+    ///   - CLEAN path: RSS rises during warmup (model load) then PLATEAUS.
+    ///   - LEAK:       RSS keeps climbing roughly linearly with iterations.
+    ///
+    /// Unlike the SCK capture repro, this needs **no Screen Recording TCC
+    /// permission** — Vision runs on an in-memory image — so it reproduces in
+    /// CI / headless. Kept `#[ignore]` (perf/memory repro, not correctness):
+    ///   cargo test -p screenpipe-screen --lib apple::tests::repro_apple_ocr_leak -- --ignored --nocapture
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "macOS memory-leak repro; prints RSS deltas"]
+    fn repro_apple_ocr_leak() {
+        use super::perform_ocr_apple;
+        use image::{DynamicImage, Rgba, RgbaImage};
+
+        /// Peak resident memory in bytes (ru_maxrss is bytes on Darwin).
+        fn peak_rss_bytes() -> u64 {
+            unsafe {
+                let mut ru: libc::rusage = std::mem::zeroed();
+                libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+                ru.ru_maxrss as u64
+            }
+        }
+        fn mb(b: u64) -> f64 {
+            (b as f64) / (1024.0 * 1024.0)
+        }
+
+        // Build a representative capture-sized frame with high-contrast
+        // "text-like" bars so the Vision recognizer engages its full pipeline.
+        // Content varies by `seed` so the OS can't trivially short-circuit a
+        // repeated identical input.
+        fn make_frame(seed: u32) -> DynamicImage {
+            let (w, h) = (1280u32, 800u32);
+            let mut img = RgbaImage::from_pixel(w, h, Rgba([255, 255, 255, 255]));
+            for line in 0..20u32 {
+                let y0 = 20 + line * 38 + (seed % 7);
+                let bar_h = 16u32;
+                let x_end = 80 + ((line * 53 + seed) % (w - 160));
+                for y in y0..(y0 + bar_h).min(h) {
+                    for x in 60..x_end.min(w) {
+                        // dashes to mimic words/letters
+                        if (x / 9) % 2 == 0 {
+                            img.put_pixel(x, y, Rgba([10, 10, 10, 255]));
+                        }
+                    }
+                }
+            }
+            DynamicImage::ImageRgba8(img)
+        }
+
+        const N: usize = 3_000;
+        const CHECKPOINT: usize = 250;
+
+        let baseline = peak_rss_bytes();
+        eprintln!("[ocr-repro] baseline peak RSS: {:.1} MB", mb(baseline));
+
+        let mut last = baseline;
+        for i in 0..N {
+            let frame = make_frame(i as u32);
+            let _ = perform_ocr_apple(&frame, &[]);
+
+            if (i + 1) % CHECKPOINT == 0 {
+                let now = peak_rss_bytes();
+                eprintln!(
+                    "[ocr-repro] after {:>5} OCRs: peak RSS {:.1} MB (+{:.1} MB since last, +{:.1} MB total)",
+                    i + 1,
+                    mb(now),
+                    mb(now.saturating_sub(last)),
+                    mb(now.saturating_sub(baseline)),
+                );
+                last = now;
+            }
+        }
+
+        let total = peak_rss_bytes().saturating_sub(baseline);
+        eprintln!(
+            "[ocr-repro] TOTAL peak-RSS growth over {} OCRs: {:.1} MB (~{:.1} KB/call)",
+            N,
+            mb(total),
+            (total as f64) / 1024.0 / (N as f64),
+        );
+        // Diagnostic only — we want the printed curve, not a hard assertion that
+        // could flake on shared CI. A clean path plateaus; a leak climbs.
+    }
 }

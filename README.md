@@ -76,7 +76,7 @@ screenpipe turns your computer into a personal AI that knows everything you've d
 
 - **search with ai** - find anything using natural language
 - **100% local** - your data never leaves your machine
-- **open source** - inspect, modify, own
+- **source-available** - inspect, modify, audit ([LICENSE.md](LICENSE.md))
 
 <p align="center">
    <a href ="https://screenpi.pe">
@@ -150,6 +150,7 @@ Thanks to all contributors:
 - [Español (Spanish)](translated_readmes/README-es.md)
 - [Português BR (Brazilian Portuguese)](translated_readmes/README-pt_BR.md)
 - [Deutsch (German)](translated_readmes/README-de.md)
+- [Українська (Ukrainian)](translated_readmes/README-uk.md)
 
 Want to translate screenpipe into another language? See [`translated_readmes/`](translated_readmes/README.md).
 

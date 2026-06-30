@@ -48,7 +48,7 @@ export function UpgradeQuotaBanner() {
     setBusy(true);
     try {
       if (!signedIn) {
-        await commands.openLoginWindow();
+        await commands.openLoginWindow(null);
         return;
       }
       const res = await fetch("https://screenpipe.com/api/cloud-sync/checkout", {

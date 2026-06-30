@@ -215,7 +215,7 @@ cargo test
 one command i keep using to avoid having to kill my main "production" process is:
 
 ```bash
-./target/release/screenpipe --port 3035 --data-dir "${TMPDIR:-/tmp}/sp"
+./target/release/screenpipe record --port 3035 --data-dir "${TMPDIR:-/tmp}/sp"
 ```
 
 it will avoid conflicts with the port and avoid conflicts with the data dir
@@ -223,6 +223,8 @@ it will avoid conflicts with the port and avoid conflicts with the data dir
 especially useful if you've done new database migrations and want to avoid breaking your previous months of data :)
 
 on macos, prefer `$TMPDIR` (a per-user temp dir) over `/tmp` — the system periodically sweeps `/tmp` and can wipe your dev data-dir mid-session, while `$TMPDIR` sticks around for the session. the `${TMPDIR:-/tmp}` form above uses it when set and falls back to `/tmp` otherwise.
+
+if you keep prod running 24/7 and want this loop scripted — pull, run dev, put prod back when you're done — [`scripts/dev`](scripts/dev) does it both ways: the cli on its own isolated dir+port (same idea as above) or the app via `bun tauri dev`. it also documents the apple-silicon build gotchas (full xcode, metal toolchain, `pre_build.js`). optional; macos only.
 
 ### macos: keeping screen/mic/accessibility permissions across dev rebuilds
 

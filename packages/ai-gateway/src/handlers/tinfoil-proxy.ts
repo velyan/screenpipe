@@ -128,7 +128,6 @@ export async function handleTinfoilProxy(
 			body: request.body,
 			// Cloudflare Workers: stream the body without buffering. Required for
 			// SSE responses (`stream: true`) and to keep memory bounded.
-			// @ts-expect-error — Workers-specific init field
 			duplex: 'half',
 		});
 	} catch (e) {

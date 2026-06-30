@@ -1527,7 +1527,7 @@ const AISection = ({
                               // checkout (or sign-in first) instead of selecting it.
                               if (locked) {
                                 if (!settings.user?.token) {
-                                  await commands.openLoginWindow();
+                                  await commands.openLoginWindow(null);
                                 } else {
                                   try {
                                     const res = await fetch("https://screenpipe.com/api/cloud-sync/checkout", {

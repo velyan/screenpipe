@@ -490,6 +490,18 @@ pub async fn start_monitor_watcher(
                         continue;
                     }
 
+                    // Respect an explicit user pause from the recording popover.
+                    // `start_monitor` already no-ops for these, but skipping here
+                    // avoids a misleading "reconnected, resuming recording" log
+                    // and a spurious "started recording" notification every tick.
+                    if vision_manager.is_monitor_user_disabled(monitor_id) {
+                        debug!(
+                            "Skipping monitor {} — user-paused from recording popover",
+                            monitor_id
+                        );
+                        continue;
+                    }
+
                     if known_monitors.contains_key(&monitor_id) {
                         info!("Monitor {} reconnected, resuming recording", monitor_id);
                     } else {

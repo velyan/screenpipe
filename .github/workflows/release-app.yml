@@ -754,6 +754,12 @@ jobs:
           # (e.g. g_variant_builder_init_static in GLib, MOUNT_2_40 in libmount).
           # Remove bundled GLib/GIO/GObject/GModule/libmount/libblkid/libpcre2
           # so system versions are used. These are core libs on all Linux desktops.
+          #
+          # Same class for libavif/libsharpyuv: linuxdeploy bundles the old Ubuntu
+          # 24.04 libsharpyuv but NOT libavif, so on Arch (libavif 1.4.2) the host
+          # libavif.so.16 loads against the stale bundled libsharpyuv and dies with
+          # "undefined symbol: SharpYuvConvertWithOptions". Strip both so the host's
+          # matched pair is used (the app already loads host libavif anyway).
           echo "Removing bundled system libraries to prevent ABI mismatch on newer distros..."
           # Install appimagetool for repacking
           curl -fsSL -o /tmp/appimagetool https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
@@ -770,7 +776,9 @@ jobs:
                   squashfs-root/usr/lib/libgmodule-2.0.so* \
                   squashfs-root/usr/lib/libmount.so* \
                   squashfs-root/usr/lib/libblkid.so* \
-                  squashfs-root/usr/lib/libpcre2-8.so*
+                  squashfs-root/usr/lib/libpcre2-8.so* \
+                  squashfs-root/usr/lib/libsharpyuv.so* \
+                  squashfs-root/usr/lib/libavif.so*
             echo "Removed bundled GLib libs, repacking AppImage..."
             ARCH=x86_64 /tmp/appimagetool squashfs-root "$APPIMAGE"
             rm -rf squashfs-root

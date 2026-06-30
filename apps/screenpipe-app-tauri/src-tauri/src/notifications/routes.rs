@@ -235,7 +235,7 @@ pub async fn send_notification(
         "type": resolved_type,
         "title": payload.title,
         "body": body,
-        "actions": payload.actions,
+        "actions": payload.actions.clone(),
         "autoDismissMs": dismiss_ms,
         "pipe_name": source.pipe_name.clone(),
         "source_session_id": source.source_session_id.clone(),
@@ -255,6 +255,8 @@ pub async fn send_notification(
         source_url: source.source_url.clone(),
         timestamp: chrono::Utc::now().to_rfc3339(),
         read: false,
+        // Ride along so the bell can re-offer them after the toast is gone.
+        actions: payload.actions,
     });
     emit_notification_source_marker(
         &state.app_handle,

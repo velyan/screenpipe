@@ -730,6 +730,7 @@ mod tests {
             ingest_url: "https://screenpipe.com/api/enterprise/ingest".to_string(),
             cursor_path: std::path::PathBuf::from("/tmp/nope"),
             upload_mode: EnterpriseUploadMode::HostedIngest,
+            log_dirs: Vec::new(),
         }
     }
 

@@ -478,15 +478,17 @@ const TOOLS: Tool[] = [
         timeout_secs: { type: "integer", description: "Auto-dismiss after N seconds (default 20). Use 0 for persistent.", default: 20 },
         actions: {
           type: "array",
-          description: "Up to 5 action buttons. Each needs id, label, type ('pipe'|'api'|'deeplink'|'dismiss').",
+          description: "Up to 5 action buttons. Each needs id, label, type ('pipe'|'chat'|'api'|'deeplink'|'dismiss').",
           items: {
             type: "object",
             properties: {
               id: { type: "string", description: "Unique action ID" },
               label: { type: "string", description: "Button label" },
-              type: { type: "string", enum: ["pipe", "api", "deeplink", "dismiss"], description: "Action type" },
-              pipe: { type: "string", description: "Pipe name to run (type=pipe)" },
-              context: { type: "object", description: "Context passed to pipe (type=pipe)" },
+              type: { type: "string", enum: ["pipe", "chat", "api", "deeplink", "dismiss"], description: "Action type. 'pipe' runs an installed pipe; 'chat' runs an inline prompt in a fresh chat session (no installed pipe needed)." },
+              pipe: { type: "string", description: "Target pipe to run when clicked (type=pipe). Set this explicitly — e.g. a 'share-data' pipe. If omitted it falls back to the sending pipe, which usually does nothing useful." },
+              prompt: { type: "string", description: "Instruction to run in a fresh chat session when clicked (type=chat). Write the whole task inline — no pre-installed pipe required." },
+              auto_send: { type: "boolean", description: "type=chat: auto-send the prompt (default true). Set false to pre-fill chat for the user to review before sending." },
+              context: { type: "object", description: "Data passed to the action (type=pipe → injected into the pipe prompt; type=chat → included as background context)" },
               open_in_chat: { type: "boolean", description: "Open pipe run in chat UI instead of background (type=pipe)" },
               url: { type: "string", description: "URL for api/deeplink actions" },
             },

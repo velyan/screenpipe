@@ -48,6 +48,11 @@ fn handle_lost(app: &AppHandle, data: &Value) {
     }
 
     info!(event = %data, "permission-lost (from engine)");
+    // Diagnostic context from the emission site ("poll", or the raw
+    // ScreenCaptureKit error string for the eager path). Forwarded to
+    // telemetry so a residual loss can be explained (real revoke vs a
+    // transient we haven't yet graced). Absent → null.
+    let reason = data.get("reason").and_then(|v| v.as_str());
     // Shape the payload to match what the Tauri webview already listens for.
     // Existing recovery modal expects `screen_recording` / `microphone` /
     // `accessibility` booleans.
@@ -56,6 +61,7 @@ fn handle_lost(app: &AppHandle, data: &Value) {
         "microphone":       kind == "microphone",
         "accessibility":    kind == "accessibility",
         "browser_automation": false,
+        "reason": reason,
     });
     if let Err(e) = app.emit("permission-lost", payload) {
         warn!("failed to emit permission-lost: {}", e);

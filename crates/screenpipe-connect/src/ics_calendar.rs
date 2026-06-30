@@ -314,7 +314,7 @@ pub fn parse_ics_to_events(
             continue;
         }
 
-        let title = event.get_summary().unwrap_or("(no title)").to_string();
+        let title = event.get_summary().unwrap_or_default().to_string();
         let location = event.get_location().map(|s| s.to_string());
         let meeting_url = normalize_meeting_url(event.get_url().map(str::to_string))
             .or_else(|| extract_meeting_url(location.as_deref()))
@@ -540,5 +540,37 @@ mod tests {
 
         assert!(parse_ics_to_events(&ics_data, "test", now, 0, 8).is_empty());
         assert_eq!(parse_ics_to_events(&ics_data, "test", now, 0, 72).len(), 1);
+    }
+
+    #[test]
+    fn event_without_summary_keeps_empty_title() {
+        let now = Utc::now();
+        let starts_at = now + chrono::Duration::hours(1);
+        let ends_at = now + chrono::Duration::hours(2);
+        let ics_data = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:empty-title-test\r\nDTSTAMP:20241010T101010Z\r\nDTSTART:{}\r\nDTEND:{}\r\nEND:VEVENT\r\nEND:VCALENDAR",
+            starts_at.format("%Y%m%dT%H%M%SZ"),
+            ends_at.format("%Y%m%dT%H%M%SZ")
+        );
+
+        let events = parse_ics_to_events(&ics_data, "test", now, 0, 8);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].title, "");
+    }
+
+    #[test]
+    fn literal_no_title_summary_is_preserved() {
+        let now = Utc::now();
+        let starts_at = now + chrono::Duration::hours(1);
+        let ends_at = now + chrono::Duration::hours(2);
+        let ics_data = format!(
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:literal-no-title-test\r\nDTSTAMP:20241010T101010Z\r\nDTSTART:{}\r\nDTEND:{}\r\nSUMMARY:No Title\r\nEND:VEVENT\r\nEND:VCALENDAR",
+            starts_at.format("%Y%m%dT%H%M%SZ"),
+            ends_at.format("%Y%m%dT%H%M%SZ")
+        );
+
+        let events = parse_ics_to_events(&ics_data, "test", now, 0, 8);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].title, "No Title");
     }
 }

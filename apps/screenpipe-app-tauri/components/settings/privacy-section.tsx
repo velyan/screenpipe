@@ -748,6 +748,20 @@ export function PrivacySection() {
     );
   };
 
+  // Secrets-only scrub of coding-agent (pi) session logs at rest. Distinct
+  // from the screen/audio PII workers above: agents persist full sessions
+  // (bash output, tool args) unredacted, so credentials land in plaintext on
+  // disk. Regex secrets-only + on-device; opt-in, default off.
+  const redactAgentSessionSecrets = Boolean(
+    settings.redactAgentSessionSecrets ?? false,
+  );
+  const handleAgentLogRedactionToggle = (checked: boolean) => {
+    handleSettingsChange(
+      { redactAgentSessionSecrets: checked } as Partial<Settings>,
+      true,
+    );
+  };
+
   // WHICH captured columns get scrubbed (orthogonal to the categories
   // above). Typed text / clipboard / transcripts / window titles /
   // on-screen text are always redacted; these extra surfaces are opt-in.
@@ -1671,6 +1685,37 @@ export function PrivacySection() {
         </Card>
       </div>
       </LockedSetting>
+
+      <div className="space-y-2">
+        <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">
+          Agent logs
+        </h2>
+
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <label className="flex items-start gap-2 text-xs cursor-pointer">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={redactAgentSessionSecrets}
+                onChange={(e) => handleAgentLogRedactionToggle(e.target.checked)}
+              />
+              <span>
+                <span className="font-medium text-foreground">
+                  Redact secrets in agent logs
+                </span>
+                <span className="text-muted-foreground">
+                  {" "}— coding agents (Pi) save full sessions, including any
+                  passwords, API keys, or tokens they touch, in plaintext on
+                  disk. When on, a background worker strips secrets from idle
+                  agent session logs. Secrets-only and on-device; never rewrites
+                  a session a run is still using.
+                </span>
+              </span>
+            </label>
+          </CardContent>
+        </Card>
+      </div>
 
       <div className="space-y-2">
         <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">

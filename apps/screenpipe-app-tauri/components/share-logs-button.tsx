@@ -24,7 +24,6 @@ import {
 import { localFetch } from "@/lib/api";
 import { useHealthCheck } from "@/lib/hooks/use-health-check";
 import { loadAllConversations } from "@/lib/chat-storage";
-import { redactPii } from "@/lib/utils/redact-pii";
 import { firstImageFile } from "@/lib/utils/clipboard-image";
 
 // Read an image File and return a compressed JPEG data URL (max 1920px wide).
@@ -272,23 +271,48 @@ export const ShareLogsButton = ({
             if (chatData.length + entry.length > MAX_CHAT_SIZE) break;
             chatData += entry;
           }
-          chatSection = "\n\n=== Pi Chat History (PII redacted) ===\n" + redactPii(chatData);
+          chatSection = "\n\n=== Pi Chat History ===\n" + chatData;
         } catch (e) {
           console.error("failed to load chat history:", e);
         }
       }
 
-      const combinedLogs =
+      // Settings are included raw here and redacted in Rust (see below) — the
+      // settings snapshot is invaluable for debugging ("did they change the
+      // transcription engine / a privacy filter?"), which logs alone don't show.
+      const settingsJson = (() => {
+        try {
+          return JSON.stringify(settings);
+        } catch (e) {
+          console.error("failed to serialize settings:", e);
+          return "";
+        }
+      })();
+
+      // Raw bundle (chat first so the enclave budget is spent on the PII-dense
+      // content before the bulk logs). ALL redaction happens in Rust — the
+      // `redact_pii_for_feedback` command strips config secrets by field name
+      // and runs the text through the screenpipe-redact pipeline (regex + the
+      // Tinfoil enclave model). No redaction is done here in the webview.
+      const rawBundle =
+        chatSection +
         logContents
-          .map((log) => `\n=== ${log.name} ===\n${log.content}`)
-          .join("\n\n") +
+          .map((log) => `\n\n=== ${log.name} ===\n${log.content}`)
+          .join("") +
         "\n\n=== Browser Console Logs ===\n" +
-        consoleLog +
-        chatSection;
+        consoleLog;
+
+      const redaction = await commands.redactPiiForFeedback(rawBundle, settingsJson);
+      if (redaction.status !== "ok") {
+        // The command never returns Err (worst case is regex-only redaction), so
+        // this means the call itself failed. Don't upload unredacted content.
+        throw new Error(`redaction failed: ${redaction.error}`);
+      }
+      const redactedLogs = redaction.data;
 
       await fetch(signedUrl, {
         method: "PUT",
-        body: combinedLogs,
+        body: redactedLogs,
         headers: { "Content-Type": "text/plain" },
       });
 
@@ -457,7 +481,8 @@ export const ShareLogsButton = ({
         )}
 
         <p className="text-[10px] text-muted-foreground leading-tight">
-          pi chat history is included to help us debug. personal info is automatically removed.
+          logs, settings, and pi chat history are included to help us debug.
+          api keys, secrets, and personal info are automatically removed.
         </p>
 
         <Button

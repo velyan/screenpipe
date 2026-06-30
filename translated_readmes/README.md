@@ -11,6 +11,7 @@ we're actively looking for contributors to translate the screenpipe README to mo
 - [Español (Spanish)](README-es.md)
 - [Português BR (Brazilian Portuguese)](README-pt_BR.md)
 - [Deutsch (German)](README-de.md)
+- [Українська (Ukrainian)](README-uk.md)
 
 ## adding a new language
 

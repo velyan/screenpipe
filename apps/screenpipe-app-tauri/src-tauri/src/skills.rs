@@ -427,6 +427,7 @@ fn validate_repo(repo: &str) -> Result<(), String> {
     let parts: Vec<&str> = repo.split('/').collect();
     let ok = |s: &str| {
         !s.is_empty()
+            && !s.contains("..")
             && s.chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     };

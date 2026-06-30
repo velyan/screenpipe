@@ -479,6 +479,14 @@ pub struct RecordArgs {
     #[arg(long, default_value_t = false)]
     pub async_pii_redaction: bool,
 
+    /// Strip secrets from coding-agent (pi) session logs at rest. A
+    /// background worker runs a secrets-only regex scrub over idle
+    /// `pi/sessions/*.jsonl` files (never one a live run is still
+    /// appending to). On-device, no model; independent of
+    /// `--async-pii-redaction`. Off by default.
+    #[arg(long, default_value_t = false)]
+    pub redact_agent_session_secrets: bool,
+
     /// Enable the async IMAGE-PII reconciliation worker. Independent
     /// of `--async-pii-redaction` (text). Runs the rfdetr_v11 detector
     /// over each captured frame, blacks out detected PII regions in
@@ -812,6 +820,7 @@ pub struct RecordArgSources {
     pub language: bool,
     pub use_pii_removal: bool,
     pub async_pii_redaction: bool,
+    pub redact_agent_session_secrets: bool,
     pub async_image_pii_redaction: bool,
     pub pii_backend: bool,
     pub pii_redaction_labels: bool,
@@ -865,6 +874,7 @@ impl RecordArgSources {
             language: from_command_line(record, "language"),
             use_pii_removal: from_command_line(record, "use_pii_removal"),
             async_pii_redaction: from_command_line(record, "async_pii_redaction"),
+            redact_agent_session_secrets: from_command_line(record, "redact_agent_session_secrets"),
             async_image_pii_redaction: from_command_line(record, "async_image_pii_redaction"),
             pii_backend: from_command_line(record, "pii_backend"),
             pii_redaction_labels: from_command_line(record, "pii_redaction_labels"),
@@ -910,6 +920,7 @@ impl RecordArgSources {
             || self.language
             || self.use_pii_removal
             || self.async_pii_redaction
+            || self.redact_agent_session_secrets
             || self.async_image_pii_redaction
             || self.pii_backend
             || self.pii_redaction_labels
@@ -1056,6 +1067,7 @@ impl RecordArgs {
             disable_timeline: false,
             use_pii_removal: self.use_pii_removal,
             async_pii_redaction: self.async_pii_redaction,
+            redact_agent_session_secrets: self.redact_agent_session_secrets,
             async_image_pii_redaction: self.async_image_pii_redaction,
             pii_backend: self.pii_backend.clone(),
             pii_redaction_labels: self.pii_redaction_labels.clone(),
@@ -1339,6 +1351,9 @@ impl RecordArgs {
         }
         if sources.async_pii_redaction {
             settings.async_pii_redaction = self.async_pii_redaction;
+        }
+        if sources.redact_agent_session_secrets {
+            settings.redact_agent_session_secrets = self.redact_agent_session_secrets;
         }
         if sources.async_image_pii_redaction {
             settings.async_image_pii_redaction = self.async_image_pii_redaction;

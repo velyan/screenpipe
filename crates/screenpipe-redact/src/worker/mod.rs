@@ -19,8 +19,10 @@
 mod columns;
 mod tables;
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex, Notify};
@@ -28,7 +30,7 @@ use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, error, info, warn};
 
-use crate::Redactor;
+use crate::{Pipeline, Redactor};
 
 pub use columns::{keys as column_keys, RedactColumns};
 pub use tables::{TargetTable, ALL_TARGET_TABLES};
@@ -75,6 +77,17 @@ pub struct WorkerConfig {
     /// [`RedactColumns::default`] (clear PII on, browser_url / ui element
     /// name+description / a11y url-field off).
     pub columns: RedactColumns,
+    /// Optional directory of coding-agent session logs (`*.jsonl`) to scrub of
+    /// secrets in place each poll, or `None` (the default) to skip it. This is
+    /// a **secrets-only** sweep that runs its own regex [`Pipeline`] over every
+    /// string in each record — independent of `tables`, `columns`, and the
+    /// (possibly model-backed) row redactor — so a worker that does no DB work
+    /// can still strip credentials from agent logs. See [`crate::sessions`].
+    pub session_dir: Option<PathBuf>,
+    /// How long a session file must be untouched before it's eligible, so a run
+    /// still appending to it is never rewritten mid-flight. Only consulted when
+    /// `session_dir` is set. Default 10 min.
+    pub session_min_idle: Duration,
 }
 
 impl Default for WorkerConfig {
@@ -86,6 +99,8 @@ impl Default for WorkerConfig {
             max_active_fraction: 0.4,
             tables: ALL_TARGET_TABLES.to_vec(),
             columns: RedactColumns::default(),
+            session_dir: None,
+            session_min_idle: Duration::from_secs(10 * 60),
         }
     }
 }
@@ -225,6 +240,20 @@ impl Worker {
         }
         let mut disabled: Vec<TargetTable> = Vec::new();
 
+        // Secrets-only scrub of agent session logs, when configured. Its own
+        // regex `Pipeline` — independent of `self.redactor`, whose policy may be
+        // full-PII and/or model-backed — so secret-stripping agent logs never
+        // depends on the (opt-in) text-PII pass. A path->mtime map skips clean,
+        // unchanged files; the scan is throttled to `poll_interval` below so a
+        // backlog drain (a tight loop) doesn't re-walk the dir every batch.
+        let session_redactor = self
+            .cfg
+            .session_dir
+            .as_ref()
+            .map(|_| Pipeline::regex_only());
+        let mut session_seen: HashMap<PathBuf, SystemTime> = HashMap::new();
+        let mut last_session_scan: Option<std::time::Instant> = None;
+
         loop {
             if self.paused.load(std::sync::atomic::Ordering::SeqCst) {
                 self.set_paused(true).await;
@@ -337,6 +366,31 @@ impl Worker {
                         {
                             return;
                         }
+                    }
+                }
+            }
+
+            // Once per poll, sweep the agent session logs. Cheap when nothing
+            // is eligible: a readdir + mtime stat, skipping files unchanged
+            // since last scrubbed and any modified within `session_min_idle`
+            // (still potentially being appended to by a live run).
+            if let (Some(dir), Some(redactor)) =
+                (self.cfg.session_dir.as_ref(), session_redactor.as_ref())
+            {
+                let due = last_session_scan
+                    .map(|t| t.elapsed() >= self.cfg.poll_interval)
+                    .unwrap_or(true);
+                if due {
+                    last_session_scan = Some(std::time::Instant::now());
+                    let n = crate::sessions::scrub_dir(
+                        dir,
+                        self.cfg.session_min_idle,
+                        &mut session_seen,
+                        redactor,
+                    )
+                    .await;
+                    if n > 0 {
+                        info!("redact worker: scrubbed secrets in {n} idle agent session file(s)");
                     }
                 }
             }

@@ -40,6 +40,11 @@ pub struct RecordingConfig {
     /// overwrites the source columns with the redacted text. Off by
     /// default.
     pub async_pii_redaction: bool,
+    /// Secrets-only scrub of coding-agent (pi) session logs at rest: a
+    /// background worker strips credentials from `pi/sessions/*.jsonl`
+    /// (idle files only). On-device regex, no model. Off by default;
+    /// independent of `async_pii_redaction`.
+    pub redact_agent_session_secrets: bool,
     /// Async image PII redaction: runs rfdetr_v8 on each captured
     /// frame and blacks out detected PII regions, atomically
     /// overwriting the source JPG. Off by default. First-run
@@ -271,6 +276,7 @@ impl RecordingConfig {
             disable_timeline: settings.disable_timeline,
             use_pii_removal: settings.use_pii_removal,
             async_pii_redaction: settings.async_pii_redaction,
+            redact_agent_session_secrets: settings.redact_agent_session_secrets,
             async_image_pii_redaction: settings.async_image_pii_redaction,
             pii_backend: settings.pii_backend.clone(),
             pii_redaction_labels: settings.pii_redaction_labels.clone(),

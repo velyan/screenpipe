@@ -41,7 +41,8 @@ export const config: TestrunnerConfig = {
     },
   },
 
-  specs: [resolve(__dirname, 'specs', '*.spec.ts')],
+  // Recursive: top-level specs plus grouped subfolders (e.g. specs/search/).
+  specs: [resolve(__dirname, 'specs', '**', '*.spec.ts')],
   maxInstances: 1,
   capabilities: [{ browserName: 'chrome' }],
   hostname: '127.0.0.1',

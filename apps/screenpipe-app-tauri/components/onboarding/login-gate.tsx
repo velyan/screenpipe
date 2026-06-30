@@ -305,7 +305,7 @@ const OnboardingLogin: React.FC<OnboardingLoginProps> = ({ handleNextSlide }) =>
     posthog.capture("onboarding_login_clicked");
     // Open login in an in-app WebView instead of Safari so we can intercept
     // the screenpipe:// deep-link redirect (Safari blocks custom-scheme redirects)
-    commands.openLoginWindow();
+    commands.openLoginWindow(null);
   }, []);
 
   const handleSkip = useCallback(() => {

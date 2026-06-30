@@ -89,16 +89,18 @@ describe("PickPipe", () => {
     });
 
     fireEvent.click(
-      screen.getByRole("checkbox", { name: /digital-clone: your ai you/i }),
+      screen.getByRole("checkbox", {
+        name: /your ai twin: writes and acts like you/i,
+      }),
     );
     fireEvent.click(
       screen.getByRole("checkbox", {
-        name: /personal-crm: remember everyone you meet/i,
+        name: /people memory: remember everyone you meet/i,
       }),
     );
 
     expect(
-      screen.getByRole("button", { name: /install 0 pipes/i }),
+      screen.getByRole("button", { name: /turn them on/i }),
     ).toBeDisabled();
 
     await act(async () => {
@@ -141,11 +143,13 @@ describe("PickPipe", () => {
     });
 
     fireEvent.click(
-      screen.getByRole("checkbox", { name: /digital-clone: your ai you/i }),
+      screen.getByRole("checkbox", {
+        name: /your ai twin: writes and acts like you/i,
+      }),
     );
 
     await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: /install 1 pipe/i }));
+      fireEvent.click(screen.getByRole("button", { name: /turn it on/i }));
     });
 
     await waitFor(() => {

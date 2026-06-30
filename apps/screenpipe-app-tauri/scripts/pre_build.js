@@ -23,6 +23,16 @@ const winArch = platform === 'windows' ? (process.arch === 'arm64' ? 'arm64' : '
 const cwd = process.cwd()
 console.log('cwd', cwd)
 
+// Remove any stale static export before the frontend rebuilds. `next build`
+// (output: 'export') only writes ../out on success; if it fails (e.g. a type
+// error), a previously-built out/ stays on disk and tauri embeds that OLD
+// bundle — so the app "builds" but silently ships a stale UI. Clearing it here
+// (prebuild runs before `next build`) means a failed build leaves no out/ and
+// tauri fails loudly on the missing frontendDist instead. See #4645 post-mortem.
+const staleExportDir = path.join(cwd, '..', 'out')
+await fs.rm(staleExportDir, { recursive: true, force: true })
+console.log('cleared stale frontend export:', staleExportDir)
+
 
 const config = {
 	ffmpegRealname: 'ffmpeg',
@@ -165,18 +175,10 @@ async function copyBunBinary() {
 			return;
 		}
 
-		if (process.env.CI === 'true' || process.env.GITHUB_ACTIONS === 'true') {
-			const systemBun = await findOnPath('bun');
-			if (!systemBun) {
-				throw new Error('CI expected bun on PATH, but command lookup failed');
-			}
-			console.log(`using CI bun binary for tauri sidecar: ${systemBun}`);
-			await copyFile(systemBun, bunDest1);
-			return;
-		}
-
 		// Download the baseline bun variant for broader glibc compatibility.
-		// Use npm's tarball mirror because GitHub release assets can 504.
+		// Use npm's tarball mirror because GitHub release assets can 504. Do
+		// this in CI too; the runner's bun can be a host-optimized binary, but
+		// the AppImage sidecar needs to run on older and different Linux hosts.
 		const bunVersion = '1.3.10';
 		const baselineUrl = `https://registry.npmjs.org/@oven/bun-linux-x64-baseline/-/bun-linux-x64-baseline-${bunVersion}.tgz`;
 		console.log(`downloading bun baseline v${bunVersion} for linux...`);
@@ -316,7 +318,11 @@ async function downloadStaticLinuxFfmpeg() {
 		}
 	}
 
-	await $`wget --no-config ${config.linux.ffmpegUrl} -O ${archive}`
+	// johnvansickle.com intermittently returns a transient HTTP 415 (and the odd
+	// 5xx). downloadFile() retries on any curl failure — including HTTP error
+	// codes via curl -f — so those transient responses fall inside the retry
+	// budget instead of hard-failing the build.
+	await downloadFile(config.linux.ffmpegUrl, archive, { retries: 5, timeoutMs: 120000 })
 	await $`tar xf ${archive}`
 
 	const entries = await fs.readdir(cwd, { withFileTypes: true });
@@ -327,6 +333,37 @@ async function downloadStaticLinuxFfmpeg() {
 
 	await fs.rename(path.join(cwd, extracted.name), config.ffmpegRealname)
 	await fs.rm(archive, { force: true })
+}
+
+async function copySystemLinuxFfmpeg() {
+	await fs.rm(config.ffmpegRealname, { recursive: true, force: true });
+	await fs.mkdir(config.ffmpegRealname, { recursive: true });
+	await copySystemBinary('ffmpeg', path.join(config.ffmpegRealname, 'ffmpeg'));
+	await copySystemBinary('ffprobe', path.join(config.ffmpegRealname, 'ffprobe'));
+
+	const qtFaststartDest = path.join(config.ffmpegRealname, 'qt-faststart');
+	const qtFaststart = await findOnPath('qt-faststart');
+	if (qtFaststart) {
+		await copyFile(qtFaststart, qtFaststartDest);
+		console.log(`using system qt-faststart: ${qtFaststart} -> ${qtFaststartDest}`);
+		return;
+	}
+
+	await fs.writeFile(
+		qtFaststartDest,
+		`#!/usr/bin/env sh
+set -eu
+
+if [ "$#" -lt 2 ]; then
+  echo "usage: qt-faststart input output" >&2
+  exit 2
+fi
+
+exec "$(dirname "$0")/ffmpeg" -y -i "$1" -c copy -movflags faststart "$2"
+`
+	);
+	await fs.chmod(qtFaststartDest, 0o755);
+	console.log(`created ffmpeg-backed qt-faststart wrapper at ${qtFaststartDest}`);
 }
 
 async function copySystemBinary(binaryName, destination) {
@@ -549,14 +586,19 @@ if (platform == 'linux') {
 		if (await fs.exists(config.ffmpegRealname)) {
 			await fs.rm(config.ffmpegRealname, { recursive: true, force: true });
 		}
-		await downloadStaticLinuxFfmpeg();
+		try {
+			await downloadStaticLinuxFfmpeg();
+		} catch (error) {
+			console.warn(`static Linux ffmpeg download failed (${error.message}); falling back to system ffmpeg`);
+			await copySystemLinuxFfmpeg();
+		}
 	} else {
 		console.log('FFMPEG already exists');
 	}
 		// Setup TESSERACT
 	if (!(await fs.exists(config.linux.tesseractName)) || (await isSymlink(config.linux.tesseractName))) {
 		await fs.rm(config.linux.tesseractName, { force: true });
-		await $`wget --no-config -nc ${config.linux.tesseractUrl} -O ${config.linux.tesseractName}`
+		await $`wget --no-config -nc --tries=5 --waitretry=10 --retry-on-http-error=415,429,500,502,503,504 --timeout=60 ${config.linux.tesseractUrl} -O ${config.linux.tesseractName}`
 		await $`chmod +x ${config.linux.tesseractName}` // Make the Tesseract binary executable
 	} else {
 		console.log('TESSERACT already exists');
@@ -764,6 +806,23 @@ if (platform == 'windows') {
 
 /* ########## macOS ########## */
 if (platform == 'macos') {
+	const installMacosSidecar = async ({ url, archive, extractDir, binaryName, dest }) => {
+		if (await fs.exists(dest)) {
+			return
+		}
+
+		try {
+			await fs.rm(extractDir, { recursive: true, force: true })
+			await downloadFile(url, archive, { retries: 10, timeoutMs: 120000 })
+			await $`unzip -o ${archive} -d ${extractDir}`
+			await fs.copyFile(path.join(extractDir, binaryName), dest)
+			await fs.chmod(dest, 0o755)
+		} finally {
+			await fs.rm(archive, { force: true }).catch(() => {})
+			await fs.rm(extractDir, { recursive: true, force: true }).catch(() => {})
+		}
+	}
+
 	// Always use the self-contained osxexperts.net binaries. The
 	// `copySystemBinary` path that briefly lived here (b73cf7f93) ships
 	// brew's dynamically-linked ffmpeg as-is, with hardcoded
@@ -774,37 +833,37 @@ if (platform == 'macos') {
 	// and ffmpeg SIGABRTs on every invocation. osxexperts.net binaries
 	// are statically linked and have zero external deps — safe to copy
 	// into any .app.
-	if (!(await fs.exists(`ffmpeg-aarch64-apple-darwin`))) {
-		await $`wget --no-config ${config.macos.ffmpegUrlArm} -O ffmpeg-aarch64.zip`;
-		await $`unzip -o ffmpeg-aarch64.zip -d ffmpeg-aarch64`;
-		await $`cp ffmpeg-aarch64/ffmpeg ffmpeg-aarch64-apple-darwin`;
-		await $`rm ffmpeg-aarch64.zip`;
-		await $`rm -rf ffmpeg-aarch64`;
-	}
+	await installMacosSidecar({
+		url: config.macos.ffmpegUrlArm,
+		archive: 'ffmpeg-aarch64.zip',
+		extractDir: 'ffmpeg-aarch64',
+		binaryName: 'ffmpeg',
+		dest: 'ffmpeg-aarch64-apple-darwin',
+	})
 
-	if (!(await fs.exists(`ffprobe-aarch64-apple-darwin`))) {
-		await $`wget --no-config ${config.macos.ffprobeUrlArm} -O ffprobe-aarch64.zip`;
-		await $`unzip -o ffprobe-aarch64.zip -d ffprobe-aarch64`;
-		await $`cp ffprobe-aarch64/ffprobe ffprobe-aarch64-apple-darwin`;
-		await $`rm ffprobe-aarch64.zip`;
-		await $`rm -rf ffprobe-aarch64`;
-	}
+	await installMacosSidecar({
+		url: config.macos.ffprobeUrlArm,
+		archive: 'ffprobe-aarch64.zip',
+		extractDir: 'ffprobe-aarch64',
+		binaryName: 'ffprobe',
+		dest: 'ffprobe-aarch64-apple-darwin',
+	})
 
-	if (!(await fs.exists(`ffmpeg-x86_64-apple-darwin`))) {
-		await $`wget --no-config ${config.macos.ffmpegUrlx86_64} -O ffmpeg-x86_64.zip`;
-		await $`unzip -o ffmpeg-x86_64.zip -d ffmpeg-x86_64`;
-		await $`cp ffmpeg-x86_64/ffmpeg ffmpeg-x86_64-apple-darwin`;
-		await $`rm ffmpeg-x86_64.zip`;
-		await $`rm -rf ffmpeg-x86_64`;
-	}
+	await installMacosSidecar({
+		url: config.macos.ffmpegUrlx86_64,
+		archive: 'ffmpeg-x86_64.zip',
+		extractDir: 'ffmpeg-x86_64',
+		binaryName: 'ffmpeg',
+		dest: 'ffmpeg-x86_64-apple-darwin',
+	})
 
-	if (!(await fs.exists(`ffprobe-x86_64-apple-darwin`))) {
-		await $`wget --no-config ${config.macos.ffprobeUrlx86_64} -O ffprobe-x86_64.zip`;
-		await $`unzip -o ffprobe-x86_64.zip -d ffprobe-x86_64`;
-		await $`cp ffprobe-x86_64/ffprobe ffprobe-x86_64-apple-darwin`;
-		await $`rm ffprobe-x86_64.zip`;
-		await $`rm -rf ffprobe-x86_64`;
-	}
+	await installMacosSidecar({
+		url: config.macos.ffprobeUrlx86_64,
+		archive: 'ffprobe-x86_64.zip',
+		extractDir: 'ffprobe-x86_64',
+		binaryName: 'ffprobe',
+		dest: 'ffprobe-x86_64-apple-darwin',
+	})
 
   console.log('FFMPEG and FFPROBE checks completed');
 	console.log('Moved and renamed ffmpeg binary for externalBin');

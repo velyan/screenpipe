@@ -215,6 +215,16 @@ pub fn notify_wake() {
     );
 }
 
+/// Returns `true` while the wake grace period is active (permission-loss
+/// emissions are currently suppressed). Diagnostic/test accessor — lets the
+/// sleep monitor's unit tests assert that an unlock/display-reconfig actually
+/// armed the grace without waiting out [`WAKE_GRACE`].
+#[allow(dead_code)] // consumed by sleep_monitor's (test-only) unlock-grace assertion
+pub(crate) fn wake_grace_active() -> bool {
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    matches!(state.wake_grace_until, Some(until) if Instant::now() < until)
+}
+
 async fn run() {
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     // First tick fires immediately — skip it, we already seeded state.

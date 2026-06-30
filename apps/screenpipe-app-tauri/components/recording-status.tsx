@@ -5,7 +5,7 @@
 "use client";
 
 import React from "react";
-import { Monitor, Mic, MicOff, Volume2, VolumeX, Phone, Pause } from "lucide-react";
+import { Monitor, MonitorOff, Mic, MicOff, Volume2, VolumeX, Phone, Pause } from "lucide-react";
 import posthog from "posthog-js";
 import {
   Popover,
@@ -25,6 +25,10 @@ export interface RecordingDevice {
   fullName: string;
   kind: "monitor" | "input" | "output";
   active: boolean;
+  /** numeric monitor id — only set for `kind: "monitor"`, used to pause/resume
+   * that display via /vision/device/*. Absent on older sidecars that don't
+   * report it, in which case the monitor row stays display-only. */
+  id?: number;
 }
 
 interface RecordingStatusProps {
@@ -44,7 +48,7 @@ const KIND_ICONS: Record<
   RecordingDevice["kind"],
   { active: typeof Monitor; paused: typeof Monitor }
 > = {
-  monitor: { active: Monitor, paused: Monitor },
+  monitor: { active: Monitor, paused: MonitorOff },
   input: { active: Mic, paused: MicOff },
   output: { active: Volume2, paused: VolumeX },
 };
@@ -82,10 +86,25 @@ export function RecordingStatus({
         : `${pausedCount} device${pausedCount > 1 ? "s" : ""} paused`;
   const label = meetingActive ? `${summary} · meeting notes` : summary;
 
+  // Monitors pause via /vision/device/* (screen capture only — audio keeps
+  // running); mics/speakers pause via /audio/device/*. Both flip optimistically
+  // and revert on failure so the popover feels instant.
   const toggleDevice = async (device: RecordingDevice) => {
-    const endpoint = device.active
-      ? "/audio/device/stop"
-      : "/audio/device/start";
+    const isMonitor = device.kind === "monitor";
+    // Monitor control needs a numeric id; older sidecars don't report one.
+    if (isMonitor && device.id == null) return;
+
+    const endpoint = isMonitor
+      ? device.active
+        ? "/vision/device/stop"
+        : "/vision/device/start"
+      : device.active
+        ? "/audio/device/stop"
+        : "/audio/device/start";
+    const body = isMonitor
+      ? JSON.stringify({ monitor_id: device.id })
+      : JSON.stringify({ device_name: device.fullName });
+
     // Optimistic flip; revert on failure.
     onDevicesChange((prev) =>
       prev.map((d) =>
@@ -96,10 +115,10 @@ export function RecordingStatus({
       const response = await localFetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ device_name: device.fullName }),
+        body,
       });
       if (!response.ok) {
-        throw new Error(`audio device toggle failed: ${response.status}`);
+        throw new Error(`device toggle failed: ${response.status}`);
       }
     } catch {
       onDevicesChange((prev) =>
@@ -192,11 +211,15 @@ export function RecordingStatus({
               onClick={() => void pauseRecording()}
               disabled={!canPauseRecording || pauseLoading}
               data-testid="recording-status-pause-all"
-              title="pause all screen and audio recording"
-              className="flex w-full items-center justify-center gap-1.5 rounded-md border border-border px-2 py-1.5 text-[11px] font-medium text-foreground transition-colors hover:bg-muted/60 disabled:cursor-not-allowed disabled:opacity-50"
+              title="pause all screen and audio recording — resume anytime"
+              className="flex w-full items-center justify-center gap-1.5 rounded-md bg-foreground px-2 py-1.5 text-[11px] font-medium text-background transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
             >
-              <Pause aria-hidden="true" className="h-3 w-3" />
-              {pauseLoading ? "pausing recording" : "pause all recording"}
+              <Pause aria-hidden="true" className="h-3 w-3 fill-current" />
+              {pauseLoading
+                ? "pausing…"
+                : canPauseRecording
+                  ? "pause all recording"
+                  : "all recording paused"}
             </button>
           </div>
         )}
@@ -235,10 +258,21 @@ export function RecordingStatus({
                 >
                   {device.name}
                 </span>
-                {device.kind !== "monitor" && (
+                {/* Monitors are controllable only when the sidecar reports an
+                    id (/vision/device/status); audio rows always are. */}
+                {(device.kind !== "monitor" || device.id != null) && (
                   <button
                     onClick={() => void toggleDevice(device)}
-                    className="text-[10px] text-muted-foreground hover:text-foreground transition-colors shrink-0"
+                    title={
+                      device.kind === "monitor"
+                        ? device.active
+                          ? "pause screen recording for this display"
+                          : "resume screen recording for this display"
+                        : device.active
+                          ? "pause recording for this device"
+                          : "resume recording for this device"
+                    }
+                    className="rounded px-1.5 py-0.5 text-[10px] text-muted-foreground hover:text-foreground hover:bg-muted/60 transition-colors shrink-0"
                   >
                     {device.active ? "pause" : "resume"}
                   </button>

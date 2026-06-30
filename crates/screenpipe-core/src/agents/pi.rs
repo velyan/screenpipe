@@ -1828,7 +1828,7 @@ impl AgentExecutor for PiExecutor {
         // Seed package.json with overrides to fix lru-cache resolution on Windows
         seed_pi_package_json(&install_dir);
 
-        let mut cmd = std::process::Command::new(&bun);
+        let mut cmd = std_bun_command(&bun);
         cmd.current_dir(&install_dir).args(args);
 
         #[cfg(windows)]
@@ -2232,7 +2232,7 @@ pub fn format_subprocess_failure(what: &str, output: &std::process::Output) -> S
 /// crashing bun (e.g. SIGILL on unsupported CPUs) is reported inline, which
 /// diagnoses the install failure before the install is even attempted.
 pub fn bun_version_string(bun: &str) -> String {
-    let mut cmd = std::process::Command::new(bun);
+    let mut cmd = std_bun_command(bun);
     cmd.arg("--version");
     #[cfg(windows)]
     {
@@ -2245,6 +2245,36 @@ pub fn bun_version_string(bun: &str) -> String {
         Ok(o) => format!("unknown ({})", describe_exit_status(&o.status)),
         Err(e) => format!("unknown (failed to run: {})", e),
     }
+}
+
+/// Inside an AppImage, AppRun exports `LD_LIBRARY_PATH` pointing at the bundle's
+/// libs. bun is a self-contained baseline binary and must not inherit it, or it
+/// loads the bundled glibc/libstdc++ and crashes (SIGSEGV/SIGILL). Only scrub it
+/// in that environment so a normal Linux install keeps any user-set value.
+fn should_scrub_bun_runtime_env() -> bool {
+    cfg!(target_os = "linux") && std::env::var_os("APPDIR").is_some()
+}
+
+/// Strip the AppImage runtime library path from a bun command (see
+/// [`should_scrub_bun_runtime_env`]). Shared with the Tauri app crate.
+pub fn scrub_bun_runtime_env(cmd: &mut std::process::Command) {
+    if should_scrub_bun_runtime_env() {
+        cmd.env_remove("LD_LIBRARY_PATH");
+    }
+}
+
+fn std_bun_command(bun: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new(bun);
+    scrub_bun_runtime_env(&mut cmd);
+    cmd
+}
+
+fn tokio_bun_command(bun: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(bun);
+    if should_scrub_bun_runtime_env() {
+        cmd.env_remove("LD_LIBRARY_PATH");
+    }
+    cmd
 }
 
 /// Returns the screenpipe-managed pi install directory (`~/.screenpipe/pi-agent/` or SCREENPIPE_DATA_DIR/pi-agent).
@@ -2489,7 +2519,7 @@ fn build_async_command(path: &str) -> tokio::process::Command {
         let mut cmd = if let Some(ref js_path) = js_entry {
             // Run JS entry point directly with bun (preferred) or node.
             if let Some(bun) = find_bun_executable() {
-                let mut c = tokio::process::Command::new(&bun);
+                let mut c = tokio_bun_command(&bun);
                 c.arg(js_path);
                 debug!("bypassing cmd.exe, running pi via bun: {} {}", bun, js_path);
                 c
@@ -2511,7 +2541,7 @@ fn build_async_command(path: &str) -> tokio::process::Command {
         } else if path.ends_with(".js") {
             // Local install returns a .js entrypoint — run with bun
             if let Some(bun) = find_bun_executable() {
-                let mut c = tokio::process::Command::new(&bun);
+                let mut c = tokio_bun_command(&bun);
                 c.arg(path);
                 debug!("running pi JS entrypoint via bun: {} {}", bun, path);
                 c
@@ -2560,7 +2590,7 @@ fn build_async_command(path: &str) -> tokio::process::Command {
     #[cfg(not(windows))]
     {
         if let Some(bun) = find_bun_executable() {
-            let mut cmd = tokio::process::Command::new(bun);
+            let mut cmd = tokio_bun_command(&bun);
             cmd.arg(path);
             cmd
         } else {
@@ -2742,7 +2772,7 @@ fn download_portable_git() -> std::result::Result<String, String> {
             PORTABLE_GIT_URL,
             temp_file.to_string_lossy().replace('\\', "\\\\")
         );
-        let mut cmd = std::process::Command::new(&bun);
+        let mut cmd = std_bun_command(&bun);
         cmd.args(["--eval", &script]);
         {
             use std::os::windows::process::CommandExt;

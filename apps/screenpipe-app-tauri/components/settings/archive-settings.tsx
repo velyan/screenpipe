@@ -296,7 +296,7 @@ export function ArchiveSettings() {
 
   const handleCheckout = async () => {
     if (!settings.user?.id) {
-      await commands.openLoginWindow();
+      await commands.openLoginWindow(null);
       return;
     }
     try {
