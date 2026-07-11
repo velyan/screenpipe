@@ -16,6 +16,11 @@
 //! `full_text` is intentionally NOT a key: it is the per-frame DETECTION
 //! source (and the primary search index), so it is always redacted — there
 //! is no coherent "redact everything else but leave the search text raw".
+//! `frames.text_json` (the per-word OCR boxes) is likewise NOT a key: it is a
+//! structured copy of the same on-screen text as `full_text`, so it is always
+//! scrubbed alongside it — leaving the raw OCR words while `full_text` is
+//! redacted is exactly the #4117 overlay leak (see the worker's derived-copy
+//! arms). The bounding-box geometry is preserved either way.
 
 use std::collections::HashSet;
 
@@ -35,6 +40,12 @@ pub mod keys {
     pub const UI_WINDOW_TITLE: &str = "ui_window_title";
     pub const UI_ELEMENT_NAME: &str = "ui_element_name";
     pub const UI_ELEMENT_DESCRIPTION: &str = "ui_element_description";
+    /// `ui_events.element_ancestors` — the clicked element's window-hierarchy
+    /// path, compact JSON `[{"role","name"},...]`. Hop names carry window
+    /// titles and content-mirroring group labels, so it defaults ON like
+    /// `ui_window_title`. Redacted JSON-aware (only the `name` values), never
+    /// as a flat string — see `process_ui_events`.
+    pub const UI_ELEMENT_ANCESTORS: &str = "ui_element_ancestors";
     pub const ELEMENT_TEXT: &str = "element_text";
     pub const ELEMENT_PROPERTIES: &str = "element_properties";
     /// The `url` string field inside `accessibility_tree_json` /
@@ -54,6 +65,7 @@ pub mod keys {
         UI_WINDOW_TITLE,
         UI_ELEMENT_NAME,
         UI_ELEMENT_DESCRIPTION,
+        UI_ELEMENT_ANCESTORS,
         ELEMENT_TEXT,
         ELEMENT_PROPERTIES,
         A11Y_URL_FIELD,
@@ -73,6 +85,10 @@ pub struct RedactColumns {
     pub ui_window_title: bool,
     pub ui_element_name: bool,
     pub ui_element_description: bool,
+    /// `ui_events.element_ancestors` (JSON hop names). ON by default —
+    /// ancestor names include window titles, which are redacted by default
+    /// everywhere else (`window_name`, `ui_window_title`).
+    pub ui_element_ancestors: bool,
     pub element_text: bool,
     pub element_properties: bool,
     /// The `url` field inside the a11y JSON copies (tree / properties).
@@ -110,6 +126,7 @@ impl Default for RedactColumns {
             ui_window_title: true,
             ui_element_name: false,
             ui_element_description: false,
+            ui_element_ancestors: true,
             element_text: true,
             element_properties: true,
             a11y_url_field: false,
@@ -148,6 +165,7 @@ impl RedactColumns {
             ui_window_title: has(keys::UI_WINDOW_TITLE),
             ui_element_name: has(keys::UI_ELEMENT_NAME),
             ui_element_description: has(keys::UI_ELEMENT_DESCRIPTION),
+            ui_element_ancestors: has(keys::UI_ELEMENT_ANCESTORS),
             element_text: has(keys::ELEMENT_TEXT),
             element_properties: has(keys::ELEMENT_PROPERTIES),
             a11y_url_field: has(keys::A11Y_URL_FIELD),
@@ -174,6 +192,7 @@ impl RedactColumns {
             keys::UI_WINDOW_TITLE => self.ui_window_title,
             keys::UI_ELEMENT_NAME => self.ui_element_name,
             keys::UI_ELEMENT_DESCRIPTION => self.ui_element_description,
+            keys::UI_ELEMENT_ANCESTORS => self.ui_element_ancestors,
             keys::ELEMENT_TEXT => self.element_text,
             keys::ELEMENT_PROPERTIES => self.element_properties,
             keys::A11Y_URL_FIELD => self.a11y_url_field,
@@ -199,6 +218,9 @@ impl RedactColumns {
         }
         if self.ui_element_description {
             cols.push("element_description");
+        }
+        if self.ui_element_ancestors {
+            cols.push("element_ancestors");
         }
         cols
     }

@@ -115,6 +115,16 @@ describe("provider error copy", () => {
     ).toContain("screenpipe cloud");
   });
 
+  it("turns raw context-window JSON into actionable chat copy", () => {
+    const raw = 'Codex error: {"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model."}}';
+    const msg = buildProviderErrorMessage(raw, { provider: "screenpipe-cloud", model: "auto" });
+
+    expect(msg).toContain("chat is too long");
+    expect(msg).toContain("Start a new chat");
+    expect(msg).not.toContain("context_length_exceeded");
+    expect(msg).not.toContain("invalid_request_error");
+  });
+
   it("does not regress ollama copy now that other providers are handled", () => {
     expect(
       buildProviderErrorMessage("Connection error.", { provider: "native-ollama", model: "gemma4:31b" })

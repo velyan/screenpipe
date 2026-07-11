@@ -59,6 +59,7 @@ mod livetext;
 #[cfg(target_os = "macos")]
 mod livetext_ffi;
 mod db_recovery_notifications;
+mod db_relaunch;
 mod meeting_export;
 mod meeting_live_notes;
 mod meeting_stall_notifications;
@@ -77,6 +78,7 @@ mod pi;
 mod pi_command_queue;
 mod pipe_suggestions_scheduler;
 mod power_awake;
+mod process_exit;
 mod recording;
 mod remote_sync_commands;
 mod secrets;
@@ -89,6 +91,8 @@ mod store;
 mod suggestions;
 mod sync;
 mod tray;
+#[cfg(target_os = "macos")]
+mod tray_monitor_preview;
 mod updates;
 mod voice_training;
 mod window;
@@ -172,6 +176,19 @@ fn get_e2e_seed_flags() -> Vec<String> {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+/// Returns true when SCREENPIPE_SKIP_ONBOARDING is set to a truthy value
+/// ("1", "true", "yes" — case-insensitive). Escape hatch for corp VDI,
+/// headless containers, MDM-preseeded deploys, and any environment where
+/// the interactive onboarding cannot complete (sandboxed WebView2, blocked
+/// egress, missing permissions dialog). When set, startup marks onboarding
+/// complete so the app lands on the main view.
+fn should_skip_onboarding() -> bool {
+    std::env::var("SCREENPIPE_SKIP_ONBOARDING")
+        .ok()
+        .map(|s| matches!(s.trim().to_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
 }
 
 use tokio::time::{sleep, Duration};
@@ -500,7 +517,7 @@ async fn main() {
         }
     }
 
-    // Check if telemetry is disabled via store setting (analyticsEnabled) or offline mode
+    // Check if telemetry is disabled via store setting (analyticsEnabled)
     let store_path = screenpipe_core::paths::default_screenpipe_data_dir().join("store.bin");
     let store_json = std::fs::read(&store_path).ok().and_then(|data| {
         if data.len() >= 8 && &data[..8] == b"SPSTORE1" {
@@ -658,8 +675,6 @@ async fn main() {
         // Obj-C (e.g. tao::send_event), we get panic_cannot_unwind and lose the real message.
         eprintln!("PANIC: {}", info);
 
-        let thread = std::thread::current();
-        let thread_name = thread.name().unwrap_or("<unnamed>");
         let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
             s.to_string()
         } else if let Some(s) = info.payload().downcast_ref::<String>() {
@@ -672,22 +687,15 @@ async fn main() {
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_default();
 
-        // Suppress "tokio context being shutdown" panics from background
-        // tasks (redact workers, etc.) — these fire when a task is mid-
-        // sqlx/timer poll at the moment the runtime tears down on app
-        // quit. ServerCore::shutdown signals workers to exit cleanly, but
-        // a residual race is possible if the worker is inside an await
-        // that doesn't include the shutdown future. Either way, this is
-        // orderly-shutdown noise — not a crash — and logging it to
-        // last-panic.log + Sentry makes the app look unstable to users
-        // and skews crash-rate dashboards.
-        if payload.contains("Tokio 1.x context was found, but it is being shutdown") {
+        if crate::process_exit::is_orderly_shutdown_panic(&payload) {
             eprintln!(
-                "(suppressed tokio shutdown-time panic on thread '{}' at {})",
-                thread_name, location
+                "(suppressed orderly-shutdown panic at {}: {})",
+                location, payload
             );
             return;
         }
+
+        let thread_name = crate::process_exit::panic_thread_label();
 
         // Force-capture a backtrace before abort() kills us
         let backtrace = std::backtrace::Backtrace::force_capture();
@@ -997,7 +1005,11 @@ async fn main() {
                         .separator();
                 }
                 let app_submenu = app_submenu_builder
-                    .item(&PredefinedMenuItem::quit(app, Some("Quit screenpipe"))?)
+                    .item(
+                        &MenuItemBuilder::with_id("quit_app", "Quit screenpipe")
+                            .accelerator("CmdOrCtrl+Q")
+                            .build(app)?,
+                    )
                     .build()?;
 
                 let edit_submenu = SubmenuBuilder::new(app, "Edit")
@@ -1033,6 +1045,9 @@ async fn main() {
                                     tracing::error!("menu: check for updates failed: {}", e);
                                 }
                             });
+                        }
+                        "quit_app" => {
+                            process_exit::request_app_quit(app_handle.clone());
                         }
                         _ => {}
                     }
@@ -1218,6 +1233,11 @@ async fn main() {
             // sidecar inherits this env).
             std::env::set_var("SCREENPIPE_DATA_DIR", &data_dir);
 
+            // Enterprise builds can identify org/device health in Sentry and
+            // PostHog without sending the raw license key. No-op on consumer
+            // builds; explicit MDM/support env vars still win when provided.
+            enterprise_sync::configure_telemetry_context(&app_handle);
+
             if data_dir_fell_back {
                 let app_handle_fb = app_handle.clone();
                 tauri::async_runtime::spawn(async move {
@@ -1278,7 +1298,7 @@ async fn main() {
             app.manage(sync::SyncState::default());
 
             // Initialize onboarding store
-            let onboarding_store = store::init_onboarding_store(&app.handle()).unwrap_or_else(|e| {
+            let mut onboarding_store = store::init_onboarding_store(&app.handle()).unwrap_or_else(|e| {
                 error!("Failed to init onboarding store, using defaults: {}", e);
                 store::OnboardingStore::default()
             });
@@ -1291,6 +1311,20 @@ async fn main() {
                     error!("E2E seed: failed to complete onboarding: {}", e);
                 } else {
                     info!("E2E seed: onboarding marked complete");
+                }
+            }
+
+            // Escape hatch: SCREENPIPE_SKIP_ONBOARDING=1 marks onboarding complete
+            // at startup so corp/VDI/headless environments (where the interactive
+            // flow can't run) land at the main view. Persists to store so downstream
+            // consumers (show.rs re-reads from disk) see the same state.
+            if should_skip_onboarding() && !onboarding_store.is_completed {
+                match store::OnboardingStore::update(&app.handle(), |o| o.complete()) {
+                    Ok(_) => {
+                        info!("SCREENPIPE_SKIP_ONBOARDING: onboarding marked complete");
+                        onboarding_store.is_completed = true;
+                    }
+                    Err(e) => error!("SCREENPIPE_SKIP_ONBOARDING: failed to complete onboarding: {}", e),
                 }
             }
 
@@ -1315,6 +1349,12 @@ async fn main() {
                     // Determine which whisper model the user's config needs
                     let engine = match store_for_download.recording.audio_transcription_engine.as_str() {
                         "deepgram" | "screenpipe-cloud" => None, // Cloud engines don't need local model
+                        // Non-whisper local engines (parakeet MLX, qwen3) download their own
+                        // models at load time — don't fetch the 834MB whisper file for them.
+                        // If the user later switches to a whisper engine, TranscriptionEngine::new
+                        // downloads it in the background ("will retry at server start").
+                        "disabled" | "parakeet" | "parakeet-tdt-0.6b-v2" | "parakeet-mlx"
+                        | "qwen3-asr" => None,
                         _ => {
                             use screenpipe_audio::core::engine::AudioTranscriptionEngine;
                             Some(std::sync::Arc::new(match store_for_download.recording.audio_transcription_engine.as_str() {
@@ -1348,7 +1388,13 @@ async fn main() {
                             }
                         },
                         async {
-                            match screenpipe_audio::speaker::models::get_or_download_model(
+                            // File-only fetch — NOT get_or_download_model, which also builds
+                            // an ORT session. That session would be immediately discarded here
+                            // and would compete for CPU with the real session build that
+                            // SegmentationManager does moments later for the same file (root
+                            // cause of the "ort session init: timed out after 30s" boot warning
+                            // observed on the macos-15-intel CI runner).
+                            match screenpipe_audio::speaker::models::ensure_model_file(
                                 screenpipe_audio::speaker::models::PyannoteModel::Segmentation
                             ).await {
                                 Ok(p) => info!("segmentation model pre-download complete: {:?}", p),
@@ -1356,7 +1402,7 @@ async fn main() {
                             }
                         },
                         async {
-                            match screenpipe_audio::speaker::models::get_or_download_model(
+                            match screenpipe_audio::speaker::models::ensure_model_file(
                                 screenpipe_audio::speaker::models::PyannoteModel::Embedding
                             ).await {
                                 Ok(p) => info!("embedding model pre-download complete: {:?}", p),
@@ -1930,7 +1976,7 @@ async fn main() {
             // telemetry builds with SCREENPIPE_ENTERPRISE_LICENSE_KEY env set.
             let _enterprise_shutdown_tx = enterprise_sync::spawn(&app_handle);
 
-            // Auto-start cloud sync if it was enabled
+            // Disable removed Storage cloud backends if old settings enabled them.
             let app_handle_clone = app_handle.clone();
             let sync_state = app_handle.state::<sync::SyncState>();
             let sync_state_clone = sync::SyncState {
@@ -1947,7 +1993,7 @@ async fn main() {
                 sync::auto_start_sync(&app_handle_clone, &sync_state_clone).await;
             });
 
-            // Auto-start cloud archive if it was enabled (after sync so it can reuse sync manager)
+            // Disable removed Storage archive backend if old settings enabled it.
             let app_handle_clone = app_handle.clone();
             tauri::async_runtime::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
@@ -1999,12 +2045,11 @@ async fn main() {
                         }
                     });
                 }
-                tauri::RunEvent::ExitRequested { api, .. } => {
-                    // When the user clicks "quit screenpipe" in the tray menu,
-                    // QUIT_REQUESTED is set to true — let the exit proceed.
-                    // Otherwise, prevent auto-exit so the app stays alive in the
-                    // tray when all windows are closed / destroyed.
-                    if tray::QUIT_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+                tauri::RunEvent::ExitRequested { code, api, .. } => {
+                    if code == Some(tauri::RESTART_EXIT_CODE) {
+                        process_exit::PENDING_RESTART.store(true, std::sync::atomic::Ordering::SeqCst);
+                        info!("ExitRequested event — app restart, allowing exit");
+                    } else if process_exit::QUIT_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
                         info!("ExitRequested event — quit was requested, allowing exit");
                     } else {
                         info!("ExitRequested event — preventing (app stays in tray)");
@@ -2015,7 +2060,7 @@ async fn main() {
                 tauri::RunEvent::Exit => {
                     info!("App exiting — running cleanup");
 
-                    // Send app closed analytics
+                    // Best-effort analytics; do not block _exit on network.
                     let app_handle_v2 = app_handle.app_handle().clone();
                     tauri::async_runtime::spawn(async move {
                         if let Some(analytics) = app_handle_v2.try_state::<Arc<AnalyticsManager>>()
@@ -2031,37 +2076,14 @@ async fn main() {
                         }
                     });
 
-                    // Shut down embedded server (incl. audio manager / ggml Metal cleanup)
-                    // MUST happen synchronously before exit() runs C++ static destructors,
-                    // otherwise the ggml Metal device destructor hits a freed resource → SIGABRT.
-                    //
-                    // Run on a dedicated thread to avoid "Cannot start a runtime from within
-                    // a runtime" panic when the Exit event fires from a tokio async context.
-                    let app_handle_shutdown = app_handle.app_handle().clone();
-                    let _ = std::thread::spawn(move || {
-                        tauri::async_runtime::block_on(async move {
-                            if let Some(recording_state) =
-                                app_handle_shutdown.try_state::<recording::RecordingState>()
-                            {
-                                // Stop capture first (self-contained), then server
-                                if let Some(session) = recording_state.capture.lock().await.take() {
-                                    session.stop().await;
-                                }
-                                if let Some(server) = recording_state.server.lock().await.take() {
-                                    server.shutdown().await;
-                                }
-                            }
-                        })
-                    })
-                    .join();
+                    process_exit::run_blocking_pre_exit_teardown(app_handle.app_handle().clone());
 
-                    // Cleanup Pi sidecar
-                    let app_handle_pi = app_handle.app_handle().clone();
-                    tauri::async_runtime::spawn(async move {
-                        if let Some(pi_state) = app_handle_pi.try_state::<pi::PiState>() {
-                            pi::cleanup_pi(&pi_state).await;
-                        }
-                    });
+                    if process_exit::PENDING_RESTART.load(std::sync::atomic::Ordering::SeqCst) {
+                        info!("Restart pending — spawning replacement and force-exiting");
+                        process_exit::force_app_relaunch(app_handle.app_handle().clone(), 0);
+                    }
+
+                    process_exit::force_process_exit(0);
                 }
 
                 tauri::RunEvent::WindowEvent {

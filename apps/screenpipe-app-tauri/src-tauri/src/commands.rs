@@ -3623,7 +3623,12 @@ pub async fn rollback_to_version(
     crate::updates::install_specific_version(&app_handle, &version).await?;
 
     info!("rollback: v{} installed, restarting", version);
-    app_handle.restart();
+    crate::process_exit::request_app_relaunch(
+        app_handle,
+        "rollback restart",
+        std::time::Duration::from_millis(250),
+    );
+    Ok(())
 }
 
 /// Perform OCR on a base64-encoded PNG image crop, using the user's configured OCR engine.

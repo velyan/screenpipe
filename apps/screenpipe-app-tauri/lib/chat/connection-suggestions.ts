@@ -17,7 +17,13 @@ export type ConnectedIntegration = {
   description?: string;
 };
 
-export type ConnectionListItem = ConnectedIntegration & { connected: boolean };
+export type ConnectionListItem = ConnectedIntegration & {
+  connected: boolean;
+  mcp?: boolean;
+  mcp_server_id?: string;
+  is_oauth?: boolean;
+  supports_oauth_instances?: boolean;
+};
 export type ActivityAppItem = { name: string; count: number; app_name?: string };
 
 export function normalizeConnectionForPlatform<T extends ConnectedIntegration>(connection: T, isWindows: boolean): T {
@@ -349,6 +355,6 @@ export function buildConnectionSetupSuggestions(
       a.fallbackRank - b.fallbackRank ||
       a.suggestion.title.localeCompare(b.suggestion.title)
     )
-    .slice(0, 2)
+    .slice(0, 3)
     .map((entry) => entry.suggestion);
 }

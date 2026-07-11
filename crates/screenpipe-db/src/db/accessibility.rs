@@ -290,7 +290,7 @@ impl DatabaseManager {
                 app_name, app_pid, window_title, browser_url,
                 element_role, element_name, element_value,
                 element_description, element_automation_id, element_bounds,
-                frame_id
+                element_ancestors, frame_id
             FROM ui_events
             WHERE {}
                 AND (? IS NULL OR timestamp >= ?)
@@ -434,6 +434,7 @@ impl DatabaseManager {
             element_description: event.element_description.clone(),
             element_automation_id: event.element_automation_id.clone(),
             element_bounds: event.element_bounds.clone(),
+            element_ancestors: event.element_ancestors.clone(),
             frame_id: event.frame_id,
         }
     }

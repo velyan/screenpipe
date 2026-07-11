@@ -7,6 +7,9 @@ import { commands } from "@/lib/utils/tauri";
 import { localFetch } from "@/lib/api";
 import { showChatWithPrefill } from "@/lib/chat-utils";
 
+const GENERIC_DEEPLINK_MOUNT_DELAY_MS = 150;
+const MEETING_DEEPLINK_RETRY_DELAYS_MS = [0, 250, 750, 1500] as const;
+
 // A single action attached to a notification. Carried both by the transient
 // notification panel (toast) and — once persisted — by the notification
 // center (bell), so an action the user misses in the toast can still be taken
@@ -51,11 +54,76 @@ export interface NotificationAction {
 
 // Route a screenpipe:// deeplink to the window that can handle it. Meeting
 // deeplinks belong to the Home window's meetings page; everything else to Main.
-export function windowForDeeplink(url: string) {
+export function isMeetingDeeplink(url: string) {
   return url.startsWith("screenpipe://meeting/") ||
-    url.startsWith("screenpipe://meeting?")
+    url.startsWith("screenpipe://meeting?");
+}
+
+export function parseMeetingDeeplink(url: string): {
+  meetingId: number;
+  transcript: boolean;
+} | null {
+  if (!isMeetingDeeplink(url)) return null;
+  try {
+    const parsedUrl = new URL(url);
+    const pathId =
+      parsedUrl.host === "meeting"
+        ? parsedUrl.pathname.replace(/^\/+/, "").split("/")[0]
+        : parsedUrl.pathname.replace(/^\/meeting\/?/, "").split("/")[0];
+    const meetingId = Number(parsedUrl.searchParams.get("id") || pathId);
+    if (!Number.isFinite(meetingId)) return null;
+    return {
+      meetingId,
+      transcript: parsedUrl.searchParams.get("live") !== "0",
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function windowForDeeplink(url: string) {
+  return isMeetingDeeplink(url)
     ? { Home: { page: "meetings" } }
     : "Main";
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export async function routeNotificationDeeplink(
+  url: string,
+  deps: {
+    showWindowActivated?: typeof commands.showWindowActivated;
+    emitEvent?: typeof emit;
+    sleepMs?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<void> {
+  const showWindowActivated =
+    deps.showWindowActivated ?? commands.showWindowActivated;
+  const emitEvent = deps.emitEvent ?? emit;
+  const sleepMs = deps.sleepMs ?? sleep;
+
+  await showWindowActivated(windowForDeeplink(url));
+
+  const meetingRoute = parseMeetingDeeplink(url);
+  if (meetingRoute) {
+    const payload = {
+      meetingId: meetingRoute.meetingId,
+      transcript: meetingRoute.transcript,
+    };
+    for (const delayMs of MEETING_DEEPLINK_RETRY_DELAYS_MS) {
+      if (delayMs > 0) {
+        await sleepMs(delayMs);
+      }
+      await emitEvent("navigate", { url: "/home?section=meetings" });
+      await emitEvent("open-meeting-note", payload);
+    }
+    return;
+  }
+
+  await sleepMs(GENERIC_DEEPLINK_MOUNT_DELAY_MS);
+  await emitEvent("deep-link-received", url);
 }
 
 export interface ExecuteActionContext {
@@ -159,9 +227,7 @@ export async function executeNotificationAction(
           typeof noteUrl === "string" &&
           noteUrl.startsWith("screenpipe://")
         ) {
-          await commands.showWindowActivated(windowForDeeplink(noteUrl));
-          await new Promise((r) => setTimeout(r, 150));
-          await emit("deep-link-received", noteUrl);
+          await routeNotificationDeeplink(noteUrl);
         }
         if (!res.ok) {
           let detail = "";
@@ -179,15 +245,7 @@ export async function executeNotificationAction(
     case "deeplink": {
       if (action.url) {
         if (action.url.startsWith("screenpipe://")) {
-          // Show the Main window FIRST — its DeeplinkHandler only routes events
-          // once mounted, and on macOS the window won't actually come to the
-          // foreground unless we activate the app (see show_window_activated for
-          // the rationale). Then give React ~150ms to mount the listener before
-          // emitting. Without this ordering, the emit fires into a handler that
-          // hasn't subscribed yet and the click silently does nothing.
-          await commands.showWindowActivated(windowForDeeplink(action.url));
-          await new Promise((r) => setTimeout(r, 150));
-          await emit("deep-link-received", action.url);
+          await routeNotificationDeeplink(action.url);
         } else {
           // External URL — open in system browser.
           const { open } = await import("@tauri-apps/plugin-shell");
@@ -203,9 +261,7 @@ export async function executeNotificationAction(
       }
       const deeplink = action.deeplink_url || action.deeplinkUrl;
       if (typeof deeplink === "string" && deeplink.startsWith("screenpipe://")) {
-        await commands.showWindowActivated(windowForDeeplink(deeplink));
-        await new Promise((r) => setTimeout(r, 150));
-        await emit("deep-link-received", deeplink);
+        await routeNotificationDeeplink(deeplink);
       }
       break;
     }
@@ -219,9 +275,7 @@ export async function executeNotificationAction(
         ctx.sourceUrl;
       if (sourceUrl) {
         if (sourceUrl.startsWith("screenpipe://")) {
-          await commands.showWindowActivated(windowForDeeplink(sourceUrl));
-          await new Promise((r) => setTimeout(r, 150));
-          await emit("deep-link-received", sourceUrl);
+          await routeNotificationDeeplink(sourceUrl);
         } else {
           const { open } = await import("@tauri-apps/plugin-shell");
           await open(sourceUrl);

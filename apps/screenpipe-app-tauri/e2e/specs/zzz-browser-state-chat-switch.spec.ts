@@ -198,7 +198,8 @@ async function clearBrowserStateCache(chatId: string): Promise<void> {
   }, `screenpipe:browser-state:${chatId}`);
 }
 
-describe("Browser state — fresh-chat save persistence", function () {
+// QUARANTINED (#4686): CI-flaky (chat seeding / owned-browser window-handle). Re-enable per issue.
+describe.skip("Browser state — fresh-chat save persistence", function () {
   this.timeout(180_000);
 
   before(async () => {

@@ -698,12 +698,26 @@ pub fn start_sleep_monitor() {
 mod tests {
     use super::*;
 
-    static GLOBAL_FLAG_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// `RECENTLY_WOKE` / `RECENTLY_WOKE_SEQ` are process-global, and
+    /// `mark_recently_woke` arms them with a 30s-delayed clear thread. Tests
+    /// that touch them must hold this lock so they can't interleave under the
+    /// parallel test runner.
+    static RECENTLY_WOKE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Neutralize any pending delayed clear (by bumping the seq) and reset the
+    /// flag, giving the caller a clean baseline regardless of what earlier
+    /// tests left behind.
+    fn reset_recently_woke() {
+        RECENTLY_WOKE_SEQ.fetch_add(1, Ordering::SeqCst);
+        RECENTLY_WOKE.store(false, Ordering::SeqCst);
+    }
 
     #[test]
     fn test_recently_woke_flag() {
-        let _guard = GLOBAL_FLAG_TEST_LOCK.lock().unwrap();
-        RECENTLY_WOKE.store(false, Ordering::SeqCst);
+        let _guard = RECENTLY_WOKE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset_recently_woke();
         assert!(!recently_woke_from_sleep());
         RECENTLY_WOKE.store(true, Ordering::SeqCst);
         assert!(recently_woke_from_sleep());
@@ -713,7 +727,15 @@ mod tests {
 
     #[test]
     fn test_screen_is_locked_flag() {
-        let _guard = GLOBAL_FLAG_TEST_LOCK.lock().unwrap();
+        // SCREEN_IS_LOCKED is process-global and the capture path mirrors the
+        // REAL machine lock state into it (event_driven_capture stores true
+        // when it resolves loginwindow as the frontmost app). Running the
+        // suite while the screen is actually locked leaves it armed — reset
+        // for a hermetic baseline.
+        let _guard = RECENTLY_WOKE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        SCREEN_IS_LOCKED.store(false, Ordering::SeqCst);
         assert!(!screen_is_locked());
         SCREEN_IS_LOCKED.store(true, Ordering::SeqCst);
         assert!(screen_is_locked());
@@ -817,11 +839,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn test_on_did_wake_sets_audio_invalidation() {
-        let _guard = GLOBAL_FLAG_TEST_LOCK.lock().unwrap();
+        let _guard = RECENTLY_WOKE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Clear stale flags
         let _ = screenpipe_audio::stream_invalidation::take();
         let _ = screenpipe_screen::stream_invalidation::take();
-        RECENTLY_WOKE.store(false, Ordering::SeqCst);
+        reset_recently_woke();
 
         let handle = tokio::runtime::Handle::current();
         on_did_wake(&handle);
@@ -843,6 +867,10 @@ mod tests {
             !screenpipe_audio::stream_invalidation::take(),
             "Audio flag should be cleared after take()"
         );
+
+        // Don't leak the armed flag (and its pending 30s clear thread) to
+        // whatever test runs next.
+        reset_recently_woke();
     }
 
     /// A screen-unlock transition must arm the permission-monitor wake grace,

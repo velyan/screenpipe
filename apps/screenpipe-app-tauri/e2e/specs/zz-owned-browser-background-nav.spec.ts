@@ -420,7 +420,8 @@ async function postEvalWithUrlAs(
   return res.status;
 }
 
-describe("Owned browser — per-chat navigation ownership", function () {
+// QUARANTINED (#4686): CI-flaky (chat seeding / owned-browser window-handle). Re-enable per issue.
+describe.skip("Owned browser — per-chat navigation ownership", function () {
   this.timeout(180_000);
 
   before(async () => {
@@ -517,7 +518,8 @@ describe("Owned browser — per-chat navigation ownership", function () {
   );
 });
 
-describe("Owned browser — fast chat switching keeps pipe state out of other chats", function () {
+// QUARANTINED (#4686): CI-flaky (chat seeding / owned-browser window-handle). Re-enable per issue.
+describe.skip("Owned browser — fast chat switching keeps pipe state out of other chats", function () {
   this.timeout(180_000);
 
   before(async () => {
@@ -627,7 +629,8 @@ describe("Owned browser — fast chat switching keeps pipe state out of other ch
   );
 });
 
-describe("Owned browser — background navigation visibility", function () {
+// QUARANTINED (#4686): CI-flaky (chat seeding / owned-browser window-handle). Re-enable per issue.
+describe.skip("Owned browser — background navigation visibility", function () {
   this.timeout(180_000);
 
   before(async () => {

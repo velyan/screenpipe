@@ -69,6 +69,17 @@ pub struct ScheduleRule {
     pub record_mode: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(rename_all = "camelCase")]
+pub enum AecMode {
+    #[default]
+    Off,
+    Screenpipe,
+    Macos,
+    Windows,
+}
+
 /// The single source of truth for recording/capture configuration.
 ///
 /// Used by:
@@ -150,6 +161,23 @@ pub struct RecordingSettings {
     )]
     pub experimental_coreaudio_system_audio: bool,
 
+    /// Beta ("Smart recording" in the app): during detected meetings, capture
+    /// the meeting app's own audio via a per-process tap plus the microphone
+    /// that app actually has open (instead of the global mix + assumed-default
+    /// mic). Default `false`. Takes precedence over everything: it engages in
+    /// ANY `audio_capture_mode` (continuous or meetings-only) and displaces
+    /// the configured devices for the meeting's duration. Requires macOS 14.4+
+    /// or Windows, plus the meeting detector (with `disable_meeting_detector`
+    /// no meeting is ever observed, so this flag is inert); when the platform
+    /// can't do it or the tap fails at runtime, capture automatically falls
+    /// back to the stable path (default mic + global system audio) — never
+    /// less capture than with the flag off.
+    #[serde(
+        rename = "experimentalMeetingPiggyback",
+        default = "default_experimental_meeting_piggyback"
+    )]
+    pub experimental_meeting_piggyback: bool,
+
     /// Experimental: request Windows WASAPI microphone Acoustic Echo Cancellation.
     /// Ignored on non-Windows platforms and fail-open when unsupported by device/driver.
     #[serde(rename = "windowsInputAecEnabled", default)]
@@ -159,6 +187,14 @@ pub struct RecordingSettings {
     /// Ignored on non-macOS platforms. Only the system default input uses VPIO; other devices use HAL.
     #[serde(rename = "macosInputVpioEnabled", default)]
     pub macos_input_vpio_enabled: bool,
+
+    /// Request Screenpipe's software Acoustic Echo Cancellation (via sonora WebRTC AEC3).
+    #[serde(rename = "screenpipeAecEnabled", default)]
+    pub screenpipe_aec_enabled: bool,
+
+    /// Durable AEC engine choice. Missing values default to off so AEC remains opt-in.
+    #[serde(rename = "aecMode", default)]
+    pub aec_mode: AecMode,
 
     /// Duration of each audio chunk in seconds before transcription.
     /// Stored as i32 to match existing store.bin schema (cast to u64 by engine).
@@ -187,9 +223,18 @@ pub struct RecordingSettings {
     pub vocabulary: Vec<VocabEntry>,
 
     // ── Vision ─────────────────────────────────────────────────────────
-    /// Disable all screen capture.
+    /// Disable the entire vision pipeline (screen images + accessibility/OCR).
+    /// Prefer `disableScreenshots` when the goal is to stop image capture while
+    /// keeping accessibility text and UI events.
     #[serde(rename = "disableVision")]
     pub disable_vision: bool,
+
+    /// Stop taking screenshot images while keeping accessibility-tree capture.
+    /// This skips visual-diff screenshots, full screenshot capture, JPEG writes,
+    /// and OCR fallback. Useful for enterprise task mining where a11y text and
+    /// UI events are enough and screen pixels are too expensive or sensitive.
+    #[serde(rename = "disableScreenshots", default)]
+    pub disable_screenshots: bool,
 
     /// Disable the timeline / rewind feature. When true, the engine skips
     /// timeline-only work: warming the hot frame cache from the DB at startup
@@ -628,6 +673,16 @@ impl RecordingSettings {
             .map(str::trim)
             .filter(|name| !name.is_empty())
     }
+
+    /// Returns effective AEC booleans as `(screenpipe, windows, macos)`.
+    pub fn effective_aec_flags(&self) -> (bool, bool, bool) {
+        match self.aec_mode {
+            AecMode::Off => (false, false, false),
+            AecMode::Screenpipe => (true, false, false),
+            AecMode::Windows => (false, true, false),
+            AecMode::Macos => (false, false, true),
+        }
+    }
 }
 
 impl Default for RecordingSettings {
@@ -643,14 +698,18 @@ impl Default for RecordingSettings {
             audio_devices: vec![],
             use_system_default_audio: true,
             experimental_coreaudio_system_audio: false,
+            experimental_meeting_piggyback: false,
             windows_input_aec_enabled: false,
             macos_input_vpio_enabled: false,
+            screenpipe_aec_enabled: false,
+            aec_mode: AecMode::Off,
             audio_chunk_duration: 30,
             deepgram_api_key: String::new(),
             filter_music: false,
             batch_max_duration_secs: None,
             vocabulary: vec![],
             disable_vision: false,
+            disable_screenshots: false,
             disable_timeline: false,
             monitor_ids: vec![],
             use_all_monitors: true,
@@ -736,6 +795,13 @@ fn default_experimental_coreaudio_system_audio() -> bool {
     false
 }
 
+/// Default OFF. The per-process tap must prove itself in the field behind this
+/// opt-in before it becomes the default capture choice (rollout decision
+/// 2026-07-01). Flip deliberately, in its own PR, with TESTING.md updated.
+fn default_experimental_meeting_piggyback() -> bool {
+    false
+}
+
 fn default_max_snapshot_width() -> u32 {
     1920
 }
@@ -775,6 +841,7 @@ fn default_pii_redaction_columns() -> Vec<String> {
         "ui_text_content",
         "ui_element_value",
         "ui_window_title",
+        "ui_element_ancestors",
         "element_text",
         "element_properties",
     ]
@@ -811,6 +878,56 @@ mod tests {
         assert_eq!(settings.video_quality, "balanced");
         assert!(settings.use_system_default_audio);
         assert!(settings.ignore_incognito_windows);
+        assert!(!settings.screenpipe_aec_enabled);
+        assert!(!settings.windows_input_aec_enabled);
+        assert!(!settings.macos_input_vpio_enabled);
+        assert_eq!(settings.aec_mode, AecMode::Off);
+        assert_eq!(settings.effective_aec_flags(), (false, false, false));
+    }
+
+    #[test]
+    fn missing_aec_mode_keeps_aec_off() {
+        let settings: RecordingSettings = serde_json::from_str(
+            r#"{
+                "screenpipeAecEnabled": false,
+                "windowsInputAecEnabled": true,
+                "macosInputVpioEnabled": true
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(settings.aec_mode, AecMode::Off);
+        assert_eq!(settings.effective_aec_flags(), (false, false, false));
+    }
+
+    #[test]
+    fn explicit_screenpipe_aec_mode_enables_software_aec() {
+        let settings: RecordingSettings = serde_json::from_str(
+            r#"{
+                "aecMode": "screenpipe",
+                "screenpipeAecEnabled": false,
+                "windowsInputAecEnabled": true,
+                "macosInputVpioEnabled": true
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(settings.effective_aec_flags(), (true, false, false));
+    }
+
+    #[test]
+    fn explicit_aec_mode_wins_over_legacy_flags() {
+        let settings: RecordingSettings = serde_json::from_str(
+            r#"{
+                "aecMode": "windows",
+                "screenpipeAecEnabled": true,
+                "windowsInputAecEnabled": false,
+                "macosInputVpioEnabled": true
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(settings.effective_aec_flags(), (false, true, false));
     }
 
     #[test]
@@ -846,6 +963,15 @@ mod tests {
     }
 
     #[test]
+    fn meeting_piggyback_defaults_off() {
+        let config = RecordingSettings::default();
+        assert!(!config.experimental_meeting_piggyback);
+        // Posture guard: promotion to default-on must be a deliberate flip of
+        // default_experimental_meeting_piggyback, reviewed on its own.
+        assert!(!default_experimental_meeting_piggyback());
+    }
+
+    #[test]
     fn deserializes_real_store_bin_shape() {
         // Simulates the JSON shape of a real existing store.bin file.
         // All recording-related fields as they exist today in SettingsStore.
@@ -859,6 +985,7 @@ mod tests {
             "vadSensitivity": "high",
             "filterMusic": false,
             "disableVision": false,
+            "disableScreenshots": false,
             "monitorIds": [],
             "useAllMonitors": true,
             "fps": 0.5,

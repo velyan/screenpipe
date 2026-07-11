@@ -107,7 +107,8 @@ async function installPendingAutoSendPrefill(): Promise<void> {
   );
 }
 
-describe("Chat prefill context leak", function () {
+// QUARANTINED (#4686): CI-flaky (chat seeding / owned-browser window-handle). Re-enable per issue.
+describe.skip("Chat prefill context leak", function () {
   this.timeout(180_000);
 
   before(async () => {

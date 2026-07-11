@@ -19,7 +19,7 @@ oasgen = { workspace = true }
 
 # Cross-platform audio capture. Tracks screenpipe/cpal main, which carries
 # the Windows WASAPI AEC and macOS VoiceProcessingIO patches.
-cpal = { git = "https://github.com/screenpipe/cpal.git", rev = "c7a610aee5c6037c9c69dc5bf7f2a850da8d8b12" }
+cpal = { git = "https://github.com/screenpipe/cpal.git", rev = "e7edfa174466e87a467d1a58e3a4aec233ff8a21" }
 
 # Wav encoding
 hound = { workspace = true }
@@ -57,6 +57,7 @@ tokio = { workspace = true }
 
 # Detect speech/silence
 webrtc-vad = "0.4.0"
+sonora = { git = "https://github.com/dignifiedquire/sonora.git", rev = "70c673606e1db8442a8ba20659b2bc7355555274" }
 
 # Deepgram
 reqwest = { workspace = true }
@@ -100,13 +101,21 @@ ort = { workspace = true, features = ["download-binaries", "tls-native"] }
 # MS Teams/Zoom route audio to the eCommunications endpoint, which may
 # differ from the multimedia/console default that cpal returns.
 [target.'cfg(target_os = "windows")'.dependencies]
+windows-core = "0.58"
 windows = { workspace = true, features = [
+    "implement",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",
+    "Win32_Security",
     "Win32_System_Com",
     "Win32_System_Threading",
     "Win32_Devices_FunctionDiscovery",
     "Win32_UI_Shell_PropertiesSystem",
+    # meeting_processes.rs WASAPI input-audio sensor: process resolution
+    # (OpenProcess/QueryFullProcessImageNameW + CloseHandle/HRESULT codes) and
+    # RDP-session detection (GetSystemMetrics/SM_REMOTESESSION).
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 # Bundle ONNX Runtime at build time on Windows x86_64 (same as Linux/macOS-arm64).
@@ -128,7 +137,7 @@ libsamplerate-sys = { workspace = true }
 # so the `download-binaries` strategy that comes in transitively is overridden by
 # ORT_STRATEGY=system).
 [target.'cfg(all(target_os = "windows", target_arch = "aarch64"))'.dependencies]
-ort = { workspace = true, default-features = false, features = ["api-24", "tracing"] }
+ort = { workspace = true, default-features = false, features = ["api-24"] }
 ort-sys = { workspace = true }
 samplerate = { workspace = true }
 libsamplerate-sys = { workspace = true }
@@ -156,6 +165,8 @@ criterion = { workspace = true }
 strsim = { workspace = true }
 futures = { workspace = true }
 tracing-subscriber = { workspace = true }
+# macOS autorelease-leak repro test reads peak RSS via getrusage.
+libc = { workspace = true }
 
 
 [features]
@@ -172,6 +183,17 @@ parakeet-mlx = ["dep:audiopipe", "audiopipe?/parakeet-mlx", "dep:mlx-rs"]
 [[example]]
 name = "screenpipe-audio"
 path = "examples/screenpipe-audio.rs"
+
+# Live probes for the experimental meeting capture (macOS-only; gated in source
+# so --all-targets still compiles a stub on other platforms). tap = far-end
+# (system/output), input = near-end (mic).
+[[example]]
+name = "meeting_tap_probe"
+path = "examples/meeting_tap_probe.rs"
+
+[[example]]
+name = "meeting_input_probe"
+path = "examples/meeting_input_probe.rs"
 
 # These benchmark/eval examples use the optional `audiopipe` crate (linked only
 # by the `parakeet` / `qwen3-asr` features). Without a `required-features` guard,

@@ -56,6 +56,7 @@ const saveCalls: Array<{
   browserState?: any;
   lastUserMessageAt?: number;
   lastViewedAt?: number;
+  presetId?: string;
 }> = [];
 
 vi.mock("@/lib/chat-storage", () => ({
@@ -66,6 +67,7 @@ vi.mock("@/lib/chat-storage", () => ({
       browserState: conv.browserState,
       lastUserMessageAt: conv.lastUserMessageAt,
       lastViewedAt: conv.lastViewedAt,
+      presetId: conv.presetId,
     });
   }),
   loadConversationFile: vi.fn(async () => null),
@@ -108,6 +110,8 @@ function useHarness(args: {
   initialMessages: any[];
   initialConversationId: string | null;
   initialPiSessionId: string;
+  selectedPreset?: any;
+  selectedPresetRef?: any;
 }) {
   const messagesRef = useRef(args.initialMessages);
   const conversationIdRef = useRef<string | null>(args.initialConversationId);
@@ -141,6 +145,8 @@ function useHarness(args: {
     setPastedImages: vi.fn() as any,
     settings: { chatHistory: { historyEnabled: true } },
     inlineHistoryEnabled: false,
+    selectedPreset: args.selectedPreset ?? null,
+    selectedPresetRef: args.selectedPresetRef,
   });
 
   return { hook, messagesRef, conversationIdRef, piSessionIdRef };
@@ -217,6 +223,51 @@ describe("saveConversation race (PR #3600 / issue #3636 candidate)", () => {
 
     expect(saveCalls).toHaveLength(1);
     expect(saveCalls[0].id).toBe("fresh-sid");
+  });
+
+  it("NO PHANTOM ID: falls back to store.currentId when conversationId and ref are both empty (#4719)", async () => {
+    // Deepest null-id window: conversationId is null AND the ref hasn't been
+    // reseeded yet. The save must adopt the last stable id the panel
+    // published to the store — NOT mint a fresh uuid twin.
+    useChatStore.setState({ currentId: "store-current-id" });
+    const messages = [{ id: "u1", role: "user" as const, content: "hi", timestamp: 1 }];
+
+    const { result } = renderHook(() =>
+      useHarness({
+        initialMessages: messages,
+        initialConversationId: null,
+        initialPiSessionId: "", // ref transiently empty
+      }),
+    );
+
+    await act(async () => {
+      await result.current.hook.saveConversation(messages);
+    });
+
+    expect(saveCalls).toHaveLength(1);
+    expect(saveCalls[0].id).toBe("store-current-id");
+  });
+
+  it("NO PHANTOM ID: skips the save entirely when no stable id exists (#4719)", async () => {
+    // conversationId null, ref empty, store.currentId null → there is no
+    // stable id to write under. Pre-fix this minted crypto.randomUUID() and
+    // wrote a phantom twin file. Now it must write NOTHING.
+    useChatStore.setState({ currentId: null });
+    const messages = [{ id: "u1", role: "user" as const, content: "hi", timestamp: 1 }];
+
+    const { result } = renderHook(() =>
+      useHarness({
+        initialMessages: messages,
+        initialConversationId: null,
+        initialPiSessionId: "",
+      }),
+    );
+
+    await act(async () => {
+      await result.current.hook.saveConversation(messages);
+    });
+
+    expect(saveCalls).toHaveLength(0);
   });
 
   it("preserves browserState from the shadow cache when the disk file does not exist yet", async () => {
@@ -315,5 +366,29 @@ describe("saveConversation race (PR #3600 / issue #3636 candidate)", () => {
 
     expect(saveCalls).toHaveLength(1);
     expect(saveCalls[0].lastViewedAt).toBe(8_500);
+  });
+
+  it("resolves selectedPreset via ref when available to prevent stale closure on summary card click (#4820)", async () => {
+    const selectedPresetRef = { current: { id: "argus", model: "argus-model", provider: "ollama" } as any };
+    const messages = [
+      { id: "u1", role: "user" as const, content: "hello", timestamp: 1_000 },
+    ];
+
+    const { result } = renderHook(() =>
+      useHarness({
+        initialMessages: messages,
+        initialConversationId: "chat-card",
+        initialPiSessionId: "chat-card",
+        selectedPreset: { id: "gpt-4o", model: "gpt-4o", provider: "openai" } as any, // Stale closure value
+        selectedPresetRef, // Latest ref value
+      }),
+    );
+
+    await act(async () => {
+      await result.current.hook.saveConversation(messages);
+    });
+
+    expect(saveCalls).toHaveLength(1);
+    expect(saveCalls[0].presetId).toBe("argus");
   });
 });

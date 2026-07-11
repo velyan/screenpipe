@@ -202,7 +202,7 @@ jobs:
     steps:
       - name: Enable Git long paths on Windows
         if: matrix.os_type == 'windows'
-        shell: powershell
+        shell: pwsh
         run: |
           Write-Host "Enabling git core.longpaths..."
           # Use --global instead of --system to avoid permission issues on self-hosted runners
@@ -224,7 +224,7 @@ jobs:
 
       - name: Shorten target dir to avoid MAX_PATH (Windows)
         if: matrix.os_type == 'windows'
-        shell: powershell
+        shell: pwsh
         run: |
           # vulkan-shaders-gen ExternalProject creates deeply nested paths
           # that exceed the 260-char Windows MAX_PATH limit when built under
@@ -272,21 +272,21 @@ jobs:
 
       - name: Install Rust (Windows x64)
         if: matrix.os_type == 'windows' && matrix.target == 'x86_64-pc-windows-msvc'
-        shell: powershell
+        shell: pwsh
         run: |
           Invoke-WebRequest https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-gnu/rustup-init.exe -OutFile rustup-init.exe
           .\rustup-init.exe -y
 
       - name: Install Rust (Windows ARM64 native)
         if: matrix.os_type == 'windows' && matrix.target == 'aarch64-pc-windows-msvc'
-        shell: powershell
+        shell: pwsh
         run: |
           Invoke-WebRequest https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe -OutFile rustup-init.exe
           .\rustup-init.exe -y
 
       - name: setup rust path
         if: matrix.os_type == 'windows'
-        shell: powershell
+        shell: pwsh
         run: |
           $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
           echo "$env:USERPROFILE\.cargo\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
@@ -499,7 +499,7 @@ jobs:
 
       - name: Install Ninja (ARM64)
         if: matrix.os_type == 'windows' && matrix.target == 'aarch64-pc-windows-msvc'
-        shell: powershell
+        shell: pwsh
         run: |
           # The windows-11-arm runner image pre-installs Ninja at C:\Tools\Ninja
           # but winget is NOT on PATH by default - so blindly calling
@@ -534,7 +534,7 @@ jobs:
 
       - name: Verify Windows download support
         if: matrix.os_type == 'windows'
-        shell: powershell
+        shell: pwsh
         env:
           SKIP_SCREENPIPE_SETUP: true
         run: |
@@ -779,6 +779,7 @@ jobs:
                   squashfs-root/usr/lib/libpcre2-8.so* \
                   squashfs-root/usr/lib/libsharpyuv.so* \
                   squashfs-root/usr/lib/libavif.so*
+            install -m 0755 src-tauri/bun-x86_64-unknown-linux-gnu squashfs-root/usr/bin/bun
             echo "Removed bundled GLib libs, repacking AppImage..."
             ARCH=x86_64 /tmp/appimagetool squashfs-root "$APPIMAGE"
             rm -rf squashfs-root
@@ -807,7 +808,7 @@ jobs:
 
       - name: Install CodeSignTool for SSL.com EV signing (Windows)
         if: matrix.os_type == 'windows'
-        shell: powershell
+        shell: pwsh
         run: |
           # 1. CodeSignTool: signs the inner binaries + final NSIS installer
           #    via SSL.com eSigner (called by Tauri's signCommand wrapper).
@@ -846,7 +847,7 @@ jobs:
       - name: Build (Windows)
         if: matrix.os_type == 'windows'
         working-directory: apps/screenpipe-app-tauri
-        shell: powershell
+        shell: pwsh
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
@@ -903,7 +904,7 @@ jobs:
         # transient SSL.com CSC API failures (HTML-instead-of-JSON,
         # "Unexpected character (<) at position 0").
         if: matrix.os_type == 'windows'
-        shell: powershell
+        shell: pwsh
         env:
           ESIGNER_USERNAME: ${{ secrets.ESIGNER_USERNAME }}
           ESIGNER_PASSWORD: ${{ secrets.ESIGNER_PASSWORD }}
@@ -1347,18 +1348,80 @@ jobs:
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          set -euo pipefail
           TARGET="${{ matrix.target }}"
           BUNDLE_DIR="apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/bundle"
+          notary_auth=(
+            --apple-id "$APPLE_ID"
+            --password "$APPLE_PASSWORD"
+            --team-id "$APPLE_TEAM_ID"
+          )
+
+          submit_for_notarization() {
+            local artifact="$1"
+            local artifact_name
+            artifact_name="$(basename "$artifact")"
+            local attempt submit_output submission_id wait_seconds
+
+            for attempt in 1 2 3; do
+              echo "Submitting ${artifact_name} for notarization (attempt ${attempt}/3)" >&2
+              if submit_output="$(xcrun notarytool submit "$artifact" "${notary_auth[@]}" 2>&1)"; then
+                printf '%s\n' "$submit_output" >&2
+                submission_id="$(printf '%s\n' "$submit_output" | awk '/^[[:space:]]*id:/ { print $2; exit }')"
+                if [ -z "$submission_id" ]; then
+                  echo "notarytool submit succeeded but did not print a submission id" >&2
+                  return 1
+                fi
+                printf '%s\n' "$submission_id"
+                return 0
+              fi
+
+              printf '%s\n' "$submit_output" >&2
+              submission_id="$(printf '%s\n' "$submit_output" | awk '/^[[:space:]]*id:/ { print $2; exit }')"
+              if [ -n "$submission_id" ]; then
+                echo "notarytool submit exited non-zero after upload; waiting on existing submission ${submission_id}" >&2
+                printf '%s\n' "$submission_id"
+                return 0
+              fi
+
+              if [ "$attempt" -eq 3 ]; then
+                echo "notarytool submit failed after ${attempt} attempts" >&2
+                return 1
+              fi
+
+              wait_seconds=$((attempt * 30))
+              echo "notarytool submit failed before a submission id; retrying in ${wait_seconds}s" >&2
+              sleep "$wait_seconds"
+            done
+          }
+
+          wait_for_notarization() {
+            local submission_id="$1"
+            local attempt wait_seconds
+
+            for attempt in 1 2 3 4; do
+              echo "Waiting for notarization ${submission_id} (attempt ${attempt}/4)"
+              if xcrun notarytool wait "$submission_id" "${notary_auth[@]}" --timeout 15m; then
+                return 0
+              fi
+
+              if [ "$attempt" -eq 4 ]; then
+                echo "notarytool wait failed after ${attempt} attempts for ${submission_id}" >&2
+                return 1
+              fi
+
+              wait_seconds=$((attempt * 30))
+              echo "notarytool wait failed; retrying same submission in ${wait_seconds}s" >&2
+              sleep "$wait_seconds"
+            done
+          }
 
           echo "=== Notarizing and stapling DMGs ==="
           for dmg in "${BUNDLE_DIR}"/dmg/*.dmg; do
             if [ -f "$dmg" ]; then
               echo "Notarizing: $(basename "$dmg")"
-              xcrun notarytool submit "$dmg" \
-                --apple-id "$APPLE_ID" \
-                --password "$APPLE_PASSWORD" \
-                --team-id "$APPLE_TEAM_ID" \
-                --wait --timeout 15m
+              submission_id="$(submit_for_notarization "$dmg")"
+              wait_for_notarization "$submission_id"
 
               echo "Stapling: $(basename "$dmg")"
               xcrun stapler staple "$dmg"
@@ -1375,11 +1438,78 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
           TARGET="${{ matrix.target }}"
           BUNDLE_DIR="${GITHUB_WORKSPACE}/apps/screenpipe-app-tauri/src-tauri/target/${TARGET}/release/bundle"
           MACOS_DIR="${BUNDLE_DIR}/macos"
+          notary_auth=(
+            --apple-id "$APPLE_ID"
+            --password "$APPLE_PASSWORD"
+            --team-id "$APPLE_TEAM_ID"
+          )
+
+          submit_for_notarization() {
+            local artifact="$1"
+            local artifact_name
+            artifact_name="$(basename "$artifact")"
+            local attempt submit_output submission_id wait_seconds
+
+            for attempt in 1 2 3; do
+              echo "Submitting ${artifact_name} for notarization (attempt ${attempt}/3)" >&2
+              if submit_output="$(xcrun notarytool submit "$artifact" "${notary_auth[@]}" 2>&1)"; then
+                printf '%s\n' "$submit_output" >&2
+                submission_id="$(printf '%s\n' "$submit_output" | awk '/^[[:space:]]*id:/ { print $2; exit }')"
+                if [ -z "$submission_id" ]; then
+                  echo "notarytool submit succeeded but did not print a submission id" >&2
+                  return 1
+                fi
+                printf '%s\n' "$submission_id"
+                return 0
+              fi
+
+              printf '%s\n' "$submit_output" >&2
+              submission_id="$(printf '%s\n' "$submit_output" | awk '/^[[:space:]]*id:/ { print $2; exit }')"
+              if [ -n "$submission_id" ]; then
+                echo "notarytool submit exited non-zero after upload; waiting on existing submission ${submission_id}" >&2
+                printf '%s\n' "$submission_id"
+                return 0
+              fi
+
+              if [ "$attempt" -eq 3 ]; then
+                echo "notarytool submit failed after ${attempt} attempts" >&2
+                return 1
+              fi
+
+              wait_seconds=$((attempt * 30))
+              echo "notarytool submit failed before a submission id; retrying in ${wait_seconds}s" >&2
+              sleep "$wait_seconds"
+            done
+          }
+
+          wait_for_notarization() {
+            local submission_id="$1"
+            local attempt wait_seconds
+
+            for attempt in 1 2 3 4; do
+              echo "Waiting for notarization ${submission_id} (attempt ${attempt}/4)"
+              if xcrun notarytool wait "$submission_id" "${notary_auth[@]}" --timeout 15m; then
+                return 0
+              fi
+
+              if [ "$attempt" -eq 4 ]; then
+                echo "notarytool wait failed after ${attempt} attempts for ${submission_id}" >&2
+                return 1
+              fi
+
+              wait_seconds=$((attempt * 30))
+              echo "notarytool wait failed; retrying same submission in ${wait_seconds}s" >&2
+              sleep "$wait_seconds"
+            done
+          }
 
           # Gatekeeper context:
           # The DMG is notarized + stapled above, so fresh installs are fine.
@@ -1408,11 +1538,8 @@ jobs:
             # notarytool only accepts flat archives; zip the .app for submission.
             APP_ZIP="${MACOS_DIR}/${APP_NAME}.notarize.zip"
             /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$app" "$APP_ZIP"
-            xcrun notarytool submit "$APP_ZIP" \
-              --apple-id "${{ secrets.APPLE_ID }}" \
-              --password "${{ secrets.APPLE_PASSWORD }}" \
-              --team-id "${{ secrets.APPLE_TEAM_ID }}" \
-              --wait --timeout 15m
+            submission_id="$(submit_for_notarization "$APP_ZIP")"
+            wait_for_notarization "$submission_id"
             rm -f "$APP_ZIP"
 
             xcrun stapler staple "$app"
@@ -1554,7 +1681,7 @@ jobs:
 
       - name: Upload to Cloudflare R2 (Windows)
         if: matrix.os_type == 'windows'
-        shell: powershell
+        shell: pwsh
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
@@ -1641,7 +1768,7 @@ jobs:
       - name: Upload debug symbols to Sentry (Windows)
         if: matrix.os_type == 'windows'
         continue-on-error: true
-        shell: powershell
+        shell: pwsh
         env:
           SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
           SENTRY_ORG: mediar

@@ -47,6 +47,7 @@
         var buf = window.__SP_OB_BUF__ || "";
         var size = window.__SP_OB_SIZE__ || CHUNK_SIZE;
         document.title = PREFIX + JSON.stringify({
+            id: window.__SP_OB_ID__ || "",
             chunk_seq: i,
             chunk_b64: buf.substr(i * size, size),
         });
@@ -77,6 +78,7 @@
         var n = Math.ceil(buf.length / CHUNK_SIZE) || 1;
         window.__SP_OB_BUF__ = buf;
         window.__SP_OB_SIZE__ = CHUNK_SIZE;
+        window.__SP_OB_ID__ = (payload && payload.id) || "";
         document.title = PREFIX + JSON.stringify({
             id: (payload && payload.id) || "",
             chunks: n,

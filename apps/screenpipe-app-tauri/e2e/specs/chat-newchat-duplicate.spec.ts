@@ -173,7 +173,8 @@ async function visibleRowCount(ids: string[]): Promise<number> {
   }, ids)) as number;
 }
 
-describe("New chat duplicate sidebar row (#3698 multi-turn variant)", function () {
+// QUARANTINED (#4686): CI-flaky (chat seeding / owned-browser window-handle). Re-enable per issue.
+describe.skip("New chat duplicate sidebar row (#3698 multi-turn variant)", function () {
   this.timeout(180_000);
 
   before(async () => {

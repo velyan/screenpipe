@@ -234,32 +234,34 @@ fn is_browser(app_name: &str) -> bool {
 /// (e.g. "Netflix - Comet" → synthesizes "https://netflix.com").
 #[cfg(target_os = "macos")]
 fn get_focused_app_info() -> Option<(String, Option<String>)> {
-    use cidre::{ax, ns};
+    cidre::objc::ar_pool(|| {
+        use cidre::{ax, ns};
 
-    let sys = ax::UiElement::sys_wide();
-    let app = sys.focused_app().ok()?;
-    let pid = app.pid().ok()?;
-    let name = ns::RunningApp::with_pid(pid)
-        .and_then(|app| app.localized_name())
-        .map(|s| s.to_string())?;
+        let sys = ax::UiElement::sys_wide();
+        let app = sys.focused_app().ok()?;
+        let pid = app.pid().ok()?;
+        let name = ns::RunningApp::with_pid(pid)
+            .and_then(|app| app.localized_name())
+            .map(|s| s.to_string())?;
 
-    let url = if is_browser(&name) {
-        // Try standard URL extraction first
-        let url = get_browser_url_ax(&app, &name);
-        if url.is_some() {
-            url
+        let url = if is_browser(&name) {
+            // Try standard URL extraction first
+            let url = get_browser_url_ax(&app, &name);
+            if url.is_some() {
+                url
+            } else {
+                // Fallback: check window title for DRM domain names.
+                // Many browsers (Comet, etc.) don't expose AXDocument but
+                // set the window title to "<page title> - <browser>".
+                // DRM sites like Netflix often put their name in the title.
+                get_drm_url_from_window_title(&app)
+            }
         } else {
-            // Fallback: check window title for DRM domain names.
-            // Many browsers (Comet, etc.) don't expose AXDocument but
-            // set the window title to "<page title> - <browser>".
-            // DRM sites like Netflix often put their name in the title.
-            get_drm_url_from_window_title(&app)
-        }
-    } else {
-        None
-    };
+            None
+        };
 
-    Some((name, url))
+        Some((name, url))
+    })
 }
 
 /// Check the focused window's title for known DRM domain names.

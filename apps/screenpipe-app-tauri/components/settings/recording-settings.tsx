@@ -24,13 +24,15 @@ export const searchIndex: SettingsField[] = [
   { label: "Languages", keywords: ["transcript language", "language"], conditional: true },
   { label: "Custom Vocabulary", keywords: ["vocabulary", "names", "jargon", "replacement"], conditional: true },
   // conditional: platform/OS-gated (Windows-only / macOS CoreAudio tap).
-  { label: "Microphone echo cancellation", keywords: ["echo", "voiceprocessingio"], conditional: true },
+  { label: "Echo cancellation mode", keywords: ["echo", "aec", "voiceprocessingio", "wasapi"], conditional: true },
   { label: "CoreAudio system audio capture", keywords: ["coreaudio", "system audio"], conditional: true },
-  { label: "Screen recording", keywords: ["screen", "video"] },
-  { label: "Use all monitors", keywords: ["monitor", "display"] },
+  { label: "Smart recording", keywords: ["smart recording", "beta", "meeting", "piggyback", "per-process", "meeting audio"], conditional: true },
+  { label: "Screen context capture", keywords: ["screen", "video", "accessibility"] },
+  { label: "Screenshot images", keywords: ["screenshot", "pixels", "ocr", "jpeg"] },
+  { label: "Use all monitors", keywords: ["monitor", "display"], conditional: true },
   // conditional: monitor picker only renders when "Use all monitors" is off — paired right under that toggle.
   { label: "Monitors", conditional: true },
-  { label: "Recording quality", keywords: ["fps", "quality"] },
+  { label: "Recording quality", keywords: ["fps", "quality"], conditional: true },
   // conditional: hidden when screen recording is off (same gate as Recording quality).
   { label: "Capture frequency", keywords: ["screenshot", "interval", "idle", "cadence", "every", "minimum"], conditional: true },
   { label: "HD recording for meetings", keywords: ["hd", "meeting"] },
@@ -133,7 +135,7 @@ import {
 import { open } from "@tauri-apps/plugin-dialog";
 import { ToastAction } from "@/components/ui/toast";
 import { open as openUrl } from "@tauri-apps/plugin-shell";
-import { listen } from "@tauri-apps/api/event";
+import { useTauriEvent } from "@/lib/hooks/use-tauri-event";
 import { getMediaFile } from "@/lib/actions/video-actions";
 import { Dialog, DialogContent, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { Progress } from "@/components/ui/progress";
@@ -206,6 +208,8 @@ type AudioEngineResolution = {
   fallbackReason: AudioEngineFallbackReason | null;
 };
 
+type AecMode = "off" | "screenpipe" | "macos" | "windows";
+
 type AudioEngineResolutionSettings = Pick<
   Settings,
   "audioTranscriptionEngine" | "deepgramApiKey" | "user"
@@ -213,6 +217,43 @@ type AudioEngineResolutionSettings = Pick<
 
 const getTranscriptionEngineLabel = (engine: string) =>
   TRANSCRIPTION_ENGINE_LABELS[engine] ?? engine;
+
+const getAecMode = (
+  settings: Pick<Settings, "aecMode">,
+  isMacOS: boolean,
+  isWindows: boolean
+): AecMode => {
+  if (settings.aecMode === "screenpipe") return "screenpipe";
+  if (settings.aecMode === "macos" && isMacOS) return "macos";
+  if (settings.aecMode === "windows" && isWindows) return "windows";
+  return "off";
+};
+
+const getAecModeSettings = (mode: AecMode) => ({
+  aecMode: mode,
+  screenpipeAecEnabled: mode === "screenpipe",
+  macosInputVpioEnabled: mode === "macos",
+  windowsInputAecEnabled: mode === "windows",
+});
+
+const AEC_MODE_DETAILS: Record<AecMode, { label: string; description: string }> = {
+  off: {
+    label: "Off",
+    description: "Echo cancellation is disabled",
+  },
+  screenpipe: {
+    label: "Screenpipe software AEC",
+    description: "Uses software AEC3 to remove speaker bleed from microphone transcripts",
+  },
+  macos: {
+    label: "Apple VoiceProcessingIO",
+    description: "Uses Apple's microphone AEC on the default macOS input",
+  },
+  windows: {
+    label: "Windows WASAPI AEC",
+    description: "Uses Windows microphone AEC when the input endpoint supports it",
+  },
+};
 
 const getAudioEngineResolution = (
   settings: AudioEngineResolutionSettings
@@ -280,6 +321,7 @@ const SERVER_RESTART_SETTINGS = new Set<keyof SettingsStore>([
   "piiBackend",
   "useChineseMirror",
   "enableWorkflowEvents",
+  "disableSnapshotCompaction",
 ]);
 
 type AudioPipelineSnapshot = {
@@ -1744,15 +1786,17 @@ export function RecordingSettings() {
     AudioDeviceInfo[]
   >([]);
 
-  // Gate for the experimental CoreAudio Process Tap toggle — we only show
-  // the switch on macOS 14.4+ where the API exists. Probed once via a
-  // Tauri command that proxies to
-  // `screenpipe_audio::core::process_tap::is_process_tap_available()`.
-  const [coreaudioTapAvailable, setCoreaudioTapAvailable] = useState<boolean | null>(null);
+  const [isMacOS, setIsMacOS] = useState(false);
+  const [isWindows, setIsWindows] = useState(false);
+
+  // Gate for process-tap-backed experimental audio controls. CoreAudio global
+  // system audio is macOS-only; meeting piggyback can use the same availability
+  // probe on macOS and Windows.
+  const [processTapAvailable, setProcessTapAvailable] = useState<boolean | null>(null);
   useEffect(() => {
     commands.checkCoreaudioProcessTapAvailable()
-      .then(setCoreaudioTapAvailable)
-      .catch(() => setCoreaudioTapAvailable(false));
+      .then(setProcessTapAvailable)
+      .catch(() => setProcessTapAvailable(false));
   }, []);
 
   type ExcludedApp = {
@@ -1790,9 +1834,9 @@ export function RecordingSettings() {
   }, [toast]);
 
   useEffect(() => {
-    if (!coreaudioTapAvailable) return;
+    if (!isMacOS || !processTapAvailable) return;
     reloadAudioExclusions();
-  }, [coreaudioTapAvailable, reloadAudioExclusions]);
+  }, [isMacOS, processTapAvailable, reloadAudioExclusions]);
 
   const addAudioExclusion = useCallback(
     (app: ExcludedApp) => {
@@ -1855,8 +1899,7 @@ export function RecordingSettings() {
   const { health } = useHealthCheck();
   const isDisabled = health?.status_code === 500;
   const audioPipeline = health?.audio_pipeline ?? null;
-  const [isMacOS, setIsMacOS] = useState(false);
-  const [isWindows, setIsWindows] = useState(false);
+  const [platformReady, setPlatformReady] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
   const [showOpenAIApiKey, setShowOpenAIApiKey] = useState(false);
   const [isRefreshingSubscription, setIsRefreshingSubscription] = useState(false);
@@ -2004,11 +2047,44 @@ export function RecordingSettings() {
     }
   }, [settings, updateSettings, debouncedValidateSettings]);
 
+  const aecMode = getAecMode(settings, isMacOS, isWindows);
+  const aecDetails = AEC_MODE_DETAILS[aecMode];
+  const screenContextEnabled = !settings.disableVision;
+  const screenshotImagesEnabled = screenContextEnabled && !(settings.disableScreenshots ?? false);
+
+  const handleAecModeChange = useCallback((mode: AecMode) => {
+    handleSettingsChange(getAecModeSettings(mode), true);
+  }, [handleSettingsChange]);
+
+  useEffect(() => {
+    if (!platformReady) return;
+
+    const expectedSettings = getAecModeSettings(aecMode);
+    const needsAecSync =
+      settings.aecMode !== expectedSettings.aecMode ||
+      Boolean(settings.screenpipeAecEnabled) !== expectedSettings.screenpipeAecEnabled ||
+      Boolean(settings.macosInputVpioEnabled) !== expectedSettings.macosInputVpioEnabled ||
+      Boolean(settings.windowsInputAecEnabled) !== expectedSettings.windowsInputAecEnabled;
+
+    if (!needsAecSync) return;
+
+    handleSettingsChange(expectedSettings, true);
+  }, [
+    aecMode,
+    handleSettingsChange,
+    platformReady,
+    settings.aecMode,
+    settings.macosInputVpioEnabled,
+    settings.screenpipeAecEnabled,
+    settings.windowsInputAecEnabled,
+  ]);
+
   useEffect(() => {
     const checkPlatform = async () => {
       const currentPlatform = platform();
       setIsMacOS(currentPlatform === "macos");
       setIsWindows(currentPlatform === "windows");
+      setPlatformReady(true);
       // Auto-migrate macOS users off qwen3-asr (CPU-only, no Metal support)
       if (currentPlatform === "macos" && settings.audioTranscriptionEngine === "qwen3-asr") {
         handleSettingsChange({ audioTranscriptionEngine: "whisper-large-v3-turbo-quantized" }, true);
@@ -2066,20 +2142,15 @@ export function RecordingSettings() {
   ]);
 
   // Listen for data-dir-fallback event (custom dir unavailable, fell back to default)
-  useEffect(() => {
-    const unlisten = listen("data-dir-fallback", () => {
-      toast({
-        title: "custom data directory unavailable",
-        description:
-          "the configured data directory could not be accessed. recordings are using the default directory (~/.screenpipe).",
-        variant: "destructive",
-        duration: 10000,
-      });
+  useTauriEvent("data-dir-fallback", () => {
+    toast({
+      title: "custom data directory unavailable",
+      description:
+        "the configured data directory could not be accessed. recordings are using the default directory (~/.screenpipe).",
+      variant: "destructive",
+      duration: 10000,
     });
-    return () => {
-      unlisten.then((fn) => fn());
-    };
-  }, [toast]);
+  });
 
   useEffect(() => {
     const loadDevices = async () => {
@@ -2565,7 +2636,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
   };
 
   return (
-    <div className="space-y-5" ref={sectionRootRef}>
+    <div className="space-y-5" data-testid="section-settings-recording" ref={sectionRootRef}>
       <p className="text-muted-foreground text-sm mb-4">
         Screen and audio recording preferences
       </p>
@@ -3414,62 +3485,47 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
           );
         })()}
 
-        {/* Windows microphone AEC */}
-        {!settings.disableAudio && isWindows && (
+        {/* Echo cancellation */}
+        {!settings.disableAudio && (
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5">
-            <div className="flex items-center justify-between">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="flex items-center space-x-2.5">
                 <Mic className="h-4 w-4 text-muted-foreground shrink-0" />
-                <div>
-                  <h3 className="text-sm font-medium text-foreground">
-                    Microphone echo cancellation
-                  </h3>
+                <div className="min-w-0">
+                  <div className="flex items-center space-x-1.5">
+                    <h3 className="text-sm font-medium text-foreground">
+                      Echo cancellation
+                    </h3>
+                    <HelpTooltip text="Reduces speaker audio leaking into microphone transcripts during calls and screen recordings." />
+                  </div>
                   <p className="text-xs text-muted-foreground">
-                    Use Windows WASAPI AEC for supported input devices
+                    {aecDetails.description}
                   </p>
                 </div>
               </div>
-              <Switch
-                id="windowsInputAecEnabled"
-                checked={Boolean(settings.windowsInputAecEnabled ?? false)}
-                onCheckedChange={(checked) => handleSettingsChange({ windowsInputAecEnabled: checked }, true)}
-              />
-            </div>
-          </CardContent>
-        </Card>
-        )}
-
-        {/* macOS microphone AEC (VoiceProcessingIO on default input) */}
-        {!settings.disableAudio && isMacOS && (
-        <Card className="border-border bg-card">
-          <CardContent className="px-3 py-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-2.5">
-                <Mic className="h-4 w-4 text-muted-foreground shrink-0" />
-                <div>
-                  <h3 className="text-sm font-medium text-foreground">
-                    Microphone echo cancellation
-                  </h3>
-                  <p className="text-xs text-muted-foreground">
-                    Use Apple VoiceProcessingIO on the default microphone
-                  </p>
-                </div>
-              </div>
-              <Switch
-                id="macosInputVpioEnabled"
-                checked={Boolean(settings.macosInputVpioEnabled ?? false)}
-                onCheckedChange={(checked) =>
-                  handleSettingsChange({ macosInputVpioEnabled: checked }, true)
-                }
-              />
+              <Select value={aecMode} onValueChange={(value) => handleAecModeChange(value as AecMode)}>
+                <SelectTrigger id="aecMode" className="h-8 w-full text-xs sm:w-[300px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="off">{AEC_MODE_DETAILS.off.label}</SelectItem>
+                  <SelectItem value="screenpipe">{AEC_MODE_DETAILS.screenpipe.label}</SelectItem>
+                  {isMacOS && (
+                    <SelectItem value="macos">{AEC_MODE_DETAILS.macos.label}</SelectItem>
+                  )}
+                  {isWindows && (
+                    <SelectItem value="windows">{AEC_MODE_DETAILS.windows.label}</SelectItem>
+                  )}
+                </SelectContent>
+              </Select>
             </div>
           </CardContent>
         </Card>
         )}
 
         {/* CoreAudio System Audio (macOS 14.4+ only) */}
-        {!settings.disableAudio && coreaudioTapAvailable && (
+        {!settings.disableAudio && isMacOS && processTapAvailable && (
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5">
             <div className="flex items-center justify-between">
@@ -3494,9 +3550,49 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         </Card>
         )}
 
+        {/* Smart recording (beta; internally "meeting piggyback"): during
+            meetings, capture only the meeting app's audio and the mic it
+            actually uses. Takes precedence over every other audio setting —
+            engages in ANY capture mode (continuous or meetings-only), not just
+            meetings-only. Uses CoreAudio Process Tap on macOS and WASAPI
+            process loopback on Windows. */}
+        {!settings.disableAudio && (isMacOS || isWindows) && processTapAvailable && (
+        <Card className="border-border bg-card">
+          <CardContent className="px-3 py-2.5">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center space-x-2.5">
+                <Mic className="h-4 w-4 text-muted-foreground shrink-0" />
+                <div>
+                  <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
+                    Smart recording
+                    <Badge variant="secondary" aria-label="beta" className="px-1.5 py-0 text-[10px] font-medium uppercase tracking-wide">
+                      beta
+                    </Badge>
+                  </h3>
+                  <p className="text-xs text-muted-foreground">
+                    during meetings, records your meeting&apos;s audio and whichever microphone you pick in the meeting app — taking precedence over your other audio settings. falls back to your configured capture automatically if unavailable.
+                  </p>
+                  {settings.disableMeetingDetector && (
+                    <p className="text-xs text-amber-600 dark:text-amber-500">
+                      requires automatic meeting detection — turn it back on above to use this.
+                    </p>
+                  )}
+                </div>
+              </div>
+              <Switch
+                id="experimentalMeetingPiggyback"
+                checked={Boolean(settings.experimentalMeetingPiggyback ?? false)}
+                disabled={Boolean(settings.disableMeetingDetector)}
+                onCheckedChange={(checked) => handleSettingsChange({ experimentalMeetingPiggyback: checked }, true)}
+              />
+            </div>
+          </CardContent>
+        </Card>
+        )}
+
         {/* Per-app exclusion list for the CoreAudio Process Tap. Only
             meaningful when the tap is the active backend. */}
-        {!settings.disableAudio && coreaudioTapAvailable && settings.experimentalCoreaudioSystemAudio && (
+        {!settings.disableAudio && isMacOS && processTapAvailable && settings.experimentalCoreaudioSystemAudio && (
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5 space-y-2">
             <div className="flex items-center space-x-2.5">
@@ -3655,15 +3751,15 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
       <div className="space-y-2 pt-2">
         <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider px-1">Screen</h2>
 
-        {/* Screen Recording Toggle */}
+        {/* Screen context capture toggle */}
         <Card className="border-border bg-card">
           <CardContent className="px-3 py-2.5">
             <div className="flex items-center justify-between">
               <div className="flex items-center space-x-2.5">
                 <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
                 <div>
-                  <h3 className="text-sm font-medium text-foreground">Screen recording</h3>
-                  <p className="text-xs text-muted-foreground">Capture screenshots from your monitors</p>
+                  <h3 className="text-sm font-medium text-foreground">Screen context capture</h3>
+                  <p className="text-xs text-muted-foreground">Capture app/window context, accessibility text, screenshot images, and OCR fallback</p>
                 </div>
               </div>
               <ManagedSwitch settingKey="disableVision" id="disableVision" checked={!settings.disableVision} onCheckedChange={(checked) => handleSettingsChange({ disableVision: !checked }, true)} />
@@ -3671,7 +3767,6 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
           </CardContent>
         </Card>
 
-        {/* Use All Monitors - right below disable screen recording */}
         {!settings.disableVision && (
           <Card className="border-border bg-card">
             <CardContent className="px-3 py-2.5">
@@ -3679,8 +3774,31 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
                 <div className="flex items-center space-x-2.5">
                   <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
                   <div>
+                    <h3 className="text-sm font-medium text-foreground">Screenshot images</h3>
+                    <p className="text-xs text-muted-foreground">Capture screen pixels and store JPEG screenshots for visual evidence and OCR fallback</p>
+                  </div>
+                </div>
+                <ManagedSwitch
+                  settingKey="disableScreenshots"
+                  id="disableScreenshots"
+                  checked={!(settings.disableScreenshots ?? false)}
+                  onCheckedChange={(checked) => handleSettingsChange({ disableScreenshots: !checked }, true)}
+                />
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Use All Monitors - right below screen capture toggles */}
+        {screenshotImagesEnabled && (
+          <Card className="border-border bg-card">
+            <CardContent className="px-3 py-2.5">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-2.5">
+                  <Monitor className="h-4 w-4 text-muted-foreground shrink-0" />
+                  <div>
                     <h3 className="text-sm font-medium text-foreground">Use all monitors</h3>
-                    <p className="text-xs text-muted-foreground">Take screenshot from all available monitors</p>
+                    <p className="text-xs text-muted-foreground">Capture screenshot images from all available monitors</p>
                   </div>
                 </div>
                 <Switch id="useAllMonitors" checked={settings.useAllMonitors} onCheckedChange={(checked) => handleSettingsChange({ useAllMonitors: checked }, true)} />
@@ -3692,7 +3810,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         {/* Monitor Selection — paired directly under "Use all monitors" so
             the picker it reveals sits next to the toggle that controls it,
             not buried below the quality/frequency/HD cards. */}
-        {!settings.disableVision && !settings.useAllMonitors && (
+        {screenshotImagesEnabled && !settings.useAllMonitors && (
           <Card className="border-border bg-card overflow-hidden">
             <CardContent className="px-3 py-2.5">
               <div className="flex items-center space-x-2.5 mb-3">
@@ -3762,7 +3880,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
         )}
 
         {/* Recording quality — single knob for crispness + disk cost */}
-        {!settings.disableVision && (
+        {screenshotImagesEnabled && (
           <Card className="border-border bg-card">
             <CardContent className="px-3 py-2.5">
               <div className="flex items-center justify-between gap-3">
@@ -3802,7 +3920,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
             feel capture is too sparse. Backed by `idleCaptureIntervalMs`
             (null = follow the power profile). Needs a recording restart to
             take effect, hence handleSettingsChange(..., true). */}
-        {!settings.disableVision && (() => {
+        {screenshotImagesEnabled && (() => {
           const idleMs = settings.idleCaptureIntervalMs ?? null;
           const seconds = idleMs == null ? 0 : Math.round(idleMs / 1000);
           return (

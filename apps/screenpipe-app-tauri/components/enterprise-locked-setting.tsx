@@ -28,6 +28,8 @@ export function LockedSetting({
  * Drop-in Switch replacement that respects enterprise managed values.
  * If admin enforced a value, the switch is locked to that value.
  * Otherwise behaves exactly like a normal Switch.
+ * Positive UI toggles often back inverted `disable…` settings. In that case a
+ * managed value of "true" means the feature is forced off.
  *
  * Usage: replace <Switch .../> with <ManagedSwitch settingKey="disableAudio" .../>
  */
@@ -42,7 +44,10 @@ export function ManagedSwitch({
   const managed = getManagedValue(settingKey);
 
   if (managed !== undefined) {
-    return <Switch checked={managed === "true"} disabled {...rest} />;
+    const managedChecked = settingKey.startsWith("disable")
+      ? managed === "false"
+      : managed === "true";
+    return <Switch checked={managedChecked} disabled {...rest} />;
   }
 
   return (

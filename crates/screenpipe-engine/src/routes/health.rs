@@ -17,6 +17,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 use screenpipe_audio::audio_manager::builder::TranscriptionMode;
+use screenpipe_audio::core::engine::AudioTranscriptionEngine;
 
 use crate::recording_coverage::{coverage_snapshot, CoverageSnapshot};
 use crate::server::AppState;
@@ -579,6 +580,13 @@ fn transcription_mode_label(
     }
 }
 
+fn should_query_audio_transcription_backlog(
+    audio_disabled: bool,
+    configured_engine: Option<AudioTranscriptionEngine>,
+) -> bool {
+    !audio_disabled && !matches!(configured_engine, Some(AudioTranscriptionEngine::Disabled))
+}
+
 async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -653,7 +661,15 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
 
     let now = Utc::now();
     let now_ts = now.timestamp() as u64;
-    let audio_reconciliation_backlog = if !state.audio_disabled {
+    let configured_transcription_engine = state.audio_manager.configured_transcription_engine();
+    let transcription_engine_disabled = matches!(
+        configured_transcription_engine.as_ref(),
+        Some(AudioTranscriptionEngine::Disabled)
+    );
+    let audio_reconciliation_backlog = if should_query_audio_transcription_backlog(
+        state.audio_disabled,
+        configured_transcription_engine,
+    ) {
         get_audio_reconciliation_backlog(state, now).await
     } else {
         None
@@ -772,6 +788,7 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
     };
 
     let audio_db_write_stalled = if !state.audio_disabled
+        && !transcription_engine_disabled
         && global_audio_active
         && audio_snap.uptime_secs > 120.0
     {
@@ -975,7 +992,10 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
     // yet, which should be visible instead of reported as healthy — *unless*
     // the backlog is the expected result of batch mode deferring during a
     // live session, in which case it's not a problem to surface.
-    let audio_degraded = if !state.audio_disabled && audio_snap.uptime_secs > 120.0 {
+    let audio_degraded = if !state.audio_disabled
+        && !transcription_engine_disabled
+        && audio_snap.uptime_secs > 120.0
+    {
         let channel_full = audio_snap.chunks_channel_full > 0;
         let transcription_backlog =
             pending_transcription_segments.is_some() && !intentionally_deferring;
@@ -1409,6 +1429,35 @@ mod tests {
         assert_eq!(transcription_mode_label(None, 0, 0), "realtime");
         assert_eq!(transcription_mode_label(None, 1, 0), "batch");
         assert_eq!(transcription_mode_label(None, 0, 1), "batch");
+    }
+
+    #[test]
+    fn disabled_transcription_engine_suppresses_backlog_health_query() {
+        assert!(
+            !should_query_audio_transcription_backlog(
+                false,
+                Some(AudioTranscriptionEngine::Disabled)
+            ),
+            "engine-disabled audio chunks are intentionally untranscribed, not stalled"
+        );
+        assert!(
+            !should_query_audio_transcription_backlog(
+                true,
+                Some(AudioTranscriptionEngine::WhisperLargeV3Turbo)
+            ),
+            "globally disabled audio should not query transcription backlog"
+        );
+        assert!(
+            should_query_audio_transcription_backlog(
+                false,
+                Some(AudioTranscriptionEngine::WhisperLargeV3Turbo)
+            ),
+            "normal enabled transcription should still surface real backlog stalls"
+        );
+        assert!(
+            should_query_audio_transcription_backlog(false, None),
+            "contended options lock should stay conservative and query backlog"
+        );
     }
 
     fn dummy_response(status: &str) -> HealthCheckResponse {

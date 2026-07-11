@@ -127,3 +127,81 @@ export function buildConnectionsContext(
     .join("\n\n");
   return `\n\n# Connected integrations\n\nThe user has connected the following external services. Use the endpoints listed under each to fetch live data when relevant. All endpoints are on http://localhost:3030 and require \`-H "Authorization: Bearer $SCREENPIPE_LOCAL_API_KEY"\`.\n\n${entries}`;
 }
+
+function normalizedTokens(value: string): string[] {
+  return value
+    .toLowerCase()
+    .replace(/\.app|\.exe/g, "")
+    .split(/[^a-z0-9]+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+function containsTokenSequence(haystack: string[], needle: string[]): boolean {
+  if (needle.length === 0 || needle.length > haystack.length) return false;
+  for (let i = 0; i <= haystack.length - needle.length; i++) {
+    let matched = true;
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) return true;
+  }
+  return false;
+}
+
+export function buildAppAwarenessContext({
+  apps,
+  connections,
+  maxApps = 8,
+}: {
+  apps: Array<{ name: string; count?: number; app_name?: string }>;
+  connections: Array<{ id: string; name: string; connected: boolean; category?: string; icon?: string; mcp?: boolean; mcp_server_id?: string }>;
+  maxApps?: number;
+}): string {
+  const normalizedConnections = connections
+    .filter((connection) => connection.id !== "owned-default")
+    .map((connection) => ({
+      ...connection,
+      matchTokenSequences: [
+        normalizedTokens(connection.id),
+        normalizedTokens(connection.name),
+        normalizedTokens(connection.icon ?? ""),
+      ].filter((tokens) => tokens.length > 0),
+    }));
+
+  const normalizedApps = apps
+    .map((app, index) => {
+      const displayName = (app.name || app.app_name || "").trim();
+      if (!displayName) return null;
+      const appTokens = normalizedTokens(`${app.name} ${app.app_name ?? ""}`);
+      const matchingConnection = normalizedConnections.find((connection) => {
+        return connection.matchTokenSequences.some((tokens) =>
+          containsTokenSequence(appTokens, tokens)
+        );
+      });
+      return {
+        displayName,
+        count: app.count ?? 0,
+        firstSeenIndex: index,
+        matchingConnection,
+      };
+    })
+    .filter((app): app is NonNullable<typeof app> => Boolean(app))
+    .sort((a, b) => b.count - a.count || a.firstSeenIndex - b.firstSeenIndex)
+    .slice(0, maxApps);
+
+  if (normalizedApps.length === 0) return "";
+
+  // keep this lean: just the app + its connection id. live connected state and
+  // the mcp-proxy caveat come from the tools, so we don't restate (or stale) it here.
+  const entries = normalizedApps.map((app) => {
+    const connection = app.matchingConnection;
+    if (!connection) return `- ${app.displayName}`;
+    return `- ${app.displayName} (connection id: ${connection.id})`;
+  });
+
+  return `\n\n# User app context\n\nThe user recently used these apps. Treat this as first-class context when summarizing work or deciding where an action could go. Apps tagged with a connection id can be acted on through that connection — call screenpipe_list_connections to check its live connected status before claiming it is connected, and screenpipe_connect_app to connect it if it isn't. Do not infer connection state from this list.\n\n${entries.join("\n")}`;
+}

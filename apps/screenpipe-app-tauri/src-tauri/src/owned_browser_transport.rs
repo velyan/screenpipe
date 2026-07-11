@@ -58,7 +58,7 @@ pub enum Marker {
     /// Header announcing a chunked large result: `chunks` pieces follow.
     Header { id: String, chunks: usize },
     /// One base64 chunk of a large result.
-    Chunk { seq: usize, b64: String },
+    Chunk { id: String, seq: usize, b64: String },
 }
 
 /// Classify the JSON trailing [`RESULT_TITLE_PREFIX`] in a title.
@@ -88,7 +88,12 @@ pub fn parse_marker(json: &str) -> Result<Marker, String> {
             .as_str()
             .ok_or_else(|| format!("chunk_b64 not a string (raw: {json})"))?
             .to_string();
-        return Ok(Marker::Chunk { seq, b64 });
+        let id = obj
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        return Ok(Marker::Chunk { id, seq, b64 });
     }
     if let Some(chunks) = obj.get("chunks") {
         let chunks = chunks
@@ -180,6 +185,20 @@ mod tests {
         assert_eq!(
             m,
             Marker::Chunk {
+                id: "".into(),
+                seq: 2,
+                b64: "QUJD".into()
+            }
+        );
+    }
+
+    #[test]
+    fn classifies_chunk_id() {
+        let m = parse_marker(r#"{"id":"abc","chunk_seq":2,"chunk_b64":"QUJD"}"#).unwrap();
+        assert_eq!(
+            m,
+            Marker::Chunk {
+                id: "abc".into(),
                 seq: 2,
                 b64: "QUJD".into()
             }

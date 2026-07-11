@@ -44,6 +44,7 @@ use tauri::{
     AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Position, Rect, Size, Webview,
     WebviewUrl, Window, WindowBuilder, Wry,
 };
+use tauri_utils::config::BackgroundThrottlingPolicy;
 use tokio::sync::{oneshot, Mutex};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -118,11 +119,12 @@ struct OwnedBrowserNavigateEvent {
     owner: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum BrowserSessionDecision {
     UseBrowserSession,
     ContinueLoggedOut,
+    CancelNavigation(String),
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -187,6 +189,22 @@ fn session_host_key(host: &str) -> String {
         .strip_prefix("www.")
         .map(|rest| rest.to_string())
         .unwrap_or(lower)
+}
+
+fn session_prompt_timeout_error(host: &str) -> String {
+    format!(
+        "Timed out waiting for browser-session permission for {host}. Approve the Screenpipe browser prompt or log in inside the owned browser, then retry."
+    )
+}
+
+fn session_prompt_in_flight_timeout_error(host: &str) -> String {
+    format!(
+        "Timed out waiting for the existing browser-session permission prompt for {host}. Answer the prompt or retry from the owned browser menu."
+    )
+}
+
+fn session_prompt_emit_error(host: &str, error: impl std::fmt::Display) -> String {
+    format!("Could not show browser-session permission prompt for {host}: {error}")
 }
 
 #[specta::specta]
@@ -423,6 +441,10 @@ impl OwnedBrowserState {
         self.inner.lock().await.visible
     }
 
+    async fn child_parent(&self) -> Option<String> {
+        self.inner.lock().await.child_parent.clone()
+    }
+
     async fn set_visible(&self, visible: bool) {
         self.inner.lock().await.visible = visible;
     }
@@ -496,6 +518,7 @@ fn child_webview_builder(
     let app_for_page_load = app.clone();
     let builder = tauri::webview::WebviewBuilder::new(label.to_string(), url)
         .initialization_script(transport::BRIDGE_INIT_SCRIPT)
+        .background_throttling(BackgroundThrottlingPolicy::Disabled)
         .on_navigation(move |_url| {
             // Browsers do not put subframe navigations in the omnibox. Wry's
             // `on_navigation` URL can be an iframe target on macOS (wry#1593),
@@ -558,18 +581,22 @@ struct TauriOwnedHandle {
 }
 
 /// Reveal the native child webview just long enough to run a *background*
-/// `eval`, returning whether it actually showed it.
+/// `eval`, returning whether it actually showed it on the user's active UI.
 ///
-/// macOS/WKWebView runs `evaluateJavaScript` while the webview is hidden — the
-/// same reason `TauriOwnedHandle::navigate` loads a page while hidden — so this
-/// is a no-op there and a background snapshot/eval never flashes the browser
-/// over whatever section (Timeline, Live notes, …) the user is currently on.
-/// Windows/WebView2 will not execute script against a hidden controller, so
-/// there we still show it for the duration of the eval; the caller hides it
-/// again afterwards. (Parking the Windows webview off-screen so it runs script
-/// without painting over the user is a tracked follow-up.)
+/// When the child is parented to the off-screen background host, `show()` is
+/// safe on every platform: it makes WebKit/WebView2 service JavaScript while
+/// still painting far outside any real display. We keep `state.visible = false`
+/// in that case because the user-facing browser panel is still closed.
+/// Otherwise, macOS keeps hidden sidebar children hidden; Windows/WebView2
+/// still needs a temporary reveal to execute script against an on-screen parent.
 #[allow(unused_variables)]
 async fn show_native_for_background_eval(active: &Webview<Wry>, state: &OwnedBrowserState) -> bool {
+    if state.child_parent().await.as_deref() == Some(BACKGROUND_HOST_LABEL) {
+        let _ = active.show();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        return false;
+    }
+
     #[cfg(target_os = "macos")]
     {
         false
@@ -581,6 +608,86 @@ async fn show_native_for_background_eval(active: &Webview<Wry>, state: &OwnedBro
         tokio::time::sleep(Duration::from_millis(100)).await;
         true
     }
+}
+
+const EVAL_RESULT_INLINE_MAX_CHARS: usize = 800;
+const EVAL_RESULT_CHUNK_SIZE: usize = 700;
+
+fn build_eval_result_script(code: &str, id: &str) -> String {
+    let id_lit = serde_json::to_string(id).unwrap();
+    let prefix_lit = serde_json::to_string(transport::RESULT_TITLE_PREFIX).unwrap();
+
+    // Keep this emitter self-contained instead of depending solely on the
+    // initialization script: a freshly-created background about:blank webview
+    // can accept eval before the init script bridge exists.
+    format!(
+        r#"(async () => {{
+                const __sp_prefix = {prefix};
+                const __sp_inline_max = {inline_max};
+                const __sp_chunk_size = {chunk_size};
+                const __sp_to_base64_utf8 = (str) => btoa(unescape(encodeURIComponent(str)));
+                const __sp_emit = (payload) => {{
+                    let json;
+                    try {{
+                        json = JSON.stringify(payload);
+                    }} catch (e) {{
+                        document.title = __sp_prefix + JSON.stringify({{
+                            id: (payload && payload.id) || "",
+                            ok: false,
+                            error: "serialize result failed: " + ((e && e.message) || e)
+                        }});
+                        return;
+                    }}
+
+                    if (json.length <= __sp_inline_max) {{
+                        document.title = __sp_prefix + json;
+                        return;
+                    }}
+
+                    const buf = __sp_to_base64_utf8(json);
+                    const n = Math.ceil(buf.length / __sp_chunk_size) || 1;
+                    window.__SP_OB_BUF__ = buf;
+                    window.__SP_OB_SIZE__ = __sp_chunk_size;
+                    window.__SP_OB_ID__ = (payload && payload.id) || "";
+                    window.__SP_OB_CHUNK__ = function (i) {{
+                        const chunkBuf = window.__SP_OB_BUF__ || "";
+                        const size = window.__SP_OB_SIZE__ || __sp_chunk_size;
+                        document.title = __sp_prefix + JSON.stringify({{
+                            id: window.__SP_OB_ID__ || "",
+                            chunk_seq: i,
+                            chunk_b64: chunkBuf.substr(i * size, size)
+                        }});
+                    }};
+                    document.title = __sp_prefix + JSON.stringify({{
+                        id: (payload && payload.id) || "",
+                        chunks: n,
+                        chunk_size: __sp_chunk_size
+                    }});
+                }};
+
+                try {{
+                    const __sp_result = await (async () => {{ {code} }})();
+                    __sp_emit({{
+                        id: {id},
+                        ok: true,
+                        title: document.title,
+                        result: __sp_result === undefined ? null : __sp_result
+                    }});
+                }} catch (e) {{
+                    __sp_emit({{
+                        id: {id},
+                        ok: false,
+                        title: document.title,
+                        error: String((e && e.message) || e)
+                    }});
+                }}
+            }})()"#,
+        code = code,
+        id = id_lit,
+        prefix = prefix_lit,
+        inline_max = EVAL_RESULT_INLINE_MAX_CHARS,
+        chunk_size = EVAL_RESULT_CHUNK_SIZE,
+    )
 }
 
 impl TauriOwnedHandle {
@@ -649,7 +756,7 @@ impl TauriOwnedHandle {
         // hidden/offscreen, leaving the request waiting forever for a title
         // marker that would never be written.
         if let Some(parsed) = target_url {
-            inject_cookies_for_url(&self.app, &parsed).await;
+            inject_cookies_for_url(&self.app, &parsed).await?;
             if !was_visible {
                 shown_for_eval = show_native_for_background_eval(&active, &self.state).await;
             }
@@ -666,39 +773,7 @@ impl TauriOwnedHandle {
         let original_title = self.state.latest_title();
 
         let id = Uuid::new_v4().to_string();
-        let id_lit = serde_json::to_string(&id).unwrap();
-
-        // Wrap user code so any outcome — success, throw, or rejected
-        // promise — reports back via __SP_RESULT__. We JSON-encode the id
-        // so it survives even if the user code crashes the surrounding
-        // scope. Defensive check on __SP_RESULT__ in case the page
-        // navigated mid-flight before the bridge re-installed.
-        let wrapped = format!(
-            r#"(async () => {{
-                try {{
-                    const __sp_result = await (async () => {{ {code} }})();
-                    if (window.__SP_RESULT__) {{
-                        window.__SP_RESULT__({{
-                            id: {id},
-                            ok: true,
-                            title: document.title,
-                            result: __sp_result === undefined ? null : __sp_result
-                        }});
-                    }}
-                }} catch (e) {{
-                    if (window.__SP_RESULT__) {{
-                        window.__SP_RESULT__({{
-                            id: {id},
-                            ok: false,
-                            title: document.title,
-                            error: String((e && e.message) || e)
-                        }});
-                    }}
-                }}
-            }})()"#,
-            code = code,
-            id = id_lit
-        );
+        let wrapped = build_eval_result_script(code, &id);
 
         active
             .eval(wrapped)
@@ -709,7 +784,7 @@ impl TauriOwnedHandle {
         // browser's ~1KB title cap, so they're pulled in base64 chunks and
         // reassembled — see [`transport`]. The whole read honours `timeout`.
         let start = Instant::now();
-        let payload = match self.read_eval_payload(&active, start, timeout).await {
+        let payload = match self.read_eval_payload(&active, start, timeout, &id).await {
             Ok(payload) => payload,
             Err(e) => {
                 // Restore hidden whenever we revealed the webview *only* to run
@@ -764,20 +839,25 @@ impl TauriOwnedHandle {
         active: &Webview<Wry>,
         start: Instant,
         timeout: Duration,
+        expected_id: &str,
     ) -> Result<transport::EvalPayload, String> {
-        match self.poll_marker(start, timeout, None).await? {
+        match self.poll_marker(start, timeout, None, expected_id).await? {
             transport::Marker::Result(payload) => Ok(payload),
-            transport::Marker::Chunk { seq, .. } => Err(format!(
-                "owned-browser eval: got chunk {seq} before a header"
-            )),
+            transport::Marker::Chunk { seq, .. } => {
+                Err(format!("owned-browser eval: got chunk {seq} before a header"))
+            }
             transport::Marker::Header { chunks, .. } => {
                 let mut parts: Vec<String> = Vec::with_capacity(chunks);
                 for i in 0..chunks {
+                    self.state.record_title(String::new());
                     active
                         .eval(transport::chunk_fetch_js(i))
                         .map_err(|e| format!("owned-browser fetch chunk {i}: {e}"))?;
-                    match self.poll_marker(start, timeout, Some(i)).await? {
-                        transport::Marker::Chunk { seq, b64 } if seq == i => parts.push(b64),
+                    match self
+                        .poll_marker(start, timeout, Some(i), expected_id)
+                        .await?
+                    {
+                        transport::Marker::Chunk { seq, b64, .. } if seq == i => parts.push(b64),
                         other => {
                             return Err(format!(
                                 "owned-browser eval: expected chunk {i}, got {other:?}"
@@ -801,6 +881,7 @@ impl TauriOwnedHandle {
         start: Instant,
         timeout: Duration,
         want_seq: Option<usize>,
+        expected_id: &str,
     ) -> Result<transport::Marker, String> {
         loop {
             if start.elapsed() >= timeout {
@@ -813,6 +894,19 @@ impl TauriOwnedHandle {
             let title = self.state.latest_title();
             if let Some(rest) = title.strip_prefix(transport::RESULT_TITLE_PREFIX) {
                 let marker = transport::parse_marker(rest)?;
+                let marker_id = match &marker {
+                    transport::Marker::Result(payload) => payload.id.as_str(),
+                    transport::Marker::Header { id, .. } => id.as_str(),
+                    transport::Marker::Chunk { id, .. } => id.as_str(),
+                };
+                if marker_id != expected_id {
+                    warn!(
+                        "owned-browser eval ignored stale result id (got {}, expected {})",
+                        marker_id, expected_id
+                    );
+                    self.state.record_title(String::new());
+                    continue;
+                }
                 match want_seq {
                     // Waiting for a specific chunk: accept only that seq; a stale
                     // header / earlier chunk title means keep polling.
@@ -820,9 +914,17 @@ impl TauriOwnedHandle {
                         if matches!(&marker, transport::Marker::Chunk { seq, .. } if *seq == want) {
                             return Ok(marker);
                         }
+                        self.state.record_title(String::new());
                     }
                     // First-marker wait (inline result or chunk header).
-                    None => return Ok(marker),
+                    None => match marker {
+                        transport::Marker::Chunk { seq, .. } => {
+                            return Err(format!(
+                                "owned-browser eval: got chunk {seq} before a header"
+                            ))
+                        }
+                        other => return Ok(other),
+                    },
                 }
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -881,7 +983,7 @@ impl OwnedWebviewHandle for TauriOwnedHandle {
         // site even though the Tauri-command-driven sidebar restore
         // path was injecting correctly.
         prepare_navigation(&self.app, &self.state, &parsed, owner, true).await;
-        inject_cookies_for_url(&self.app, &parsed).await;
+        inject_cookies_for_url(&self.app, &parsed).await?;
 
         // Attach a hidden offscreen child on demand if none exists, so a
         // background/scheduled pipe can navigate without the sidebar ever being
@@ -1047,7 +1149,7 @@ async fn ensure_child_bounds(
     state.set_visible(true).await;
 
     if let Some(url) = pending_url {
-        inject_cookies_for_url(app, &url).await;
+        inject_cookies_for_url(app, &url).await?;
         let _ = child.navigate(url);
     }
 
@@ -1101,11 +1203,9 @@ const BACKGROUND_HOST_LABEL: &str = "owned-browser-bg-host";
 
 /// Far-off-screen origin for the background host window. The window is tiny,
 /// undecorated, off the taskbar, and never focused, so it never paints on any
-/// real monitor. It is created **visible** (not `.visible(false)`) on purpose:
-/// Windows/WebView2 will not run script in a webview whose host window is
-/// hidden, so off-screen-but-visible is what gives us headless eval on every
-/// platform without the user ever seeing it. macOS evaluates fine either way.
+/// real monitor.
 const BG_HOST_OFFSCREEN: f64 = -32000.0;
+const BG_HOST_SIZE: f64 = 1.0;
 
 /// Get-or-create the off-screen window that parents the owned-browser child
 /// during headless background use. Idempotent — reused across background calls.
@@ -1114,7 +1214,7 @@ async fn background_host_window(app: &AppHandle) -> Result<Window<Wry>, String> 
         return Ok(window);
     }
     WindowBuilder::new(app, BACKGROUND_HOST_LABEL)
-        .inner_size(1.0, 1.0)
+        .inner_size(BG_HOST_SIZE, BG_HOST_SIZE)
         .position(BG_HOST_OFFSCREEN, BG_HOST_OFFSCREEN)
         .visible(true)
         .focused(false)
@@ -1161,13 +1261,17 @@ async fn ensure_background_child(
         .add_child(
             builder,
             LogicalPosition::new(0.0, 0.0),
-            LogicalSize::new(1.0, 1.0),
+            LogicalSize::new(BG_HOST_SIZE, BG_HOST_SIZE),
         )
         .map_err(|e| format!("owned-browser background child attach failed: {e}"))?;
+    child
+        .show()
+        .map_err(|e| format!("owned-browser background child show failed: {e}"))?;
     inner.child = Some(child.clone());
     inner.child_parent = Some(host_label);
-    // `visible` stays false: the child rides an off-screen window, so the
-    // sidebar/visibility paths must keep treating it as not-on-screen.
+    // `visible` stays false: the child is shown only inside the off-screen
+    // background host, so the sidebar/visibility paths must keep treating it as
+    // not-on-screen.
     info!("owned-browser: background child webview attached on off-screen host (headless)");
     Ok(child)
 }
@@ -1248,7 +1352,10 @@ fn normalize_url(raw: &str) -> Result<url::Url, String> {
 
 #[cfg(test)]
 mod normalize_url_tests {
-    use super::{normalize_url, OwnedBrowserState};
+    use super::{
+        build_eval_result_script, normalize_url, session_host_key,
+        session_prompt_in_flight_timeout_error, session_prompt_timeout_error, OwnedBrowserState,
+    };
 
     #[test]
     fn keeps_fully_qualified() {
@@ -1290,6 +1397,34 @@ mod normalize_url_tests {
     fn preserves_data_url() {
         let u = normalize_url("data:text/plain,hello").unwrap();
         assert_eq!(u.scheme(), "data");
+    }
+
+    #[test]
+    fn normalizes_www_hosts_for_cookie_prompt_decisions() {
+        assert_eq!(session_host_key("www.linkedin.com"), "linkedin.com");
+        assert_eq!(session_host_key("WWW.LinkedIn.COM"), "linkedin.com");
+        assert_eq!(session_host_key("app.example.com"), "app.example.com");
+    }
+
+    #[test]
+    fn prompt_timeout_errors_tell_agent_to_retry_or_login() {
+        let timeout = session_prompt_timeout_error("linkedin.com");
+        assert!(timeout.contains("Timed out waiting for browser-session permission"));
+        assert!(timeout.contains("log in inside the owned browser"));
+
+        let in_flight = session_prompt_in_flight_timeout_error("linkedin.com");
+        assert!(in_flight.contains("existing browser-session permission prompt"));
+        assert!(in_flight.contains("retry from the owned browser menu"));
+    }
+
+    #[test]
+    fn eval_result_script_is_self_contained_and_tags_chunks() {
+        let script = build_eval_result_script("return 42;", "eval-id-1");
+
+        assert!(script.contains("return 42;"));
+        assert!(script.contains("\"eval-id-1\""));
+        assert!(script.contains("window.__SP_OB_CHUNK__"));
+        assert!(script.contains("id: window.__SP_OB_ID__ || \"\""));
     }
 
     // The `document.title` result-transport logic (inline + chunked) and the
@@ -1353,7 +1488,7 @@ pub async fn owned_browser_navigate(
         reveal.unwrap_or(true),
     )
     .await;
-    inject_cookies_for_url(&app, &parsed).await;
+    inject_cookies_for_url(&app, &parsed).await?;
     if let Some(active) = state.active().await {
         // Visibility is owned by the frontend sidebar — never force-show here
         // (see the matching note in `TauriOwnedHandle::navigate`). Force-showing
@@ -1456,21 +1591,33 @@ pub async fn e2e_owned_browser_detach() -> Result<(), String> {
 ///   navigate via the connect HTTP API),
 /// - `TauriOwnedHandle::eval` when a target URL is supplied (agent's
 ///   eval-with-navigate path).
-/// Fail-open everywhere — any error and we proceed to navigate
-/// without injection.
-async fn inject_cookies_for_url(app: &AppHandle, url: &url::Url) {
+/// Cookie read/injection failures still fail open, but unresolved user consent
+/// fails closed. If we know the user has a real-browser session and cannot get
+/// a yes/no answer, silently loading the logged-out page makes agents think the
+/// browser is broken or authenticated when it is neither.
+async fn inject_cookies_for_url(app: &AppHandle, url: &url::Url) -> Result<(), String> {
     let Some(host) = url.host_str() else {
         info!("owned-browser cookies: skipping inject — url has no host");
-        return;
+        return Ok(());
     };
 
-    if browser_session_decision_for_url(app, url).await != BrowserSessionDecision::UseBrowserSession
-    {
-        info!(
-            host,
-            "owned-browser cookies: navigating without real-browser session"
-        );
-        return;
+    match browser_session_decision_for_url(app, url).await {
+        BrowserSessionDecision::UseBrowserSession => {}
+        BrowserSessionDecision::ContinueLoggedOut => {
+            info!(
+                host,
+                "owned-browser cookies: navigating without real-browser session"
+            );
+            return Ok(());
+        }
+        BrowserSessionDecision::CancelNavigation(reason) => {
+            warn!(
+                host,
+                reason = reason.as_str(),
+                "owned-browser cookies: navigation blocked before logged-out fallback"
+            );
+            return Err(reason);
+        }
     }
 
     info!(host, "owned-browser cookies: pre-navigate inject starting");
@@ -1521,7 +1668,7 @@ async fn inject_cookies_for_url(app: &AppHandle, url: &url::Url) {
                     if let Err(e) = app.emit(V20_COOKIE_BLOCK_EVENT, payload) {
                         warn!("owned-browser cookies: failed to emit v20 block event: {e}");
                     }
-                    return;
+                    return Ok(());
                 }
             } else if crate::owned_browser_cookies::locked_browser_block_for_host(host)
                 .await
@@ -1544,14 +1691,14 @@ async fn inject_cookies_for_url(app: &AppHandle, url: &url::Url) {
                             host,
                             "owned-browser cookies: extension returned no cookies for locked browser"
                         );
-                        return;
+                        return Ok(());
                     }
                     Err(e) => {
                         info!(
                             host,
                             "owned-browser cookies: extension unavailable for locked browser — {e}"
                         );
-                        return;
+                        return Ok(());
                     }
                 }
             }
@@ -1563,7 +1710,7 @@ async fn inject_cookies_for_url(app: &AppHandle, url: &url::Url) {
              (causes: real browser not installed, Keychain denied, or no cookies stored \
              for this host yet)"
             );
-            return;
+            return Ok(());
         }
     }
     info!(
@@ -1593,6 +1740,7 @@ async fn inject_cookies_for_url(app: &AppHandle, url: &url::Url) {
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let _ = (app, &cookies); // until Linux injector lands
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -1818,7 +1966,9 @@ async fn browser_session_decision_for_url(
                     host = host_key.as_str(),
                     "owned-browser session access: timed out waiting for in-flight prompt"
                 );
-                return BrowserSessionDecision::ContinueLoggedOut;
+                return BrowserSessionDecision::CancelNavigation(
+                    session_prompt_in_flight_timeout_error(&host_key),
+                );
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -1851,34 +2001,47 @@ async fn browser_session_decision_for_url(
         pending_session_access().lock().await.remove(&request_id);
         SESSION_ACCESS_PROMPT_IN_FLIGHT.store(false, Ordering::SeqCst);
         warn!("owned-browser session access: failed to emit request: {e}");
-        return BrowserSessionDecision::ContinueLoggedOut;
+        return BrowserSessionDecision::CancelNavigation(session_prompt_emit_error(
+            &host_key, e,
+        ));
     }
 
     let decision = match tokio::time::timeout(SESSION_ACCESS_TIMEOUT, rx).await {
         Ok(Ok(decision)) => decision,
-        Ok(Err(_)) => BrowserSessionDecision::ContinueLoggedOut,
+        Ok(Err(_)) => BrowserSessionDecision::CancelNavigation(session_prompt_timeout_error(
+            &host_key,
+        )),
         Err(_) => {
             pending_session_access().lock().await.remove(&request_id);
             warn!(
                 host = host_key.as_str(),
                 "owned-browser session access: user prompt timed out"
             );
-            BrowserSessionDecision::ContinueLoggedOut
+            BrowserSessionDecision::CancelNavigation(session_prompt_timeout_error(
+                &host_key,
+            ))
         }
     };
 
     SESSION_ACCESS_PROMPT_IN_FLIGHT.store(false, Ordering::SeqCst);
-    if decision == BrowserSessionDecision::UseBrowserSession {
-        // Set the global runtime flag — frontend is responsible for
-        // persisting to the store and calling set_browser_cookie_access_granted.
-        GLOBAL_SESSION_ACCESS_GRANTED.store(true, Ordering::SeqCst);
-        GLOBAL_SESSION_ACCESS_DISABLED.store(false, Ordering::SeqCst);
-        SESSION_ACCESS_PRIMED_THIS_RUN.store(true, Ordering::SeqCst);
-    } else {
-        // First-time "Continue logged out" is a real preference: don't keep
-        // prompting. User can enable cookies later from the cookie menu.
-        GLOBAL_SESSION_ACCESS_GRANTED.store(false, Ordering::SeqCst);
-        GLOBAL_SESSION_ACCESS_DISABLED.store(true, Ordering::SeqCst);
+    match &decision {
+        BrowserSessionDecision::UseBrowserSession => {
+            // Set the global runtime flag — frontend is responsible for
+            // persisting to the store and calling set_browser_cookie_access_granted.
+            GLOBAL_SESSION_ACCESS_GRANTED.store(true, Ordering::SeqCst);
+            GLOBAL_SESSION_ACCESS_DISABLED.store(false, Ordering::SeqCst);
+            SESSION_ACCESS_PRIMED_THIS_RUN.store(true, Ordering::SeqCst);
+        }
+        BrowserSessionDecision::ContinueLoggedOut => {
+            // First-time "Continue logged out" is a real preference: don't keep
+            // prompting. User can enable cookies later from the cookie menu.
+            GLOBAL_SESSION_ACCESS_GRANTED.store(false, Ordering::SeqCst);
+            GLOBAL_SESSION_ACCESS_DISABLED.store(true, Ordering::SeqCst);
+        }
+        BrowserSessionDecision::CancelNavigation(_) => {
+            // No user choice happened — keep the setting unchanged so retrying
+            // can show/answer the prompt instead of treating timeout as denial.
+        }
     }
     decision
 }

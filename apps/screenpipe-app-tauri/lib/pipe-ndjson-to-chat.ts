@@ -177,6 +177,20 @@ export function parsePipeNdjsonToMessages(raw: string, pipeName?: string): ChatM
           pendingLastTs = msgTs;
         }
         const toolBlocks = Array.isArray(content) ? extractToolCalls(content, i) : [];
+        // Extract thinking blocks from the content array so their
+        // duration is absorbed by collapseHiddenWorkGroups
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block.type === "thinking") {
+              pendingBlocks.push({
+                type: "thinking",
+                text: block.thinking || block.text || "",
+                isThinking: false,
+                durationMs: undefined,
+              });
+            }
+          }
+        }
         if (text.trim()) {
           pendingBlocks.push({ type: "text", text: text.trim() });
           pendingTexts.push(text.trim());
@@ -231,7 +245,7 @@ export function parsePipeNdjsonToMessages(raw: string, pipeName?: string): ChatM
   const messages: ChatMessage[] = [];
   let currentText = "";
   let currentBlocks: any[] = [];
-  let currentToolCall: { name: string; input: string } | null = null;
+  let currentToolCall: { name: string; input: string; startedAtMs: number } | null = null;
   let inAssistantTurn = false;
   let workFirstTs: number | null = null;
   let workLastTs: number | null = null;
@@ -348,14 +362,24 @@ export function parsePipeNdjsonToMessages(raw: string, pipeName?: string): ChatM
         if (toolName === "unknown" && ae.partial?.content) {
           for (const c of ae.partial.content) { if (c.type === "toolCall" && c.name) { toolName = c.name; break; } }
         }
-        currentToolCall = { name: toolName, input: "" };
+        currentToolCall = { name: toolName, input: "", startedAtMs: ts };
       } else if (ae.type === "toolcall_delta" && ae.delta && currentToolCall) currentToolCall.input += ae.delta;
       else if (ae.type === "toolcall_end") {
         let args: Record<string, any> = {};
         const rawInput = currentToolCall?.input || "";
         if (rawInput) { try { args = JSON.parse(rawInput); } catch { args = { raw: rawInput }; } }
         let toolName = currentToolCall?.name || "unknown";
-        currentBlocks.push({ type: "tool", toolCall: { id: `pipe-tool-${messageCounter}-${currentBlocks.length}`, toolName, args, isRunning: false } });
+        currentBlocks.push({
+          type: "tool",
+          toolCall: {
+            id: `pipe-tool-${messageCounter}-${currentBlocks.length}`,
+            toolName,
+            args,
+            isRunning: false,
+            startedAtMs: currentToolCall?.startedAtMs ?? ts,
+            endedAtMs: ts,
+          },
+        });
         currentToolCall = null;
       }
       continue;
@@ -372,7 +396,15 @@ export function parsePipeNdjsonToMessages(raw: string, pipeName?: string): ChatM
         currentText = extractText(content);
         for (const block of content) {
           if (block.type === "toolCall") {
-            currentBlocks.push({ type: "tool", toolCall: { id: block.id || `pipe-tool-${messageCounter}-${currentBlocks.length}`, toolName: block.name || "unknown", args: block.arguments || {}, isRunning: false } });
+            currentBlocks.push({
+              type: "tool",
+              toolCall: {
+                id: block.id || `pipe-tool-${messageCounter}-${currentBlocks.length}`,
+                toolName: block.name || "unknown",
+                args: block.arguments || {},
+                isRunning: false,
+              },
+            });
           }
         }
       }

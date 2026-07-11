@@ -80,10 +80,14 @@ export const ShareLogsButton = ({
   useEffect(() => {
     const loadMachineId = async () => {
       let id: string | null = null;
-      try { id = localStorage?.getItem("machineId"); } catch {}
+      try {
+        id = localStorage?.getItem("machineId");
+      } catch {}
       if (!id) {
         id = crypto.randomUUID();
-        try { localStorage?.setItem("machineId", id); } catch {}
+        try {
+          localStorage?.setItem("machineId", id);
+        } catch {}
       }
       setMachineId(id);
     };
@@ -94,10 +98,10 @@ export const ShareLogsButton = ({
     try {
       const result = await commands.getLogFiles();
       if (result.status === "ok") {
-        return result.data.map(file => ({
+        return result.data.map((file) => ({
           name: file.name,
           path: file.path,
-          modified_at: Number(file.modified_at)
+          modified_at: Number(file.modified_at),
         }));
       } else {
         console.error("failed to get log files:", result.error);
@@ -112,31 +116,42 @@ export const ShareLogsButton = ({
   const captureLastFiveMinutes = async () => {
     setIsLoadingVideo(true);
     try {
+      const captureEnd = new Date();
+      const captureStart = new Date(captureEnd.getTime() - 5 * 60 * 1000);
+      const sqlString = (value: string) => value.replace(/'/g, "''");
       const response = await localFetch("/raw_sql", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           query: `
-            SELECT * FROM video_chunks
-            ORDER BY id DESC
-            LIMIT 6
+            SELECT
+              vc.device_name,
+              vc.file_path,
+              vc.id
+            FROM video_chunks vc
+            JOIN frames f ON f.video_chunk_id = vc.id
+            WHERE datetime(f.timestamp) >= datetime('${sqlString(captureStart.toISOString())}')
+              AND datetime(f.timestamp) <= datetime('${sqlString(captureEnd.toISOString())}')
+              AND COALESCE(vc.file_path, '') <> ''
+              AND vc.file_path NOT LIKE 'cloud://%'
+            GROUP BY vc.id, vc.file_path, vc.device_name
+            ORDER BY MIN(datetime(f.timestamp)) ASC, vc.id ASC
+            LIMIT 18
           `,
         }),
       });
 
       if (!response.ok) throw new Error("failed to fetch video chunks");
       const chunks = (await response.json()) as VideoChunk[];
+      if (!chunks.length) throw new Error("no recent video chunks found");
 
-      const mergeResponse = await localFetch(
-        "/experimental/frames/merge",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            video_paths: chunks.map((c) => c.file_path),
-          }),
-        }
-      );
+      const mergeResponse = await localFetch("/experimental/frames/merge", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          video_paths: chunks.map((c) => c.file_path),
+        }),
+      });
 
       if (!mergeResponse.ok) throw new Error("failed to merge video chunks");
       const { video_path } = await mergeResponse.json();
@@ -169,7 +184,7 @@ export const ShareLogsButton = ({
   };
 
   const handleScreenshotUpload = async (
-    e: React.ChangeEvent<HTMLInputElement>
+    e: React.ChangeEvent<HTMLInputElement>,
   ) => {
     const file = e.target.files?.[0];
     if (file) await attachImageFile(file);
@@ -206,11 +221,15 @@ export const ShareLogsButton = ({
   };
 
   const sendLogs = async () => {
-    const logFiles = await getLogFiles();
-    if (!logFiles.length) return;
-
     setIsSending(true);
     try {
+      // Log files are best-effort. If none are found (fresh install, or an
+      // unreadable/misconfigured data dir — common on Windows), we still send
+      // the feedback text, screenshot, settings and console logs, which are
+      // valuable on their own. Bailing here silently was the original bug:
+      // clicking the button did nothing, with no toast and no spinner.
+      const logFiles = await getLogFiles();
+
       const BASE_URL = "https://screenpipe.com";
       const identifier = settings.user?.id || machineId;
       const type = settings.user?.id ? "user" : "machine";
@@ -220,9 +239,11 @@ export const ShareLogsButton = ({
         logFiles.slice(0, 5).map(async (file) => {
           try {
             const content = await readTextFile(file.path);
-            const truncatedContent = content.length > MAX_LOG_SIZE
-              ? `... [truncated, showing last ${MAX_LOG_SIZE / 1024}KB] ...\n` + content.slice(-MAX_LOG_SIZE)
-              : content;
+            const truncatedContent =
+              content.length > MAX_LOG_SIZE
+                ? `... [truncated, showing last ${MAX_LOG_SIZE / 1024}KB] ...\n` +
+                  content.slice(-MAX_LOG_SIZE)
+                : content;
             return {
               name: file.name,
               content: truncatedContent,
@@ -230,11 +251,15 @@ export const ShareLogsButton = ({
           } catch (e) {
             return { name: file.name, content: `[Error reading file: ${e}]` };
           }
-        })
+        }),
       );
 
       let consoleLog = "";
-      try { consoleLog = (localStorage?.getItem("console_logs") || "").slice(-50000); } catch {}
+      try {
+        consoleLog = (localStorage?.getItem("console_logs") || "").slice(
+          -50000,
+        );
+      } catch {}
 
       const signedRes = await fetch(`${BASE_URL}/api/logs`, {
         method: "POST",
@@ -265,7 +290,10 @@ export const ShareLogsButton = ({
           let chatData = "";
           for (const conv of recentConvs) {
             const convText = conv.messages
-              .map((m: any) => `[${m.role}] ${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`)
+              .map(
+                (m: any) =>
+                  `[${m.role}] ${typeof m.content === "string" ? m.content : JSON.stringify(m.content)}`,
+              )
               .join("\n");
             const entry = `\n--- ${conv.title || conv.id} (${new Date(conv.updatedAt).toISOString()}) ---\n${convText}\n`;
             if (chatData.length + entry.length > MAX_CHAT_SIZE) break;
@@ -302,7 +330,10 @@ export const ShareLogsButton = ({
         "\n\n=== Browser Console Logs ===\n" +
         consoleLog;
 
-      const redaction = await commands.redactPiiForFeedback(rawBundle, settingsJson);
+      const redaction = await commands.redactPiiForFeedback(
+        rawBundle,
+        settingsJson,
+      );
       if (redaction.status !== "ok") {
         // The command never returns Err (worst case is regex-only redaction), so
         // this means the call itself failed. Don't upload unredacted content.
@@ -330,9 +361,10 @@ export const ShareLogsButton = ({
       if (mergedVideoPath && signedUrlVideo) {
         const videoResult = await commands.uploadFileToS3(
           mergedVideoPath,
-          signedUrlVideo
+          signedUrlVideo,
         );
-        if (videoResult.status !== "ok") throw new Error("Failed to upload video");
+        if (videoResult.status !== "ok")
+          throw new Error("Failed to upload video");
       }
 
       const os = osPlatform();
@@ -414,9 +446,7 @@ export const ShareLogsButton = ({
               variant={screenshot ? "secondary" : "outline"}
               size="sm"
               className={`gap-1.5 h-7 text-xs transition-all ${
-                screenshot
-                  ? "bg-foreground/10 text-foreground"
-                  : ""
+                screenshot ? "bg-foreground/10 text-foreground" : ""
               }`}
               disabled={!!screenshot}
               asChild
@@ -435,9 +465,7 @@ export const ShareLogsButton = ({
                 size="sm"
                 onClick={captureLastFiveMinutes}
                 className={`gap-1.5 h-7 text-xs transition-all ${
-                  mergedVideoPath
-                    ? "bg-foreground/10 text-foreground"
-                    : ""
+                  mergedVideoPath ? "bg-foreground/10 text-foreground" : ""
                 }`}
                 disabled={isLoadingVideo || health?.status === "error"}
               >
@@ -452,10 +480,7 @@ export const ShareLogsButton = ({
                 </span>
               </Button>
             </TooltipTrigger>
-            <TooltipContent
-              side="bottom"
-              className="text-xs"
-            >
+            <TooltipContent side="bottom" className="text-xs">
               attach last 5 minutes of screen recording
             </TooltipContent>
           </Tooltip>
@@ -481,8 +506,8 @@ export const ShareLogsButton = ({
         )}
 
         <p className="text-[10px] text-muted-foreground leading-tight">
-          logs, settings, and pi chat history are included to help us debug.
-          api keys, secrets, and personal info are automatically removed.
+          logs, settings, and pi chat history are included to help us debug. api
+          keys, secrets, and personal info are automatically removed.
         </p>
 
         <Button

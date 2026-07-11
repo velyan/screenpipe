@@ -716,6 +716,10 @@ pub struct UiElementContext {
     pub description: Option<String>,
     pub automation_id: Option<String>,
     pub bounds: Option<String>, // JSON: {"x":0,"y":0,"width":100,"height":50}
+    /// Root-first JSON path in the window hierarchy:
+    /// [{"role":"AXWindow","name":"Inbox"},{"role":"AXGroup"},...]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ancestors: Option<String>,
 }
 
 /// A UI input event stored in the database
@@ -780,6 +784,10 @@ pub struct UiEventRow {
     pub element_description: Option<String>,
     pub element_automation_id: Option<String>,
     pub element_bounds: Option<String>,
+    /// Root-first JSON path of the element in the window hierarchy
+    /// (`[{"role":"AXWindow","name":"Inbox"},...]`) — disambiguates identical
+    /// labels in different containers. macOS click events only for now.
+    pub element_ancestors: Option<String>,
     pub frame_id: Option<i64>,
 }
 
@@ -796,6 +804,7 @@ impl From<UiEventRow> for UiEventRecord {
                 description: row.element_description,
                 automation_id: row.element_automation_id,
                 bounds: row.element_bounds,
+                ancestors: row.element_ancestors,
             })
         } else {
             None
@@ -853,6 +862,9 @@ pub struct InsertUiEvent {
     pub element_description: Option<String>,
     pub element_automation_id: Option<String>,
     pub element_bounds: Option<String>,
+    /// Root-first JSON path of the element in the window hierarchy — see
+    /// `UiEventRow::element_ancestors`.
+    pub element_ancestors: Option<String>,
     pub frame_id: Option<i64>,
 }
 

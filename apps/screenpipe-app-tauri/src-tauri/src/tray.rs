@@ -6,9 +6,10 @@ use crate::commands::{hide_main_window, show_main_window};
 use crate::enterprise_policy::{is_app_ui_hidden, is_tray_item_hidden};
 use crate::health::{
     get_audio_device_status, get_high_fps_status, get_recording_info, get_recording_status,
-    set_high_fps_status, DeviceKind, HighFpsCacheEntry, RecordingStatus,
+    get_vision_device_status, set_high_fps_status, DeviceKind, HighFpsCacheEntry, RecordingStatus,
 };
-use crate::recording::{local_api_context_from_app, RecordingState, PRE_EXIT_TEARDOWN_TIMEOUT};
+use crate::process_exit;
+use crate::recording::{local_api_context_from_app, RecordingState};
 use crate::store::{OnboardingStore, SettingsStore};
 use crate::updates::{is_enterprise_build, is_source_build};
 use crate::window::ShowRewindWindow;
@@ -20,6 +21,8 @@ use std::sync::Mutex;
 use tauri::async_runtime::JoinHandle;
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::Emitter;
+#[cfg(target_os = "macos")]
+use tauri::menu::IconMenuItemBuilder;
 use tauri::{
     menu::{
         CheckMenuItemBuilder, MenuBuilder, MenuItem, MenuItemBuilder, PredefinedMenuItem,
@@ -32,15 +35,8 @@ use tauri_plugin_opener::OpenerExt;
 
 use tracing::{debug, error, info, warn};
 
-/// Flag set by the "quit screenpipe" menu item so that the ExitRequested
-/// handler in main.rs knows this is an intentional quit (not just a window close).
-pub static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-/// Latched once a quit teardown has started so repeated "Quit" clicks don't each
-/// spawn another blocking teardown. In the 2026-06-26 MacBook Air hang the user
-/// rage-clicked Quit while an update-restart looked frozen, and each click piled
-/// another unbounded `stop_screenpipe` onto the same wedged capture lock.
-pub static QUIT_TEARDOWN_STARTED: AtomicBool = AtomicBool::new(false);
+/// Re-export for callers that already import from tray.
+pub use crate::process_exit::QUIT_REQUESTED;
 
 /// Pre-fetched data for building the tray menu. All store reads, settings
 /// deserialization, and permission checks happen OFF the main thread; only
@@ -432,6 +428,45 @@ fn apply_pending_tray_menu(app: &AppHandle) -> Result<()> {
     Ok(())
 }
 
+/// Snapshot current recording/HD/device state into a `MenuState`. Shared by
+/// the periodic refresh loop and the macOS preview-driven rebuild so change
+/// detection can't drift between the two.
+fn snapshot_menu_state(data: &TrayMenuData, effective_status: RecordingStatus) -> MenuState {
+    let recording_info = get_recording_info();
+    let hd = get_high_fps_status();
+    MenuState {
+        shortcuts: {
+            let mut m = HashMap::new();
+            m.insert("show".to_string(), data.show_shortcut.clone());
+            m.insert("search".to_string(), data.search_shortcut.clone());
+            m.insert("chat".to_string(), data.chat_shortcut.clone());
+            m
+        },
+        recording_status: Some(effective_status),
+        onboarding_completed: data.onboarding_completed,
+        has_permission_issue: data.has_permission_issue,
+        devices: recording_info
+            .devices
+            .iter()
+            .map(|d| (d.name.clone(), d.active))
+            .collect(),
+        cloud_subscribed: data.cloud_subscribed,
+        subscription_plan: data.subscription_plan.clone(),
+        hd_active: hd.active,
+        hd_remaining_secs: hd.remaining_secs,
+        hd_session_kind: hd.session_kind,
+        hd_interval_ms: hd.interval_ms,
+    }
+}
+
+/// Rebuild the tray menu after a monitor preview image arrives (macOS only).
+#[cfg(target_os = "macos")]
+pub(crate) fn queue_tray_menu_refresh_for_preview(app: &AppHandle) {
+    let data = prefetch_tray_menu_data(app);
+    let state = snapshot_menu_state(&data, get_effective_recording_status());
+    queue_pending_tray_menu(state, data);
+}
+
 /// Installs the queued tray menu while no menu is open — the only flash-free,
 /// crash-free moment to call `set_menu` on macOS (see the `ACTIVE_TRAY_MENU`
 /// doc above for the two hazards).
@@ -551,6 +586,9 @@ pub fn setup_tray(app: &AppHandle, update_item: Option<&tauri::menu::MenuItem<Wr
         // open (flash-free, crash-free). Once-guarded, so recreate_tray is fine.
         #[cfg(target_os = "macos")]
         menu_refresh_observer::install(app);
+
+        #[cfg(target_os = "macos")]
+        crate::tray_monitor_preview::install(app);
 
         // Setup click handlers
         setup_tray_click_handlers(&main_tray)?;
@@ -805,19 +843,74 @@ fn create_dynamic_menu(
     {
         let info = get_recording_info();
 
-        // Show monitors (non-clickable)
-        for device in info
+        // Monitors: CheckMenuItem when the sidecar reports a numeric id (per-display
+        // pause via /vision/device/*). Older sidecars stay display-only.
+        let vision_status = get_vision_device_status();
+        let mut monitors: Vec<_> = info
             .devices
             .iter()
             .filter(|d| d.kind == DeviceKind::Monitor)
+            .collect();
+        monitors.sort_by(|a, b| a.name.cmp(&b.name));
+        #[cfg(target_os = "macos")]
         {
-            let dot = if device.active { "●" } else { "○" };
-            let label = format!("  {} ▣ {}", dot, device.name);
-            menu_builder = menu_builder.item(
-                &MenuItemBuilder::with_id(format!("monitor_{}", device.name), label)
+            crate::tray_monitor_preview::clear_registrations();
+            let monitor_ids: Vec<u32> = monitors.iter().filter_map(|d| d.monitor_id).collect();
+            crate::tray_monitor_preview::sync_refresh_monitors(&monitor_ids);
+        }
+        for device in monitors {
+            let label = format!("  ▣ {}", device.name);
+            if let Some(monitor_id) = device.monitor_id {
+                let is_active = vision_status
+                    .iter()
+                    .find(|d| d.id == monitor_id)
+                    .map(|d| !d.user_disabled)
+                    .unwrap_or(device.active);
+
+                #[cfg(target_os = "macos")]
+                {
+                    crate::tray_monitor_preview::register_monitor_submenu(monitor_id, is_active);
+                    crate::tray_monitor_preview::register_preview_item(monitor_id);
+
+                    let preview =
+                        crate::tray_monitor_preview::preview_image_or_placeholder(monitor_id);
+                    let preview_row = IconMenuItemBuilder::with_id(
+                        format!("monitor_preview_{monitor_id}"),
+                        " ",
+                    )
                     .enabled(false)
-                    .build(app)?,
-            );
+                    .icon(preview)
+                    .build(app)?;
+
+                    let submenu = SubmenuBuilder::with_id(
+                        app,
+                        format!("toggle_vision_device_{monitor_id}"),
+                        label,
+                    )
+                    .item(&preview_row)
+                    .build()?;
+                    menu_builder = menu_builder.item(&submenu);
+                }
+
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let toggle = CheckMenuItemBuilder::with_id(
+                        format!("toggle_vision_device_{}", monitor_id),
+                        label,
+                    )
+                    .checked(is_active)
+                    .build(app)?;
+                    menu_builder = menu_builder.item(&toggle);
+                }
+            } else {
+                let dot = if device.active { "●" } else { "○" };
+                let fallback_label = format!("  {} ▣ {}", dot, device.name);
+                menu_builder = menu_builder.item(
+                    &MenuItemBuilder::with_id(format!("monitor_{}", device.name), fallback_label)
+                        .enabled(false)
+                        .build(app)?,
+                );
+            }
         }
 
         // Show only the audio devices from get_recording_info (the ones
@@ -1310,6 +1403,36 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
                 }
             });
         }
+        id if id.starts_with("toggle_vision_device_") => {
+            let monitor_id: u32 = id
+                .strip_prefix("toggle_vision_device_")
+                .unwrap()
+                .parse()
+                .unwrap_or(0);
+
+            let cached = get_vision_device_status();
+            let is_active = cached
+                .iter()
+                .find(|d| d.id == monitor_id)
+                .map(|d| !d.user_disabled)
+                .unwrap_or(true);
+
+            let api = local_api_context_from_app(&app_handle);
+            let endpoint = if is_active {
+                api.url("/vision/device/stop")
+            } else {
+                api.url("/vision/device/start")
+            };
+            tauri::async_runtime::spawn(async move {
+                let client = reqwest::Client::new();
+                let _ = api
+                    .apply_auth(client.post(endpoint))
+                    .header("Content-Type", "application/json")
+                    .body(serde_json::json!({"monitor_id": monitor_id}).to_string())
+                    .send()
+                    .await;
+            });
+        }
         id if id.starts_with("toggle_audio_device_") => {
             let device_name = id.strip_prefix("toggle_audio_device_").unwrap().to_string();
 
@@ -1477,65 +1600,7 @@ fn handle_menu_event(app_handle: &AppHandle, event: tauri::menu::MenuEvent) {
         }
         "quit" => {
             debug!("Quit requested");
-
-            // Signal that this is an intentional quit so the ExitRequested
-            // handler in main.rs won't prevent it.
-            QUIT_REQUESTED.store(true, Ordering::SeqCst);
-
-            // De-dupe rapid re-clicks: a teardown is already in flight and will
-            // force-exit shortly, so don't pile another one onto the same locks.
-            if QUIT_TEARDOWN_STARTED.swap(true, Ordering::SeqCst) {
-                debug!("Quit ignored — teardown already in progress");
-                return;
-            }
-
-            // Stop recording before exiting
-            let app_handle_clone = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                info!("Stopping screenpipe recording before quit...");
-                let teardown = async {
-                    if let Some(recording_state) = app_handle_clone.try_state::<RecordingState>() {
-                        // Stop capture first (self-contained)
-                        if let Some(session) = recording_state.capture.lock().await.take() {
-                            session.stop().await;
-                        }
-                        // Then shutdown server
-                        if let Some(server) = recording_state.server.lock().await.take() {
-                            server.shutdown().await;
-                        }
-                        info!("Screenpipe server + recording stopped successfully");
-                    }
-                };
-                // Never let a wedged capture/audio shutdown block the exit: the
-                // process is dying anyway, and a stuck quit is what stranded the
-                // 2026-06-26 MacBook Air for ~57s. Force-exit once the bound elapses.
-                if tokio::time::timeout(PRE_EXIT_TEARDOWN_TIMEOUT, teardown)
-                    .await
-                    .is_err()
-                {
-                    warn!(
-                        "quit: teardown exceeded {}s (capture shutdown wedged) — force-exiting",
-                        PRE_EXIT_TEARDOWN_TIMEOUT.as_secs()
-                    );
-                }
-                info!("All tasks stopped, exiting process");
-                // Use _exit() instead of exit() to skip C++ atexit/static destructors.
-                // The whisper/ggml Metal GPU context registers a global destructor that
-                // asserts during teardown (ggml_metal_rsets_free), causing SIGABRT.
-                // We've already done our own cleanup above, so atexit handlers have
-                // nothing useful left to do.
-                #[cfg(unix)]
-                {
-                    extern "C" {
-                        fn _exit(status: i32) -> !;
-                    }
-                    unsafe {
-                        _exit(0);
-                    }
-                }
-                #[cfg(not(unix))]
-                app_handle_clone.exit(0);
-            });
+            process_exit::request_app_quit(app_handle.clone());
         }
         _ => debug!("Unhandled menu event: {:?}", event.id()),
     }
@@ -1552,32 +1617,8 @@ async fn update_menu_if_needed(
     // main-thread closure only does lightweight menu-item construction.
     let data = prefetch_tray_menu_data(app);
 
-    let recording_info = get_recording_info();
     let effective_status = get_effective_recording_status();
-    let hd = get_high_fps_status();
-    let new_state = MenuState {
-        shortcuts: {
-            let mut m = HashMap::new();
-            m.insert("show".to_string(), data.show_shortcut.clone());
-            m.insert("search".to_string(), data.search_shortcut.clone());
-            m.insert("chat".to_string(), data.chat_shortcut.clone());
-            m
-        },
-        recording_status: Some(effective_status),
-        onboarding_completed: data.onboarding_completed,
-        has_permission_issue: data.has_permission_issue,
-        devices: recording_info
-            .devices
-            .iter()
-            .map(|d| (d.name.clone(), d.active))
-            .collect(),
-        cloud_subscribed: data.cloud_subscribed,
-        subscription_plan: data.subscription_plan.clone(),
-        hd_active: hd.active,
-        hd_remaining_secs: hd.remaining_secs,
-        hd_session_kind: hd.session_kind,
-        hd_interval_ms: hd.interval_ms,
-    };
+    let new_state = snapshot_menu_state(&data, effective_status);
 
     // Compare with last state (poison-safe: run handler must not panic)
     let should_update = {

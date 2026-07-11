@@ -60,7 +60,7 @@ pub async fn handle_connection_command(command: &ConnectionCommand) -> anyhow::R
             } else if has_session {
                 "WhatsApp has a saved session but the gateway is not running. It should auto-reconnect on server restart.".to_string()
             } else {
-                "Not paired. User must pair via Settings > Connections in the desktop app first."
+                "Not paired. User must pair WhatsApp from the Connections page in the desktop app first."
                     .to_string()
             };
 
@@ -152,7 +152,7 @@ pub async fn handle_connection_command(command: &ConnectionCommand) -> anyhow::R
                     json!({
                         "id": "whatsapp",
                         "connected": false,
-                        "description": "Not paired. User must pair via Settings > Connections in the desktop app first."
+                        "description": "Not paired. User must pair WhatsApp from the Connections page in the desktop app first."
                     })
                 };
                 if *use_json {

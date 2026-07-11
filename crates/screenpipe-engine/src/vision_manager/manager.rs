@@ -47,6 +47,8 @@ pub struct VisionManagerConfig {
     /// snapshot max width via `screenpipe_core::video::*`. Values: "low",
     /// "balanced" (default), "high", "max".
     pub video_quality: String,
+    /// Skip screenshot pixels/JPEG/OCR while keeping accessibility-tree capture.
+    pub disable_screenshots: bool,
 
     /// Mitsukeru fork: overrides for `EventDrivenCaptureConfig`.
     /// Each field is applied only when `Some(_)`. None = follow active PowerProfile.
@@ -486,6 +488,7 @@ impl VisionManager {
         // baseline ceiling (`min(profile, baseline)`) at runtime.
         let mut capture_config = EventDrivenCaptureConfig {
             jpeg_quality: baseline_q,
+            disable_screenshots: self.config.disable_screenshots,
             ..EventDrivenCaptureConfig::default()
         };
         // Mitsukeru fork: apply per-parameter CLI / settings overrides if any.
@@ -632,6 +635,12 @@ impl VisionManager {
 
     /// Get list of currently recording monitor IDs.
     /// Removes dead tasks (finished JoinHandles) so MonitorWatcher can restart them.
+    /// DB handle for sibling vision_manager modules (the monitor watcher
+    /// persists display-layout snapshots). Cheap Arc clone.
+    pub(crate) fn db_handle(&self) -> Arc<DatabaseManager> {
+        self.db.clone()
+    }
+
     pub async fn active_monitors(&self) -> Vec<u32> {
         // Collect dead task IDs first to avoid holding DashMap refs during removal
         let dead: Vec<u32> = self
@@ -681,10 +690,16 @@ impl VisionManager {
     }
 
     /// Resume recording on a monitor the user previously paused. Clears the
-    /// paused flag first so `start_monitor`'s guard lets it through.
+    /// paused flag first so `start_monitor`'s guard lets it through. When the
+    /// manager isn't running (global capture paused), records resume intent only.
     pub async fn resume_monitor(&self, monitor_id: u32) -> Result<()> {
         self.user_disabled.remove(&monitor_id);
         info!("user resumed vision recording for monitor {}", monitor_id);
+
+        if self.status().await != VisionManagerStatus::Running {
+            return Ok(());
+        }
+
         self.start_monitor(monitor_id).await
     }
 
@@ -736,6 +751,7 @@ mod tests {
             pause_on_drm_content: false,
             languages: vec![Language::English],
             video_quality: "balanced".to_string(),
+            disable_screenshots: false,
             idle_capture_interval_ms: None,
             visual_check_interval_ms: None,
             visual_change_threshold: None,
@@ -818,9 +834,30 @@ mod tests {
 
         // Resuming clears the flag (the actual start then fails only because the
         // fake id has no monitor — the flag clear is what we assert here).
-        vm.user_disabled.remove(&id);
+        vm.resume_monitor(id).await.expect("resume clears intent");
         assert!(!vm.is_monitor_user_disabled(id));
         assert!(vm.user_disabled_monitors().is_empty());
+    }
+
+    /// Resuming while the manager is stopped clears user pause intent but does
+    /// not spawn capture — mirrors audio `resume_device` when capture is off.
+    #[tokio::test]
+    async fn resume_while_stopped_clears_intent_without_starting() {
+        let vm = make_vm_with_monitor_ids(vec!["default".to_string()]).await;
+        let id = 4242;
+
+        vm.pause_monitor(id).await.expect("pause records intent");
+        assert!(vm.is_monitor_user_disabled(id));
+        assert_eq!(vm.status().await, VisionManagerStatus::Stopped);
+
+        vm.resume_monitor(id)
+            .await
+            .expect("resume while stopped is Ok");
+        assert!(!vm.is_monitor_user_disabled(id));
+        assert!(
+            !vm.recording_tasks.contains_key(&id),
+            "stopped manager must not start capture on resume"
+        );
     }
 
     /// Verify that stop_monitor completes promptly when the task finishes normally.

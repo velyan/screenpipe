@@ -150,6 +150,70 @@ fn vision_capture_silent(
 /// Start the monitor watcher that polls for monitor changes.
 /// When `audio_manager` is provided, SCK-based (output) audio devices are also
 /// stopped/restarted alongside vision during DRM pause/resume.
+/// Canonical JSON snapshot of the display arrangement — displays sorted by
+/// runtime id, stable field order — so change detection is a string compare
+/// and consumers get a deterministic shape:
+/// `[{"id":1,"stable_id":"Built-in_1512x982_0,0","name":"Built-in",
+///    "x":0,"y":0,"width":1512,"height":982,"is_primary":true}, ...]`
+///
+/// `x`/`y` are global-desktop origins in points; `width`/`height` are as
+/// reported by the capture backend (SCK reports pixels, xcap logical points —
+/// pair with the monitor's a11y-tree normalization at read time). This is the
+/// metadata that lets a click's global-desktop point be resolved to a monitor
+/// (and thus to per-monitor-normalized element-tree bounds) — historically
+/// unrecorded, which capped click↔tree coordinate matching at ~25% accuracy.
+pub(crate) fn canonical_display_layout_json(
+    displays: &mut [(u32, String, screenpipe_screen::monitor::MonitorData)],
+) -> String {
+    displays.sort_by_key(|(id, _, _)| *id);
+    let arr: Vec<serde_json::Value> = displays
+        .iter()
+        .map(|(id, stable_id, d)| {
+            serde_json::json!({
+                "id": id,
+                "stable_id": stable_id,
+                "name": d.name,
+                "x": d.x,
+                "y": d.y,
+                "width": d.width,
+                "height": d.height,
+                "is_primary": d.is_primary,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(arr).to_string()
+}
+
+/// Persist a layout snapshot, bounded and failure-tolerant: this loop is also
+/// the DB-wedge watchdog, so a stalled DB must never block it. Returns whether
+/// the write landed (callers only advance their change-tracking on success, so
+/// a failed write retries next pass).
+async fn persist_display_layout(
+    db: &screenpipe_db::DatabaseManager,
+    layout_json: &str,
+    reason: &str,
+) -> bool {
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        db.insert_display_layout(layout_json, reason),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {
+            info!(reason, "display layout snapshot persisted");
+            true
+        }
+        Ok(Err(e)) => {
+            debug!("display layout persist failed (will retry on next pass): {e}");
+            false
+        }
+        Err(_) => {
+            debug!("display layout persist timed out (will retry on next pass)");
+            false
+        }
+    }
+}
+
 pub async fn start_monitor_watcher(
     vision_manager: Arc<VisionManager>,
     audio_manager: Option<screenpipe_audio::audio_manager::AudioManager>,
@@ -184,6 +248,22 @@ pub async fn start_monitor_watcher(
         let mut recovery_retry_warned = false;
         // Last time the silent-wedge watchdog restarted capture (cooldown gate).
         let mut last_vision_restart: Option<Instant> = None;
+        // Display-layout snapshotting (see canonical_display_layout_json).
+        // Seeded from the DB so a process restart with an unchanged
+        // arrangement writes nothing. Diffed on the FULL geometry — not the
+        // id set — so re-arrangements and resolution changes (same ids) are
+        // recorded too. `None` seed (fresh DB / read failure) makes the first
+        // successful write a 'startup' row.
+        let db_for_layout = vision_manager.db_handle();
+        let mut last_layout_json: Option<String> = match tokio::time::timeout(
+            Duration::from_secs(5),
+            db_for_layout.latest_display_layout(),
+        )
+        .await
+        {
+            Ok(Ok(v)) => v,
+            _ => None,
+        };
 
         // Initialize with current monitors
         match list_monitors_detailed().await {
@@ -466,6 +546,28 @@ pub async fn start_monitor_watcher(
             };
             let current_ids: HashSet<u32> = current_monitors.iter().map(|m| m.id()).collect();
 
+            // Persist a display-layout snapshot when the arrangement changed
+            // (origins/sizes/primary — not just the id set). Cheap when
+            // unchanged: one string compare against the last persisted value.
+            {
+                let mut geo: Vec<(u32, String, screenpipe_screen::monitor::MonitorData)> =
+                    current_monitors
+                        .iter()
+                        .map(|m| (m.id(), m.stable_id(), m.get_info()))
+                        .collect();
+                let layout = canonical_display_layout_json(&mut geo);
+                if last_layout_json.as_deref() != Some(layout.as_str()) {
+                    let reason = if last_layout_json.is_none() {
+                        "startup"
+                    } else {
+                        "change"
+                    };
+                    if persist_display_layout(&db_for_layout, &layout, reason).await {
+                        last_layout_json = Some(layout);
+                    }
+                }
+            }
+
             // Get currently recording monitors
             let active_ids: HashSet<u32> =
                 vision_manager.active_monitors().await.into_iter().collect();
@@ -617,6 +719,7 @@ pub async fn stop_monitor_watcher() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use screenpipe_screen::monitor::MonitorData;
 
     // Fixed "now" so deltas are exact and the tests never depend on wall clock.
     const NOW: u64 = 2_000_000_000;
@@ -718,5 +821,77 @@ mod tests {
         // same config won't help (permission/monitor issue handled elsewhere) and
         // could restart-loop → not silent.
         assert!(!vision_capture_silent(600.0, 0, 0, NOW));
+    }
+
+    fn mon(name: &str, x: i32, y: i32, w: u32, h: u32, primary: bool) -> MonitorData {
+        MonitorData {
+            width: w,
+            height: h,
+            x,
+            y,
+            name: name.to_string(),
+            is_primary: primary,
+        }
+    }
+
+    #[test]
+    fn layout_json_is_canonical_and_sorted_by_id() {
+        // deliberately out of id order — canonical form must sort
+        let mut a = vec![
+            (
+                7,
+                "DELL_1920x1080_1512,0".to_string(),
+                mon("DELL", 1512, 0, 1920, 1080, false),
+            ),
+            (
+                1,
+                "Built-in_1512x982_0,0".to_string(),
+                mon("Built-in", 0, 0, 1512, 982, true),
+            ),
+        ];
+        let mut b = vec![
+            (
+                1,
+                "Built-in_1512x982_0,0".to_string(),
+                mon("Built-in", 0, 0, 1512, 982, true),
+            ),
+            (
+                7,
+                "DELL_1920x1080_1512,0".to_string(),
+                mon("DELL", 1512, 0, 1920, 1080, false),
+            ),
+        ];
+        assert_eq!(
+            canonical_display_layout_json(&mut a),
+            canonical_display_layout_json(&mut b),
+            "input order must not matter"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&canonical_display_layout_json(&mut a)).unwrap();
+        assert_eq!(v[0]["id"], 1);
+        assert_eq!(v[0]["x"], 0);
+        assert_eq!(v[1]["id"], 7);
+        assert_eq!(v[1]["x"], 1512);
+        assert_eq!(v[1]["is_primary"], false);
+    }
+
+    #[test]
+    fn layout_change_detection_sees_rearrangement_with_same_ids() {
+        // The id-SET diff the watcher does for hot-plug is blind to this case;
+        // the layout snapshot must not be. Same two ids, external display
+        // moved from the right to the left of the laptop.
+        let mut before = vec![
+            (1, "b".to_string(), mon("Built-in", 0, 0, 1512, 982, true)),
+            (2, "d".to_string(), mon("DELL", 1512, 0, 1920, 1080, false)),
+        ];
+        let mut after = vec![
+            (1, "b".to_string(), mon("Built-in", 0, 0, 1512, 982, true)),
+            (2, "d".to_string(), mon("DELL", -1920, 0, 1920, 1080, false)),
+        ];
+        assert_ne!(
+            canonical_display_layout_json(&mut before),
+            canonical_display_layout_json(&mut after),
+            "re-arrangement with unchanged ids must change the canonical json"
+        );
     }
 }

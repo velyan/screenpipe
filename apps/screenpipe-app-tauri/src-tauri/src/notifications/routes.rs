@@ -442,6 +442,30 @@ pub async fn clear() -> Json<ApiResponse> {
     })
 }
 
+/// `POST /notifications/:id/read` — mark a single notification as read.
+///
+/// Opening the bell no longer marks everything read; a notification is read
+/// only once the user actually expands it. This per-id endpoint persists that.
+pub async fn mark_one_read(Path(id): Path<String>) -> (StatusCode, Json<ApiResponse>) {
+    if store::mark_read_by_id(&id) {
+        (
+            StatusCode::OK,
+            Json(ApiResponse {
+                success: true,
+                message: "notification marked as read".to_string(),
+            }),
+        )
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse {
+                success: false,
+                message: "notification not found".to_string(),
+            }),
+        )
+    }
+}
+
 /// `DELETE /notifications/:id` — dismiss a single notification.
 pub async fn dismiss(Path(id): Path<String>) -> (StatusCode, Json<ApiResponse>) {
     if store::remove_by_id(&id) {

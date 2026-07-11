@@ -195,6 +195,14 @@ jobs:
                 squashfs-root/usr/lib/libsharpyuv.so* \
                 squashfs-root/usr/lib/libavif.so*
 
+          # linuxdeploy rewrites the bundled bun sidecar with
+          # RUNPATH=$ORIGIN/../lib during AppImage assembly. That makes bun load
+          # the AppImage's bundled libc/libstdc++ set and SIGSEGV on newer hosts
+          # (Debian 13 Sentry/CI repro). Restore the pristine baseline bun that
+          # pre_build.js downloaded so screenpipe can continue scrubbing
+          # LD_LIBRARY_PATH and run bun against the host runtime.
+          install -m 0755 src-tauri/bun-x86_64-unknown-linux-gnu squashfs-root/usr/bin/bun
+
           # Guard the libavif/libsharpyuv fix: an orphan bundled libsharpyuv
           # shadows the host one and breaks Arch (libavif 1.4.2) with
           # "undefined symbol: SharpYuvConvertWithOptions". Fail if either
@@ -355,9 +363,10 @@ jobs:
               app_bin="$(find squashfs-root/usr/bin -maxdepth 1 -type f -executable -iname "*screenpipe*" -print -quit)"
               test -n "${app_bin}"
 
-              export LD_LIBRARY_PATH=/smoke/squashfs-root/usr/lib
+              app_ld_library_path=/smoke/squashfs-root/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+              unset LD_LIBRARY_PATH
               set +e
-              su smoke-user -c "cd /smoke && export XDG_RUNTIME_DIR=/tmp/screenpipe-runtime && export SCREENPIPE_E2E_SEED=onboarding,no-recording && export LD_LIBRARY_PATH=/smoke/squashfs-root/usr/lib && timeout 20 dbus-run-session -- xvfb-run -a squashfs-root/AppRun --help" 2>&1 | tee /tmp/apprun-arch.log
+              su smoke-user -c "cd /smoke && export XDG_RUNTIME_DIR=/tmp/screenpipe-runtime && export SCREENPIPE_E2E_SEED=onboarding,no-recording && timeout 20 dbus-run-session -- xvfb-run -a env LD_LIBRARY_PATH=\"${app_ld_library_path}\" squashfs-root/AppRun --help" 2>&1 | tee /tmp/apprun-arch.log
               status="${PIPESTATUS[0]}"
               set -e
               # The exact failure we are guarding against.

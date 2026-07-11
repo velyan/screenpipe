@@ -194,6 +194,8 @@ export function NoteView({
   const noteEditorRef = useRef<NoteEditorHandle>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const [isDraggingImage, setIsDraggingImage] = useState(false);
+  const canSummarizeMeeting =
+    !isLive && !stopping && !savingBeforeStop && Boolean(meeting.meeting_end);
 
   // Drag-and-drop images straight into the note. Tauri delivers OS file drops
   // at the webview level (they never surface as DOM drop events), and the event
@@ -359,25 +361,13 @@ export function NoteView({
     [meeting.id],
   );
 
-  // Reset draft when meeting changes
-  useEffect(() => {
-    setTitle(meeting.title ?? "");
-    setAttendees(meeting.attendees ?? "");
-    setNote(meeting.note ?? "");
-    setSaveState({ kind: "idle" });
-    setMeetingCtx(null);
-    setTranscriptOpenState(
-      initialTranscriptOpen || readTranscriptOpenPreference(meeting.id),
-    );
-    setTranscriptRefreshKey(0);
-    setInactivityPrompt(false);
-    setDismissedJoinUrl(null);
-    lastSavedRef.current = {
-      title: meeting.title ?? "",
-      attendees: meeting.attendees ?? "",
-      note: meeting.note ?? "",
-    };
-  }, [meeting.id, initialTranscriptOpen]);
+  // Draft state resets when the meeting changes because the parent already
+  // remounts this component per meeting: `<NoteView key={selected.id} ... />`
+  // in components/meeting-notes/index.tsx (selected === the `meeting` prop).
+  // A fresh mount re-runs the useState initializers and lastSavedRef above,
+  // which reproduce exactly what a reset effect would set — so no reset effect
+  // is needed. (A dedicated effect below opens the transcript when
+  // initialTranscriptOpen is requested.)
 
   useEffect(() => {
     posthog.capture("meeting_note_opened", {
@@ -573,6 +563,15 @@ export function NoteView({
       was_live: isLive,
       pipe_slug: settings.meetingSummaryPipeSlug || "meeting-summary",
     });
+    if (!canSummarizeMeeting) {
+      toast({
+        title: "stop the meeting first",
+        description:
+          "summaries run on the saved transcript after the meeting ends.",
+      });
+      return;
+    }
+
     setSummarizing(true);
     try {
       const last = lastSavedRef.current;
@@ -1093,9 +1092,17 @@ export function NoteView({
                   variant="ghost"
                   size="sm"
                   onClick={handleSummarize}
-                  disabled={summarizing}
-                  title="summarize meeting"
-                  aria-label="summarize meeting"
+                  disabled={summarizing || !canSummarizeMeeting}
+                  title={
+                    canSummarizeMeeting
+                      ? "summarize meeting"
+                      : "stop the meeting first"
+                  }
+                  aria-label={
+                    canSummarizeMeeting
+                      ? "summarize meeting"
+                      : "stop the meeting first"
+                  }
                   className="h-8 w-8 rounded-none p-0"
                 >
                   {summarizing ? (
@@ -1303,9 +1310,17 @@ export function NoteView({
                 variant="ghost"
                 size="sm"
                 onClick={handleSummarize}
-                disabled={summarizing}
-                title="summarize meeting"
-                aria-label="summarize meeting"
+                disabled={summarizing || !canSummarizeMeeting}
+                title={
+                  canSummarizeMeeting
+                    ? "summarize meeting"
+                    : "stop the meeting first"
+                }
+                aria-label={
+                  canSummarizeMeeting
+                    ? "summarize meeting"
+                    : "stop the meeting first"
+                }
                 className="h-9 w-9 rounded-none p-0"
               >
                 {summarizing ? (

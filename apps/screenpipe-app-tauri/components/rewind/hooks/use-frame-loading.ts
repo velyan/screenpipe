@@ -129,6 +129,12 @@ export function useFrameLoading(opts: {
 		if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);
 		if (!frameId || !filePath) {
 			setDebouncedFrame(null);
+			setIsLoading(false);
+			setHasError(false);
+			setNaturalDimensions(null);
+			setRenderedImageInfo(null);
+			setSnapshotAssetUrl(null);
+			setDisplayedFallbackUrl(null);
 			return;
 		}
 		setIsLoading(true);

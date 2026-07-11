@@ -412,6 +412,11 @@ pub struct RecordArgs {
     #[arg(long, default_value_t = false)]
     pub experimental_coreaudio_system_audio: bool,
 
+    /// Beta: meeting-driven per-process audio capture (piggyback; "Smart
+    /// recording" in the app). Engages during meetings in any capture mode.
+    #[arg(long, default_value_t = false)]
+    pub experimental_meeting_piggyback: bool,
+
     /// [experimental, Windows] Request WASAPI microphone AEC when supported.
     /// Ignored on non-Windows platforms and unsupported endpoints.
     #[arg(long, default_value_t = false)]
@@ -421,6 +426,10 @@ pub struct RecordArgs {
     /// Ignored on non-macOS platforms and non-default input devices.
     #[arg(long, default_value_t = false)]
     pub macos_input_vpio_enabled: bool,
+
+    /// Request Screenpipe's software Acoustic Echo Cancellation (via sonora WebRTC AEC3).
+    #[arg(long, default_value_t = false)]
+    pub screenpipe_aec_enabled: bool,
 
     /// Data directory. Default to $HOME/.screenpipe
     #[arg(long, value_hint = ValueHint::DirPath)]
@@ -520,16 +529,20 @@ pub struct RecordArgs {
     /// keys; orthogonal to --pii-redaction-labels which picks categories).
     /// Keys: accessibility_text, accessibility_tree, window_name,
     /// browser_url, audio_transcription, ui_text_content, ui_element_value,
-    /// ui_window_title, ui_element_name, ui_element_description, element_text,
-    /// element_properties, a11y_url_field. The list is exact (key present →
-    /// on, absent → off); `full_text` is always redacted. Default scrubs the
-    /// clear surfaces plus element_properties (form-field values — the real
-    /// PII surface); leaves browser_url / ui_element_name /
-    /// ui_element_description / a11y_url_field OFF (opt-in).
+    /// ui_window_title, ui_element_name, ui_element_description,
+    /// ui_element_ancestors, element_text, element_properties,
+    /// a11y_url_field. The list is exact (key present → on, absent → off);
+    /// `full_text` is always redacted, and so is `frames.text_json` (the
+    /// per-word OCR boxes — a structured copy of the same on-screen text,
+    /// scrubbed alongside full_text, issue #4117). Default scrubs the clear
+    /// surfaces plus element_properties (form-field values — the real PII
+    /// surface) and ui_element_ancestors (hop names carry window titles);
+    /// leaves browser_url / ui_element_name / ui_element_description /
+    /// a11y_url_field OFF (opt-in).
     #[arg(
         long,
         value_delimiter = ',',
-        default_value = "accessibility_text,accessibility_tree,window_name,audio_transcription,ui_text_content,ui_element_value,ui_window_title,element_text,element_properties"
+        default_value = "accessibility_text,accessibility_tree,window_name,audio_transcription,ui_text_content,ui_element_value,ui_window_title,ui_element_ancestors,element_text,element_properties"
     )]
     pub pii_redaction_columns: Vec<String>,
 
@@ -547,9 +560,13 @@ pub struct RecordArgs {
     #[arg(long, default_value_t = false)]
     pub filter_music: bool,
 
-    /// Disable vision recording
+    /// Disable the full vision pipeline (screen images + accessibility/OCR)
     #[arg(long, default_value_t = false)]
     pub disable_vision: bool,
+
+    /// Disable screenshot pixels/JPEG/OCR while keeping accessibility-tree capture
+    #[arg(long, default_value_t = false)]
+    pub disable_screenshots: bool,
 
     /// Windows to ignore (case-insensitive contains). Use `App::Title` to
     /// scope to one window of one app (e.g. `Slack::#hr`). `::title` matches
@@ -763,8 +780,10 @@ pub struct RecordArgs {
     pub encrypt_secrets: bool,
 
     /// Local data retention in days. Old screen/audio data is auto-deleted after this period.
-    /// Set to 0 to disable retention (keep data forever).
-    #[arg(long, default_value_t = 14)]
+    /// Disabled by default (0 = keep data forever); set a positive number of days to opt in.
+    /// CLI deployments must never silently delete data — the desktop app opts new users in
+    /// through its own onboarding default instead.
+    #[arg(long, default_value_t = 0)]
     pub retention_days: u32,
 
     /// What gets cleaned up past the retention cutoff.
@@ -812,8 +831,10 @@ pub struct RecordArgSources {
     pub audio_device: bool,
     pub use_system_default_audio: bool,
     pub experimental_coreaudio_system_audio: bool,
+    pub experimental_meeting_piggyback: bool,
     pub windows_input_aec_enabled: bool,
     pub macos_input_vpio_enabled: bool,
+    pub screenpipe_aec_enabled: bool,
     pub audio_transcription_engine: bool,
     pub monitor_id: bool,
     pub use_all_monitors: bool,
@@ -828,6 +849,7 @@ pub struct RecordArgSources {
     pub pii_redaction_pseudonyms: bool,
     pub filter_music: bool,
     pub disable_vision: bool,
+    pub disable_screenshots: bool,
     pub ignored_windows: bool,
     pub included_windows: bool,
     pub ignored_urls: bool,
@@ -866,8 +888,13 @@ impl RecordArgSources {
                 record,
                 "experimental_coreaudio_system_audio",
             ),
+            experimental_meeting_piggyback: from_command_line(
+                record,
+                "experimental_meeting_piggyback",
+            ),
             windows_input_aec_enabled: from_command_line(record, "windows_input_aec_enabled"),
             macos_input_vpio_enabled: from_command_line(record, "macos_input_vpio_enabled"),
+            screenpipe_aec_enabled: from_command_line(record, "screenpipe_aec_enabled"),
             audio_transcription_engine: from_command_line(record, "audio_transcription_engine"),
             monitor_id: from_command_line(record, "monitor_id"),
             use_all_monitors: from_command_line(record, "use_all_monitors"),
@@ -882,6 +909,7 @@ impl RecordArgSources {
             pii_redaction_pseudonyms: from_command_line(record, "pii_redaction_pseudonyms"),
             filter_music: from_command_line(record, "filter_music"),
             disable_vision: from_command_line(record, "disable_vision"),
+            disable_screenshots: from_command_line(record, "disable_screenshots"),
             ignored_windows: from_command_line(record, "ignored_windows"),
             included_windows: from_command_line(record, "included_windows"),
             ignored_urls: from_command_line(record, "ignored_urls"),
@@ -912,8 +940,10 @@ impl RecordArgSources {
             || self.audio_device
             || self.use_system_default_audio
             || self.experimental_coreaudio_system_audio
+            || self.experimental_meeting_piggyback
             || self.windows_input_aec_enabled
             || self.macos_input_vpio_enabled
+            || self.screenpipe_aec_enabled
             || self.audio_transcription_engine
             || self.monitor_id
             || self.use_all_monitors
@@ -928,6 +958,7 @@ impl RecordArgSources {
             || self.pii_redaction_pseudonyms
             || self.filter_music
             || self.disable_vision
+            || self.disable_screenshots
             || self.ignored_windows
             || self.included_windows
             || self.ignored_urls
@@ -1056,12 +1087,22 @@ impl RecordArgs {
             CliTranscriptionMode::Realtime => "realtime",
             CliTranscriptionMode::Batch => "batch",
         };
+        let aec_mode = if self.screenpipe_aec_enabled {
+            screenpipe_config::AecMode::Screenpipe
+        } else if self.windows_input_aec_enabled {
+            screenpipe_config::AecMode::Windows
+        } else if self.macos_input_vpio_enabled {
+            screenpipe_config::AecMode::Macos
+        } else {
+            screenpipe_config::AecMode::Off
+        };
 
         screenpipe_config::RecordingSettings {
             audio_chunk_duration: self.audio_chunk_duration as i32,
             port: self.port,
             disable_audio: self.disable_audio,
             disable_vision: self.disable_vision,
+            disable_screenshots: self.disable_screenshots,
             // CLI has no --disable-timeline flag; the desktop app drives this
             // toggle. Default to enabled (timeline on) for the engine binary.
             disable_timeline: false,
@@ -1079,8 +1120,11 @@ impl RecordArgs {
             audio_devices: self.audio_device.clone(),
             use_system_default_audio: self.use_system_default_audio,
             experimental_coreaudio_system_audio: self.experimental_coreaudio_system_audio,
-            windows_input_aec_enabled: self.windows_input_aec_enabled,
-            macos_input_vpio_enabled: self.macos_input_vpio_enabled,
+            experimental_meeting_piggyback: self.experimental_meeting_piggyback,
+            windows_input_aec_enabled: aec_mode == screenpipe_config::AecMode::Windows,
+            macos_input_vpio_enabled: aec_mode == screenpipe_config::AecMode::Macos,
+            screenpipe_aec_enabled: aec_mode == screenpipe_config::AecMode::Screenpipe,
+            aec_mode,
             monitor_ids: self.monitor_id.iter().map(|id| id.to_string()).collect(),
             // Explicit `--monitor-id` implies opting out of `--use-all-monitors`.
             // `use_all_monitors` has `default_value_t = true`, so without this
@@ -1320,11 +1364,24 @@ impl RecordArgs {
         if sources.experimental_coreaudio_system_audio {
             settings.experimental_coreaudio_system_audio = self.experimental_coreaudio_system_audio;
         }
-        if sources.windows_input_aec_enabled {
-            settings.windows_input_aec_enabled = self.windows_input_aec_enabled;
+        if sources.experimental_meeting_piggyback {
+            settings.experimental_meeting_piggyback = self.experimental_meeting_piggyback;
         }
-        if sources.macos_input_vpio_enabled {
-            settings.macos_input_vpio_enabled = self.macos_input_vpio_enabled;
+        if sources.screenpipe_aec_enabled && self.screenpipe_aec_enabled {
+            settings.aec_mode = screenpipe_config::AecMode::Screenpipe;
+            settings.screenpipe_aec_enabled = true;
+            settings.windows_input_aec_enabled = false;
+            settings.macos_input_vpio_enabled = false;
+        } else if sources.windows_input_aec_enabled && self.windows_input_aec_enabled {
+            settings.aec_mode = screenpipe_config::AecMode::Windows;
+            settings.screenpipe_aec_enabled = false;
+            settings.windows_input_aec_enabled = true;
+            settings.macos_input_vpio_enabled = false;
+        } else if sources.macos_input_vpio_enabled && self.macos_input_vpio_enabled {
+            settings.aec_mode = screenpipe_config::AecMode::Macos;
+            settings.screenpipe_aec_enabled = false;
+            settings.windows_input_aec_enabled = false;
+            settings.macos_input_vpio_enabled = true;
         }
         if sources.audio_transcription_engine {
             settings.audio_transcription_engine =
@@ -1375,6 +1432,9 @@ impl RecordArgs {
         }
         if sources.disable_vision {
             settings.disable_vision = self.disable_vision;
+        }
+        if sources.disable_screenshots {
+            settings.disable_screenshots = self.disable_screenshots;
         }
         // An explicit --monitor-id or --use-all-monitors means the user wants
         // vision on, so it clears a persisted disable_vision:true (the #3648

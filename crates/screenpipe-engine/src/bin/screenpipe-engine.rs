@@ -112,6 +112,22 @@ const DISPLAY: &str = r"
 
 ";
 
+fn local_retention_configure_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/retention/configure")
+}
+
+fn with_local_api_auth(
+    request: reqwest::RequestBuilder,
+    api_auth_key: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match api_auth_key {
+        Some(key) if !key.is_empty() => {
+            request.header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
+        }
+        _ => request,
+    }
+}
+
 fn get_base_dir(custom_path: &Option<String>) -> anyhow::Result<PathBuf> {
     let default_path = paths::default_screenpipe_data_dir();
 
@@ -1290,7 +1306,9 @@ async fn main() -> anyhow::Result<()> {
     server.timeline_disabled = config.disable_timeline;
     server.power_manager = Some(power_manager);
     // Share the VisionManager so /vision/device/* can pause/resume monitors.
-    server.vision_manager = vision_manager_for_server;
+    if let Some(vm) = vision_manager_for_server {
+        server.vision_manager.store(Arc::new(Some(vm)));
+    }
     server.manual_meeting = Some(manual_meeting.clone());
     server.api_auth = config.api_auth;
     server.api_auth_key = config.api_auth_key.clone();
@@ -1825,6 +1843,7 @@ async fn main() -> anyhow::Result<()> {
     // same HTTP endpoint after a short delay to let the server bind.
     {
         let port = config.port;
+        let api_auth_key = config.api_auth_key.clone();
         let retention_days = record_args.retention_days;
         let retention_mode = record_args.retention_mode;
         let retention_enabled = retention_days > 0;
@@ -1835,17 +1854,16 @@ async fn main() -> anyhow::Result<()> {
             }
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let client = reqwest::Client::new();
-            let url = format!("http://localhost:{}/retention/configure", port);
-            match client
-                .post(&url)
-                .json(&serde_json::json!({
+            let url = local_retention_configure_url(port);
+            let request = with_local_api_auth(
+                client.post(&url).json(&serde_json::json!({
                     "enabled": true,
                     "retention_days": retention_days,
                     "mode": retention_mode,
-                }))
-                .send()
-                .await
-            {
+                })),
+                api_auth_key.as_deref(),
+            );
+            match request.send().await {
                 Ok(r) if r.status().is_success() => {
                     tracing::info!(
                         "local retention auto-enabled ({} days, mode={:?})",
@@ -1854,10 +1872,12 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
                 Ok(r) => {
-                    tracing::debug!("retention configure returned {}", r.status());
+                    let status = r.status();
+                    let body = r.text().await.unwrap_or_default();
+                    tracing::warn!("local retention auto-enable failed ({}): {}", status, body);
                 }
                 Err(e) => {
-                    tracing::debug!("retention configure failed: {}", e);
+                    tracing::warn!("local retention auto-enable request failed: {}", e);
                 }
             }
         });
@@ -2207,4 +2227,49 @@ async fn main() -> anyhow::Result<()> {
     info!("shutdown complete");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::AUTHORIZATION;
+
+    #[test]
+    fn local_retention_configure_url_uses_ipv4_loopback() {
+        assert_eq!(
+            local_retention_configure_url(3030),
+            "http://127.0.0.1:3030/retention/configure"
+        );
+    }
+
+    #[test]
+    fn with_local_api_auth_attaches_bearer_token() {
+        let client = reqwest::Client::new();
+        let request = with_local_api_auth(
+            client.post(local_retention_configure_url(3030)),
+            Some("local-secret"),
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get(AUTHORIZATION)
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "Bearer local-secret"
+        );
+    }
+
+    #[test]
+    fn with_local_api_auth_skips_missing_token() {
+        let client = reqwest::Client::new();
+        let request = with_local_api_auth(client.post(local_retention_configure_url(3030)), None)
+            .build()
+            .unwrap();
+
+        assert!(request.headers().get(AUTHORIZATION).is_none());
+    }
 }

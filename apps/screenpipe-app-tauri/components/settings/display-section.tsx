@@ -18,6 +18,7 @@ import { Settings } from "@/lib/hooks/use-settings";
 import { FONT_SIZE_DEFAULT, FONT_SIZE_OPTIONS } from "@/lib/utils/font-size";
 import { open } from "@tauri-apps/plugin-shell";
 import type { SettingsField } from "./settings-search";
+import { ManagedSwitch } from "@/components/enterprise-locked-setting";
 
 /** Settings search index for this section. Co-located with the component so adding a field here means updating one file. See `SettingsField` in `./settings-search` for the schema. */
 export const searchIndex: SettingsField[] = [
@@ -25,6 +26,7 @@ export const searchIndex: SettingsField[] = [
   { label: "Font Size" },
   { label: "Chat Always on Top", keywords: ["pin", "window"] },
   { label: "Show Shortcut Reminder" },
+  { label: "Timeline / rewind", keywords: ["rewind", "timeline", "backend"] },
   { label: "Overlay Size" },
   { label: "Sidebar translucency", keywords: ["vibrancy", "translucent"] },
 ];
@@ -147,16 +149,18 @@ export function DisplaySection() {
                 <EyeOff className="h-4 w-4 text-muted-foreground shrink-0" />
                 <div>
                   <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                    Disable Timeline
+                    Timeline / rewind
                     <HelpTooltip text="Turn off the timeline / rewind feature. Skips the in-memory hot frame cache (warm-up + per-frame/audio buffering) that only the timeline uses, and disables the native macOS Live Text overlay that can otherwise leak a selection layer over other windows (e.g. the chat input) and block typing. Restarts screenpipe to apply." />
                   </h3>
-                  <p className="text-xs text-muted-foreground">Hide rewind and skip its background work</p>
+                  <p className="text-xs text-muted-foreground">Show rewind and keep its background cache work on</p>
                 </div>
               </div>
-              <Switch
+              <ManagedSwitch
+                settingKey="disableTimeline"
                 id="disableTimeline"
-                checked={settings?.disableTimeline ?? false}
+                checked={!(settings?.disableTimeline ?? false)}
                 onCheckedChange={async (checked) => {
+                  const disabled = !checked;
                   // Collapse double-invoke (rapid toggle / re-render) into one
                   // restart — two overlapping stop/spawn cycles raced before.
                   if (timelineRestartingRef.current) return;
@@ -164,12 +168,12 @@ export function DisplaySection() {
                   try {
                     // Persist first (awaited) so the backend reads the new value
                     // on restart and the shortcut-reminder guard sees it.
-                    await updateSettings({ disableTimeline: checked });
+                    await updateSettings({ disableTimeline: disabled });
                     // The screenpipe shortcut only opens the timeline, so its
                     // reminder overlay is meaningless once the timeline is off —
                     // tear it down on disable, restore it on re-enable.
                     try {
-                      if (checked) {
+                      if (disabled) {
                         await commands.hideShortcutReminder();
                       } else if (settings?.showShortcutOverlay) {
                         await commands.showShortcutReminder(settings.showScreenpipeShortcut);
@@ -183,7 +187,7 @@ export function DisplaySection() {
                       await new Promise((r) => setTimeout(r, 500));
                       await commands.spawnScreenpipe(null);
                       toast({
-                        title: checked ? "timeline disabled" : "timeline enabled",
+                        title: disabled ? "timeline disabled" : "timeline enabled",
                         description: "screenpipe restarted to apply the change.",
                       });
                     } catch (e) {
@@ -265,30 +269,6 @@ export function DisplaySection() {
                 checked={settings?.chatAlwaysOnTop ?? true}
                 onCheckedChange={(checked) =>
                   handleSettingsChange({ chatAlwaysOnTop: checked })
-                }
-                className="ml-4"
-              />
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card className="border-border bg-card">
-          <CardContent className="px-3 py-2.5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-2.5">
-                <MessageSquare className="h-4 w-4 text-muted-foreground shrink-0" />
-                <div>
-                  <h3 className="text-sm font-medium text-foreground flex items-center gap-1.5">
-                    Hide Thinking Blocks
-                    <HelpTooltip text="Don't render the collapsible model-reasoning blocks in chat. The model still emits them; this just hides them from the transcript." />
-                  </h3>
-                  <p className="text-xs text-muted-foreground">Hide model reasoning in chat transcript</p>
-                </div>
-              </div>
-              <Switch
-                checked={settings?.hideThinkingBlocks ?? true}
-                onCheckedChange={(checked) =>
-                  handleSettingsChange({ hideThinkingBlocks: checked })
                 }
                 className="ml-4"
               />

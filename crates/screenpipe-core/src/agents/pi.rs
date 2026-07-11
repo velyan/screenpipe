@@ -11,6 +11,7 @@ use super::{install_spawned_pid, AgentExecutor, AgentOutput, ExecutionHandle};
 use anyhow::{anyhow, Result};
 use arc_swap::ArcSwap;
 use serde_json::json;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -57,6 +58,14 @@ fn parse_rate_limit_reset_secs(text: &str) -> Option<u64> {
 /// Whether a pi failure was caused by provider rate limiting (HTTP 429).
 fn is_rate_limit_error(text: &str) -> bool {
     let lower = text.to_lowercase();
+    if lower.contains("daily_cost_limit_exceeded")
+        || lower.contains("daily_limit_exceeded")
+        || lower.contains("credits_exhausted")
+        || lower.contains("model_not_allowed")
+        || crate::pipes::has_quota_exhausted_token(&lower)
+    {
+        return false;
+    }
     lower.contains("429")
         || lower.contains("rate limit")
         || lower.contains("rate_limit")
@@ -696,10 +705,10 @@ impl PiExecutor {
         Ok(())
     }
 
-    /// Install or remove the web-search extension based on provider and offline mode.
+    /// Install or remove the web-search extension based on provider.
     /// Web search uses the screenpipe cloud backend, so we only enable it
     /// for screenpipe-cloud to avoid sending data to our backend when the
-    /// user chose a local/custom provider. Always removed in offline mode.
+    /// user chose a local/custom provider.
     pub fn ensure_web_search_extension(project_dir: &Path, provider: Option<&str>) -> Result<()> {
         let ext_dir = project_dir.join(".pi").join("extensions");
         let ext_path = ext_dir.join("web-search.ts");
@@ -1113,14 +1122,14 @@ impl PiExecutor {
     /// `Ok(model)`  → the requested model is allowed (or we can't validate).
     /// `Err(model)` → requested not allowed; the returned value is the fallback.
     fn pick_allowed_model(requested: &str, allowed: &[String]) -> Result<String, String> {
-        // No catalog, or only the offline/degraded fallback sentinel → we
+        // No catalog, or only the gateway fallback sentinel → we
         // couldn't actually validate, so don't second-guess the requested
         // model. Without the sentinel check the `["auto"]` list returned by
         // `fallback_cloud_models` when the gateway is unreachable would
         // masquerade as a one-model tier and spuriously downgrade a
         // deliberately-chosen premium model, firing a bogus `model_fallback`
-        // notice on every offline run.
-        if allowed.is_empty() || Self::is_offline_fallback_catalog(allowed) {
+        // notice on every degraded run.
+        if allowed.is_empty() || Self::is_gateway_fallback_catalog(allowed) {
             return Ok(requested.to_string());
         }
         // "auto" is always valid: the gateway picks an allowed model server-side.
@@ -1137,7 +1146,7 @@ impl PiExecutor {
         Err(fallback)
     }
 
-    /// `true` when `allowed` is exactly the offline/degraded fallback catalog
+    /// `true` when `allowed` is exactly the unvalidated gateway fallback catalog
     /// (`["auto"]`) produced by [`fallback_cloud_models`] when the gateway's
     /// `/v1/models` is unreachable. It carries no real tier information, so we
     /// treat it like an empty catalog and never let it drive a downgrade.
@@ -1147,7 +1156,7 @@ impl PiExecutor {
     /// concrete model ids), and even if one appeared `auto` is always accepted
     /// by the gateway, so passing the requested model through for its
     /// server-side auto-pick stays correct.
-    fn is_offline_fallback_catalog(allowed: &[String]) -> bool {
+    fn is_gateway_fallback_catalog(allowed: &[String]) -> bool {
         allowed.len() == 1 && allowed[0] == "auto"
     }
 
@@ -2247,12 +2256,14 @@ pub fn bun_version_string(bun: &str) -> String {
     }
 }
 
-/// Inside an AppImage, AppRun exports `LD_LIBRARY_PATH` pointing at the bundle's
-/// libs. bun is a self-contained baseline binary and must not inherit it, or it
-/// loads the bundled glibc/libstdc++ and crashes (SIGSEGV/SIGILL). Only scrub it
-/// in that environment so a normal Linux install keeps any user-set value.
+/// On Linux, bun is a self-contained baseline binary and should not inherit the
+/// parent process' `LD_LIBRARY_PATH`. In AppImage launches that path points at
+/// the bundle's glibc/libstdc++ and bun can crash before it prints anything
+/// (observed as SIGSEGV/SIGILL during AppImage smoke). Scrubbing unconditionally
+/// on Linux avoids relying on AppImage-specific env markers that may not survive
+/// every launcher path.
 fn should_scrub_bun_runtime_env() -> bool {
-    cfg!(target_os = "linux") && std::env::var_os("APPDIR").is_some()
+    cfg!(target_os = "linux")
 }
 
 /// Strip the AppImage runtime library path from a bun command (see
@@ -2280,6 +2291,46 @@ fn tokio_bun_command(bun: &str) -> tokio::process::Command {
 /// Returns the screenpipe-managed pi install directory (`~/.screenpipe/pi-agent/` or SCREENPIPE_DATA_DIR/pi-agent).
 fn pi_local_install_dir() -> Option<PathBuf> {
     Some(crate::paths::default_screenpipe_data_dir().join("pi-agent"))
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
+/// Build the PATH inherited by Pi and any subagents it launches.
+///
+/// The local `.bin` directory must come before user-global npm/bun bins so
+/// nested `pi` invocations resolve to screenpipe's pinned Pi package, not an
+/// older global install.
+pub fn pi_child_path(existing_path: &OsStr) -> Option<OsString> {
+    let mut paths = Vec::new();
+
+    if let Some(dir) = pi_local_install_dir() {
+        push_unique_path(&mut paths, dir.join("node_modules").join(".bin"));
+    }
+
+    if let Some(bun_path) = find_bun_executable() {
+        if let Some(bun_dir) = Path::new(&bun_path).parent() {
+            push_unique_path(&mut paths, bun_dir.to_path_buf());
+        }
+    }
+
+    for path in std::env::split_paths(existing_path) {
+        if !path.as_os_str().is_empty() {
+            push_unique_path(&mut paths, path);
+        }
+    }
+
+    std::env::join_paths(paths).ok()
+}
+
+fn apply_pi_child_path(cmd: &mut tokio::process::Command) {
+    let current_path = std::env::var_os("PATH").unwrap_or_default();
+    if let Some(path) = pi_child_path(&current_path) {
+        cmd.env("PATH", path);
+    }
 }
 
 /// Check whether the locally-installed Pi version matches `PI_PACKAGE`.
@@ -2577,7 +2628,9 @@ fn build_async_command(path: &str) -> tokio::process::Command {
                     debug!("injected bash dir into PATH for pi: {}", bash_dir);
                 }
 
-                cmd.env("PATH", new_path);
+                let path_for_pi = pi_child_path(OsStr::new(&new_path))
+                    .unwrap_or_else(|| OsString::from(new_path));
+                cmd.env("PATH", path_for_pi);
                 debug!("injected bun dir into PATH for pi: {}", bun_dir.display());
             }
         }
@@ -2589,14 +2642,16 @@ fn build_async_command(path: &str) -> tokio::process::Command {
     }
     #[cfg(not(windows))]
     {
-        if let Some(bun) = find_bun_executable() {
+        let mut cmd = if let Some(bun) = find_bun_executable() {
             let mut cmd = tokio_bun_command(&bun);
             cmd.arg(path);
             cmd
         } else {
             // Fallback: run pi directly (requires node in PATH)
             tokio::process::Command::new(path)
-        }
+        };
+        apply_pi_child_path(&mut cmd);
+        cmd
     }
 }
 
@@ -2984,6 +3039,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pi_child_path_prefers_screenpipe_local_pi() {
+        let existing_a = std::path::PathBuf::from("existing-a");
+        let existing_b = std::path::PathBuf::from("existing-b");
+        let existing_path = std::env::join_paths([existing_a.clone(), existing_b.clone()]).unwrap();
+
+        let child_path = pi_child_path(&existing_path).expect("child path");
+        let parts = std::env::split_paths(&child_path).collect::<Vec<_>>();
+
+        assert_eq!(
+            parts.first(),
+            Some(
+                &crate::paths::default_screenpipe_data_dir()
+                    .join("pi-agent")
+                    .join("node_modules")
+                    .join(".bin")
+            )
+        );
+        assert!(parts.iter().any(|path| path == &existing_a));
+        assert!(parts.iter().any(|path| path == &existing_b));
+    }
+
+    #[test]
     fn clear_screenpipe_auth_preserves_other_provider_tokens() {
         let dir = tempfile::tempdir().expect("tempdir");
         let auth_path = dir.path().join("auth.json");
@@ -3295,22 +3372,22 @@ mod tests {
             Ok("claude-opus-4".to_string())
         );
 
-        // Offline sentinel ["auto"] (gateway unreachable → fallback_cloud_models)
+        // Gateway fallback sentinel ["auto"] (gateway unreachable → fallback_cloud_models)
         // must be treated like an empty catalog: it is NOT a one-model tier, so
         // a deliberately-chosen premium model passes through unchanged instead
         // of being spuriously downgraded. This is the #3763 offline regression.
-        let offline_sentinel = vec!["auto".to_string()];
+        let gateway_fallback = vec!["auto".to_string()];
         assert_eq!(
-            PiExecutor::pick_allowed_model("claude-opus-4", &offline_sentinel),
+            PiExecutor::pick_allowed_model("claude-opus-4", &gateway_fallback),
             Ok("claude-opus-4".to_string())
         );
         assert_eq!(
-            PiExecutor::pick_allowed_model("auto", &offline_sentinel),
+            PiExecutor::pick_allowed_model("auto", &gateway_fallback),
             Ok("auto".to_string())
         );
-        assert!(PiExecutor::is_offline_fallback_catalog(&offline_sentinel));
+        assert!(PiExecutor::is_gateway_fallback_catalog(&gateway_fallback));
         // A real single-model tier on a concrete id is NOT the sentinel.
-        assert!(!PiExecutor::is_offline_fallback_catalog(&[
+        assert!(!PiExecutor::is_gateway_fallback_catalog(&[
             "claude-haiku-4-5".to_string()
         ]));
     }
@@ -3324,6 +3401,11 @@ mod tests {
         assert!(is_rate_limit_error(r#"{"reset_in":12}"#));
         assert!(!is_rate_limit_error("model not found"));
         assert!(!is_rate_limit_error("credits_exhausted"));
+        assert!(!is_rate_limit_error(r#"429 "daily_cost_limit_exceeded""#));
+        assert!(!is_rate_limit_error(r#"429 "credits_exhausted""#));
+        assert!(!is_rate_limit_error(
+            r#"429 {"error":{"type":"insufficient_quota"}}"#
+        ));
     }
 
     #[tokio::test]
@@ -3518,5 +3600,26 @@ mod tests {
         let tail = output_tail(unicode.as_bytes(), 101);
         assert!(tail.starts_with("..."));
         assert!(tail.ends_with('é'));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scrub_bun_runtime_env_always_removes_ld_library_path_on_linux() {
+        use std::ffi::OsStr;
+
+        let mut cmd = std::process::Command::new("sh");
+        cmd.env("LD_LIBRARY_PATH", "/tmp/appimage/usr/lib");
+
+        scrub_bun_runtime_env(&mut cmd);
+
+        let env_value = cmd
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("LD_LIBRARY_PATH"))
+            .map(|(_, value)| value);
+        assert_eq!(
+            env_value,
+            Some(None),
+            "bun subprocesses on Linux must clear inherited LD_LIBRARY_PATH"
+        );
     }
 }

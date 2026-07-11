@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::server::AppState;
 
@@ -312,6 +312,17 @@ fn spawn_retention_loop(
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
         interval.tick().await; // consume immediate tick
 
+        // Resume cursor across cycles. Media/Lean modes never delete frames
+        // (they only evict media files / strip heavy text), so
+        // `get_oldest_timestamp()` returns the same value for the life of the
+        // process — without this, every single cycle would re-walk the full
+        // history from the dawn of the database instead of picking up where
+        // the last cycle left off. Reset whenever the mode changes: eviction
+        // is mode-specific, so history already passed under a different mode
+        // may not have received the new mode's treatment.
+        let mut watermark: Option<DateTime<Utc>> = None;
+        let mut watermark_mode: Option<RetentionMode> = None;
+
         loop {
             tokio::select! {
                 _ = interval.tick() => {}
@@ -339,15 +350,42 @@ fn spawn_retention_loop(
                 }
             };
 
+            if watermark_mode != Some(mode) {
+                watermark = None;
+                watermark_mode = Some(mode);
+            }
+
+            let batch_start = match watermark {
+                Some(ts) => ts,
+                None => match db.get_oldest_timestamp().await {
+                    Ok(Some(ts)) => ts,
+                    Ok(None) => continue, // nothing in the DB yet
+                    Err(e) => {
+                        warn!("retention: failed to get oldest timestamp: {}", e);
+                        continue;
+                    }
+                },
+            };
+
+            if batch_start >= cutoff {
+                // Already caught up to the retention window — nothing ages
+                // past the cutoff until more time passes. Remember where we
+                // are so the next cycle doesn't re-derive it.
+                watermark = Some(batch_start);
+                continue;
+            }
+
             info!(
-                "retention: cleaning up data before {} ({}d retention, mode={:?})",
+                "retention: cleaning up data from {} to {} ({}d retention, mode={:?})",
+                batch_start.to_rfc3339(),
                 cutoff.to_rfc3339(),
                 retention_days,
                 mode
             );
 
-            match do_local_cleanup(&db, cutoff, mode).await {
-                Ok(deleted) => {
+            match do_local_cleanup(&db, batch_start, cutoff, mode).await {
+                Ok((deleted, new_watermark)) => {
+                    watermark = Some(new_watermark);
                     if deleted > 0 {
                         info!("retention: deleted {} records", deleted);
                     }
@@ -381,28 +419,53 @@ fn retention_cutoff(retention_days: u32, now: DateTime<Utc>) -> Option<DateTime<
     Duration::try_days(retention_days as i64).and_then(|d| now.checked_sub_signed(d))
 }
 
+/// Remove a media file the DB has already marked evicted.
+///
+/// The DB row is cleared inside `evict_media_in_range`'s transaction *before*
+/// we touch the disk, so a missing file here means the on-disk goal (file gone)
+/// is already met — usually because it was compacted away, deleted by a prior
+/// run, or the data dir was pruned by hand. Log that at debug, not warn, so the
+/// backend log isn't flooded with alarming "failed to evict" lines for a
+/// perfectly healthy outcome. Any other error (permissions, I/O) still warns.
+async fn remove_evicted_file(path: &str) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            debug!("retention: file already gone, nothing to evict: {}", path);
+        }
+        Err(e) => warn!("retention: failed to evict file {}: {}", path, e),
+    }
+}
+
+/// Runs eviction/stripping batches over `[start, cutoff)` and returns the
+/// number of records touched along with the new resume point (always
+/// `cutoff` once the loop below completes, or `start` unchanged if there was
+/// nothing to process) — the caller persists this as the next cycle's
+/// starting point instead of re-deriving it from `get_oldest_timestamp()`.
 async fn do_local_cleanup(
     db: &Arc<DatabaseManager>,
+    start: DateTime<Utc>,
     cutoff: DateTime<Utc>,
     mode: RetentionMode,
-) -> anyhow::Result<u64> {
+) -> anyhow::Result<(u64, DateTime<Utc>)> {
     let batch_size = Duration::hours(1);
     let mut total: u64 = 0;
 
-    let oldest = match db.get_oldest_timestamp().await {
-        Ok(Some(ts)) => ts,
-        Ok(None) => return Ok(0),
-        Err(e) => {
-            warn!("retention: failed to get oldest timestamp: {}", e);
-            return Ok(0);
-        }
-    };
-
-    let mut batch_start = oldest;
+    let mut batch_start = start;
     let mut any_deleted = false;
 
     while batch_start < cutoff {
         let batch_end = (batch_start + batch_size).min(cutoff);
+        // Set on any per-batch DB error below. Before the watermark-resume
+        // fix, a failed batch was retried "for free" on the very next cycle
+        // because `batch_start` was always re-derived from
+        // `get_oldest_timestamp()`. Now that the caller persists whatever
+        // watermark this call returns, silently advancing `batch_start` past
+        // a batch that errored (transient SQLITE_BUSY / pool timeout under
+        // concurrent capture writes, etc.) would permanently skip that range
+        // — so a failure must stop the walk here instead of advancing past
+        // it, leaving `batch_start` for the next cycle to retry.
+        let mut batch_failed = false;
 
         match mode {
             RetentionMode::All => {
@@ -437,9 +500,7 @@ async fn do_local_cleanup(
                             .chain(result.audio_files.iter())
                             .chain(result.snapshot_files.iter())
                         {
-                            if let Err(e) = tokio::fs::remove_file(path).await {
-                                warn!("retention: failed to delete file {}: {}", path, e);
-                            }
+                            remove_evicted_file(path).await;
                         }
                     }
                     Err(e) => {
@@ -447,6 +508,7 @@ async fn do_local_cleanup(
                             "retention: batch delete failed for range {} to {}: {}",
                             batch_start, batch_end, e
                         );
+                        batch_failed = true;
                     }
                 }
             }
@@ -478,9 +540,7 @@ async fn do_local_cleanup(
                         .chain(result.audio_files.iter())
                         .chain(result.snapshot_files.iter())
                     {
-                        if let Err(e) = tokio::fs::remove_file(path).await {
-                            warn!("retention: failed to evict file {}: {}", path, e);
-                        }
+                        remove_evicted_file(path).await;
                     }
                 }
                 Err(e) => {
@@ -488,6 +548,7 @@ async fn do_local_cleanup(
                         "retention: batch evict failed for range {} to {}: {}",
                         batch_start, batch_end, e
                     );
+                    batch_failed = true;
                 }
             },
             RetentionMode::Lean => {
@@ -508,15 +569,16 @@ async fn do_local_cleanup(
                             .chain(result.audio_files.iter())
                             .chain(result.snapshot_files.iter())
                         {
-                            if let Err(e) = tokio::fs::remove_file(path).await {
-                                warn!("retention: failed to evict file {}: {}", path, e);
-                            }
+                            remove_evicted_file(path).await;
                         }
                     }
-                    Err(e) => warn!(
-                        "retention: lean media evict failed for range {} to {}: {}",
-                        batch_start, batch_end, e
-                    ),
+                    Err(e) => {
+                        warn!(
+                            "retention: lean media evict failed for range {} to {}: {}",
+                            batch_start, batch_end, e
+                        );
+                        batch_failed = true;
+                    }
                 }
 
                 // 2. Strip the heavy text rows (elements tree, AX JSON,
@@ -537,12 +599,24 @@ async fn do_local_cleanup(
                         }
                         total += stripped;
                     }
-                    Err(e) => warn!(
-                        "retention: lean text strip failed for range {} to {}: {}",
-                        batch_start, batch_end, e
-                    ),
+                    Err(e) => {
+                        warn!(
+                            "retention: lean text strip failed for range {} to {}: {}",
+                            batch_start, batch_end, e
+                        );
+                        batch_failed = true;
+                    }
                 }
             }
+        }
+
+        if batch_failed {
+            // Stop here without advancing `batch_start` past this range —
+            // the caller persists the returned value as next cycle's resume
+            // point, so leaving it here means the failed range gets retried
+            // on the next 5-minute tick instead of being silently skipped
+            // forever.
+            break;
         }
 
         batch_start = batch_end;
@@ -576,7 +650,7 @@ async fn do_local_cleanup(
         }
     }
 
-    Ok(total)
+    Ok((total, batch_start))
 }
 
 #[cfg(test)]
@@ -600,5 +674,180 @@ mod tests {
         // `now - Duration::days(..)` panicked here; the guard must yield None so
         // the retention loop skips the cycle instead of crashing.
         assert_eq!(retention_cutoff(u32::MAX, now), None);
+    }
+
+    /// Regression test for screenpipe/screenpipe#4843: the retention loop used
+    /// to call `get_oldest_timestamp()` and restart the batch walk from there
+    /// on *every* cycle. In Media/Lean mode that value never changes (those
+    /// modes don't delete frames), so every 5-minute cycle re-walked the
+    /// entire history in 1-hour batches, each paying a 500ms inter-batch
+    /// sleep. Resuming from the watermark `do_local_cleanup` now returns
+    /// turns a steady-state cycle into a no-op instead of a full re-scan.
+    #[tokio::test]
+    async fn do_local_cleanup_resume_from_watermark_skips_reprocessed_range() {
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
+
+        let now = Utc::now();
+        let start = now - Duration::hours(3);
+        let cutoff = now;
+
+        // Cold pass: 3 hourly batches must be walked, each paying the
+        // inter-batch yield sleep — this is what every single 5-minute cycle
+        // cost under the bug, regardless of how many cycles had already run.
+        let t0 = std::time::Instant::now();
+        let (_, watermark) = do_local_cleanup(&db, start, cutoff, RetentionMode::Media)
+            .await
+            .unwrap();
+        let cold_pass_elapsed = t0.elapsed();
+        assert_eq!(watermark, cutoff, "must advance all the way to cutoff");
+        assert!(
+            cold_pass_elapsed >= std::time::Duration::from_millis(1400),
+            "3 hourly batches at 500ms each should take >= ~1.5s, got {:?}",
+            cold_pass_elapsed
+        );
+
+        // Next cycle, resuming from the returned watermark with no new data
+        // aged past the cutoff: must be a no-op, not a repeat of the same 3
+        // batches. Under the bug this call would have been identical to the
+        // first — and would stay identical forever, every 5 minutes.
+        let t1 = std::time::Instant::now();
+        let (deleted, watermark2) = do_local_cleanup(&db, watermark, cutoff, RetentionMode::Media)
+            .await
+            .unwrap();
+        let resumed_pass_elapsed = t1.elapsed();
+        assert_eq!(deleted, 0);
+        assert_eq!(
+            watermark2, watermark,
+            "watermark must not move when there is nothing new to process"
+        );
+        assert!(
+            resumed_pass_elapsed < std::time::Duration::from_millis(200),
+            "resuming from the watermark must skip the batch loop entirely, got {:?}",
+            resumed_pass_elapsed
+        );
+
+        println!(
+            "retention watermark perf: cold pass = {:?}, resumed pass = {:?} ({:.0}x faster)",
+            cold_pass_elapsed,
+            resumed_pass_elapsed,
+            cold_pass_elapsed.as_secs_f64() / resumed_pass_elapsed.as_secs_f64().max(0.0001)
+        );
+    }
+
+    /// Drives `do_local_cleanup` through several simulated 5-minute retention
+    /// cycles two ways — restarting from `oldest` every time (the pre-#4843
+    /// calling convention; Media/Lean mode never advances
+    /// `get_oldest_timestamp()`) vs resuming from the previous cycle's
+    /// watermark (the fix). Both paths exercise the identical batch-walk
+    /// implementation, so the timing gap below is the fix's real, measured
+    /// effect, not a reimplementation standing in for it.
+    #[tokio::test]
+    async fn simulated_retention_cycles_old_vs_new_calling_convention() {
+        let db_old = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
+        let db_new = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
+
+        let now = Utc::now();
+        let oldest = now - Duration::hours(6);
+        let cutoff = now;
+        const CYCLES: u32 = 4;
+
+        // Pre-#4843: every cycle re-derives `oldest` and re-walks the full
+        // [oldest, cutoff) range from scratch.
+        let t_old = std::time::Instant::now();
+        for _ in 0..CYCLES {
+            do_local_cleanup(&db_old, oldest, cutoff, RetentionMode::Media)
+                .await
+                .unwrap();
+        }
+        let old_elapsed = t_old.elapsed();
+
+        // Fixed: each cycle resumes from the watermark the previous cycle
+        // reached, so only the first cycle pays the full walk.
+        let t_new = std::time::Instant::now();
+        let mut watermark = oldest;
+        for _ in 0..CYCLES {
+            let (_, wm) = do_local_cleanup(&db_new, watermark, cutoff, RetentionMode::Media)
+                .await
+                .unwrap();
+            watermark = wm;
+        }
+        let new_elapsed = t_new.elapsed();
+
+        println!(
+            "retention: {} simulated 5-min cycles over 6h of history — \
+             pre-#4843 calling convention = {:?}, fixed = {:?} ({:.1}x faster)",
+            CYCLES,
+            old_elapsed,
+            new_elapsed,
+            old_elapsed.as_secs_f64() / new_elapsed.as_secs_f64().max(0.0001)
+        );
+
+        assert!(
+            new_elapsed < old_elapsed / 2,
+            "fixed watermark-resuming loop must be meaningfully faster across \
+             repeated cycles: old={:?} new={:?}",
+            old_elapsed,
+            new_elapsed
+        );
+        // Speed alone doesn't prove correctness — a buggy resume that
+        // fast-forwards the watermark past unprocessed history would be
+        // fast too. Confirm the resumed convention actually walked the
+        // entire range and didn't skip any of it to get there.
+        assert_eq!(
+            watermark, cutoff,
+            "the watermark-resuming convention must still reach cutoff, not just run fast"
+        );
+    }
+
+    /// Regression test found by adversarial review of the #4843 fix itself:
+    /// before watermark-resuming, a batch that failed (transient SQLITE_BUSY,
+    /// pool timeout under concurrent capture writes, etc.) was retried "for
+    /// free" on the very next cycle, because `batch_start` was always
+    /// re-derived from `get_oldest_timestamp()`. Once the caller persists
+    /// whatever watermark `do_local_cleanup` returns, silently advancing past
+    /// a failed batch would permanently skip that range forever instead of
+    /// retrying it. `do_local_cleanup` must stop at the failed batch and
+    /// return the watermark from *before* it, not the batch it failed to
+    /// process.
+    #[tokio::test]
+    async fn do_local_cleanup_failed_batch_does_not_advance_watermark_past_it() {
+        let db = Arc::new(
+            DatabaseManager::new("sqlite::memory:", Default::default())
+                .await
+                .unwrap(),
+        );
+
+        // Force the first batch's query to fail deterministically and
+        // instantly: `begin_immediate_with_retry` only retries
+        // connection-acquisition errors, not query errors after BEGIN, so a
+        // missing table surfaces immediately as Err, no backoff needed.
+        db.execute_raw_sql("DROP TABLE video_chunks").await.unwrap();
+
+        let now = Utc::now();
+        let start = now - Duration::hours(2);
+        let cutoff = now;
+
+        let (total, watermark) = do_local_cleanup(&db, start, cutoff, RetentionMode::Media)
+            .await
+            .unwrap();
+
+        assert_eq!(total, 0);
+        assert_eq!(
+            watermark, start,
+            "a failed batch must leave the watermark where it was so the next \
+             cycle retries the same range, instead of silently skipping it forever"
+        );
     }
 }

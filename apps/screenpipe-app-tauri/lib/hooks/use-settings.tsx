@@ -13,7 +13,7 @@ import posthog from "posthog-js";
 import { cacheAnalyticsId } from "@/lib/analytics-id";
 import { User } from "../utils/tauri";
 import { SettingsStore } from "../utils/tauri";
-import { installAuthInterceptor } from "../auth-guard";
+import { installAuthInterceptor, stripSessionToken } from "../auth-guard";
 import { hasAppEntitlement, normalizeAppUser } from "@/lib/app-entitlement";
 import { screenpipeWebUrl } from "@/lib/web-url";
 import type { SourceCitation } from "@/lib/source-citations";
@@ -113,6 +113,7 @@ export interface ChatMessage {
 	}>;
 	interruptedBySteer?: boolean;
 	steeredResponse?: boolean;
+	stoppedByUser?: boolean;
 	/** Wall-clock work duration for coalesced assistant messages (pipe
 	 *  runs). Used by the chat renderer as a fallback when no thinking
 	 *  blocks contributed a duration, so the work-group can still show
@@ -296,10 +297,20 @@ export type Settings = SettingsStore & {
 	/** Experimental: capture System Audio via CoreAudio Process Tap (macOS 14.4+) instead of ScreenCaptureKit.
 	 *  Off by default. Ignored on macOS <14.4 and non-macOS — falls back to SCK. */
 	experimentalCoreaudioSystemAudio?: boolean;
+	/** Beta ("Smart recording" in the app): during meetings, capture only the meeting app's audio
+	 *  and the microphone it actually uses (per-process piggyback). Off by default. Engages in ANY
+	 *  audio capture mode — takes precedence over the configured devices for the meeting's
+	 *  duration. Requires the meeting detector. Falls back to standard capture automatically if
+	 *  unavailable. */
+	experimentalMeetingPiggyback?: boolean;
 	/** Experimental: request Windows WASAPI microphone AEC when supported. */
 	windowsInputAecEnabled?: boolean;
 	/** Experimental: request Apple VoiceProcessingIO AEC on the default macOS microphone. */
 	macosInputVpioEnabled?: boolean;
+	/** Request Screenpipe's software Acoustic Echo Cancellation (via sonora WebRTC AEC3). */
+	screenpipeAecEnabled?: boolean;
+	/** Selected echo cancellation engine. Missing values default to off. */
+	aecMode?: "off" | "screenpipe" | "macos" | "windows";
 	/** Continue recording audio when the screen is locked (default: false) */
 	recordWhileLocked?: boolean;
 	/** Auto-delete local data older than retention days (free alternative to cloud archive) */
@@ -316,8 +327,6 @@ export type Settings = SettingsStore & {
 	localRetentionMode?: "media" | "lean" | "all";
 	/** Apply macOS vibrancy effect to sidebar for a translucent glass look */
 	translucentSidebar?: boolean;
-	/** Hide model "thinking" reasoning blocks in chat (default: true) */
-	hideThinkingBlocks?: boolean;
 	/** Show the chat suggestion chips above the input — the "follow up"
 	 *  questions and the connection-aware suggested prompts. The single inline
 	 *  X on the chips flips this to false; re-enable from Settings → Display.
@@ -646,6 +655,7 @@ let DEFAULT_SETTINGS: Settings = {
 			searchShortcut: "Control+Super+K",
 			lockVaultShortcut: "Super+Shift+L",
 			disableVision: false,
+			disableScreenshots: false,
 			useAllMonitors: true,
 			showShortcutOverlay: true,
 			chatHistory: {
@@ -669,8 +679,11 @@ let DEFAULT_SETTINGS: Settings = {
 			disableClickCapture: false,
 			keepComputerAwake: false,
 			experimentalCoreaudioSystemAudio: false,
+			experimentalMeetingPiggyback: false,
 			windowsInputAecEnabled: false,
 			macosInputVpioEnabled: false,
+			screenpipeAecEnabled: false,
+			aecMode: "off",
 			recordWhileLocked: false,
 			localRetentionEnabled: false,
 			localRetentionDays: 14,
@@ -715,12 +728,30 @@ let _store: Promise<Store> | undefined;
 
 export const getStore = async () => {
 	if (!_store) {
-		// Use homeDir to match Rust backend's get_base_dir which uses $HOME/.screenpipe
-		const dir = await homeDir();
-		_store = Store.load(`${dir}/.screenpipe/store.bin`, {
-			autoSave: false,
-			defaults: {},
-		});
+		_store = (async () => {
+			// Resolve the base dir via the backend so the webview opens the same
+			// store.bin as Rust (get_base_dir honors SCREENPIPE_DATA_DIR); a
+			// hardcoded ~/.screenpipe here splits the settings store in two
+			// whenever that override is set.
+			let baseDir: string | null = null;
+			try {
+				const res = await commands.getScreenpipeBaseDir();
+				if (res.status === "ok") {
+					baseDir = res.data;
+				} else {
+					console.warn("get_screenpipe_base_dir failed, using ~/.screenpipe:", res.error);
+				}
+			} catch (e) {
+				console.warn("get_screenpipe_base_dir unavailable, using ~/.screenpipe:", e);
+			}
+			if (!baseDir) {
+				baseDir = `${await homeDir()}/.screenpipe`;
+			}
+			return Store.load(`${baseDir}/store.bin`, {
+				autoSave: false,
+				defaults: {},
+			});
+		})();
 	}
 	return _store;
 };
@@ -1164,7 +1195,16 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
 		installAuthInterceptor(
 			() => settingsRef.current.user?.token ?? undefined,
 			async () => {
-				await updateSettings({ user: null as any });
+				// Strip only the token — keep the profile + entitlement evidence so
+				// the entitlement gate's transient-loss cushion can hold instead of
+				// resetting onboarding (SCR-132). Because the user stays non-null,
+				// the explicit-logout invalidation in updateSettings ("user" in
+				// updates && !updates.user) intentionally does NOT fire: an
+				// in-flight loadUser that still succeeds may legitimately restore
+				// the session after a transient 401.
+				await updateSettings({
+					user: stripSessionToken(settingsRef.current.user) as any,
+				});
 				// Mirror the sign-out into the sidecar so the pi-agent and
 				// cloud_proxy.rs stop sending the now-revoked token on the
 				// next pipe run.

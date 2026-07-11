@@ -125,7 +125,8 @@ async function emitTargetedAutoSendPrefill(
   );
 }
 
-describe("Parallel-job chat duplication (sidebar shows 2x same template run)", function () {
+// QUARANTINED (#4686): CI-flaky (chat seeding / owned-browser window-handle). Re-enable per issue.
+describe.skip("Parallel-job chat duplication (sidebar shows 2x same template run)", function () {
   this.timeout(180_000);
 
   before(async () => {

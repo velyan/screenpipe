@@ -33,6 +33,8 @@ const EMBEDDER_VERSION_ENV_VARS: &[&str] = &[
     "SCREENPIPE_TELEMETRY_HOST_VERSION",
 ];
 const DISTRIBUTION_ENV_VARS: &[&str] = &["SCREENPIPE_DISTRIBUTION", "SCREENPIPE_DIST"];
+const ENTERPRISE_LICENSE_HASH_ENV_VARS: &[&str] = &["SCREENPIPE_ENTERPRISE_LICENSE_HASH"];
+const ENTERPRISE_DEVICE_ID_ENV_VARS: &[&str] = &["SCREENPIPE_ENTERPRISE_DEVICE_ID"];
 
 /// How this engine was launched: "desktop-app" (Tauri app), "cli" (npm/bunx),
 /// or "source"/"source-dev" (built locally). The app and CLI set
@@ -57,6 +59,8 @@ pub struct TelemetryContext {
     pub deployment_id: Option<String>,
     pub embedder: Option<String>,
     pub embedder_version: Option<String>,
+    pub enterprise_license_hash: Option<String>,
+    pub enterprise_device_id: Option<String>,
 }
 
 impl TelemetryContext {
@@ -67,6 +71,8 @@ impl TelemetryContext {
             deployment_id: first_env(DEPLOYMENT_ID_ENV_VARS),
             embedder: first_env(EMBEDDER_ENV_VARS),
             embedder_version: first_env(EMBEDDER_VERSION_ENV_VARS),
+            enterprise_license_hash: first_env(ENTERPRISE_LICENSE_HASH_ENV_VARS),
+            enterprise_device_id: first_env(ENTERPRISE_DEVICE_ID_ENV_VARS),
         }
     }
 
@@ -101,6 +107,16 @@ impl TelemetryContext {
             "screenpipe_embedder_version",
             &self.embedder_version,
         );
+        push_if_some(
+            &mut pairs,
+            "screenpipe_enterprise_license_hash",
+            &self.enterprise_license_hash,
+        );
+        push_if_some(
+            &mut pairs,
+            "screenpipe_enterprise_device_id",
+            &self.enterprise_device_id,
+        );
         pairs
     }
 
@@ -131,6 +147,13 @@ impl TelemetryContext {
             set_obj.insert("screenpipe_distribution".to_string(), json!(distribution));
             for (key, value) in &pairs {
                 set_obj.insert((*key).to_string(), json!(value));
+            }
+        }
+
+        if let Some(org_key) = self.enterprise_license_hash.as_deref() {
+            let groups = properties.entry("$groups").or_insert_with(|| json!({}));
+            if let Some(groups_obj) = groups.as_object_mut() {
+                groups_obj.insert("enterprise_org".to_string(), json!(org_key));
             }
         }
 
@@ -183,6 +206,8 @@ mod tests {
         "SCREENPIPE_TELEMETRY_HOST_VERSION",
         "SCREENPIPE_DISTRIBUTION",
         "SCREENPIPE_DIST",
+        "SCREENPIPE_ENTERPRISE_LICENSE_HASH",
+        "SCREENPIPE_ENTERPRISE_DEVICE_ID",
     ];
 
     fn with_env<T>(pairs: &[(&str, &str)], test: impl FnOnce() -> T) -> T {
@@ -326,5 +351,43 @@ mod tests {
                 Some(&json!("cli"))
             );
         });
+    }
+
+    #[test]
+    fn posthog_properties_include_enterprise_tags_and_group() {
+        with_env(
+            &[
+                ("SCREENPIPE_ENTERPRISE_LICENSE_HASH", "ent_abc123"),
+                ("SCREENPIPE_ENTERPRISE_DEVICE_ID", "device-1"),
+            ],
+            || {
+                let context = TelemetryContext::from_env();
+                let mut properties = Map::new();
+                context.insert_posthog_properties(&mut properties);
+
+                assert_eq!(
+                    properties.get("screenpipe_enterprise_license_hash"),
+                    Some(&json!("ent_abc123"))
+                );
+                assert_eq!(
+                    properties.get("screenpipe_enterprise_device_id"),
+                    Some(&json!("device-1"))
+                );
+
+                let groups = properties
+                    .get("$groups")
+                    .and_then(|value| value.as_object());
+                assert_eq!(
+                    groups.and_then(|value| value.get("enterprise_org")),
+                    Some(&json!("ent_abc123"))
+                );
+
+                let set = properties.get("$set").and_then(|value| value.as_object());
+                assert_eq!(
+                    set.and_then(|value| value.get("screenpipe_enterprise_device_id")),
+                    Some(&json!("device-1"))
+                );
+            },
+        );
     }
 }

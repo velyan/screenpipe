@@ -61,6 +61,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { emit } from "@tauri-apps/api/event";
 import { parseBrainSearchQuery } from "@/lib/utils/brain-search";
 import { getArtifactCardDisplay } from "@/lib/utils/artifact-display";
+import { searchInputBehaviorProps } from "@/lib/search-input-behavior";
 import {
   resolveArtifactOpenTarget,
   type ArtifactOpenTarget,
@@ -470,9 +471,11 @@ export function BrainSection() {
     total: artifactsTotal,
     sources: artifactSources,
     isLoading: artifactsLoading,
+    error: artifactsError,
     hasMore: artifactsHaveMore,
     loadMore: loadMoreArtifacts,
     deleteRegistered,
+    refresh: refreshArtifacts,
   } = useUnifiedArtifacts(
     parsedSearch.contentQuery,
     artifactSourceFilter,
@@ -1153,6 +1156,7 @@ export function BrainSection() {
                     }
                     className="h-8 pl-7 text-xs"
                     autoFocus
+                    {...searchInputBehaviorProps}
                   />
                 </div>
               </div>
@@ -1219,6 +1223,7 @@ export function BrainSection() {
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             className="pl-8 h-8 text-sm"
+            {...searchInputBehaviorProps}
           />
         </div>
         {typeFilter === "memories" && (
@@ -1539,6 +1544,25 @@ export function BrainSection() {
 
       {(typeFilter === "memories" ? loading : artifactsLoading) ? (
         <BrainSkeleton />
+      ) : typeFilter === "artifacts" && artifactsError && unifiedItems.length === 0 ? (
+        <div
+          data-testid="brain-artifacts-error"
+          className="text-sm text-muted-foreground py-8 space-y-3 text-center"
+        >
+          <div className="space-y-1">
+            <p className="font-medium text-foreground">failed to load artifacts</p>
+            <p className="text-xs">{artifactsError}</p>
+          </div>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="h-7 text-xs"
+            onClick={refreshArtifacts}
+          >
+            retry
+          </Button>
+        </div>
       ) : unifiedItems.length === 0 ? (
         <div className="text-sm text-muted-foreground py-8 space-y-2 text-center">
           <p>{emptyStateMessage(typeFilter, debouncedQuery, activeTags.length > 0)}</p>

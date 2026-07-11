@@ -64,6 +64,7 @@ pub mod config;
 pub mod events;
 pub mod incognito;
 pub mod platform;
+pub mod scroll;
 pub mod tree;
 pub mod url_filter;
 

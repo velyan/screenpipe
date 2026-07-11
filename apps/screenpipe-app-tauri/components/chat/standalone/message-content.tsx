@@ -6,16 +6,18 @@
 import * as React from "react";
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { Calendar, ChevronDown, ChevronUp, Plug, RefreshCw } from "lucide-react";
+import { Check, Calendar, ChevronDown, ChevronRight, ChevronUp, Plug, RefreshCw } from "lucide-react";
 import { SourceCitationFooter } from "@/components/chat/source-citation-footer";
 import { MarkdownBlock } from "@/components/chat/markdown-block";
+import { AskUserToolCard, isAskUserToolCall } from "@/components/chat/standalone/ask-user-tool-card";
 import { getFaviconUrl } from "@/components/rewind/timeline/favicon-utils";
 import { IntegrationIcon } from "@/components/settings/connections-section";
-import { useSettings } from "@/lib/hooks/use-settings";
 import { useFeedbackStore } from "@/lib/stores/feedback-store";
 import { cn } from "@/lib/utils";
 import type { Message, ToolCall, ContentBlock } from "@/lib/chat/types";
-import { formatWorkDuration } from "@/lib/chat/message-rendering";
+import type { ConnectionListItem } from "@/lib/chat/connection-suggestions";
+import type { InlineConnectStatus } from "@/lib/connections/inline-connect";
+import { formatDurationParts, formatStoppedWorkDuration, formatWorkDuration, hasAssistantToolWorkBody } from "@/lib/chat/message-rendering";
 import {
   classifyCurl,
   endpointFamily,
@@ -56,7 +58,7 @@ function MermaidDiagramBlock({ chart }: { chart: string }) {
 }
 
 // Animation phase for the grid dissolve loader.
-export type LoaderPhase = "analyzing" | "thinking" | "tool" | "streaming";
+export type LoaderPhase = "analyzing" | "tool" | "streaming";
 
 // Grid dissolve loading indicator — 5x4 grid of cells with animation patterns
 // that shift based on what the model is doing. Geometric, screen-capture themed.
@@ -64,12 +66,10 @@ export function GridDissolveLoader({
   phase = "analyzing",
   label,
   toolName,
-  thinkingSecs,
 }: {
   phase?: LoaderPhase;
   label?: string;
   toolName?: string;
-  thinkingSecs?: number;
 }) {
   const ROWS = 3;
   const COLS = 5;
@@ -102,7 +102,7 @@ export function GridDissolveLoader({
             const fill = tick % (ROWS + 1);
             return row <= fill || row === scanRow % ROWS;
           }
-          // analyzing / thinking: scan line is bright, other cells flicker
+          // analyzing: scan line is bright, other cells flicker
           if (row === scanRow % ROWS) return true;
           return Math.random() > 0.6;
         });
@@ -113,7 +113,6 @@ export function GridDissolveLoader({
   }, [phase]);
 
   const displayLabel = label ?? (
-    phase === "thinking" ? `thinking${thinkingSecs != null ? ` ${thinkingSecs}s` : ""}...` :
     phase === "tool" ? (toolName ?? "running tool...") :
     phase === "streaming" ? "writing..." :
     "analyzing..."
@@ -135,10 +134,12 @@ export function GridDissolveLoader({
             className={cn(
               "transition-colors duration-100",
               on
-                ? phase === "streaming"
+                ? phase === "streaming" || phase === "analyzing"
                   ? "bg-foreground/40"
                   : "bg-foreground"
-                : "bg-border/30"
+                : phase === "streaming" || phase === "analyzing"
+                  ? "bg-border/20"
+                  : "bg-border/30"
             )}
             style={{ width: 5, height: 5 }}
           />
@@ -179,6 +180,7 @@ function extractWebTargetFromToolCall(toolCall: ToolCall): WebTargetPresentation
 // Human-friendly label for a tool call (no JSON, no raw paths)
 function friendlyToolLabel(toolCall: ToolCall): string {
   const fileName = (p: string) => p.split("/").pop() || p;
+  if (isAskUserToolCall(toolCall)) return "Asked for input";
   switch (toolCall.toolName) {
     case "bash": {
       const cmd = String(toolCall.args.command ?? "");
@@ -434,12 +436,21 @@ function FriendlyToolDetails({ toolCall }: { toolCall: ToolCall }) {
 }
 
 // Single tool call row in the progress rail
-function ToolCallRailItem({ toolCall, isLast }: { toolCall: ToolCall; isLast: boolean }) {
+function ToolCallRailItem({
+  toolCall,
+  isLast,
+  onAskUserReply,
+}: {
+  toolCall: ToolCall;
+  isLast: boolean;
+  onAskUserReply?: (reply: string, displayLabel: string) => void | Promise<void>;
+}) {
   const [expanded, setExpanded] = useState(false);
   const label = friendlyToolLabel(toolCall);
   const appName = extractAppFromToolCall(toolCall);
   const connectionIconName = extractConnectionIconFromToolCall(toolCall);
   const webTarget = extractWebTargetFromToolCall(toolCall);
+  const isAskUser = isAskUserToolCall(toolCall);
 
   return (
     <div className="relative flex min-w-0">
@@ -477,24 +488,28 @@ function ToolCallRailItem({ toolCall, isLast }: { toolCall: ToolCall; isLast: bo
 
       {/* Content */}
       <div className="flex-1 min-w-0 pb-2">
-        <button
-          onClick={() => setExpanded(!expanded)}
-          className="w-full flex items-center gap-1.5 text-left min-w-0 group py-0.5"
-        >
-          {webTarget ? (
-            <WebTargetIcon target={webTarget} sizeClass="w-3.5 h-3.5" letterClass="text-[8px]" />
-          ) : appName && !connectionIconName && (
-            <AppIcon name={appName} sizeClass="w-3.5 h-3.5" letterClass="text-[8px]" />
-          )}
-          <span className="truncate flex-1 text-xs font-mono text-foreground/70 group-hover:text-foreground transition-colors duration-150">
-            {label}
-          </span>
-          <span className="text-foreground/30 flex-shrink-0 text-[10px] font-mono group-hover:text-foreground/60 transition-colors duration-150">
-            {expanded ? "−" : "+"}
-          </span>
-        </button>
+        {isAskUser ? (
+          <AskUserToolCard toolCall={toolCall} onSubmit={onAskUserReply} />
+        ) : (
+          <button
+            onClick={() => setExpanded(!expanded)}
+            className="w-full flex items-center gap-1.5 text-left min-w-0 group py-0.5"
+          >
+            {webTarget ? (
+              <WebTargetIcon target={webTarget} sizeClass="w-3.5 h-3.5" letterClass="text-[8px]" />
+            ) : appName && !connectionIconName && (
+              <AppIcon name={appName} sizeClass="w-3.5 h-3.5" letterClass="text-[8px]" />
+            )}
+            <span className="truncate flex-1 text-xs font-mono text-foreground/70 group-hover:text-foreground transition-colors duration-150">
+              {label}
+            </span>
+            <span className="text-foreground/30 flex-shrink-0 text-[10px] font-mono group-hover:text-foreground/60 transition-colors duration-150">
+              {expanded ? "−" : "+"}
+            </span>
+          </button>
+        )}
         <AnimatePresence>
-          {expanded && (
+          {!isAskUser && expanded && (
             <motion.div
               initial={{ height: 0, opacity: 0 }}
               animate={{ height: "auto", opacity: 1 }}
@@ -519,42 +534,6 @@ function ToolCallRailItem({ toolCall, isLast }: { toolCall: ToolCall; isLast: bo
           )}
         </AnimatePresence>
       </div>
-    </div>
-  );
-}
-
-function ThinkingBlock({ text, isThinking, durationMs, defaultExpanded = false }: { text: string; isThinking: boolean; durationMs?: number; defaultExpanded?: boolean }) {
-  const [expanded, setExpanded] = useState(defaultExpanded);
-  const [elapsed, setElapsed] = useState(0);
-  const startRef = useRef(Date.now());
-
-  useEffect(() => {
-    if (!isThinking) return;
-    const id = window.setInterval(() => setElapsed(Math.floor((Date.now() - startRef.current) / 1000)), 1000);
-    return () => window.clearInterval(id);
-  }, [isThinking]);
-
-  const seconds = isThinking ? elapsed : durationMs ? Math.round(durationMs / 1000) : 0;
-
-  return (
-    <div className="rounded-lg border border-border/30 bg-muted/20 text-xs overflow-hidden max-w-full">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-2 px-3 py-2 hover:bg-muted/40 transition-colors text-left"
-      >
-        <div className={cn("h-2 w-2 rounded-full", isThinking ? "bg-foreground/60 animate-pulse" : "bg-foreground/30")} />
-        <span className="font-mono text-muted-foreground">
-          {isThinking ? `thinking... (${seconds}s)` : `thought for ${seconds}s`}
-        </span>
-        <span className="ml-auto text-muted-foreground">{expanded ? "▾" : "▸"}</span>
-      </button>
-      {expanded && text.trim() && (
-        <div className="px-3 py-2 border-t border-border/30">
-          <div className="pl-3 border-l-2 border-border/40 text-muted-foreground font-mono whitespace-pre-wrap break-words max-h-[300px] overflow-y-auto text-[11px] leading-relaxed">
-            {text}
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -780,6 +759,7 @@ function AppStatsBlock({ content }: { content: string }) {
 type GroupedBlock =
   | { type: "text"; text: string; key: number }
   | { type: "thinking"; text: string; isThinking: boolean; durationMs?: number; key: number }
+  | { type: "connection-action"; block: Extract<ContentBlock, { type: "connection_action" }>; key: number }
   | { type: "tool-group"; toolCalls: ToolCall[]; key: number }
   | { type: "work-group"; toolCalls: ToolCall[]; durationMs: number; key: number };
 
@@ -800,6 +780,8 @@ function groupContentBlocks(blocks: ContentBlock[]): GroupedBlock[] {
         result.push({ type: "text", text: block.text, key: result.length });
       } else if (block.type === "thinking") {
         result.push({ type: "thinking", text: block.text, isThinking: block.isThinking, durationMs: block.durationMs, key: result.length });
+      } else if (block.type === "connection_action") {
+        result.push({ type: "connection-action", block, key: result.length });
       }
     }
   }
@@ -809,12 +791,10 @@ function groupContentBlocks(blocks: ContentBlock[]): GroupedBlock[] {
   return result;
 }
 
-function collapseHiddenWorkGroups(grouped: GroupedBlock[], hideThinkingBlocks: boolean): GroupedBlock[] {
-  // Run always: collapsing consecutive tool-groups into a single
-  // "Worked for X min" rail is useful regardless of the thinking-block
-  // visibility setting. `hideThinkingBlocks` only controls whether
-  // thinking blocks get absorbed into the work-group (true) or shown
-  // as separate pills (false).
+function collapseHiddenWorkGroups(grouped: GroupedBlock[]): GroupedBlock[] {
+  // Collapse consecutive tool-groups into a single "Worked for X min"
+  // rail. Thinking blocks are always absorbed — their duration folds
+  // into the work-group and they never render as separate pills.
 
   const out: GroupedBlock[] = [];
   let pendingToolCalls: ToolCall[] = [];
@@ -857,15 +837,9 @@ function collapseHiddenWorkGroups(grouped: GroupedBlock[], hideThinkingBlocks: b
     }
 
     if (group.type === "thinking") {
-      if (hideThinkingBlocks) {
-        pendingDurationMs += group.durationMs ?? 0;
-        pendingKey ??= group.key;
-        continue;
-      }
-      // Show thinking pills inline — flush pending tool work first so
-      // ordering is preserved and the thinking pill renders separately.
-      flushPending();
-      out.push(group);
+      // Always absorb thinking duration into the pending work-group
+      pendingDurationMs += group.durationMs ?? 0;
+      pendingKey ??= group.key;
       continue;
     }
 
@@ -877,90 +851,366 @@ function collapseHiddenWorkGroups(grouped: GroupedBlock[], hideThinkingBlocks: b
   return out;
 }
 
-// Build natural-language summary of completed tool calls
-function buildToolSummary(toolCalls: ToolCall[]): string {
-  const counts: Record<string, number> = {};
-  for (const tc of toolCalls) {
-    const action = tc.toolName === "bash" ? "ran" : tc.toolName === "read" ? "read" : tc.toolName === "edit" ? "edited" : tc.toolName === "write" ? "wrote" : tc.toolName === "grep" ? "searched" : tc.toolName;
-    counts[action] = (counts[action] || 0) + 1;
+/**
+ * Merge all tool/work groups into a single "Worked for Xs" rail at the top.
+ * Intermediate narration text between tool calls is dropped — only the
+ * final text block (the actual response after all tools finish) renders
+ * as visible prose. Connection-action blocks always render outside.
+ */
+function mergeWorkAndIntermediateText(groups: GroupedBlock[]): GroupedBlock[] {
+  // Find the last work/tool group — everything up to that boundary is
+  // "work". Text after is the final response.
+  let lastWorkIdx = -1;
+  for (let i = groups.length - 1; i >= 0; i--) {
+    if (groups[i].type === "work-group" || groups[i].type === "tool-group") {
+      lastWorkIdx = i;
+      break;
+    }
   }
-  const parts = Object.entries(counts).map(([action, count]) => {
-    if (action === "read") return `read ${count} file${count > 1 ? "s" : ""}`;
-    if (action === "edited") return `edited ${count} file${count > 1 ? "s" : ""}`;
-    if (action === "wrote") return `wrote ${count} file${count > 1 ? "s" : ""}`;
-    if (action === "ran") return `ran ${count} command${count > 1 ? "s" : ""}`;
-    if (action === "searched") return `${count} search${count > 1 ? "es" : ""}`;
-    return `${count} ${action}`;
-  });
-  return parts.join(", ");
+
+  // No tool calls at all → nothing to merge, show text as-is.
+  if (lastWorkIdx === -1) return groups;
+
+  // Accumulate all tool calls and duration into one work group.
+  // Intermediate text (model narration between tools) is dropped.
+  const allToolCalls: ToolCall[] = [];
+  let totalDurationMs = 0;
+  let firstKey: number | null = null;
+  const finalBlocks: GroupedBlock[] = [];
+
+  for (let i = 0; i <= lastWorkIdx; i++) {
+    const g = groups[i];
+    if (g.type === "work-group") {
+      firstKey ??= g.key;
+      allToolCalls.push(...g.toolCalls);
+      totalDurationMs += g.durationMs;
+    } else if (g.type === "tool-group") {
+      firstKey ??= g.key;
+      allToolCalls.push(...g.toolCalls);
+    } else if (g.type === "connection-action") {
+      finalBlocks.push(g);
+    }
+    // text and thinking blocks before the boundary are dropped
+  }
+
+  // Build the merged work group
+  if (allToolCalls.length > 0) {
+    finalBlocks.unshift({
+      type: "work-group",
+      toolCalls: allToolCalls,
+      durationMs: totalDurationMs,
+      key: firstKey ?? 0,
+    });
+  }
+
+  // Everything after lastWorkIdx is the final response
+  for (let i = lastWorkIdx + 1; i < groups.length; i++) {
+    finalBlocks.push(groups[i]);
+  }
+
+  return finalBlocks;
+}
+
+function InlineConnectionActionCard({
+  block,
+  connected,
+  onConnect,
+  onContinue,
+  onDismiss,
+}: {
+  block: Extract<ContentBlock, { type: "connection_action" }>;
+  connected: boolean;
+  onConnect: () => Promise<InlineConnectStatus | void> | InlineConnectStatus | void;
+  onContinue?: (prompt: string, label?: string) => void | Promise<void>;
+  onDismiss: () => void;
+}) {
+  const [connectState, setConnectState] = useState<"idle" | "waiting" | "error">("idle");
+  const [locallyConnected, setLocallyConnected] = useState(false);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const effectiveConnected = connected || locallyConnected;
+  const connectLabel = effectiveConnected ? `${block.connectionName} connected` : `connect ${block.connectionName}`;
+  const continueLabel = block.pendingActionLabel ?? `continue with ${block.connectionName}`;
+  const continuePrompt = block.pendingActionPrompt ??
+    `${block.connectionName} is connected now. Continue the action we were discussing, but ask me for confirmation before writing to ${block.connectionName}.`;
+  const isPiGate = Boolean(block.extensionRequestId);
+
+  const handleConnect = async () => {
+    setConnectState("waiting");
+    setStatusMessage("opening authorization in your browser...");
+    try {
+      const result = await onConnect();
+      if (result?.status === "error") {
+        setConnectState("error");
+        setStatusMessage(result.reason);
+        return;
+      }
+      if (result?.status === "unsupported") {
+        setConnectState("error");
+        setStatusMessage(result.reason);
+        return;
+      }
+      if (result?.status === "connected") {
+        setLocallyConnected(true);
+        setStatusMessage("connected");
+      }
+    } finally {
+      setTimeout(() => {
+        setConnectState("idle");
+        setStatusMessage(null);
+      }, 1600);
+    }
+  };
+
+  return (
+    <div className="w-full max-w-xl border border-border bg-background p-3 font-mono">
+      <div className="flex items-start gap-3">
+        <div className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center">
+          {effectiveConnected ? (
+            <Check className="h-4 w-4" strokeWidth={2} aria-hidden />
+          ) : (
+            <IntegrationIcon
+              icon={block.icon || block.connectionId}
+              className="h-4 w-4 flex items-center justify-center"
+              fallbackClassName="h-4 w-4 text-foreground"
+            />
+          )}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-semibold leading-5 text-foreground">
+            {connectLabel}
+          </div>
+          <div className="mt-1 max-w-md text-xs leading-5 text-muted-foreground">
+            {statusMessage ?? block.extensionReason ?? "token stays in the local secret store and is never shown to the model."}
+          </div>
+          {effectiveConnected && isPiGate ? (
+            <div className="mt-3 text-xs uppercase tracking-wide text-muted-foreground">
+              continuing...
+            </div>
+          ) : effectiveConnected ? (
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => onContinue?.(continuePrompt, continueLabel)}
+                className="border border-foreground bg-foreground px-2.5 py-1.5 text-xs uppercase tracking-wide text-background transition-colors duration-150"
+              >
+                {continueLabel}
+              </button>
+              <button
+                type="button"
+                onClick={onDismiss}
+                className="border border-border px-2.5 py-1.5 text-xs uppercase tracking-wide text-muted-foreground transition-colors duration-150 hover:bg-foreground hover:text-background"
+              >
+                dismiss
+              </button>
+            </div>
+          ) : (
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={handleConnect}
+                disabled={connectState === "waiting"}
+                className="border border-foreground bg-foreground px-2.5 py-1.5 text-xs uppercase tracking-wide text-background transition-opacity duration-150 disabled:opacity-60"
+              >
+                {connectState === "waiting" ? "waiting" : connectState === "error" ? "retry" : "connect"}
+              </button>
+              <button
+                type="button"
+                onClick={onDismiss}
+                className="border border-border px-2.5 py-1.5 text-xs uppercase tracking-wide text-muted-foreground transition-colors duration-150 hover:bg-foreground hover:text-background"
+              >
+                not now
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function toolCallRenderKey(toolCall: ToolCall, index: number): string {
   return `${toolCall.id || toolCall.toolName || "tool"}:${index}`;
 }
 
+function toolWorkStartedAt(toolCalls: ToolCall[], fallbackStartedAtMs?: number): number | undefined {
+  const starts = toolCalls
+    .map((toolCall) => toolCall.startedAtMs)
+    .filter((startedAtMs): startedAtMs is number => typeof startedAtMs === "number" && Number.isFinite(startedAtMs));
+  if (starts.length > 0) return Math.min(...starts);
+  return fallbackStartedAtMs;
+}
+
+function toolWorkEndedAt(toolCalls: ToolCall[]): number | undefined {
+  const ends = toolCalls
+    .map((toolCall) => toolCall.endedAtMs)
+    .filter((endedAtMs): endedAtMs is number => typeof endedAtMs === "number" && Number.isFinite(endedAtMs));
+  if (ends.length > 0) return Math.max(...ends);
+  return undefined;
+}
+
+function formatRunningWorkDuration(startedAtMs: number): string {
+  const durationMs = Date.now() - startedAtMs;
+  return durationMs >= 1000 ? `Working for ${formatDurationParts(durationMs)}` : "Working";
+}
+
+function completedWorkSummaryFromRunning(runningSummary: string): string {
+  const prefix = "Working for ";
+  if (runningSummary.startsWith(prefix)) {
+    return `Worked for ${runningSummary.slice(prefix.length)}`;
+  }
+  return "Worked";
+}
+
+function WorkSummaryText({
+  text,
+  animateRunningDuration,
+}: {
+  text: string;
+  animateRunningDuration: boolean;
+}) {
+  const prefix = "Working";
+
+  if (!animateRunningDuration || !text.startsWith(prefix)) {
+    return <>{text}</>;
+  }
+
+  const durationSuffix = text.slice(prefix.length);
+
+  return (
+    <>
+      {prefix}
+      <AnimatePresence initial={false}>
+        {durationSuffix && (
+          <motion.span
+            key="running-duration"
+            initial={{ opacity: 0, y: 2 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -2 }}
+            transition={{ duration: 0.16, ease: "easeOut" }}
+            className="inline-block whitespace-pre"
+          >
+            {durationSuffix}
+          </motion.span>
+        )}
+      </AnimatePresence>
+    </>
+  );
+}
+
 function ToolCallGroup({
   toolCalls,
   defaultExpanded = false,
+  isGenerating = false,
+  preferSummaryOverride = false,
   summaryOverride,
-  hideCount = false,
+  workStartedAtMs,
+  hideSummary = false,
+  forceCollapsed = false,
+  onAskUserReply,
 }: {
   toolCalls: ToolCall[];
   defaultExpanded?: boolean;
+  isGenerating?: boolean;
+  preferSummaryOverride?: boolean;
   summaryOverride?: string;
-  hideCount?: boolean;
+  workStartedAtMs?: number;
+  hideSummary?: boolean;
+  forceCollapsed?: boolean;
+  onAskUserReply?: (reply: string, displayLabel: string) => void | Promise<void>;
 }) {
   const [manualExpand, setManualExpand] = useState<boolean | null>(null);
+  const [runningSummary, setRunningSummary] = useState("Working");
+  const [completedLiveSummary, setCompletedLiveSummary] = useState<string | null>(null);
+  const wasWorkingRef = useRef(false);
 
-  const hasRunning = toolCalls.some((tc) => tc.isRunning);
+  const hasRunningTool = toolCalls.some((tc) => tc.isRunning);
+  const isWorking = hasRunningTool || isGenerating;
   const hasError = toolCalls.some((tc) => tc.isError);
-  const allDone = !hasRunning;
-  const doneCount = toolCalls.filter((tc) => !tc.isRunning).length;
+  const allDone = !isWorking;
   const total = toolCalls.length;
-  const summary = allDone ? (summaryOverride || buildToolSummary(toolCalls)) : "";
+  const startedAtMs = toolWorkStartedAt(toolCalls, workStartedAtMs);
+  const endedAtMs = allDone ? toolWorkEndedAt(toolCalls) : undefined;
+  const completedDurationMs = startedAtMs && endedAtMs ? Math.max(1, endedAtMs - startedAtMs) : undefined;
+  const justCompletedSummary = !isWorking && wasWorkingRef.current
+    ? completedWorkSummaryFromRunning(runningSummary)
+    : null;
+  const summary = allDone
+    ? (
+        preferSummaryOverride && summaryOverride
+          ? summaryOverride
+          : justCompletedSummary ||
+            completedLiveSummary ||
+            (completedDurationMs ? formatWorkDuration(completedDurationMs) : (summaryOverride || "Worked"))
+      )
+    : "";
 
-  // Auto-expand while running, auto-collapse when done (user can override).
-  // `defaultExpanded` keeps the group open even when done — used for
-  // messages whose entire output is tool calls (typical pipe-runs)
-  // where the tool result is the whole story.
-  const isExpanded = manualExpand !== null ? manualExpand : (hasRunning || defaultExpanded);
+  useEffect(() => {
+    if (!isWorking || !startedAtMs) {
+      setRunningSummary("Working");
+      return;
+    }
+    const updateSummary = () => setRunningSummary(formatRunningWorkDuration(startedAtMs));
+    updateSummary();
+    const id = window.setInterval(updateSummary, 1000);
+    return () => window.clearInterval(id);
+  }, [isWorking, startedAtMs]);
+
+  useEffect(() => {
+    if (isWorking) {
+      wasWorkingRef.current = true;
+      setCompletedLiveSummary(null);
+      return;
+    }
+    if (wasWorkingRef.current) {
+      setCompletedLiveSummary(completedWorkSummaryFromRunning(runningSummary));
+      wasWorkingRef.current = false;
+    }
+  }, [isWorking, runningSummary]);
+
+  // While working → always expanded, no user toggle.
+  // When done → auto-collapse (user can re-expand). `defaultExpanded`
+  // keeps it open even when done for messages whose entire output is
+  // tool calls (typical pipe-runs without a final prose response).
+  const isExpanded = forceCollapsed
+    ? false
+    : hideSummary
+      ? true
+      : isWorking
+        ? true
+        : manualExpand !== null ? manualExpand : defaultExpanded;
 
   return (
-    <div className="w-full min-w-0">
-      {/* Header bar — clickable to toggle */}
-      <button
-        onClick={() => setManualExpand(isExpanded ? false : true)}
-        className="w-full flex items-center gap-2 py-1 text-left min-w-0 group"
-      >
-        {/* Status indicator */}
-        {!hideCount && hasRunning && (
-          <span className="flex-shrink-0 text-xs font-mono text-foreground/40">
-            <motion.span
-              className="inline-block"
-              animate={{ opacity: [1, 1, 0.3, 0.3, 1] }}
-              transition={{ duration: 1, repeat: Infinity, times: [0, 0.25, 0.25, 0.75, 0.75], ease: "linear" }}
+    <div className="w-full min-w-0 self-stretch">
+      {!hideSummary && (
+        <div className="mb-2 w-full min-w-full">
+          {/* Header — plain text while working, clickable with chevron when done */}
+          {isWorking ? (
+            <div className="w-full flex items-center gap-1.5 py-1 text-left min-w-0">
+              <span className="truncate text-xs font-mono text-foreground/50">
+                <WorkSummaryText text={runningSummary} animateRunningDuration />
+              </span>
+            </div>
+          ) : (
+            <button
+              onClick={() => setManualExpand(isExpanded ? false : true)}
+              className="w-full flex items-center gap-1.5 py-1 text-left min-w-0 group cursor-pointer"
             >
-              [{doneCount}/{total}]
-            </motion.span>
-          </span>
-        )}
-
-        {/* Summary text */}
-        <span className="truncate flex-1 text-xs font-mono text-foreground/50 group-hover:text-foreground/80 transition-colors duration-150">
-          {hasRunning
-            ? friendlyToolLabel(toolCalls.find((tc) => tc.isRunning)!)
-            : summary || `${total} steps`
-          }
-          {hasError && allDone && (
-            <span className="ml-1.5 text-foreground/30">· {toolCalls.filter(tc => tc.isError).length} failed</span>
+              <span className="truncate text-xs font-mono text-foreground/50 group-hover:text-foreground/80 transition-colors duration-150">
+                <WorkSummaryText text={summary || `${total} steps`} animateRunningDuration={false} />
+                {hasError && (
+                  <span className="ml-1.5 text-foreground/30">· {toolCalls.filter(tc => tc.isError).length} failed</span>
+                )}
+              </span>
+              {isExpanded ? (
+                <ChevronDown className="h-3.5 w-3.5 flex-shrink-0 text-foreground/30 group-hover:text-foreground/60 transition-colors duration-150" />
+              ) : (
+                <ChevronRight className="h-3.5 w-3.5 flex-shrink-0 text-foreground/30 group-hover:text-foreground/60 transition-colors duration-150" />
+              )}
+            </button>
           )}
-        </span>
-
-        {/* Expand chevron */}
-        <span className="flex-shrink-0 text-[10px] font-mono text-foreground/30 group-hover:text-foreground/60 transition-colors duration-150">
-          {isExpanded ? "▾" : "▸"}
-        </span>
-      </button>
+          <div className="w-full min-w-full border-t border-border/50" />
+        </div>
+      )}
 
       {/* Expanded rail view */}
       <AnimatePresence>
@@ -983,6 +1233,7 @@ function ToolCallGroup({
                   <ToolCallRailItem
                     toolCall={tc}
                     isLast={i === toolCalls.length - 1}
+                    onAskUserReply={onAskUserReply}
                   />
                 </motion.div>
               ))}
@@ -997,20 +1248,36 @@ function ToolCallGroup({
 // Renders message content with interleaved text and tool call blocks
 export function MessageContent({
   message,
+  isGenerating = false,
   deferSourceFooter = false,
+  hideToolSummary = false,
+  forceCollapseTools = false,
+  connectionItems = [],
   onImageClick,
   onRetry,
   onOpenViewerPath,
+  onOpenConnectionSetup,
+  onConnectConnectionAction,
+  onContinueConnectionAction,
+  onDismissConnectionAction,
+  onAskUserReply,
 }: {
   message: Message;
+  isGenerating?: boolean;
   deferSourceFooter?: boolean;
+  hideToolSummary?: boolean;
+  forceCollapseTools?: boolean;
+  connectionItems?: ConnectionListItem[];
   onImageClick?: (images: string[], index: number) => void;
   onRetry?: (prompt: string) => void;
   onOpenViewerPath?: (path: string) => void;
+  onOpenConnectionSetup?: (connectionId: string) => void | Promise<void>;
+  onConnectConnectionAction?: (connectionId: string, block?: Extract<ContentBlock, { type: "connection_action" }>) => Promise<InlineConnectStatus | void> | InlineConnectStatus | void;
+  onContinueConnectionAction?: (prompt: string, label?: string) => void | Promise<void>;
+  onDismissConnectionAction?: (messageId: string, connectionId: string) => void;
+  onAskUserReply?: (reply: string, displayLabel: string) => void | Promise<void>;
 }) {
   const isUser = message.role === "user";
-  const { settings } = useSettings();
-  const hideThinkingBlocks = settings?.hideThinkingBlocks ?? true;
   const sourceCitations = isUser ? [] : sourceCitationsFromMessage(message);
   const sourceFooter = !deferSourceFooter && sourceCitations.length > 0 ? (
     <SourceCitationFooter citations={sourceCitations} onOpenFile={onOpenViewerPath} />
@@ -1137,14 +1404,21 @@ export function MessageContent({
   // Group consecutive tool blocks into collapsible containers
   if (message.contentBlocks && message.contentBlocks.length > 0) {
     const grouped = groupContentBlocks(message.contentBlocks);
-    const displayGroups = collapseHiddenWorkGroups(grouped, hideThinkingBlocks);
-    // When the message has no rendered prose (no text block — common for
-    // pipe-run executions whose entire output is thinking + tool calls),
-    // expand thinking blocks by default. Otherwise the collapsed
-    // "thought for 0s" pill is the only visible thing on the message
-    // and the chat panel reads as empty even though there's real
-    // content to see.
-    const hasText = grouped.some((g) => g.type === "text");
+    const collapsed = collapseHiddenWorkGroups(grouped);
+    const displayGroups = mergeWorkAndIntermediateText(collapsed);
+
+    // If all blocks were absorbed (for example, thinking-only output with no
+    // visible text or tool work), render nothing. The loader covers the active
+    // case and an empty stopped turn should not invent a finished state.
+    if (displayGroups.length === 0 && !isGenerating && !sourceFooter && !retryCta) {
+      return null;
+    }
+
+    const hasFinalText = displayGroups.some((g) => g.type === "text");
+    const hasToolWorkGroup = hasAssistantToolWorkBody(message);
+    const stoppedSummary = message.stoppedByUser && hasToolWorkGroup
+      ? formatStoppedWorkDuration(message.workDurationMs)
+      : undefined;
     return (
       <div className="space-y-2 min-w-0 w-full overflow-hidden">
         {displayGroups.map((group) => {
@@ -1168,16 +1442,44 @@ export function MessageContent({
             );
           }
           if (group.type === "thinking") {
-            // Settings → Display → Hide Thinking Blocks (default true). Even
-            // when shown the block starts collapsed: the "thought for Xs"
-            // pill is enough signal that the assistant did chain-of-thought
-            // work — auto-expanding (the c092166e0 behavior) drew the eye
-            // to raw reasoning instead of the response.
-            if (hideThinkingBlocks) return null;
-            return <ThinkingBlock key={`thinking-${group.key}`} text={group.text} isThinking={group.isThinking} durationMs={group.durationMs} />;
+            // Thinking blocks are always hidden — guard until
+            // collapseHiddenWorkGroups absorbs them fully.
+            return null;
+          }
+          if (group.type === "connection-action") {
+            const liveConnection = connectionItems.find((connection) => connection.id === group.block.connectionId);
+            const connected = liveConnection?.connected ?? false;
+            return (
+              <InlineConnectionActionCard
+                key={`connection-${group.key}-${group.block.connectionId}`}
+                block={group.block}
+                connected={connected}
+                onConnect={() => {
+                  if (onConnectConnectionAction) {
+                    return onConnectConnectionAction(group.block.connectionId, group.block);
+                  }
+                  return onOpenConnectionSetup?.(group.block.connectionId);
+                }}
+                onContinue={onContinueConnectionAction}
+                onDismiss={() => onDismissConnectionAction?.(message.id, group.block.connectionId)}
+              />
+            );
           }
           if (group.type === "tool-group") {
-            return <ToolCallGroup key={`tools-${group.key}`} toolCalls={group.toolCalls} defaultExpanded={!hasText} />;
+            return (
+              <ToolCallGroup
+                key={`tools-${group.key}`}
+                toolCalls={group.toolCalls}
+                defaultExpanded={!hasFinalText}
+                isGenerating={isGenerating && !message.workDurationMs}
+                preferSummaryOverride={Boolean(stoppedSummary)}
+                summaryOverride={stoppedSummary || (message.workDurationMs ? formatWorkDuration(message.workDurationMs) : undefined)}
+                workStartedAtMs={message.timestamp}
+                hideSummary={hideToolSummary}
+                forceCollapsed={forceCollapseTools}
+                onAskUserReply={onAskUserReply}
+              />
+            );
           }
           if (group.type === "work-group") {
             // Fall back to message-level workDurationMs when the
@@ -1189,9 +1491,14 @@ export function MessageContent({
               <ToolCallGroup
                 key={`work-${group.key}`}
                 toolCalls={group.toolCalls}
-                defaultExpanded={!hasText}
-                summaryOverride={formatWorkDuration(durationMs)}
-                hideCount={hasText}
+                defaultExpanded={!hasFinalText}
+                isGenerating={isGenerating && !message.workDurationMs}
+                preferSummaryOverride={Boolean(stoppedSummary)}
+                summaryOverride={stoppedSummary || formatWorkDuration(durationMs)}
+                workStartedAtMs={message.timestamp}
+                hideSummary={hideToolSummary}
+                forceCollapsed={forceCollapseTools}
+                onAskUserReply={onAskUserReply}
               />
             );
           }
@@ -1210,24 +1517,31 @@ export function MessageContent({
   const displayText = !isUser && message.content.startsWith("Error: ")
     ? message.content.slice("Error: ".length)
     : message.content;
+  const hasMeaningfulText = Boolean(displayText && displayText !== "Processing...");
+
+  if (!isUser && !hasMeaningfulText && !attachmentsRow && !sourceFooter && !retryCta) {
+    return null;
+  }
 
   return (
-    <div className="space-y-2">
+    <div className="space-y-2 min-w-0 w-full">
       {attachmentsRow}
-      <MarkdownBlock
-        text={displayText}
-        isUser={isUser}
-        onOpenViewerPath={onOpenViewerPath}
-        renderSpecialCodeBlock={(language, content) => {
-          if (language === "mermaid") {
-            return <MermaidDiagramBlock chart={content} />;
-          }
-          if (language === "app-stats") {
-            return <AppStatsBlock content={content} />;
-          }
-          return null;
-        }}
-      />
+      {displayText ? (
+        <MarkdownBlock
+          text={displayText}
+          isUser={isUser}
+          onOpenViewerPath={onOpenViewerPath}
+          renderSpecialCodeBlock={(language, content) => {
+            if (language === "mermaid") {
+              return <MermaidDiagramBlock chart={content} />;
+            }
+            if (language === "app-stats") {
+              return <AppStatsBlock content={content} />;
+            }
+            return null;
+          }}
+        />
+      ) : null}
       {sourceFooter}
       {retryCta}
     </div>

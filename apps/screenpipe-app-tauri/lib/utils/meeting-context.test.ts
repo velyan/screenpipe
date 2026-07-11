@@ -7,6 +7,8 @@ import type { MeetingRecord } from "./meeting-format";
 import {
   buildEnrichedSummarizePrompt,
   extractImageDataUrlsFromMarkdown,
+  mergeMeetingAudioChunks,
+  type MeetingAudioChunk,
   type MeetingContext,
 } from "./meeting-context";
 
@@ -48,5 +50,80 @@ describe("meeting-context image notes", () => {
     expect(prompt).not.toContain(PNG);
     expect(prompt).toContain("[attached image 1: diagram]");
     expect(prompt).toContain("1 image from the user's notes");
+  });
+});
+
+function chunk(overrides: Partial<MeetingAudioChunk>): MeetingAudioChunk {
+  return {
+    audioChunkId: 1,
+    audioFilePath: "/audio/a.mp4",
+    speakerId: null,
+    speakerName: "",
+    deviceType: "output",
+    isInput: false,
+    transcription: "hello world",
+    timestamp: "2026-06-04T15:00:00.000Z",
+    source: "background",
+    ...overrides,
+  };
+}
+
+describe("mergeMeetingAudioChunks", () => {
+  it("collapses the same utterance across sources even when speaker labels differ", () => {
+    // After a meeting ends, the live segment is mirrored into
+    // audio_transcriptions with speaker_id NULL. The routed endpoint returns
+    // the live copy labeled "speaker 1" (Deepgram diarization); /search
+    // returns the mirrored copy with an empty speaker name. Both describe the
+    // same utterance and must render once.
+    const live = chunk({
+      audioChunkId: -10,
+      speakerName: "speaker 1",
+      source: "live",
+    });
+    const mirrored = chunk({ audioChunkId: 7, speakerName: "" });
+
+    const merged = mergeMeetingAudioChunks([live], [mirrored], 100);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].speakerName).toBe("speaker 1");
+    expect(merged[0].source).toBe("live");
+  });
+
+  it("keeps the labeled live copy when /search returns first in time order", () => {
+    // sortAudioChunks ranks live before background on timestamp ties, so the
+    // labeled routed row survives regardless of input order.
+    const live = chunk({ speakerName: "speaker 2", source: "live" });
+    const mirrored = chunk({ speakerName: "speaker" });
+
+    const merged = mergeMeetingAudioChunks([live], [mirrored, chunk({ speakerName: "" })], 100);
+
+    expect(merged).toHaveLength(1);
+    expect(merged[0].speakerName).toBe("speaker 2");
+  });
+
+  it("does not collapse the same text across devices (mic echo vs remote)", () => {
+    const remote = chunk({ speakerName: "speaker 1", source: "live" });
+    const mic = chunk({
+      deviceType: "Input",
+      isInput: true,
+      speakerName: "me",
+    });
+
+    const merged = mergeMeetingAudioChunks([remote], [mic], 100);
+
+    expect(merged).toHaveLength(2);
+  });
+
+  it("does not collapse distinct utterances in different seconds", () => {
+    const first = chunk({ source: "live", speakerName: "speaker 1" });
+    const second = chunk({
+      source: "live",
+      speakerName: "speaker 1",
+      timestamp: "2026-06-04T15:00:05.000Z",
+    });
+
+    const merged = mergeMeetingAudioChunks([first, second], [], 100);
+
+    expect(merged).toHaveLength(2);
   });
 });

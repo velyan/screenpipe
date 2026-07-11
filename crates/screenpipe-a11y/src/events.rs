@@ -148,6 +148,62 @@ pub struct ElementContext {
     /// Bounding rectangle
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bounds: Option<ElementBounds>,
+
+    /// Ancestor chain of the element, window-root first, as compact JSON
+    /// (see [`ancestors_to_json`]) — the element's "path in the window
+    /// hierarchy". Captured budgeted at click time on macOS; `None` on other
+    /// platforms and when the walk is skipped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ancestors: Option<String>,
+}
+
+/// One hop in an element's ancestor chain (root-most first when serialized).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AncestorHop {
+    /// Accessibility role, e.g. "AXWindow", "AXGroup", "AXToolbar".
+    pub role: String,
+    /// The hop's label (AXTitle / AXDescription) when it has one.
+    pub name: Option<String>,
+}
+
+/// Serialize an ancestor chain (leaf-most first, as collected by walking
+/// AXParent upward) into the compact root-first JSON stored on the event:
+/// `[{"role":"AXWindow","name":"Inbox"},{"role":"AXGroup"},...]`.
+///
+/// Truncation guard: labels cap at 80 chars, at most `max_hops` hops are kept
+/// (dropping the MIDDLE of the chain, since the window root and the hops
+/// nearest the element carry the signal). Returns `None` for an empty chain.
+pub fn ancestors_to_json(mut leaf_first: Vec<AncestorHop>, max_hops: usize) -> Option<String> {
+    if leaf_first.is_empty() || max_hops == 0 {
+        return None;
+    }
+    leaf_first.reverse(); // now root-first
+    let chain: Vec<AncestorHop> = if leaf_first.len() > max_hops {
+        // keep the root half and the leaf half, drop the middle
+        let head = max_hops / 2;
+        let tail = max_hops - head;
+        let mut kept = leaf_first[..head].to_vec();
+        kept.extend_from_slice(&leaf_first[leaf_first.len() - tail..]);
+        kept
+    } else {
+        leaf_first
+    };
+    let arr: Vec<serde_json::Value> = chain
+        .into_iter()
+        .map(|h| {
+            let mut o = serde_json::Map::new();
+            o.insert("role".into(), serde_json::Value::String(h.role));
+            if let Some(n) = h.name {
+                let n = n.trim();
+                if !n.is_empty() {
+                    let capped: String = n.chars().take(80).collect();
+                    o.insert("name".into(), serde_json::Value::String(capped));
+                }
+            }
+            serde_json::Value::Object(o)
+        })
+        .collect();
+    serde_json::to_string(&arr).ok()
 }
 
 /// Element bounding rectangle
@@ -820,6 +876,7 @@ impl UiEvent {
             element_description,
             element_automation_id,
             element_bounds,
+            element_ancestors,
         ) = if let Some(ref elem) = self.element {
             (
                 Some(elem.role.clone()),
@@ -836,9 +893,10 @@ impl UiEvent {
                     })
                     .to_string()
                 }),
+                elem.ancestors.clone(),
             )
         } else {
-            (None, None, None, None, None, None)
+            (None, None, None, None, None, None, None)
         };
 
         // Extract app_name and window_title from EventData for certain event types
@@ -872,6 +930,7 @@ impl UiEvent {
             element_description,
             element_automation_id,
             element_bounds,
+            element_ancestors,
             frame_id: self.frame_id,
         }
     }
@@ -880,6 +939,101 @@ impl UiEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hop(role: &str, name: Option<&str>) -> AncestorHop {
+        AncestorHop {
+            role: role.into(),
+            name: name.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn ancestors_to_json_is_root_first_and_skips_empty_names() {
+        // collected leaf-first (walking AXParent up); serialized root-first
+        let chain = vec![
+            hop("AXGroup", None),
+            hop("AXToolbar", Some("  ")), // whitespace-only name dropped
+            hop("AXWindow", Some("Inbox")),
+        ];
+        let json = ancestors_to_json(chain, 12).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["role"], "AXWindow");
+        assert_eq!(arr[0]["name"], "Inbox");
+        assert_eq!(arr[1]["role"], "AXToolbar");
+        assert!(arr[1].get("name").is_none(), "blank name omitted");
+        assert_eq!(arr[2]["role"], "AXGroup");
+    }
+
+    #[test]
+    fn ancestors_to_json_drops_middle_on_overflow_keeping_root_and_leaf() {
+        let chain: Vec<AncestorHop> = (0..20).map(|i| hop(&format!("AXLevel{i}"), None)).collect(); // leaf-first: AXLevel0 is nearest the element
+        let json = ancestors_to_json(chain, 6).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 6);
+        // root half survives (root-first order: AXLevel19 is the window root)
+        assert_eq!(arr[0]["role"], "AXLevel19");
+        // leaf half survives (last = nearest the clicked element)
+        assert_eq!(arr[5]["role"], "AXLevel0");
+    }
+
+    #[test]
+    fn ancestors_to_json_caps_names_and_handles_empty_chain() {
+        assert!(ancestors_to_json(vec![], 12).is_none());
+        assert!(ancestors_to_json(vec![hop("AXWindow", None)], 0).is_none());
+        let long = "x".repeat(300);
+        let json = ancestors_to_json(vec![hop("AXWindow", Some(&long))], 12).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v[0]["name"].as_str().unwrap().len(), 80);
+    }
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn to_db_insert_carries_element_ancestors() {
+        let mut event = UiEvent::click(Utc::now(), 100, 500, 300, 0, 1, 0);
+        event.element = Some(ElementContext {
+            role: "AXButton".into(),
+            name: Some("Continue".into()),
+            value: None,
+            description: None,
+            automation_id: None,
+            bounds: None,
+            ancestors: Some(r#"[{"role":"AXWindow","name":"Setup"}]"#.into()),
+        });
+        let ins = event.to_db_insert(None);
+        assert_eq!(
+            ins.element_ancestors.as_deref(),
+            Some(r#"[{"role":"AXWindow","name":"Setup"}]"#)
+        );
+        assert_eq!(ins.element_role.as_deref(), Some("AXButton"));
+    }
+
+    #[test]
+    #[cfg(feature = "db")]
+    fn to_db_insert_maps_scroll_deltas() {
+        let event = UiEvent {
+            id: None,
+            timestamp: Utc::now(),
+            relative_ms: 5,
+            data: EventData::Scroll {
+                x: 10,
+                y: 20,
+                delta_x: -3,
+                delta_y: -120,
+            },
+            app_name: Some("Arc".into()),
+            window_title: None,
+            browser_url: None,
+            element: None,
+            frame_id: None,
+        };
+        let ins = event.to_db_insert(None);
+        assert_eq!(ins.event_type.to_string(), "scroll");
+        assert_eq!((ins.x, ins.y), (Some(10), Some(20)));
+        assert_eq!((ins.delta_x, ins.delta_y), (Some(-3), Some(-120)));
+    }
 
     #[test]
     fn test_event_serialization() {

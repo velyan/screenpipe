@@ -28,6 +28,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
     abortControllerRef,
     activePipeExecution,
     activePreset,
+    activePresetRef,
     attachedDocsRef,
     autoSendBypassRef,
     buildProviderConfig,
@@ -74,6 +75,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
     stagePendingAttachments,
     syncThinkingLevelAfterStart,
   } = options;
+  const getActivePreset = () => activePresetRef?.current ?? activePreset;
   const { enqueuePiMessage } = createPiMessageQueueTransport(
     options,
     (message, displayLabel, imageDataUrls) => sendPiMessage(message, displayLabel, imageDataUrls),
@@ -81,11 +83,13 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
   const { handleStop, openConnectionSetup } = usePiLiveSendControls({
     abortControllerRef,
     activePipeExecution,
+    cancelStreamingMessageRender,
     piActiveStopRequestedRef,
     piContentBlocksRef,
     piMessageIdRef,
     piSessionIdRef,
     piStreamingTextRef,
+    setMessages,
     setIsLoading,
     setIsStreaming,
   });
@@ -272,8 +276,8 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
         role: "assistant",
         content: "Processing...",
         timestamp: Date.now(),
-        model: activePreset?.model,
-        provider: activePreset?.provider,
+        model: getActivePreset()?.model,
+        provider: getActivePreset()?.provider,
       } as any);
       storeState.actions.setStreaming(sidNow, {
         streamingMessageId: assistantMessageId,
@@ -294,8 +298,8 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
     }
 
     posthog.capture("chat_message_sent", {
-      provider: activePreset?.provider,
-      model: activePreset?.model,
+      provider: getActivePreset()?.provider,
+      model: getActivePreset()?.model,
       has_images: outgoingImages.length > 0 || !!prefillFrameId,
       has_context: !!prefillContext,
       message_index: messages.filter((m) => m.role === "user").length,
@@ -336,7 +340,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
 
       setMessages((prev) => [
         ...prev,
-        { id: assistantMessageId, role: "assistant", content: "Processing...", timestamp: Date.now(), model: activePreset?.model, provider: activePreset?.provider },
+        { id: assistantMessageId, role: "assistant", content: "Processing...", timestamp: Date.now(), model: getActivePreset()?.model, provider: getActivePreset()?.provider },
       ]);
 
       // Always re-inject the recent conversation history into every prompt
@@ -388,7 +392,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
         }
       }
 
-      const providerPreflight = await preflightChatProvider(activePreset);
+      const providerPreflight = await preflightChatProvider(getActivePreset());
       if (!providerPreflight.ok) {
         piStreamingTextRef.current = "";
         piMessageIdRef.current = null;
@@ -468,13 +472,14 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
         const rawError = result.error;
         let errorMsg: string;
         let retryPrompt: string | undefined;
-        const providerError = buildProviderErrorMessage(rawError, activePreset);
+        const currentPreset = getActivePreset();
+        const providerError = buildProviderErrorMessage(rawError, currentPreset);
 
         if (rawError.includes("already processing")) {
           errorMsg = "The AI was mid-response when your message arrived.";
           retryPrompt = userMessage;
         } else if (rawError.includes("Broken pipe") || rawError.includes("not running") || rawError.includes("has died") || rawError.includes("Pi not initialized")) {
-          const provider = activePreset?.provider;
+          const provider = currentPreset?.provider;
           errorMsg = provider === "native-ollama"
             ? "Ollama isn't running. Start it with: `ollama serve`"
             : "AI agent crashed — restarting automatically...";
@@ -483,7 +488,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
           errorMsg = providerError;
           retryPrompt = userMessage;
         } else if (rawError.includes("not found")) {
-          errorMsg = `Model "${activePreset?.model}" not found. Check your AI preset in settings.`;
+          errorMsg = `Model "${currentPreset?.model}" not found. Check your AI preset in settings.`;
         } else {
           errorMsg = rawError;
           retryPrompt = userMessage;
@@ -503,7 +508,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
       if (timeoutId) clearTimeout(timeoutId);
       piMessageIdRef.current = null;
       const rawError = error instanceof Error ? error.message : "Unknown error";
-      const providerError = buildProviderErrorMessage(rawError, activePreset);
+      const providerError = buildProviderErrorMessage(rawError, getActivePreset());
       setMessages((prev) =>
         prev.map((m) =>
           m.id === assistantMessageId
@@ -518,7 +523,7 @@ export function usePiSendTransport(options: PiSendTransportOptions) {
   }
 
   async function sendMessage(userMessage: string, displayLabel?: string, imageDataUrls?: string[]) {
-    if ((!canChat && !autoSendBypassRef.current) || (!activePreset && !autoSendBypassRef.current)) return;
+    if ((!canChat && !autoSendBypassRef.current) || (!getActivePreset() && !autoSendBypassRef.current)) return;
     const trimmed = userMessage.trim();
     const outgoingImages = imageDataUrls ?? pastedImages;
     const queuedDocs = attachedDocsRef.current;

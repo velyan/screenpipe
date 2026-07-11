@@ -20,12 +20,25 @@ export interface ToolCall {
   result?: string;
   isError?: boolean;
   isRunning: boolean;
+  startedAtMs?: number;
+  endedAtMs?: number;
 }
 
 export type ContentBlock =
   | { type: "text"; text: string }
   | { type: "tool"; toolCall: ToolCall }
-  | { type: "thinking"; text: string; isThinking: boolean; durationMs?: number };
+  | { type: "thinking"; text: string; isThinking: boolean; durationMs?: number }
+  | {
+      type: "connection_action";
+      connectionId: string;
+      connectionName: string;
+      icon?: string;
+      description?: string;
+      pendingActionLabel?: string;
+      pendingActionPrompt?: string;
+      extensionRequestId?: string;
+      extensionReason?: string;
+    };
 
 export interface Message {
   id: string;
@@ -45,6 +58,7 @@ export interface Message {
   interruptedBySteer?: boolean;
   steeredResponse?: boolean;
   workDurationMs?: number;
+  stoppedByUser?: boolean;
 }
 
 export type QueuedDisplayPayload = {

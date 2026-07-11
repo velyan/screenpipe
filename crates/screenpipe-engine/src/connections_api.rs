@@ -398,7 +398,7 @@ async fn list_connections(State(state): State<ConnectionsState>) -> Json<Value> 
             port, port
         )
     } else {
-        "Connect your personal WhatsApp via QR code pairing in Settings > Connections.".to_string()
+        "Connect your personal WhatsApp via QR code pairing from the Connections page in the desktop app.".to_string()
     };
 
     let mut data = serde_json::to_value(&list).unwrap_or(json!([]));
@@ -2097,7 +2097,7 @@ async fn slack_send(
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(
-                    json!({ "error": "Slack is not connected. Connect Slack in Settings > Connections." }),
+                    json!({ "error": "Slack is not connected. Connect Slack from the Connections page in the desktop app." }),
                 ),
             );
         }
@@ -2249,7 +2249,7 @@ async fn slack_user_token(
         .await
         .ok_or((
             StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "Slack is not connected. Connect Slack in Settings > Connections." })),
+            Json(json!({ "error": "Slack is not connected. Connect Slack from the Connections page in the desktop app." })),
         ))?;
     token_json["authed_user"]["access_token"]
         .as_str()
@@ -3289,7 +3289,7 @@ mod calendar_error_response_tests {
     #[test]
     fn gcal_auth_failure_maps_to_structured_401() {
         let err = anyhow::Error::new(GcalAuthError {
-            message: "Google Calendar not connected — use 'Connect Google Calendar' in Settings > Connections".to_string(),
+            message: "Google Calendar not connected — use 'Connect Google Calendar' from the Connections page in the desktop app".to_string(),
         });
         let (status, Json(body)) = gcal_events_error_response(&err);
         assert_eq!(status, StatusCode::UNAUTHORIZED);

@@ -76,6 +76,22 @@ export function buildRemoteConnectionMessage(provider?: string | null): string {
   return `Can't reach the AI provider${named}. Check your internet connection and try again.`;
 }
 
+function isContextOverflowError(errorStr: string): boolean {
+  const normalized = errorStr.toLowerCase();
+  return (
+    normalized.includes("context_length_exceeded") ||
+    normalized.includes("context window") ||
+    normalized.includes("maximum context length") ||
+    normalized.includes("prompt is too long") ||
+    normalized.includes("input is too long") ||
+    normalized.includes("too many tokens")
+  );
+}
+
+export function buildContextOverflowMessage(): string {
+  return "This chat is too long for the selected model. Start a new chat, ask a narrower question, or remove large attachments/screenshots before trying again.";
+}
+
 export function buildProviderErrorMessage(
   errorStr: string,
   preset?: ProviderLike | null
@@ -83,6 +99,10 @@ export function buildProviderErrorMessage(
   const provider = preset?.provider;
   const model = preset?.model || undefined;
   const normalized = errorStr.toLowerCase();
+
+  if (isContextOverflowError(errorStr)) {
+    return buildContextOverflowMessage();
+  }
 
   if (isNativeOllamaProvider(provider)) {
     if (normalized.includes("not found")) {
@@ -94,6 +114,20 @@ export function buildProviderErrorMessage(
       return buildOllamaConnectionMessage(model);
     }
     return null;
+  }
+
+  if (isHostedScreenpipeProvider(provider)) {
+    if (normalized.includes("not allowed")) {
+      return `Model is restricted on your current plan. Please switch to a free model or upgrade your account.`;
+    }
+    if (
+      normalized.includes("rate-limited") ||
+      normalized.includes("rate limit") ||
+      normalized.includes("too many requests") ||
+      normalized.includes("unavailable")
+    ) {
+      return `You are currently rate-limited or the service is temporarily unavailable. Please wait a moment before trying again, or upgrade your plan for higher limits.`;
+    }
   }
 
   // Hosted/remote providers: a connection-like failure means we never reached

@@ -30,6 +30,10 @@ pub struct RecordingConfig {
     // Feature toggles
     pub disable_audio: bool,
     pub disable_vision: bool,
+    /// Disable screenshot image capture while keeping accessibility/UI-event
+    /// capture alive. This skips visual-diff images, full screenshot capture,
+    /// JPEG writes, and OCR fallback.
+    pub disable_screenshots: bool,
     /// Disable the timeline / rewind feature. Skips timeline-only backend work
     /// (hot frame cache warm-up + per-frame/audio buffering into the hot cache
     /// that only the timeline streaming endpoint consumes).
@@ -89,10 +93,15 @@ pub struct RecordingConfig {
     pub use_system_default_audio: bool,
     /// Experimental: use CoreAudio Process Tap for System Audio on macOS 14.4+.
     pub experimental_coreaudio_system_audio: bool,
+    /// Beta: meeting-driven per-process audio capture (piggyback; "Smart
+    /// recording" in the app). Engages during meetings in any capture mode.
+    pub experimental_meeting_piggyback: bool,
     /// Experimental: request Windows WASAPI microphone AEC when supported.
     pub windows_input_aec_enabled: bool,
     /// Use Apple VoiceProcessingIO on the default macOS microphone when supported.
     pub macos_input_vpio_enabled: bool,
+    /// Request Screenpipe's software Acoustic Echo Cancellation (via sonora WebRTC AEC3).
+    pub screenpipe_aec_enabled: bool,
     pub monitor_ids: Vec<String>,
     pub use_all_monitors: bool,
 
@@ -265,6 +274,8 @@ impl RecordingConfig {
         // Sync the record_while_locked preference to the shared atomic flag
         // so the audio recording loop can read it without holding a config reference.
         screenpipe_config::set_record_while_locked(settings.record_while_locked);
+        let (screenpipe_aec_enabled, windows_input_aec_enabled, macos_input_vpio_enabled) =
+            settings.effective_aec_flags();
 
         Self {
             audio_chunk_duration: settings.audio_chunk_duration.max(0) as u64,
@@ -273,6 +284,7 @@ impl RecordingConfig {
             disable_audio: settings.disable_audio
                 || settings.audio_capture_mode.eq_ignore_ascii_case("disabled"),
             disable_vision: settings.disable_vision,
+            disable_screenshots: settings.disable_screenshots,
             disable_timeline: settings.disable_timeline,
             use_pii_removal: settings.use_pii_removal,
             async_pii_redaction: settings.async_pii_redaction,
@@ -322,8 +334,10 @@ impl RecordingConfig {
             audio_devices: settings.audio_devices.clone(),
             use_system_default_audio: settings.use_system_default_audio,
             experimental_coreaudio_system_audio: settings.experimental_coreaudio_system_audio,
-            windows_input_aec_enabled: settings.windows_input_aec_enabled,
-            macos_input_vpio_enabled: settings.macos_input_vpio_enabled,
+            experimental_meeting_piggyback: settings.experimental_meeting_piggyback,
+            windows_input_aec_enabled,
+            macos_input_vpio_enabled,
+            screenpipe_aec_enabled,
             monitor_ids: settings.monitor_ids.clone(),
             use_all_monitors: settings.use_all_monitors,
             ignored_windows: settings.ignored_windows.clone(),
@@ -484,8 +498,10 @@ impl RecordingConfig {
             .enabled_devices(audio_devices)
             .use_system_default_audio(self.use_system_default_audio)
             .experimental_coreaudio_system_audio(self.experimental_coreaudio_system_audio)
+            .experimental_meeting_piggyback(self.experimental_meeting_piggyback)
             .windows_input_aec_enabled(self.windows_input_aec_enabled)
             .macos_input_vpio_enabled(self.macos_input_vpio_enabled)
+            .screenpipe_aec_enabled(self.screenpipe_aec_enabled)
             .deepgram_config(self.deepgram_config.clone())
             .output_path(output_path)
             .use_pii_removal(self.use_pii_removal)
@@ -517,6 +533,7 @@ impl RecordingConfig {
             pause_on_drm_content: self.pause_on_drm_content,
             languages: self.languages.clone(),
             video_quality: self.video_quality.clone(),
+            disable_screenshots: self.disable_screenshots,
             idle_capture_interval_ms: self.idle_capture_interval_ms,
             visual_check_interval_ms: self.visual_check_interval_ms,
             visual_change_threshold: self.visual_change_threshold,
@@ -595,6 +612,44 @@ mod tests {
         let c = build(&settings_with(false, false));
         assert_eq!(c.listen_address, Ipv4Addr::LOCALHOST);
         assert!(!c.api_auth);
+    }
+
+    #[test]
+    fn aec_mode_produces_one_effective_backend() {
+        let legacy_conflict_without_mode = screenpipe_config::RecordingSettings {
+            screenpipe_aec_enabled: false,
+            windows_input_aec_enabled: true,
+            macos_input_vpio_enabled: true,
+            ..Default::default()
+        };
+        let c = build(&legacy_conflict_without_mode);
+        assert!(!c.screenpipe_aec_enabled);
+        assert!(!c.windows_input_aec_enabled);
+        assert!(!c.macos_input_vpio_enabled);
+
+        let explicit_screenpipe = screenpipe_config::RecordingSettings {
+            aec_mode: screenpipe_config::AecMode::Screenpipe,
+            screenpipe_aec_enabled: false,
+            windows_input_aec_enabled: true,
+            macos_input_vpio_enabled: true,
+            ..Default::default()
+        };
+        let c = build(&explicit_screenpipe);
+        assert!(c.screenpipe_aec_enabled);
+        assert!(!c.windows_input_aec_enabled);
+        assert!(!c.macos_input_vpio_enabled);
+
+        let explicit_macos = screenpipe_config::RecordingSettings {
+            aec_mode: screenpipe_config::AecMode::Macos,
+            screenpipe_aec_enabled: true,
+            windows_input_aec_enabled: true,
+            macos_input_vpio_enabled: false,
+            ..Default::default()
+        };
+        let c = build(&explicit_macos);
+        assert!(!c.screenpipe_aec_enabled);
+        assert!(!c.windows_input_aec_enabled);
+        assert!(c.macos_input_vpio_enabled);
     }
 
     #[test]
@@ -725,6 +780,7 @@ mod tests {
         assert!(vision.ignore_incognito_windows);
         assert!(vision.pause_on_drm_content);
         assert_eq!(vision.video_quality, "high");
+        assert!(!vision.disable_screenshots);
         assert_eq!(vision.idle_capture_interval_ms, Some(2_000));
         assert_eq!(vision.visual_check_interval_ms, Some(350));
         assert_eq!(vision.visual_change_threshold, Some(0.18));

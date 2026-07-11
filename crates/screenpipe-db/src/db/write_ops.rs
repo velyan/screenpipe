@@ -172,6 +172,7 @@ impl DatabaseManager {
         element_description: Option<&str>,
         element_automation_id: Option<&str>,
         element_bounds: Option<&str>,
+        element_ancestors: Option<&str>,
         frame_id: Option<i64>,
     ) -> Result<(), sqlx::Error> {
         use crate::write_queue::WriteOp;
@@ -203,6 +204,7 @@ impl DatabaseManager {
                 element_description: element_description.map(|s| s.to_string()),
                 element_automation_id: element_automation_id.map(|s| s.to_string()),
                 element_bounds: element_bounds.map(|s| s.to_string()),
+                element_ancestors: element_ancestors.map(|s| s.to_string()),
                 frame_id,
             })
             .await?;

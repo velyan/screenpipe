@@ -457,6 +457,7 @@ fn z_order_score_for_window(
 }
 
 /// Intermediate structure for window data extracted from platform-specific Window types
+#[cfg_attr(target_os = "macos", derive(Clone))]
 struct WindowData {
     app_name: String,
     title: String,
@@ -982,11 +983,16 @@ fn get_all_windows() -> Result<Vec<WindowData>, Box<dyn Error>> {
 
 #[cfg(target_os = "macos")]
 fn get_all_windows_sck() -> Result<Vec<WindowData>, Box<dyn Error>> {
-    let windows = SckWindow::all()?;
-    Ok(windows
-        .into_iter()
-        .filter_map(extract_window_data_sck)
-        .collect())
+    let result: Result<Vec<WindowData>, String> = cidre::objc::ar_pool(|| {
+        let windows = SckWindow::all().map_err(|e| e.to_string())?;
+        Ok(windows
+            .into_iter()
+            .filter_map(extract_window_data_sck)
+            .collect())
+    });
+
+    result
+        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn Error>)
 }
 
 #[cfg(target_os = "macos")]
@@ -1261,8 +1267,28 @@ pub fn get_excluded_sck_window_ids(window_filters: &WindowFilters) -> Vec<u32> {
         return Vec::new();
     }
 
-    let windows = match SckWindow::all() {
-        Ok(w) => w,
+    let excluded = match cidre::objc::ar_pool(|| -> Result<Vec<u32>, String> {
+        let windows = SckWindow::all().map_err(|e| e.to_string())?;
+        let mut excluded = Vec::new();
+
+        for w in &windows {
+            let app_name = w.app_name().unwrap_or_default();
+            let title = w.title().unwrap_or_default();
+
+            if app_name.is_empty() {
+                continue;
+            }
+
+            if !window_filters.is_valid(&app_name, &title) {
+                if let Ok(id) = w.id() {
+                    excluded.push(id);
+                }
+            }
+        }
+
+        Ok(excluded)
+    }) {
+        Ok(ids) => ids,
         Err(e) => {
             debug!(
                 "get_excluded_sck_window_ids: failed to enumerate windows: {}",
@@ -1271,22 +1297,6 @@ pub fn get_excluded_sck_window_ids(window_filters: &WindowFilters) -> Vec<u32> {
             return Vec::new();
         }
     };
-
-    let mut excluded = Vec::new();
-    for w in &windows {
-        let app_name = w.app_name().unwrap_or_default();
-        let title = w.title().unwrap_or_default();
-
-        if app_name.is_empty() {
-            continue;
-        }
-
-        if !window_filters.is_valid(&app_name, &title) {
-            if let Ok(id) = w.id() {
-                excluded.push(id);
-            }
-        }
-    }
 
     if !excluded.is_empty() {
         debug!(

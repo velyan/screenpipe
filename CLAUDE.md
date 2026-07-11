@@ -27,6 +27,9 @@ Use `#` for Python, `//` for Rust/TS/JS/Swift. Keep it as the first comment in t
 - Use `cargo` for Rust
 
 ## Testing
+
+Always test your work. Verification and reviewing pull requests is the hardest thing to do for us, so you need to always make sure to do as much as possible end-to-end testing. If necessary, computer use testing and be very rigorous in your testing, and add as many visuals as possible, like screenshots or video recording, in the body of your pull request.
+
 - `cargo test` for Rust
 - `bun test` for JS/TS
 - **Tauri TypeScript bindings** (from `apps/screenpipe-app-tauri/`):

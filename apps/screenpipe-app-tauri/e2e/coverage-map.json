@@ -183,6 +183,16 @@
       "notes": "Composer draft isolation across conversations."
     },
     {
+      "spec": "chat-ask-user-tool-card.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["chat-ai", "real-ui-e2e"],
+      "features": ["chat", "chat-tools", "pi-ask-user"],
+      "criticality": "medium",
+      "confidence": "partial",
+      "ux": "mixed",
+      "notes": "Synthetic assistant tool block renders the Pi ask_user dropdown and sends the selected answer through the normal chat reply path."
+    },
+    {
       "spec": "chat-newchat-duplicate.spec.ts",
       "platforms": ["windows", "macos", "linux"],
       "layers": ["chat-ai"],
@@ -221,6 +231,16 @@
       "confidence": "partial",
       "ux": "synthetic",
       "notes": "Parallel auto-send prefill dedupe regression."
+    },
+    {
+      "spec": "chat-connections-context-duplicate.spec.ts",
+      "platforms": ["windows", "macos"],
+      "layers": ["chat-ai"],
+      "features": ["chat", "chat-sidebar-dedupe"],
+      "criticality": "medium",
+      "confidence": "partial",
+      "ux": "synthetic",
+      "notes": "QUARANTINED (#4689): connections-context wrapper stripping regression. The synthetic background-router event path never persists deterministically on Linux/macOS CI; re-enable once it drives a deterministic persisted session."
     },
     {
       "spec": "chat-prefill-duplicate.spec.ts",
@@ -351,6 +371,16 @@
       "confidence": "strong",
       "ux": "real-user-flow",
       "notes": "Clicks through Home, Pipes, Timeline, Help, and Settings."
+    },
+    {
+      "spec": "pi-extensions.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["real-ui-e2e", "settings"],
+      "features": ["connections", "pi-extensions", "agent-extensions"],
+      "criticality": "medium",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "Opens Home -> Connections, opens Pi extensions, verifies catalog and warning copy, filters package search, and captures a screenshot. Read-only smoke: does not install packages."
     },
     {
       "spec": "macos-ui-performance.spec.ts",
@@ -663,6 +693,16 @@
       "notes": "Production billing gate blocks an unentitled session behind the paywall and restores access when the forced-gate flag is cleared."
     },
     {
+      "spec": "zz-enterprise-license-prompt.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["settings", "billing", "real-ui-e2e"],
+      "features": ["app-entitlement-gate", "billing-gate"],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "Enterprise license prompt handles invalid keys, full-seat errors, and retry success after seats are added without staying stuck in validating state."
+    },
+    {
       "spec": "zz-logout-resurrect.spec.ts",
       "platforms": ["windows", "macos", "linux"],
       "layers": ["real-ui-e2e", "settings"],
@@ -671,6 +711,16 @@
       "confidence": "strong",
       "ux": "synthetic",
       "notes": "Logout must not be resurrected by an in-flight loadUser. Logs in via a synthetic deep-link (?api_key=) with a mocked /api/user fetch, makes the fetch slow, fires it, then clicks logout while it is pending and asserts the slow response cannot re-write the user (the 'logout needs two clicks' bug). Covers the auth-generation guard in use-settings.tsx."
+    },
+    {
+      "spec": "zz-account-basic-upgrade-billing.spec.ts",
+      "platforms": ["windows", "macos", "linux"],
+      "layers": ["real-ui-e2e", "settings", "billing"],
+      "features": ["account-upgrade", "billing-proration", "checkout-duplication"],
+      "criticality": "high",
+      "confidence": "strong",
+      "ux": "real-user-flow",
+      "notes": "Basic paid user clicking Account upgrade opens account billing for subscription changes/proration and does not call the fresh subscription checkout endpoint."
     },
     {
       "spec": "zz-account-stale-subscription.spec.ts",

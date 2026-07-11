@@ -63,7 +63,11 @@ async fn setup_db() -> sqlx::SqlitePool {
             window_name TEXT,
             window_name_redacted_at INTEGER,
             browser_url TEXT,
-            browser_url_redacted_at INTEGER
+            browser_url_redacted_at INTEGER,
+            -- Per-word OCR boxes (issue #4117); scrubbed via full_text
+            -- propagation (only each block's `text`, geometry preserved).
+            text_json TEXT,
+            text_json_redacted_at INTEGER
         );
         -- ui_events: text_content plus the accessibility element context
         -- + window_title + element_name/description, all redacted together.
@@ -75,6 +79,7 @@ async fn setup_db() -> sqlx::SqlitePool {
             element_name TEXT,
             element_value TEXT,
             element_description TEXT,
+            element_ancestors TEXT,
             redacted_at INTEGER
         );
         -- Per-element OCR/accessibility rows (issue #3993); text is NULL on
@@ -629,15 +634,21 @@ async fn frame_fulltext_propagates_to_all_derived_copies_once() {
     );
     let window = format!("Dashboard — {secret}");
     let url = format!("https://app.example.com/u/{secret}/settings");
+    // Per-word OCR boxes: one block embeds the secret in its `text`; geometry
+    // fields are present so we can assert they survive verbatim.
+    let text_json = format!(
+        r#"[{{"block_num":"1","conf":"95","left":"10","top":"40","width":"120","height":"22","level":"5","page_num":"1","par_num":"1","line_num":"1","word_num":"1","text":"login {secret}"}}]"#
+    );
     let full = format!("login {secret}\nocr dashboard {secret}");
     sqlx::query(
-        "INSERT INTO frames (id, full_text, accessibility_tree_json, window_name, browser_url) \
-         VALUES (1, ?, ?, ?, ?)",
+        "INSERT INTO frames (id, full_text, accessibility_tree_json, window_name, browser_url, text_json) \
+         VALUES (1, ?, ?, ?, ?, ?)",
     )
     .bind(&full)
     .bind(&tree)
     .bind(&window)
     .bind(&url)
+    .bind(&text_json)
     .execute(&pool)
     .await
     .unwrap();
@@ -662,7 +673,8 @@ async fn frame_fulltext_propagates_to_all_derived_copies_once() {
     let row = sqlx::query(
         "SELECT accessibility_tree_json, accessibility_tree_redacted_at, \
                 window_name, window_name_redacted_at, \
-                browser_url, browser_url_redacted_at \
+                browser_url, browser_url_redacted_at, \
+                text_json, text_json_redacted_at \
          FROM frames WHERE id = 1",
     )
     .fetch_one(&pool)
@@ -674,6 +686,8 @@ async fn frame_fulltext_propagates_to_all_derived_copies_once() {
     let win_when: Option<i64> = row.get(3);
     let url_red: String = row.get(4);
     let url_when: Option<i64> = row.get(5);
+    let text_json_red: String = row.get(6);
+    let text_json_when: Option<i64> = row.get(7);
 
     // Secret gone from every derived copy; watermarks stamped.
     assert!(
@@ -700,8 +714,17 @@ async fn frame_fulltext_propagates_to_all_derived_copies_once() {
         url_red.contains("[SECRET]"),
         "browser_url not redacted: {url_red:?}"
     );
+    // Per-word OCR text scrubbed; the bounding-box geometry survives verbatim.
     assert!(
-        tree_when.is_some() && win_when.is_some() && url_when.is_some(),
+        !text_json_red.contains(secret),
+        "secret survived in text_json: {text_json_red:?}"
+    );
+    assert!(
+        text_json_red.contains("[SECRET]"),
+        "text_json not redacted: {text_json_red:?}"
+    );
+    assert!(
+        tree_when.is_some() && win_when.is_some() && url_when.is_some() && text_json_when.is_some(),
         "all derived watermarks must be stamped"
     );
 
@@ -709,6 +732,14 @@ async fn frame_fulltext_propagates_to_all_derived_copies_once() {
     let tree_parsed: serde_json::Value = serde_json::from_str(&tree_red).unwrap();
     assert_eq!(tree_parsed[0]["role"], "AXStaticText");
     assert_eq!(tree_parsed[1]["automation_id"], "f1");
+    // OCR geometry preserved byte-for-byte on the scrubbed block.
+    let tj_parsed: serde_json::Value = serde_json::from_str(&text_json_red).unwrap();
+    assert_eq!(tj_parsed[0]["text"], "login [SECRET]");
+    assert_eq!(tj_parsed[0]["left"], "10");
+    assert_eq!(tj_parsed[0]["top"], "40");
+    assert_eq!(tj_parsed[0]["width"], "120");
+    assert_eq!(tj_parsed[0]["height"], "22");
+    assert_eq!(tj_parsed[0]["conf"], "95");
 
     // ONE detection, propagated to the derived copies — never re-run.
     assert_eq!(
@@ -1023,7 +1054,11 @@ async fn worker_disables_missing_table_and_keeps_reconciling_others() {
             window_name TEXT,
             window_name_redacted_at INTEGER,
             browser_url TEXT,
-            browser_url_redacted_at INTEGER
+            browser_url_redacted_at INTEGER,
+            -- Per-word OCR boxes (issue #4117); scrubbed via full_text
+            -- propagation (only each block's `text`, geometry preserved).
+            text_json TEXT,
+            text_json_redacted_at INTEGER
         );
         "#,
     )
@@ -1245,4 +1280,59 @@ async fn default_columns_leave_optin_columns_untouched() {
         ev_name.contains(email),
         "element_name must be left raw by default: {ev_name:?}"
     );
+}
+
+/// `element_ancestors` (compact JSON `[{"role","name"},...]`) must be scrubbed
+/// JSON-aware: hop `name` values redacted, roles + structure preserved, and
+/// the row watermarked — a raw copy of a window title surviving inside the
+/// ancestors blob while `window_title` itself gets redacted would silently
+/// defeat the redaction contract for clicks.
+#[tokio::test]
+async fn ui_events_ancestors_json_scrubbed_structure_preserved() {
+    let pool = setup_db().await;
+    sqlx::query(
+        "INSERT INTO ui_events (event_type, window_title, element_ancestors) VALUES ( \
+            'click', \
+            'Mail — dave@example.com', \
+            '[{\"role\":\"AXWindow\",\"name\":\"Mail — dave@example.com\"},{\"role\":\"AXGroup\"},{\"role\":\"AXButton\",\"name\":\"Reply\"}]' \
+        )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let redactor = Arc::new(RegexRedactor::new()) as Arc<dyn Redactor>;
+    let cfg = WorkerConfig {
+        idle_between_batches: Duration::from_millis(1),
+        poll_interval: Duration::from_millis(20),
+        tables: vec![TargetTable::UiEvents],
+        ..Default::default()
+    };
+    let worker = Worker::new(pool.clone(), redactor, cfg);
+    let handle = worker.clone().spawn();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    handle.abort();
+
+    let (title, ancestors, redacted_at): (String, String, Option<i64>) = sqlx::query_as(
+        "SELECT window_title, element_ancestors, redacted_at FROM ui_events LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert!(redacted_at.is_some(), "row watermarked");
+    assert!(
+        !title.contains("dave@example.com"),
+        "title scrubbed: {title}"
+    );
+    assert!(
+        !ancestors.contains("dave@example.com"),
+        "ancestor hop name scrubbed: {ancestors}"
+    );
+    // structure + roles survive the JSON-aware pass
+    let parsed: serde_json::Value = serde_json::from_str(&ancestors).expect("still valid JSON");
+    let hops = parsed.as_array().expect("still an array");
+    assert_eq!(hops.len(), 3, "no hops dropped");
+    assert_eq!(hops[0]["role"], "AXWindow");
+    assert_eq!(hops[2]["name"], "Reply", "non-PII hop name untouched");
 }

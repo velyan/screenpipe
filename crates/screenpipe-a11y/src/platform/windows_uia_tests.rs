@@ -516,7 +516,11 @@ fn test_multi_app_tree_isolation() {
 #[test]
 #[ignore]
 fn test_full_pipeline_with_app() {
-    let config = UiCaptureConfig::new();
+    // Tree capture is off by default (freezes foreground apps) — this test
+    // asserts tree snapshots arrive, so opt in explicitly.
+    let mut config = UiCaptureConfig::new();
+    config.capture_tree = true;
+    config.tree_capture_interval_ms = 2000;
     let (tree_tx, tree_rx) = bounded::<WindowTreeSnapshot>(64);
     let (element_tx, _element_rx) =
         bounded::<(ClickElementRequest, crate::events::ElementContext)>(64);

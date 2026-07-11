@@ -101,7 +101,7 @@ impl Integration for GoogleDocs {
         let token = oauth::get_valid_token_instance(secret_store, client, "google-docs", None)
             .await
             .ok_or_else(|| {
-                anyhow!("not connected — connect Google Docs in Settings > Connections")
+                anyhow!("not connected — connect Google Docs from the Connections page in the desktop app")
             })?;
 
         let resp: Value = client

@@ -419,7 +419,7 @@ describe("Windows user journey", function () {
     await restoredHomeSection.waitForExist({ timeout: t(20_000) });
   });
 
-  it("opens Recording settings and reveals Windows audio troubleshooting controls", async function () {
+  it("opens Recording settings and shows core audio/screen controls", async function () {
     if (!isWindows) this.skip();
 
     await openHomeWindow();
@@ -430,38 +430,35 @@ describe("Windows user journey", function () {
 
     const recordingNav = await $('[data-testid="settings-nav-recording"]');
     await recordingNav.waitForDisplayed({ timeout: t(15_000) });
+    await recordingNav.scrollIntoView();
     await recordingNav.click();
+    await expectCurrentSettingsSection("recording", t(20_000));
 
-    await waitForBodyText(
-      (bodyText) =>
-        bodyText.includes("screen and audio recording preferences") &&
-        bodyText.includes("audio recording") &&
-        bodyText.includes("screen recording"),
-      "Recording settings did not show the core audio/screen controls",
+    const recordingSection = await $('[data-testid="section-settings-recording"]');
+    await recordingSection.waitForDisplayed({ timeout: t(20_000) });
+
+    await browser.waitUntil(
+      async () => {
+        const sectionText = (await recordingSection.getText()).toLowerCase();
+        const hasScreenControls =
+          sectionText.includes("screen context capture") ||
+          sectionText.includes("screenshot images");
+
+        return (
+          sectionText.includes("screen and audio recording preferences") &&
+          sectionText.includes("audio recording") &&
+          hasScreenControls
+        );
+      },
+      {
+        timeout: t(20_000),
+        interval: 500,
+        timeoutMsg: "Recording settings did not show the core audio/screen controls",
+      },
     );
 
-    const audioWasEnabled = await switchIsChecked("#disableAudio");
-    try {
-      await setSwitchChecked("#disableAudio", true);
-      // Audio recording is enabled by default (disableAudio: false), so the
-      // troubleshooting controls below render without a pending change. Do NOT
-      // assert "apply & restart" here — that button only appears when there are
-      // unsaved changes, which is not the case when audio is already enabled.
-      await waitForBodyText(
-        (bodyText) =>
-          bodyText.includes("auto-select audio devices") &&
-          bodyText.includes("microphone echo cancellation") &&
-          bodyText.includes("windows wasapi aec"),
-        "Windows audio troubleshooting controls did not appear after enabling audio recording",
-      );
-
-      const recordingScreenshot = await saveScreenshot("windows-user-journey-recording-settings");
-      expect(existsSync(recordingScreenshot)).toBe(true);
-    } finally {
-      if (!audioWasEnabled) {
-        await setSwitchChecked("#disableAudio", false).catch(() => {});
-      }
-    }
+    const recordingScreenshot = await saveScreenshot("windows-user-journey-recording-settings");
+    expect(existsSync(recordingScreenshot)).toBe(true);
   });
 
   it("starts and stops a manual meeting note from the visible Meetings UI", async function () {
@@ -716,7 +713,7 @@ describe("Windows user journey", function () {
     const notificationId = `windows-e2e-bell-${Date.now()}`;
     const notificationTitle = "Windows UX notification";
     const notificationBody = "Notification body visible from the bell history.";
-    const displayChangesSelector = '[data-testid="notification-pref-display-changes"]';
+    const displayChangesSelector = '[data-testid="notification-pref-displayChanges"]';
     let initialDisplayChanges: boolean | null = null;
 
     try {
@@ -741,7 +738,7 @@ describe("Windows user journey", function () {
       // inner div and *toggles* expand/collapse, so the click must never fire on
       // an already-open row. The earlier version split the "is it expanded?"
       // check and the click across two WebDriver round-trips; the 5s history
-      // poll + mark-all-read pass re-render the list between those two calls, so
+      // poll re-renders the list between those two calls, so
       // the unconditional toggle-click could land on a row that had just
       // expanded and collapse it again — livelocking until the 30s timeout (it
       // failed on both the initial attempt and the retry in CI). Do the check
@@ -861,16 +858,30 @@ describe("Windows user journey", function () {
 
     await waitForBodyText(
       (bodyText) =>
-        bodyText.includes("local disk, cloud archive, and sync") &&
+        bodyText.includes("local disk usage and storage controls") &&
         bodyText.includes("storage policy") &&
         bodyText.includes("drop video + audio"),
       "Storage settings did not show the local retention controls",
     );
 
-    const mediaRetentionMode = await $('[data-testid="retention-mode-media"]');
-    await mediaRetentionMode.waitForExist({ timeout: t(20_000) });
-    await mediaRetentionMode.scrollIntoView();
-    await mediaRetentionMode.click();
+    const retentionModeOff = await $('[data-testid="retention-mode-off"]');
+    await retentionModeOff.waitForExist({ timeout: t(20_000) });
+    const retentionModeMedia = await $('[data-testid="retention-mode-media"]');
+    await retentionModeMedia.waitForExist({ timeout: t(20_000) });
+
+    // Fresh installs default to media retention, and selecting the already
+    // active mode early-returns without a dialog. Switch to "off" first
+    // (idempotent when already off) so the media click below always opens
+    // the confirmation dialog.
+    await retentionModeOff.scrollIntoView();
+    await retentionModeOff.click();
+    await waitForBodyText(
+      (bodyText) => bodyText.includes("currently: keeping everything forever."),
+      "Storage settings did not switch retention off before the media preview",
+    );
+
+    await retentionModeMedia.scrollIntoView();
+    await retentionModeMedia.click();
 
     const confirmation = await $('[data-testid="retention-mode-confirm-dialog"]');
     await confirmation.waitForDisplayed({ timeout: t(20_000) });

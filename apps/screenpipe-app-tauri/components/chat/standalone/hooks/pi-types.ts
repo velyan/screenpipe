@@ -156,6 +156,7 @@ export type PiSendTransportOptions = {
   abortControllerRef: PiTransportRefs["abortControllerRef"];
   activePipeExecution: { name: string } | null;
   activePreset: AIPreset | undefined;
+  activePresetRef?: React.MutableRefObject<AIPreset | undefined>;
   attachedDocsRef: React.MutableRefObject<ExtractedDoc[]>;
   autoSendBypassRef: PiTransportRefs["autoSendBypassRef"];
   buildProviderConfig: PiProviderConfigBuilder;
@@ -222,6 +223,7 @@ export type PiSendTransportOptions = {
 
 export type PiForegroundEventsOptions = {
   activePreset: AIPreset | undefined;
+  activePresetRef?: React.MutableRefObject<AIPreset | undefined>;
   buildProviderConfig: PiProviderConfigBuilder;
   cancelStreamingMessageRender: StreamingActions["cancelStreamingMessageRender"];
   clearPipeExecution: () => void;

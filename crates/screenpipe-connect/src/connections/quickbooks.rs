@@ -69,7 +69,7 @@ impl Integration for QuickBooks {
         let token = oauth::get_valid_token_instance(secret_store, client, "quickbooks", None)
             .await
             .ok_or_else(|| {
-                anyhow!("not connected — connect QuickBooks Online in Settings > Connections")
+                anyhow!("not connected — connect QuickBooks Online from the Connections page in the desktop app")
             })?;
 
         let stored = oauth::load_oauth_json(secret_store, "quickbooks", None)

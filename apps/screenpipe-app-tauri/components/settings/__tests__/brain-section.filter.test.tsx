@@ -36,6 +36,8 @@ const ARTIFACTS = Array.from({ length: 5 }, (_, i) => ({
   created_at: null,
 }));
 
+let artifactFetchError = false;
+
 vi.mock("@/lib/api", () => ({
   localFetch: vi.fn(async (path: string) => {
     const ok = (body: unknown) => ({
@@ -66,6 +68,14 @@ vi.mock("@/lib/api", () => ({
       });
     }
     if (path.startsWith("/artifacts")) {
+      if (artifactFetchError) {
+        return {
+          ok: false,
+          status: 500,
+          json: async () => ({ error: "artifact index unavailable" }),
+          text: async () => "artifact index unavailable",
+        };
+      }
       const url = new URL(`http://x${path}`);
       const source = url.searchParams.get("source");
       const q = url.searchParams.get("q")?.toLowerCase();
@@ -114,6 +124,7 @@ import { useChatStore } from "@/lib/stores/chat-store";
 
 beforeEach(() => {
   vi.clearAllMocks();
+  artifactFetchError = false;
   resetBrainViewStateForTests();
   useChatStore.getState().actions.hydrateFromDisk([
     {
@@ -241,6 +252,24 @@ describe("BrainSection type filter", () => {
         screen.getByText('no artifacts matching "yoo" in title or content'),
       ).toBeTruthy();
     });
+  });
+
+  it("shows artifact load failures instead of an empty artifacts list", async () => {
+    artifactFetchError = true;
+
+    render(<BrainSection />);
+    await waitFor(() => expect(memoryRows().length).toBe(8));
+
+    fireEvent.click(screen.getAllByTestId("brain-filter-artifacts")[0]);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("brain-artifacts-error")).toBeTruthy();
+    });
+    expect(screen.getByText("failed to load artifacts")).toBeTruthy();
+    expect(screen.getByText("HTTP 500")).toBeTruthy();
+    expect(
+      screen.queryByText("no artifacts yet. create a chat note or run a pipe."),
+    ).toBeNull();
   });
 
   it("shows memory-specific empty search copy", async () => {

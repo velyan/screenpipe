@@ -20,6 +20,7 @@ import {
   deriveFallbackConversationTitle,
   isFallbackLikeTitle,
   shouldAcceptTitleSource,
+  stripPromptPlumbing,
 } from "@/lib/utils/chat-title";
 import { isInjectedTitleSourcePrompt } from "@/lib/chat-utils";
 import {
@@ -84,6 +85,7 @@ interface UseChatConversationsOpts {
   pendingDocsRef?: MutableRefObject<any[]>;
   settings: any;
   selectedPreset?: AIPreset | null;
+  selectedPresetRef?: MutableRefObject<AIPreset | undefined | null>;
   inlineHistoryEnabled?: boolean;
 }
 
@@ -135,6 +137,10 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     selectedPreset,
     inlineHistoryEnabled = true,
   } = opts;
+  const getSelectedPreset = () =>
+    opts.selectedPresetRef && opts.selectedPresetRef.current !== undefined
+      ? (opts.selectedPresetRef.current ?? null)
+      : opts.selectedPreset;
   const componentUnmountedRef = useRef(false);
 
   const [showHistory, setShowHistoryRaw] = useState(() => {
@@ -482,7 +488,20 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     // during startNewConversation (setConversationId(null) → … →
     // setConversationId(newSid)); without the fallback the save would mint
     // a fresh uuid and duplicate the conversation.
-    const convId = conversationId || piSessionIdRef.current || crypto.randomUUID();
+    //
+    // Never mint a fresh id here (issue #4719). If `conversationId` and the
+    // ref are both transiently empty (the null-id window inside
+    // startNewConversation), fall back to the store's `currentId` — the last
+    // stable id the panel published — and if even that is missing, SKIP the
+    // save rather than invent one. A `crypto.randomUUID()` fallback would
+    // persist a phantom twin file for what is really one conversation, which
+    // is exactly the cross-window duplicate this issue tracks.
+    const { useChatStore } = await import("@/lib/stores/chat-store");
+    const convId =
+      conversationId ||
+      piSessionIdRef.current ||
+      useChatStore.getState().currentId;
+    if (!convId) return;
 
     // Try to load existing conversation to preserve createdAt + title + kind.
     const { loadConversationFile } = await import("@/lib/chat-storage");
@@ -500,10 +519,11 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
     const existingTitle = existing?.title?.trim() || null;
     const computedLastUserMessageAt = newestUserMessageTimestamp(msgs);
 
+    const currentPreset = getSelectedPreset();
     const hasValidPreset =
-      selectedPreset &&
-      selectedPreset.provider &&
-      selectedPreset.model?.trim();
+      currentPreset &&
+      currentPreset.provider &&
+      currentPreset.model?.trim();
 
     const existingSource = existing?.titleSource;
     const existingLooksFallback = isFallbackLikeTitle(
@@ -525,8 +545,15 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       preservedTitleSource ?? "fallback";
 
     // Start AI title generation in background (once per conversation)
-    // Only generate if current title is fallback priority
-    const rawContent = firstUserMsg?.content?.trim() || null;
+    // Only generate if current title is fallback priority.
+    // Prefer the clean display label (e.g. "dbb") when present; otherwise strip
+    // plumbing wrappers (<attached file: ...>, <screenpipe-large-context>, etc.)
+    // so a 68k-char pasted attachment isn't shipped to the title model or
+    // echoed verbatim into the title.
+    const rawContent =
+      firstUserMsg?.displayContent?.trim() ||
+      (firstUserMsg?.content ? stripPromptPlumbing(firstUserMsg.content) : "") ||
+      null;
     // Opt-out: when the user disables auto title generation (to save tokens),
     // skip the extra LLM call entirely — chats keep the fallback title.
     const autoTitleEnabled = settings?.autoGenerateChatTitles !== false;
@@ -552,7 +579,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
         try {
           const aiTitle = await titleCreatedByAI(
             rawContent,
-            selectedPreset,
+            currentPreset,
             settings?.user?.token ?? null,
             async (partial) => {
               try {
@@ -696,6 +723,8 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
           ...(m.provider ? { provider: m.provider } : {}),
           ...(m.interruptedBySteer ? { interruptedBySteer: true } : {}),
           ...(m.steeredResponse ? { steeredResponse: true } : {}),
+          ...(m.workDurationMs ? { workDurationMs: m.workDurationMs } : {}),
+          ...(m.stoppedByUser ? { stoppedByUser: true } : {}),
         };
       }),
       createdAt: existing?.createdAt ?? Date.now(),
@@ -736,7 +765,7 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
       })()),
       // Persist the preset ID so the model selection survives app restart
       // and is restored when switching between chats.
-      ...(selectedPreset?.id ? { presetId: selectedPreset.id } : existing?.presetId ? { presetId: existing.presetId } : {}),
+      ...(currentPreset?.id ? { presetId: currentPreset.id } : existing?.presetId ? { presetId: existing.presetId } : {}),
     };
 
     // Mirror the final messages into the in-memory chat-store BEFORE
@@ -1192,6 +1221,8 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
         ...((m as any).provider ? { provider: (m as any).provider } : {}),
         ...((m as any).interruptedBySteer ? { interruptedBySteer: true } : {}),
         ...((m as any).steeredResponse ? { steeredResponse: true } : {}),
+        ...((m as any).workDurationMs ? { workDurationMs: (m as any).workDurationMs } : {}),
+        ...((m as any).stoppedByUser ? { stoppedByUser: true } : {}),
       }));
       // Make sure a record exists, then seed messages and mark hydrated.
       if (!store.sessions[conv.id]) {
@@ -1369,6 +1400,8 @@ export function useChatConversations(opts: UseChatConversationsOpts) {
           ...(m.provider ? { provider: m.provider } : {}),
           ...(m.interruptedBySteer ? { interruptedBySteer: true } : {}),
           ...(m.steeredResponse ? { steeredResponse: true } : {}),
+          ...(m.workDurationMs ? { workDurationMs: m.workDurationMs } : {}),
+          ...(m.stoppedByUser ? { stoppedByUser: true } : {}),
         };
       }),
       createdAt,

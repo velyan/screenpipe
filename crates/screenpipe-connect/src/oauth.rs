@@ -516,17 +516,17 @@ pub async fn describe_oauth_error(
         .collect();
     match (instance, instances.as_slice(), all_instances.as_slice()) {
         (Some(inst), _, _) => format!(
-            "{display_name} account '{inst}' is not connected or its token can't be refreshed — reconnect it in Settings > Connections"
+            "{display_name} account '{inst}' is not connected or its token can't be refreshed — reconnect it from the Connections page in the desktop app"
         ),
         (None, [], []) => format!(
-            "{display_name} not connected — use 'Connect {display_name}' in Settings > Connections"
+            "{display_name} not connected — use 'Connect {display_name}' from the Connections page in the desktop app"
         ),
         (None, [], stale) => format!(
-            "{display_name} has saved account row(s) ({}) but none can be refreshed — reconnect it in Settings > Connections",
+            "{display_name} has saved account row(s) ({}) but none can be refreshed — reconnect it from the Connections page in the desktop app",
             stale.join(", "),
         ),
         (None, [only], _) => format!(
-            "{display_name} account '{only}' token can't be refreshed — reconnect it in Settings > Connections"
+            "{display_name} account '{only}' token can't be refreshed — reconnect it from the Connections page in the desktop app"
         ),
         (None, many, _) => format!(
             "multiple {display_name} accounts connected ({}) — specify which one with `instance`. On JSON-body endpoints add `\"instance\": \"<email>\"` to the request body; on proxy/query endpoints add `?instance=<email>` (e.g. instance=\"{}\")",

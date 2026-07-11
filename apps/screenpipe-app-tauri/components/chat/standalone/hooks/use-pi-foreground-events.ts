@@ -10,7 +10,7 @@ import { mountAgentEventBus, onTerminated as onAgentTerminated } from "@/lib/eve
 import { commands } from "@/lib/utils/tauri";
 import { useChatStore } from "@/lib/stores/chat-store";
 import { statusForEvent } from "@/lib/stores/pi-event-router";
-import { extractConversationHistorySyncUserText } from "@/lib/chat-utils";
+import { extractInjectedUserText } from "@/lib/chat-utils";
 import { imageDataUrlsFromPiContent } from "@/lib/chat/image-content";
 import { buildDailyLimitMessage, buildRateLimitMessage, classifyQuotaError, parseRateLimitWaitSeconds, PI_MAX_RATE_LIMIT_RETRIES } from "@/lib/chat/quota-errors";
 import { buildInvalidatedAuthTokenMessage, isInvalidatedAuthTokenError } from "@/lib/chat/auth-errors";
@@ -33,6 +33,7 @@ const POST_STREAM_SIDE_EFFECT_DELAY_MS = 1_500;
 
 export function usePiForegroundEvents({
   activePreset,
+  activePresetRef,
   buildProviderConfig,
   cancelStreamingMessageRender,
   clearPipeExecution,
@@ -80,6 +81,7 @@ export function usePiForegroundEvents({
   syncThinkingLevelAfterStart,
   turnIntentTextValuesMatch,
 }: PiForegroundEventsOptions) {
+  const getActivePreset = () => activePresetRef?.current ?? activePreset;
   // Listen for Pi / pipe events.
   //
   // Stage 3 of the events refactor: the panel registers with the
@@ -140,8 +142,8 @@ export function usePiForegroundEvents({
           role: "assistant",
           content: "Processing...",
           timestamp: Date.now(),
-          model: activePreset?.model,
-          provider: activePreset?.provider,
+          model: getActivePreset()?.model,
+          provider: getActivePreset()?.provider,
         });
         return base;
       });
@@ -159,8 +161,8 @@ export function usePiForegroundEvents({
           role: "assistant",
           content: "Processing...",
           timestamp: Date.now(),
-          model: activePreset?.model,
-          provider: activePreset?.provider,
+          model: getActivePreset()?.model,
+          provider: getActivePreset()?.provider,
         } as any);
         storeState.actions.setStreaming(sidNow, {
           streamingMessageId: newAssistantId,
@@ -334,6 +336,7 @@ export function usePiForegroundEvents({
               toolName: stringValue(data.toolName, "unknown"),
               args: isRecord(data.args) ? data.args : {},
               isRunning: true,
+              startedAtMs: Date.now(),
             };
             // Add tool block (text before it is already its own block)
             piContentBlocksRef.current.push({ type: "tool", toolCall });
@@ -356,6 +359,7 @@ export function usePiForegroundEvents({
                 block.toolCall.isRunning = false;
                 block.toolCall.result = truncated;
                 block.toolCall.isError = data.isError === true;
+                block.toolCall.endedAtMs = Date.now();
               }
             }
             const contentBlocks = [...piContentBlocksRef.current];
@@ -366,12 +370,15 @@ export function usePiForegroundEvents({
         } else if (data.type === "auto_retry_end" && data.success === false) {
           // Pi exhausted retries on a transient error (rate limit, overloaded, etc.)
           const errorStr = stringValue(data.finalError, "Request failed after retries");
-          console.error("[Pi] Auto-retry failed:", errorStr);
+          const quotaErrorType = classifyQuotaError(errorStr);
+          const logAutoRetryFailure = quotaErrorType === "daily" || quotaErrorType === "rate" || errorStr.includes("model_not_allowed")
+            ? console.warn
+            : console.error;
+          logAutoRetryFailure("[Pi] Auto-retry failed:", errorStr);
           piLastErrorRef.current = errorStr;
           emitSessionActivity({ status: "error", lastError: errorStr });
 
           // Detect rate limit or daily limit from the error
-          const quotaErrorType = classifyQuotaError(errorStr);
           if (quotaErrorType === "daily" || quotaErrorType === "rate") {
             if (quotaErrorType === "daily") {
               posthog.capture("wall_hit", { reason: "daily_limit", source: "chat" });
@@ -395,7 +402,7 @@ export function usePiForegroundEvents({
               );
             }
           } else {
-            const providerError = buildProviderErrorMessage(errorStr, activePreset);
+            const providerError = buildProviderErrorMessage(errorStr, getActivePreset());
             if (providerError && piMessageIdRef.current) {
               const msgId = piMessageIdRef.current;
               setMessages((prev) =>
@@ -434,7 +441,7 @@ export function usePiForegroundEvents({
                 prev.map((m) => m.id === msgId ? { ...m, content: "This model requires an upgrade to Screenpipe Business. Switch to a free model (auto, glm-5, gemini flash) to keep going." } : m)
               );
             } else {
-              const providerError = buildProviderErrorMessage(fullError, activePreset);
+              const providerError = buildProviderErrorMessage(fullError, getActivePreset());
               if (providerError) {
                 setMessages((prev) =>
                   prev.map((m) => m.id === msgId
@@ -477,7 +484,7 @@ export function usePiForegroundEvents({
           }
 
           const rawText = textFromMessageContent(data.message?.content);
-          const text = extractConversationHistorySyncUserText(rawText) ?? rawText;
+          const text = extractInjectedUserText(rawText) ?? rawText;
           const eventImages = imageDataUrlsFromPiContent(data.message?.content);
           const pendingOptimisticSteer = optimisticSteerRef.current;
           const isPendingOptimisticSteerEcho = Boolean(
@@ -552,8 +559,8 @@ export function usePiForegroundEvents({
               ...(matchedTurnIntent ? { turnIntentId: matchedTurnIntent.id } : {}),
               ...(nextUserIntent === "steer" ? { steeredResponse: true } : {}),
               timestamp: Date.now(),
-              model: activePreset?.model,
-              provider: activePreset?.provider,
+              model: getActivePreset()?.model,
+              provider: getActivePreset()?.provider,
             };
 
             let nextRows: Message[] | null = null;
@@ -596,7 +603,11 @@ export function usePiForegroundEvents({
                    data.message?.role === "assistant" && data.message?.stopReason === "error") {
           // LLM returned an error (credits_exhausted, rate limit, provider error, etc.)
           const errMsg = stringValue(data.message.errorMessage, stringValue(data.message.error, "Unknown error"));
-          console.error("[Pi] LLM error via", data.type, ":", errMsg);
+          const quotaErrorType = classifyQuotaError(errMsg);
+          const logLlmError = quotaErrorType === "daily" || quotaErrorType === "rate" || errMsg.includes("model_not_allowed")
+            ? console.warn
+            : console.error;
+          logLlmError("[Pi] LLM error via", data.type, ":", errMsg);
           piLastErrorRef.current = errMsg;
           emitSessionActivity({ status: "error", lastError: errMsg });
           const authTokenInvalidated = isInvalidatedAuthTokenError(errMsg);
@@ -607,8 +618,7 @@ export function usePiForegroundEvents({
           if (piMessageIdRef.current) {
             const msgId = piMessageIdRef.current;
 
-            const quotaErrorType = classifyQuotaError(errMsg);
-            const providerError = buildProviderErrorMessage(errMsg, activePreset);
+            const providerError = buildProviderErrorMessage(errMsg, getActivePreset());
             if (authTokenInvalidated) {
               setMessages((prev) =>
                 prev.map((m) => m.id === msgId ? { ...m, content: buildInvalidatedAuthTokenMessage() } : m)
@@ -682,7 +692,7 @@ export function usePiForegroundEvents({
               } else if (errStr.includes("model_not_allowed")) {
                 content = "This model requires an upgrade to Screenpipe Business. Switch to a free model (auto, glm-5, gemini flash) to keep going.";
               } else {
-                content = buildProviderErrorMessage(errStr, activePreset) || errStr;
+                content = buildProviderErrorMessage(errStr, getActivePreset()) || errStr;
               }
             }
 
@@ -703,6 +713,7 @@ export function usePiForegroundEvents({
                 existing?.content?.includes("requires an upgrade") ||
                 existing?.content?.includes("Rate limited") ||
                 existing?.content?.includes("rate limit") ||
+                existing?.content?.includes("chat is too long") ||
                 existing?.content?.startsWith("Error:");
               if (isErrorMessage) {
                 return prev;
@@ -733,10 +744,10 @@ export function usePiForegroundEvents({
                 } else if (lastErr && lastErrKind === "rate") {
                   content = buildRateLimitMessage(lastErr);
                 } else if (lastErr) {
-                  content = buildProviderErrorMessage(lastErr, activePreset) || `Error: ${lastErr}`;
+                  content = buildProviderErrorMessage(lastErr, getActivePreset()) || `Error: ${lastErr}`;
                   emptyResponseRetryPrompt = lastUserMessageRef.current || undefined;
                 } else {
-                  content = buildNoResponseMessage(activePreset);
+                  content = buildNoResponseMessage(getActivePreset());
                   emptyResponseRetryPrompt = lastUserMessageRef.current || undefined;
                 }
               }
@@ -746,13 +757,24 @@ export function usePiForegroundEvents({
                 contentBlocks.push({ type: "text", text: content });
               }
               return prev.map((m) => m.id === msgId
-                ? { ...m, content, contentBlocks, ...(emptyResponseRetryPrompt ? { retryPrompt: emptyResponseRetryPrompt } : {}) }
+                ? {
+                    ...m,
+                    content,
+                    contentBlocks,
+                    ...(wasStoppedByUser
+                      ? {
+                          workDurationMs: Math.max(1, Date.now() - m.timestamp),
+                          stoppedByUser: true,
+                        }
+                      : {}),
+                    ...(emptyResponseRetryPrompt ? { retryPrompt: emptyResponseRetryPrompt } : {}),
+                  }
                 : m);
             });
             if (!isPipeWatch) {
               const analyticsPayload = {
-                provider: activePreset?.provider,
-                model: activePreset?.model,
+                provider: getActivePreset()?.provider,
+                model: getActivePreset()?.model,
                 has_tool_use: blocksSnapshot.some((b) => b.type === "tool"),
                 response_length: streamedText?.length ?? 0,
               };
@@ -854,7 +876,7 @@ export function usePiForegroundEvents({
                 prev.map((m) => m.id === msgId ? { ...m, content: "This model requires an upgrade to Screenpipe Business. Switch to a free model (auto, glm-5, gemini flash) to keep going." } : m)
               );
             } else {
-              const providerError = buildProviderErrorMessage(errorStr, activePreset);
+              const providerError = buildProviderErrorMessage(errorStr, getActivePreset());
               if (providerError) {
                 setMessages((prev) =>
                   prev.map((m) => m.id === msgId
@@ -892,8 +914,8 @@ export function usePiForegroundEvents({
             : errorStr.includes("model_not_allowed") ? "model_not_allowed"
             : "other";
           posthog.capture("chat_response_error", {
-            provider: activePreset?.provider,
-            model: activePreset?.model,
+            provider: getActivePreset()?.provider,
+            model: getActivePreset()?.model,
             error_type: errorCategory,
           });
           piStreamingTextRef.current = "";

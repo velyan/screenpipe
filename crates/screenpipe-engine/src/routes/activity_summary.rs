@@ -73,8 +73,8 @@ pub struct ActivitySummaryQuery {
     /// capture flag). Default: true. Disable to skip one cheap SQL call.
     #[serde(default = "default_true")]
     pub include_recording: bool,
-    /// Include top memories filtered by `q` (or recent high-importance if no
-    /// `q`). Default: true.
+    /// Include top memories filtered by `q` and bounded to the requested time
+    /// range. Default: true.
     #[serde(default = "default_true")]
     pub include_memories: bool,
     /// Include bounded, deduped screen+audio snippets. Default: true. Screen
@@ -311,10 +311,16 @@ pub async fn get_activity_summary(
         },
         async {
             if query.include_memories {
-                load_memories(&state.db, memory_query, query.max_memories.clamp(1, 20))
-                    .await
-                    .map_err(|e| error!("activity summary: memories failed: {}", e))
-                    .ok()
+                load_memories(
+                    &state.db,
+                    memory_query,
+                    query.max_memories.clamp(1, 20),
+                    &start,
+                    &end,
+                )
+                .await
+                .map_err(|e| error!("activity summary: memories failed: {}", e))
+                .ok()
             } else {
                 None
             }
@@ -397,55 +403,118 @@ async fn collect_summary_core(
         .unwrap_or_default();
 
     let apps_query = format!(
-        "SELECT app_name, \
-         COUNT(*) as frame_count, \
-         ROUND(SUM(CASE WHEN gap_sec < {IDLE_CAP_SECS} THEN gap_sec ELSE 0 END) / 60.0, 1) as minutes, \
-         MIN(ts) as first_seen, \
-         MAX(ts) as last_seen \
-         FROM ( \
-           SELECT app_name, timestamp as ts, \
-             (JULIANDAY(LEAD(timestamp) OVER (PARTITION BY app_name ORDER BY timestamp)) \
-              - JULIANDAY(timestamp)) * 86400 AS gap_sec \
+        "WITH raw AS ( \
+           SELECT app_name, \
+             COUNT(*) AS frame_count, \
+             MIN(timestamp) AS first_seen, \
+             MAX(timestamp) AS last_seen \
            FROM frames \
            WHERE timestamp BETWEEN '{start}' AND '{end}'{app_filter} \
            AND app_name IS NOT NULL AND app_name != '' \
-         ) gaps \
-         GROUP BY app_name ORDER BY minutes DESC LIMIT 20"
+           GROUP BY app_name \
+         ), selected AS ( \
+           SELECT id, app_name, timestamp AS ts \
+           FROM ( \
+             SELECT id, app_name, timestamp, focused, \
+               ROW_NUMBER() OVER ( \
+                 PARTITION BY timestamp \
+                 ORDER BY focused DESC, id DESC \
+               ) AS rn \
+             FROM frames \
+             WHERE timestamp BETWEEN '{start}' AND '{end}'{app_filter} \
+             AND app_name IS NOT NULL AND app_name != '' \
+           ) ranked \
+           WHERE rn = 1 \
+         ), allocated AS ( \
+           SELECT app_name, \
+             CASE \
+               WHEN gap_sec > 0 AND gap_sec < {IDLE_CAP_SECS} THEN gap_sec \
+               ELSE 0 \
+             END AS active_sec \
+           FROM ( \
+             SELECT app_name, ts, \
+               (JULIANDAY(LEAD(ts) OVER (ORDER BY ts, id)) - JULIANDAY(ts)) * 86400 AS gap_sec \
+             FROM selected \
+           ) gaps \
+         ) \
+         SELECT raw.app_name, \
+           raw.frame_count, \
+           COALESCE(ROUND(SUM(allocated.active_sec) / 60.0, 1), 0.0) AS minutes, \
+           raw.first_seen, \
+           raw.last_seen \
+         FROM raw \
+         LEFT JOIN allocated ON allocated.app_name = raw.app_name \
+         GROUP BY raw.app_name \
+         ORDER BY minutes DESC, raw.frame_count DESC, raw.app_name ASC \
+         LIMIT 20"
     );
 
     let windows_query = format!(
-        "SELECT app_name, window_name, \
-         COALESCE(browser_url, '') as browser_url, \
-         COUNT(*) as frame_count, \
-         ROUND(SUM(CASE WHEN gap_sec < {IDLE_CAP_SECS} THEN gap_sec ELSE 0 END) / 60.0, 1) as minutes \
-         FROM ( \
+        "WITH raw AS ( \
            SELECT app_name, \
-             COALESCE(window_name, '') as window_name, \
-             browser_url, \
-             (JULIANDAY(LEAD(timestamp) OVER (PARTITION BY app_name, window_name ORDER BY timestamp)) \
-              - JULIANDAY(timestamp)) * 86400 AS gap_sec \
+             COALESCE(window_name, '') AS window_name, \
+             COALESCE(MAX(browser_url), '') AS browser_url, \
+             COUNT(*) AS frame_count \
            FROM frames \
            WHERE timestamp BETWEEN '{start}' AND '{end}'{app_filter} \
            AND app_name IS NOT NULL AND app_name != '' \
            AND window_name IS NOT NULL AND window_name != '' \
-         ) gaps \
-         GROUP BY app_name, window_name \
-         ORDER BY minutes DESC LIMIT 30"
+           GROUP BY app_name, window_name \
+         ), selected AS ( \
+           SELECT id, app_name, COALESCE(window_name, '') AS window_name, timestamp AS ts \
+           FROM ( \
+             SELECT id, app_name, window_name, timestamp, focused, \
+               ROW_NUMBER() OVER ( \
+                 PARTITION BY timestamp \
+                 ORDER BY focused DESC, id DESC \
+               ) AS rn \
+             FROM frames \
+             WHERE timestamp BETWEEN '{start}' AND '{end}'{app_filter} \
+             AND app_name IS NOT NULL AND app_name != '' \
+             AND window_name IS NOT NULL AND window_name != '' \
+           ) ranked \
+           WHERE rn = 1 \
+         ), allocated AS ( \
+           SELECT app_name, window_name, \
+             CASE \
+               WHEN gap_sec > 0 AND gap_sec < {IDLE_CAP_SECS} THEN gap_sec \
+               ELSE 0 \
+             END AS active_sec \
+           FROM ( \
+             SELECT app_name, window_name, ts, \
+               (JULIANDAY(LEAD(ts) OVER (ORDER BY ts, id)) - JULIANDAY(ts)) * 86400 AS gap_sec \
+             FROM selected \
+           ) gaps \
+         ) \
+         SELECT raw.app_name, \
+           raw.window_name, \
+           raw.browser_url, \
+           raw.frame_count, \
+           COALESCE(ROUND(SUM(allocated.active_sec) / 60.0, 1), 0.0) AS minutes \
+         FROM raw \
+         LEFT JOIN allocated \
+           ON allocated.app_name = raw.app_name \
+          AND allocated.window_name = raw.window_name \
+         GROUP BY raw.app_name, raw.window_name \
+         ORDER BY minutes DESC, raw.frame_count DESC, raw.app_name ASC, raw.window_name ASC \
+         LIMIT 30"
     );
 
     // One representative text per app+window context. Prefer user input
     // (AXTextArea/AXTextField) over static text, cap at 300 chars to skip
     // marketing copy walls.
     let texts_query = format!(
-        "SELECT text, app_name, window_name, timestamp FROM ( \
+        "WITH ranked_contexts AS ( \
            SELECT e.text, f.app_name, \
              COALESCE(f.window_name, '') as window_name, \
              f.timestamp, \
+             DATE(f.timestamp) AS bucket, \
              ROW_NUMBER() OVER ( \
-               PARTITION BY f.app_name, f.window_name \
+               PARTITION BY DATE(f.timestamp), f.app_name, f.window_name \
                ORDER BY \
                  CASE WHEN e.role IN ('AXTextArea', 'AXTextField') THEN 0 ELSE 1 END, \
-                 LENGTH(e.text) DESC \
+                 LENGTH(e.text) DESC, \
+                 f.timestamp DESC \
              ) as rn \
            FROM elements e \
            JOIN frames f ON f.id = e.frame_id \
@@ -455,9 +524,16 @@ async fn collect_summary_core(
            AND LENGTH(e.text) BETWEEN 30 AND 300 \
            AND e.text NOT LIKE 'http%' \
            AND e.text NOT LIKE 'cdn.%' \
-         ) ranked \
-         WHERE rn = 1 \
-         ORDER BY timestamp DESC LIMIT 20"
+         ), balanced AS ( \
+           SELECT text, app_name, window_name, timestamp, bucket, \
+             ROW_NUMBER() OVER (PARTITION BY bucket ORDER BY timestamp DESC) AS bucket_rank \
+           FROM ranked_contexts \
+           WHERE rn = 1 \
+         ) \
+         SELECT text, app_name, window_name, timestamp \
+         FROM balanced \
+         ORDER BY bucket_rank ASC, timestamp ASC \
+         LIMIT 20"
     );
 
     let audio_speakers_query = format!(
@@ -727,6 +803,8 @@ async fn load_memories(
     db: &DatabaseManager,
     q: Option<&str>,
     limit: u32,
+    start: &str,
+    end: &str,
 ) -> Result<Vec<ActivityMemory>, String> {
     let rows = db
         .list_memories(
@@ -734,8 +812,8 @@ async fn load_memories(
             None,
             None,
             None,
-            None,
-            None,
+            Some(start),
+            Some(end),
             limit,
             0,
             Some("importance"),
@@ -802,18 +880,21 @@ async fn load_snippets(
          LIMIT {audio_limit}"
     );
 
+    let screen_candidates: Vec<&KeyText> = key_texts
+        .iter()
+        .filter(|key_text| {
+            let text = key_text.text.trim();
+            text.len() >= 20
+                && !query_text_lower
+                    .as_ref()
+                    .is_some_and(|q| !text.to_lowercase().contains(q))
+        })
+        .collect();
+
     let mut snippets = Vec::new();
-    for key_text in key_texts {
+    for index in evenly_spaced_indices(screen_candidates.len(), screen_limit as usize) {
+        let key_text = screen_candidates[index];
         let text = key_text.text.trim();
-        if text.len() < 20 {
-            continue;
-        }
-        if query_text_lower
-            .as_ref()
-            .is_some_and(|q| !text.to_lowercase().contains(q))
-        {
-            continue;
-        }
         push_snippet(
             &mut snippets,
             ActivitySnippet {
@@ -825,9 +906,6 @@ async fn load_snippets(
                 timestamp: key_text.timestamp.clone(),
             },
         );
-        if snippets.len() >= screen_limit as usize {
-            break;
-        }
     }
 
     let audio_rows = db
@@ -867,6 +945,31 @@ fn push_snippet(snippets: &mut Vec<ActivitySnippet>, snippet: ActivitySnippet) {
         return;
     }
     snippets.push(snippet);
+}
+
+fn evenly_spaced_indices(len: usize, limit: usize) -> Vec<usize> {
+    if len == 0 || limit == 0 {
+        return Vec::new();
+    }
+    if limit >= len {
+        return (0..len).collect();
+    }
+    if limit == 1 {
+        return vec![0];
+    }
+
+    let step = (len - 1) as f64 / (limit - 1) as f64;
+    let mut indices = Vec::with_capacity(limit);
+    let mut last = None;
+    for i in 0..limit {
+        let mut index = (i as f64 * step).round() as usize;
+        if Some(index) == last {
+            index = index.saturating_add(1).min(len - 1);
+        }
+        last = Some(index);
+        indices.push(index);
+    }
+    indices
 }
 
 // ---------- status + guidance ----------
@@ -1240,6 +1343,14 @@ mod tests {
         assert_eq!(snippets.len(), 2);
     }
 
+    #[test]
+    fn evenly_spaced_indices_include_edges() {
+        assert_eq!(evenly_spaced_indices(0, 4), Vec::<usize>::new());
+        assert_eq!(evenly_spaced_indices(7, 99), vec![0, 1, 2, 3, 4, 5, 6]);
+        assert_eq!(evenly_spaced_indices(7, 4), vec![0, 2, 4, 6]);
+        assert_eq!(evenly_spaced_indices(8, 3), vec![0, 4, 7]);
+    }
+
     // ---- data_status ----
 
     #[test]
@@ -1451,13 +1562,36 @@ mod db_tests {
     /// Insert one frame. `ts` is `YYYY-MM-DD HH:MM:SS`; app/window are optional
     /// so tests can exercise NULL/empty filtering.
     async fn add_frame(db: &DatabaseManager, ts: &str, app: Option<&str>, window: Option<&str>) {
+        add_frame_focused(db, ts, app, window, false).await;
+    }
+
+    async fn add_frame_focused(
+        db: &DatabaseManager,
+        ts: &str,
+        app: Option<&str>,
+        window: Option<&str>,
+        focused: bool,
+    ) {
         let q = format!(
-            "INSERT INTO frames (timestamp, app_name, window_name) VALUES ('{}', {}, {})",
+            "INSERT INTO frames (timestamp, app_name, window_name, focused) VALUES ('{}', {}, {}, {})",
             ts,
             sql_val(app),
-            sql_val(window)
+            sql_val(window),
+            if focused { 1 } else { 0 }
         );
         db.execute_raw_sql(&q).await.expect("insert frame");
+    }
+
+    async fn last_frame_id(db: &DatabaseManager) -> i64 {
+        let rows = db
+            .execute_raw_sql("SELECT MAX(id) AS id FROM frames")
+            .await
+            .expect("select latest frame id");
+        rows.as_array()
+            .and_then(|rows| rows.first())
+            .and_then(|row| row.get("id"))
+            .and_then(value_i64)
+            .expect("latest frame id")
     }
 
     /// Query over a range with an optional app filter. `start_time`/`end_time`
@@ -1527,13 +1661,15 @@ mod db_tests {
         );
         assert_eq!(core.total_frames, 8);
 
-        // Per app: Arc = 20+20+20 = 60s = 1.0; Claude = 30+30 = 60s (480 idle
-        // excluded) = 1.0.
-        assert!(near(app_min(&core, "Arc").unwrap(), 1.0));
+        // Per app follows the global timeline: Arc owns the 30s gap until the
+        // first Claude frame too, so Arc = 20+20+20+30 = 90s = 1.5; Claude =
+        // 30+30 = 60s (480 idle excluded) = 1.0.
+        assert!(near(app_min(&core, "Arc").unwrap(), 1.5));
         assert!(near(app_min(&core, "Claude").unwrap(), 1.0));
 
-        // Per window: Arc/GitHub = 20+20 = 40s ≈ 0.7; Claude/Chat = 30+30 = 1.0.
-        assert!(near(win_min(&core, "Arc", "GitHub").unwrap(), 0.7));
+        // Per window follows the same global timeline: Arc/GitHub owns the
+        // 20s gap until the first Arc/Gmail frame, so it totals 60s = 1.0.
+        assert!(near(win_min(&core, "Arc", "GitHub").unwrap(), 1.0));
         assert!(near(win_min(&core, "Claude", "Chat").unwrap(), 1.0));
 
         // The total includes the cross-app gap (Arc to Claude) that per-app sums
@@ -1544,6 +1680,47 @@ mod db_tests {
             "total {} < app_sum {}",
             core.total_active_minutes,
             app_sum
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_visible_frames_do_not_inflate_app_hours() {
+        let (db, _d) = fresh_db().await;
+        for ts in ["10:00:00", "10:01:00", "10:02:00"] {
+            add_frame_focused(
+                &db,
+                &format!("{DAY} {ts}"),
+                Some("Arc"),
+                Some("Browser"),
+                true,
+            )
+            .await;
+            add_frame_focused(
+                &db,
+                &format!("{DAY} {ts}"),
+                Some("Claude"),
+                Some("Chat"),
+                false,
+            )
+            .await;
+        }
+
+        let (s, e) = full_range();
+        let core = collect_summary_core(&db, &query(None), &s, &e).await;
+
+        assert!(
+            near(core.total_active_minutes, 2.0),
+            "deduped timeline total should be 2m, got {}",
+            core.total_active_minutes
+        );
+        assert!(near(app_min(&core, "Arc").unwrap(), 2.0));
+        assert!(near(app_min(&core, "Claude").unwrap(), 0.0));
+
+        let app_sum: f64 = core.apps.iter().map(|a| a.minutes).sum();
+        assert!(
+            app_sum <= core.total_active_minutes + 0.1,
+            "app minutes should not exceed total active minutes; app_sum={app_sum}, total={}",
+            core.total_active_minutes
         );
     }
 
@@ -1750,6 +1927,128 @@ mod db_tests {
     }
 
     #[tokio::test]
+    async fn key_texts_are_balanced_across_weekly_ranges() {
+        let (db, _d) = fresh_db().await;
+        for day in 1..=7 {
+            let ts = format!("2026-06-0{day} 10:00:00");
+            add_frame(&db, &ts, Some("Arc"), Some("Weekly Summary")).await;
+            let frame_id = last_frame_id(&db).await;
+            let txt = format!(
+                "weekly day {day} planning notes with enough detail for summary regression"
+            );
+            db.execute_raw_sql(&format!(
+                "INSERT INTO elements (frame_id, source, role, text, depth, sort_order) \
+                 VALUES ({frame_id}, 'accessibility', 'AXTextField', '{}', 0, 0)",
+                txt.replace('\'', "''")
+            ))
+            .await
+            .unwrap();
+        }
+
+        let core = collect_summary_core(
+            &db,
+            &query(None),
+            "2026-06-01 00:00:00",
+            "2026-06-08 00:00:00",
+        )
+        .await;
+        let texts = core
+            .key_texts
+            .iter()
+            .map(|k| k.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(
+            texts.iter().any(|t| t.contains("weekly day 1")),
+            "weekly key_texts should include early-week context: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("weekly day 7")),
+            "weekly key_texts should include late-week context: {texts:?}"
+        );
+        assert!(
+            core.key_texts.len() >= 7,
+            "expected one sampled text per day, got {texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn snippets_sample_screen_text_across_range_not_just_newest() {
+        let (db, _d) = fresh_db().await;
+        let mut q = query(None);
+        q.include_key_texts = false;
+        q.max_snippets = 12;
+
+        let key_texts = (1..=7)
+            .rev()
+            .map(|day| KeyText {
+                text: format!(
+                    "weekly day {day} detailed status text that should survive snippet sampling"
+                ),
+                app_name: "Arc".to_string(),
+                window_name: "Weekly Summary".to_string(),
+                timestamp: format!("2026-06-0{day}T10:00:00Z"),
+            })
+            .collect::<Vec<_>>();
+
+        let snippets = load_snippets(
+            &db,
+            &q,
+            &key_texts,
+            "2026-06-01T00:00:00Z",
+            "2026-06-08T00:00:00Z",
+        )
+        .await
+        .expect("load snippets");
+        let texts = snippets.iter().map(|s| s.text.as_str()).collect::<Vec<_>>();
+
+        assert!(
+            texts.iter().any(|t| t.contains("weekly day 7")),
+            "should keep recent context: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("weekly day 1")),
+            "should keep early-week context instead of only newest snippets: {texts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memories_respect_activity_summary_time_range() {
+        let (db, _d) = fresh_db().await;
+        for (content, created_at) in [
+            (
+                "old important memory outside requested week",
+                "2026-05-01T10:00:00Z",
+            ),
+            (
+                "in-range weekly memory that belongs in the summary",
+                "2026-06-03T10:00:00Z",
+            ),
+        ] {
+            db.execute_raw_sql(&format!(
+                "INSERT INTO memories (content, source, tags, importance, created_at, updated_at) \
+                 VALUES ('{}', 'test', '[]', 0.9, '{created_at}', '{created_at}')",
+                content.replace('\'', "''")
+            ))
+            .await
+            .unwrap();
+        }
+
+        let memories = load_memories(
+            &db,
+            None,
+            10,
+            "2026-06-01T00:00:00Z",
+            "2026-06-08T00:00:00Z",
+        )
+        .await
+        .expect("load memories");
+
+        assert_eq!(memories.len(), 1);
+        assert!(memories[0].content.contains("in-range weekly memory"));
+    }
+
+    #[tokio::test]
     async fn recording_status_counts_frames() {
         let (db, _d) = fresh_db().await;
         for ts in ["10:00:00", "10:00:20", "10:00:40"] {
@@ -1856,7 +2155,7 @@ mod db_tests {
             "real-format total wrong: {}",
             core.total_active_minutes
         );
-        assert!(near(app_min(&core, "Arc").unwrap(), 1.0));
+        assert!(near(app_min(&core, "Arc").unwrap(), 1.5));
         assert!(near(app_min(&core, "Claude").unwrap(), 1.0));
         assert_eq!(core.total_frames, 8);
     }

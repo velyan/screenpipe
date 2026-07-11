@@ -10,8 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
 use screenpipe_db::{
-    ChunkOutcome, DatabaseManager, NewDiarizationSegment, ReplacementAudioTranscription,
-    UntranscribedChunk,
+    AudioDevice, ChunkOutcome, DatabaseManager, DeviceType, NewDiarizationSegment,
+    ReplacementAudioTranscription, UntranscribedChunk,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
@@ -36,7 +36,7 @@ const RECONCILIATION_CHUNKS_PER_SWEEP: i64 = 50;
 use crate::core::engine::AudioTranscriptionEngine;
 use crate::metrics::AudioPipelineMetrics;
 use crate::segmentation::segmentation_manager::SegmentationManager;
-use crate::speaker::segment::{get_segments, SpeechSegment};
+use crate::speaker::segment::{get_segments_without_samples, SpeechSegment};
 use crate::transcription::engine::{TranscriptionEngine, TranscriptionSession};
 use crate::transcription::get_or_create_speaker_from_embedding;
 use crate::transcription::{AudioInsertCallback, AudioInsertInfo, TranscriptionDiarizationSegment};
@@ -76,6 +76,29 @@ struct PendingTranscription {
 pub(crate) struct PendingChunk {
     pub file_path: String,
     pub timestamp: Option<DateTime<Utc>>,
+    /// Original transcription, when the dropped insert was a *combined*
+    /// chunk+transcription write (the live transcription path). Carrying it lets
+    /// recovery re-insert the chunk AND its transcript in one shot, so the
+    /// recovered chunk is already transcribed and never becomes a reconciliation
+    /// re-transcribe candidate — avoiding a redundant (and, on a permanently
+    /// failing insert, repeated) Whisper pass. `None` for the raw-capture path
+    /// (audio_manager), which only ever had a row to recover.
+    #[serde(default)]
+    pub transcription: Option<PendingChunkTranscription>,
+}
+
+/// Transcription payload carried by a `PendingChunk` so recovery can replay the
+/// exact original `insert_audio_chunk_and_transcription` call instead of
+/// re-transcribing. Mirrors that call's arguments (offset_index is always 0).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub(crate) struct PendingChunkTranscription {
+    pub text: String,
+    pub engine: String,
+    pub device_name: String,
+    pub is_input: bool,
+    pub speaker_id: Option<i64>,
+    pub start_time: Option<f64>,
+    pub end_time: Option<f64>,
 }
 
 /// Maximum batch duration in seconds per engine.
@@ -755,10 +778,32 @@ pub(crate) async fn persist_orphaned_chunk(
     file_path: String,
     timestamp: Option<DateTime<Utc>>,
 ) {
+    persist_pending_chunk(data_dir, file_path, timestamp, None).await;
+}
+
+/// Like `persist_orphaned_chunk` but for the live transcription path: carries the
+/// original transcript so recovery re-inserts chunk+transcription together (no
+/// re-transcription). See `PendingChunk::transcription`.
+pub(crate) async fn persist_transcribed_chunk(
+    data_dir: &Path,
+    file_path: String,
+    timestamp: Option<DateTime<Utc>>,
+    transcription: PendingChunkTranscription,
+) {
+    persist_pending_chunk(data_dir, file_path, timestamp, Some(transcription)).await;
+}
+
+async fn persist_pending_chunk(
+    data_dir: &Path,
+    file_path: String,
+    timestamp: Option<DateTime<Utc>>,
+    transcription: Option<PendingChunkTranscription>,
+) {
     let dir = data_dir.to_path_buf();
     let chunk = PendingChunk {
         file_path: file_path.clone(),
         timestamp,
+        transcription,
     };
     match tokio::task::spawn_blocking(move || write_pending_chunk(&dir, &chunk)).await {
         Ok(Ok(())) => debug!(
@@ -873,10 +918,39 @@ async fn retry_pending_chunks(db: &DatabaseManager, data_dir: &Path) -> usize {
             continue;
         }
 
-        match db
-            .get_or_insert_audio_chunk(&pending.file_path, pending.timestamp)
-            .await
-        {
+        // When the marker carries the original transcript (live combined-insert
+        // path), replay the exact insert_audio_chunk_and_transcription call so the
+        // chunk is recovered ALREADY transcribed — it never re-enters the
+        // re-transcribe candidate set. Otherwise (raw-capture path) just insert
+        // the row; the candidate sweep will transcribe it.
+        let insert_result = match &pending.transcription {
+            Some(t) => db
+                .insert_audio_chunk_and_transcription(
+                    &pending.file_path,
+                    &t.text,
+                    0,
+                    &t.engine,
+                    &AudioDevice {
+                        name: t.device_name.clone(),
+                        device_type: if t.is_input {
+                            DeviceType::Input
+                        } else {
+                            DeviceType::Output
+                        },
+                    },
+                    t.speaker_id,
+                    t.start_time,
+                    t.end_time,
+                    pending.timestamp,
+                )
+                .await
+                .map(|_| ()),
+            None => db
+                .get_or_insert_audio_chunk(&pending.file_path, pending.timestamp)
+                .await
+                .map(|_| ()),
+        };
+        match insert_result {
             Ok(_) => {
                 let _ = std::fs::remove_file(&path);
                 recovered += 1;
@@ -1201,7 +1275,7 @@ async fn extract_local_diarization_segments(
         }
     };
 
-    let segments = match get_segments(
+    let segments = match get_segments_without_samples(
         samples,
         sample_rate,
         segmentation_model_path,
@@ -1331,7 +1405,7 @@ async fn extract_speaker_id(
         }
     };
 
-    let segments = match get_segments(
+    let segments = match get_segments_without_samples(
         samples,
         sample_rate,
         segmentation_model_path,
@@ -1684,6 +1758,7 @@ mod tests {
             &PendingChunk {
                 file_path: audio.clone(),
                 timestamp: Some(Utc::now()),
+                transcription: None,
             },
         )
         .unwrap();
@@ -1728,6 +1803,7 @@ mod tests {
             &PendingChunk {
                 file_path: audio.clone(),
                 timestamp: Some(Utc::now()),
+                transcription: None,
             },
         )
         .unwrap();
@@ -1764,6 +1840,7 @@ mod tests {
             &PendingChunk {
                 file_path: gone.clone(),
                 timestamp: Some(Utc::now()),
+                transcription: None,
             },
         )
         .unwrap();
@@ -1818,6 +1895,7 @@ mod tests {
             &PendingChunk {
                 file_path: audio.clone(),
                 timestamp: Some(ts),
+                transcription: None,
             },
         )
         .unwrap();
@@ -1836,6 +1914,55 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn recovered_chunk_with_transcript_is_not_a_retranscribe_candidate() {
+        // The improvement (#4562): when the dropped insert was a combined
+        // chunk+transcription write, the marker carries the transcript so
+        // recovery replays the full insert. The chunk comes back already
+        // transcribed and must NOT re-enter the re-transcribe candidate set —
+        // otherwise a permanently-failing insert would re-Whisper every sweep.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        let db = temp_db(data_dir).await;
+
+        let audio = make_audio_file(data_dir, "Mic (input)_2026-01-02_00-00-00.mp4");
+        let ts = Utc::now() - chrono::Duration::hours(1);
+        write_pending_chunk(
+            data_dir,
+            &PendingChunk {
+                file_path: audio.clone(),
+                timestamp: Some(ts),
+                transcription: Some(PendingChunkTranscription {
+                    text: "hello from durable recovery".to_string(),
+                    engine: "whisper-large-v3-turbo".to_string(),
+                    device_name: "Mic".to_string(),
+                    is_input: true,
+                    speaker_id: None,
+                    start_time: Some(0.0),
+                    end_time: Some(1.0),
+                }),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(retry_pending_chunks(&db, data_dir).await, 1);
+        assert!(
+            db.find_audio_chunk_id(&audio).await.unwrap().is_some(),
+            "recovered chunk row must exist"
+        );
+
+        let since = Utc::now() - chrono::Duration::days(7);
+        let older_than = Utc::now() - chrono::Duration::minutes(10);
+        let candidates = db
+            .get_reconciliation_candidate_chunks(since, older_than, 50)
+            .await
+            .unwrap();
+        assert!(
+            !candidates.iter().any(|c| c.file_path == audio),
+            "a chunk recovered WITH its transcript must not be a re-transcribe candidate"
+        );
+    }
+
     #[test]
     fn marker_writes_are_bounded_by_the_cap() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1844,6 +1971,7 @@ mod tests {
         let mk = |p: &str| PendingChunk {
             file_path: p.to_string(),
             timestamp: None,
+            transcription: None,
         };
         // Cap of 2: first two distinct paths land, the third is refused.
         assert_eq!(
@@ -1920,6 +2048,7 @@ mod tests {
                 &PendingChunk {
                     file_path: a,
                     timestamp: Some(Utc::now()),
+                    transcription: None,
                 },
             )
             .unwrap();
@@ -1965,6 +2094,7 @@ mod tests {
                 &PendingChunk {
                     file_path: p.clone(),
                     timestamp: Some(Utc::now() - chrono::Duration::hours(1)),
+                    transcription: None,
                 },
             )
             .unwrap();

@@ -139,6 +139,8 @@ pub struct UiEventSyncRecord {
     #[serde(default)]
     pub element_bounds: Option<String>,
     #[serde(default)]
+    pub element_ancestors: Option<String>,
+    #[serde(default)]
     pub frame_id: Option<i64>,
 }
 
@@ -454,7 +456,7 @@ impl ScreenpipeSyncProvider {
                    text_content, x, y, key_code, modifiers, element_role, element_name,
                    session_id, relative_ms, delta_x, delta_y, button, click_count,
                    text_length, app_pid, element_value, element_description,
-                   element_automation_id, element_bounds, frame_id
+                   element_automation_id, element_bounds, element_ancestors, frame_id
             FROM ui_events
             WHERE synced_at IS NULL
             ORDER BY timestamp ASC
@@ -501,6 +503,7 @@ impl ScreenpipeSyncProvider {
                 element_description: r.get("element_description"),
                 element_automation_id: r.get("element_automation_id"),
                 element_bounds: r.get("element_bounds"),
+                element_ancestors: r.get("element_ancestors"),
                 frame_id: r.get("frame_id"),
             })
             .collect();
@@ -777,6 +780,7 @@ impl ScreenpipeSyncProvider {
                     event.element_description.as_deref(),
                     event.element_automation_id.as_deref(),
                     event.element_bounds.as_deref(),
+                    event.element_ancestors.as_deref(),
                     event.frame_id,
                 )
                 .await

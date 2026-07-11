@@ -7,7 +7,9 @@ import type * as React from "react";
 import { commands } from "@/lib/utils/tauri";
 import type { ImageViewerState } from "@/components/chat/standalone/image-viewer-dialog";
 import type { ChatMessageListProps } from "@/components/chat/standalone/chat-message-list";
-import type { Message } from "@/lib/chat/types";
+import type { ContentBlock, Message } from "@/lib/chat/types";
+import type { ConnectionListItem } from "@/lib/chat/connection-suggestions";
+import type { InlineConnectStatus } from "@/lib/connections/inline-connect";
 import type { MarkdownCitationPlan } from "@/lib/chat/markdown-export";
 
 interface UseChatMessageActionsOptions {
@@ -22,6 +24,10 @@ interface UseChatMessageActionsOptions {
   openFilePreview: (path: string) => void;
   branchConversation: (messageId: string) => Promise<void> | void;
   scheduleMessage: (message: string, displayLabel: string) => void;
+  connectionItems?: ConnectionListItem[];
+  onOpenConnectionSetup?: (connectionId: string) => void | Promise<void>;
+  onConnectConnectionAction?: (connectionId: string, block?: Extract<ContentBlock, { type: "connection_action" }>) => Promise<InlineConnectStatus | void> | InlineConnectStatus | void;
+  onDeclineConnectionAction?: (block: Extract<ContentBlock, { type: "connection_action" }>) => void | Promise<void>;
 }
 
 export function useChatMessageActions({
@@ -36,6 +42,10 @@ export function useChatMessageActions({
   openFilePreview,
   branchConversation,
   scheduleMessage,
+  connectionItems = [],
+  onOpenConnectionSetup,
+  onConnectConnectionAction,
+  onDeclineConnectionAction,
 }: UseChatMessageActionsOptions) {
   const [expandedSteerWorkIds, setExpandedSteerWorkIds] = useState<Set<string>>(() => new Set());
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
@@ -172,6 +182,26 @@ export function useChatMessageActions({
     });
   }, [messages]);
 
+  const dismissConnectionAction = useCallback((messageId: string, connectionId: string) => {
+    const block = messages
+      .find((message) => message.id === messageId)
+      ?.contentBlocks?.find(
+        (candidate): candidate is Extract<ContentBlock, { type: "connection_action" }> =>
+          candidate.type === "connection_action" && candidate.connectionId === connectionId,
+      );
+    if (block) void onDeclineConnectionAction?.(block);
+    setMessages((prev) =>
+      prev.flatMap((message) => {
+        if (message.id !== messageId || !message.contentBlocks?.length) return [message];
+        const nextBlocks = message.contentBlocks.filter(
+          (block) => block.type !== "connection_action" || block.connectionId !== connectionId,
+        );
+        if (nextBlocks.length === 0 && !message.content.trim()) return [];
+        return [{ ...message, contentBlocks: nextBlocks }];
+      }),
+    );
+  }, [messages, onDeclineConnectionAction, setMessages]);
+
   const messageListProps: ChatMessageListProps = {
     messages,
     isLoading,
@@ -202,6 +232,12 @@ export function useChatMessageActions({
     sendMessage,
     openFilePreview,
     branchConversation,
+    connectionItems,
+    onOpenConnectionSetup,
+    onConnectConnectionAction,
+    onContinueConnectionAction: (prompt, label) => sendMessage(prompt, label),
+    onDismissConnectionAction: dismissConnectionAction,
+    onAskUserReply: (reply, label) => sendMessage(reply, label),
     suppressSourceFooters: true,
   };
 

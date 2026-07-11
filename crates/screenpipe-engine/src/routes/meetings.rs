@@ -12,7 +12,9 @@ use oasgen::{oasgen, OaSchema};
 use screenpipe_db::DatabaseManager;
 use screenpipe_db::{MeetingRecord, MeetingTranscriptSegment, MEETING_END_REASON_EXPLICIT_STOP};
 
-use crate::meeting_telemetry::{capture_detection_decision, capture_detection_feedback};
+use crate::meeting_watcher::shared::telemetry::{
+    capture_detection_decision, capture_detection_feedback,
+};
 use crate::server::AppState;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -688,6 +690,15 @@ pub(crate) async fn start_meeting_handler(
     }
     if let Some(detector) = state.audio_manager.meeting_detector().await {
         detector.set_v2_in_meeting(true);
+        // No sensor will ever attribute a process to a manual meeting, so
+        // publish the identity with `manual: true` — the piggyback sweep
+        // derives its tap targets from the live mic-holder enumeration for
+        // manual meetings instead of riding the stable path.
+        detector.set_active_meeting(Some(screenpipe_audio::meeting_detector::ActiveMeeting {
+            pid: None,
+            bundle_id: None,
+            manual: true,
+        }));
     }
 
     if let Ok(status) = resolve_meeting_status(&state).await {
@@ -787,6 +798,7 @@ pub(crate) async fn stop_meeting_handler(
     }
     if let Some(detector) = state.audio_manager.meeting_detector().await {
         detector.set_v2_in_meeting(false);
+        detector.set_active_meeting(None);
     }
     // Signal the detector loop to drop tracking immediately (skip grace period).
     // The app comes from the already-resolved status so this needs no DB read

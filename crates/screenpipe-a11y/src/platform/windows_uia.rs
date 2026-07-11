@@ -9,13 +9,15 @@
 
 use crate::config::UiCaptureConfig;
 use crate::events::{AccessibilityNode, ElementBounds, ElementContext, WindowTreeSnapshot};
+use crate::tree::TruncationReason;
 use chrono::Utc;
 use crossbeam_channel::Sender;
 use parking_lot::Mutex;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, trace, warn};
 
@@ -88,6 +90,114 @@ pub struct ClickElementRequest {
     pub x: i32,
     pub y: i32,
     pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// Default wall-clock budget when the caller doesn't provide one (tests,
+/// ad-hoc captures). Generous on purpose — the capture pipelines pass their
+/// own, much tighter budget via `capture_window_tree_bounded`.
+#[cfg(test)]
+const DEFAULT_TREE_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A captured tree plus whether (and why) the walk stopped early.
+pub(crate) struct CapturedTree {
+    pub root: AccessibilityNode,
+    pub truncation: TruncationReason,
+}
+
+/// Shared node-count + wall-clock budget for a single tree capture.
+/// Records the first limit hit so callers can report truncation.
+struct TreeBudget {
+    max_elements: usize,
+    /// `None` = node cap only. Used for the cached path: its subtree is
+    /// already materialized in-process by the time nodes are built, so a
+    /// deadline there can only discard data that was already paid for —
+    /// it cannot shorten the target app's freeze.
+    deadline: Option<Instant>,
+    count: usize,
+    truncation: TruncationReason,
+}
+
+impl TreeBudget {
+    fn new(max_elements: usize, deadline: Instant) -> Self {
+        Self {
+            max_elements,
+            deadline: Some(deadline),
+            count: 0,
+            truncation: TruncationReason::None,
+        }
+    }
+
+    /// Budget bounded by node count only (cached, in-process tree builds).
+    fn node_capped(max_elements: usize) -> Self {
+        Self {
+            max_elements,
+            deadline: None,
+            count: 0,
+            truncation: TruncationReason::None,
+        }
+    }
+
+    /// True once a limit is hit; records the reason on first hit.
+    fn exhausted(&mut self) -> bool {
+        if self.count >= self.max_elements {
+            if self.truncation == TruncationReason::None {
+                self.truncation = TruncationReason::MaxNodes;
+            }
+            return true;
+        }
+        if let Some(deadline) = self.deadline {
+            if Instant::now() >= deadline {
+                if self.truncation == TruncationReason::None {
+                    self.truncation = TruncationReason::Timeout;
+                }
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// How long a "this window needs the TreeWalker fallback" verdict stays valid.
+/// TTL'd because HWNDs get recycled by the OS and a provider can start
+/// populating the cached subtree later; re-probing costs one cross-process
+/// call, so a stale verdict is cheap to correct.
+const WALKER_FALLBACK_MEMO_TTL: Duration = Duration::from_secs(300);
+
+/// Process-wide memo of windows whose UIA provider requires the per-element
+/// TreeWalker fallback (Chromium/Electron). Shared across capture pipelines —
+/// the paired-capture path recreates its `UiaContext` per walk, so this can't
+/// live on the context.
+fn walker_fallback_memo() -> &'static Mutex<HashMap<isize, Instant>> {
+    static MEMO: OnceLock<Mutex<HashMap<isize, Instant>>> = OnceLock::new();
+    MEMO.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// True if `hwnd` was recently observed to need the TreeWalker fallback.
+fn needs_walker_fallback(hwnd: HWND) -> bool {
+    let mut memo = walker_fallback_memo().lock();
+    let key = hwnd.0 as isize;
+    match memo.get(&key) {
+        Some(seen) if seen.elapsed() < WALKER_FALLBACK_MEMO_TTL => true,
+        Some(_) => {
+            memo.remove(&key);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Record that `hwnd`'s provider needs the TreeWalker fallback.
+fn remember_walker_fallback(hwnd: HWND) {
+    let mut memo = walker_fallback_memo().lock();
+    if memo.len() >= 64 {
+        memo.retain(|_, seen| seen.elapsed() < WALKER_FALLBACK_MEMO_TTL);
+    }
+    memo.insert(hwnd.0 as isize, Instant::now());
+}
+
+/// Drop the fallback verdict for `hwnd` (cached path produced a real tree).
+fn forget_walker_fallback(hwnd: HWND) {
+    walker_fallback_memo().lock().remove(&(hwnd.0 as isize));
 }
 
 /// UIA context holding COM objects (single-thread only, not Send)
@@ -167,52 +277,116 @@ impl UiaContext {
         }
     }
 
-    /// Capture the full accessibility tree of a window by HWND.
-    /// Uses CacheRequest to batch all property reads into minimal cross-process calls.
-    /// Falls back to TreeWalker for apps whose UIA providers don't populate
-    /// the cached subtree (Chromium, Electron, etc.).
+    /// Capture the full accessibility tree of a window by HWND with a default
+    /// wall-clock budget. Kept as the convenience entry point for tests —
+    /// production pipelines pass their own budget via
+    /// [`Self::capture_window_tree_bounded`].
+    #[cfg(test)]
     pub(crate) fn capture_window_tree(
         &self,
         hwnd: HWND,
         max_elements: usize,
     ) -> Option<AccessibilityNode> {
+        self.capture_window_tree_bounded(hwnd, max_elements, DEFAULT_TREE_CAPTURE_TIMEOUT)
+            .map(|captured| captured.root)
+    }
+
+    /// Capture the full accessibility tree of a window by HWND, bounded by a
+    /// node cap and a wall-clock deadline.
+    ///
+    /// Uses CacheRequest to batch all property reads into minimal cross-process
+    /// calls. Falls back to TreeWalker for apps whose UIA providers don't
+    /// populate the cached subtree (Chromium, Electron, etc.).
+    ///
+    /// The deadline bounds the per-element TreeWalker fallback (~2 cross-process
+    /// COM round-trips per element, serviced on the target app's UI thread — the
+    /// unbounded-freeze path), checked before every element fetch so it overruns
+    /// by at most one element. The cached path is different: its one
+    /// `ElementFromHandleBuildCache` call is synchronous and cannot be
+    /// interrupted, and afterwards the subtree is already materialized
+    /// in-process — so building it is bounded by the node cap only. Truncating
+    /// that local build on the deadline would discard data the target app
+    /// already paid to produce without shortening its freeze.
+    pub(crate) fn capture_window_tree_bounded(
+        &self,
+        hwnd: HWND,
+        max_elements: usize,
+        timeout: Duration,
+    ) -> Option<CapturedTree> {
+        let deadline = Instant::now() + timeout;
+
+        // Windows already known to need the per-element fallback (Chromium/
+        // Electron) go straight to it, so the walker gets the full wall-clock
+        // budget instead of paying for a cached attempt that returns a handful
+        // of titlebar nodes every single walk.
+        if needs_walker_fallback(hwnd) {
+            let mut walker_budget = TreeBudget::new(max_elements, deadline);
+            if let Some(root) = self.capture_window_tree_walker(hwnd, &mut walker_budget) {
+                return Some(CapturedTree {
+                    root,
+                    truncation: walker_budget.truncation,
+                });
+            }
+            // Walker setup failed (window gone, provider error) — fall through
+            // to the cached path rather than dropping the capture.
+        }
+
         unsafe {
             let element = self
                 .automation
                 .ElementFromHandleBuildCache(hwnd, &self.cache_request)
                 .ok()?;
 
-            let mut count = 0;
-            let root = self.build_node(&element, max_elements, &mut count);
+            // Node cap only: the whole subtree was materialized by the single
+            // COM call above; building nodes from it is local work.
+            let mut budget = TreeBudget::node_capped(max_elements);
+            let root = self.build_node(&element, &mut budget);
+            let count = budget.count;
 
             // Some UIA providers (notably Chromium/Electron) don't populate the
             // cached subtree via ElementFromHandleBuildCache, returning only a
             // handful of titlebar nodes. When this happens, fall back to
-            // TreeWalker which makes individual COM calls per element.
+            // TreeWalker which makes individual COM calls per element. The
+            // fallback runs against the original deadline (so a slow cached
+            // attempt shrinks its window) with a fresh node budget, matching
+            // the count comparison below.
             if count <= 10 {
-                if let Some(walker_root) = self.capture_window_tree_walker(hwnd, max_elements) {
+                let mut walker_budget = TreeBudget::new(max_elements, deadline);
+                if let Some(walker_root) = self.capture_window_tree_walker(hwnd, &mut walker_budget)
+                {
                     let walker_count = walker_root.node_count();
                     if walker_count > count {
                         debug!(
                             "Cache returned {} nodes, walker returned {} - using walker result",
                             count, walker_count
                         );
-                        return Some(walker_root);
+                        remember_walker_fallback(hwnd);
+                        return Some(CapturedTree {
+                            root: walker_root,
+                            truncation: walker_budget.truncation,
+                        });
                     }
                 }
+            } else {
+                // Cached path works for this window — clear any stale memo
+                // (HWND recycling, provider started populating the cache).
+                forget_walker_fallback(hwnd);
             }
 
-            Some(root)
+            Some(CapturedTree {
+                root,
+                truncation: budget.truncation,
+            })
         }
     }
 
     /// Fallback tree capture using TreeWalker for UIA providers that don't
     /// support cached subtree (e.g. Chromium, Electron apps).
-    /// Walks the tree element-by-element via GetFirstChild/GetNextSibling.
+    /// Walks the tree element-by-element via COM calls, bounded by `budget`.
     fn capture_window_tree_walker(
         &self,
         hwnd: HWND,
-        max_elements: usize,
+        budget: &mut TreeBudget,
     ) -> Option<AccessibilityNode> {
         unsafe {
             // Get a live element (required for TreeWalker navigation)
@@ -222,21 +396,20 @@ impl UiaContext {
                 .BuildUpdatedCache(&self.walker_cache_request)
                 .ok()?;
 
-            let mut count = 0;
-            Some(self.build_node_walker(&cached_root, max_elements, &mut count))
+            Some(self.build_node_walker(&cached_root, budget))
         }
     }
 
     /// Recursively build an AccessibilityNode using TreeWalker navigation.
     /// Unlike build_node which reads pre-cached children, this walks the tree
-    /// one element at a time via COM calls.
+    /// one element at a time via COM calls (~2 cross-process round trips per
+    /// element), so the budget's deadline is checked before every fetch.
     fn build_node_walker(
         &self,
         element: &IUIAutomationElement,
-        max_elements: usize,
-        count: &mut usize,
+        budget: &mut TreeBudget,
     ) -> AccessibilityNode {
-        *count += 1;
+        budget.count += 1;
 
         let control_type = self.get_control_type_name(element);
         let name = self.get_cached_string(element, UIA_NamePropertyId);
@@ -256,23 +429,23 @@ impl UiaContext {
             self.get_cached_string(element, UIA_LocalizedControlTypePropertyId);
 
         let mut children = Vec::new();
-        if *count < max_elements {
+        if !budget.exhausted() {
             unsafe {
                 // Navigate to first child via TreeWalker
                 if let Ok(child) = self
                     .tree_walker
                     .GetFirstChildElementBuildCache(element, &self.walker_cache_request)
                 {
-                    children.push(self.build_node_walker(&child, max_elements, count));
+                    children.push(self.build_node_walker(&child, budget));
                     // Iterate siblings
                     let mut current = child;
-                    while *count < max_elements {
+                    while !budget.exhausted() {
                         match self
                             .tree_walker
                             .GetNextSiblingElementBuildCache(&current, &self.walker_cache_request)
                         {
                             Ok(next) => {
-                                children.push(self.build_node_walker(&next, max_elements, count));
+                                children.push(self.build_node_walker(&next, budget));
                                 current = next;
                             }
                             Err(_) => break,
@@ -304,13 +477,14 @@ impl UiaContext {
     }
 
     /// Recursively build an AccessibilityNode from a cached UIA element.
+    /// The subtree is already materialized in-process, so per-node work is a
+    /// local property read; callers pass a node-cap-only budget.
     fn build_node(
         &self,
         element: &IUIAutomationElement,
-        max_elements: usize,
-        count: &mut usize,
+        budget: &mut TreeBudget,
     ) -> AccessibilityNode {
-        *count += 1;
+        budget.count += 1;
 
         let control_type = self.get_control_type_name(element);
         let name = self.get_cached_string(element, UIA_NamePropertyId);
@@ -330,17 +504,17 @@ impl UiaContext {
             self.get_cached_string(element, UIA_LocalizedControlTypePropertyId);
 
         let mut children = Vec::new();
-        if *count < max_elements {
+        if !budget.exhausted() {
             unsafe {
                 // Walk cached children (already fetched via TreeScope_Subtree)
                 if let Ok(child_array) = element.GetCachedChildren() {
                     if let Ok(len) = child_array.Length() {
                         for i in 0..len {
-                            if *count >= max_elements {
+                            if budget.exhausted() {
                                 break;
                             }
                             if let Ok(child) = child_array.GetElement(i) {
-                                children.push(self.build_node(&child, max_elements, count));
+                                children.push(self.build_node(&child, budget));
                             }
                         }
                     }
@@ -499,6 +673,9 @@ impl UiaContext {
             description: None,
             automation_id,
             bounds,
+            // Windows ancestor-chain capture not implemented yet — macOS only
+            // for now (see collect_ancestor_chain in platform/macos.rs).
+            ancestors: None,
         }
     }
 
@@ -661,19 +838,25 @@ pub fn run_uia_thread(
     let interval_dur = Duration::from_millis(config.tree_capture_interval_ms);
     let mut was_lock_paused = false;
 
-    // Capture initial focused window (no input has happened yet, so input_too_recent is a no-op)
-    let initial_hwnd = unsafe { GetForegroundWindow() };
-    if !initial_hwnd.is_invalid() {
-        capture_and_send(
-            &uia,
-            initial_hwnd,
-            &config,
-            &tree_tx,
-            &focused_element,
-            &mut last_captured_hwnd,
-            &mut last_tree_hash,
-            &mut last_capture_time,
-        );
+    // Seed initial state (no input has happened yet, so input_too_recent is a no-op).
+    // Full tree walk only when tree capture is on; otherwise just prime the focused
+    // element so click/app-switch enrichment has context from the start.
+    if config.capture_tree {
+        let initial_hwnd = unsafe { GetForegroundWindow() };
+        if !initial_hwnd.is_invalid() {
+            capture_and_send(
+                &uia,
+                initial_hwnd,
+                &config,
+                &tree_tx,
+                &focused_element,
+                &mut last_captured_hwnd,
+                &mut last_tree_hash,
+                &mut last_capture_time,
+            );
+        }
+    } else if config.capture_context {
+        refresh_focused_element(&uia, &config, &focused_element);
     }
 
     // Compute the cooldown for shortening MsgWaitForMultipleObjects timeout when input is recent.
@@ -701,65 +884,9 @@ pub fn run_uia_thread(
             continue;
         }
 
-        if was_lock_paused && config.capture_tree {
+        if was_lock_paused {
             was_lock_paused = false;
-            let hwnd = unsafe { GetForegroundWindow() };
-            if !hwnd.is_invalid() {
-                capture_and_send(
-                    &uia,
-                    hwnd,
-                    &config,
-                    &tree_tx,
-                    &focused_element,
-                    &mut last_captured_hwnd,
-                    &mut last_tree_hash,
-                    &mut last_capture_time,
-                );
-            } else {
-                last_capture_time = Instant::now();
-            }
-        } else {
-            was_lock_paused = false;
-        }
-
-        // Defer tree captures while the user is actively typing/clicking. The captured
-        // tree would be stale within ms anyway, and the work would steal CPU from input
-        // threads. We keep `pending_focus` and don't bump `last_capture_time` so the
-        // capture is retried on the next loop once input pauses.
-        let skip_capture = input_too_recent(&config, start_time, &last_input_at_ms);
-
-        // Check for pending focus change (debounced)
-        if config.capture_tree && !skip_capture {
-            let should_capture = {
-                let pending = pending_focus.lock();
-                if let Some(ref pf) = *pending {
-                    pf.time.elapsed() >= debounce_dur
-                } else {
-                    false
-                }
-            };
-
-            if should_capture {
-                let hwnd = {
-                    let mut pending = pending_focus.lock();
-                    pending.take().map(|pf| pf.hwnd)
-                };
-                if let Some(hwnd) = hwnd {
-                    capture_and_send(
-                        &uia,
-                        hwnd,
-                        &config,
-                        &tree_tx,
-                        &focused_element,
-                        &mut last_captured_hwnd,
-                        &mut last_tree_hash,
-                        &mut last_capture_time,
-                    );
-                }
-            }
-
-            // Periodic safety-net re-capture
-            if config.tree_capture_interval_ms > 0 && last_capture_time.elapsed() >= interval_dur {
+            if config.capture_tree {
                 let hwnd = unsafe { GetForegroundWindow() };
                 if !hwnd.is_invalid() {
                     capture_and_send(
@@ -775,6 +902,76 @@ pub fn run_uia_thread(
                 } else {
                     last_capture_time = Instant::now();
                 }
+            } else if config.capture_context {
+                refresh_focused_element(&uia, &config, &focused_element);
+            }
+        }
+
+        // Defer tree captures while the user is actively typing/clicking. The captured
+        // tree would be stale within ms anyway, and the work would steal CPU from input
+        // threads. We keep `pending_focus` and don't bump `last_capture_time` so the
+        // capture is retried on the next loop once input pauses.
+        let skip_capture = input_too_recent(&config, start_time, &last_input_at_ms);
+
+        // Check for pending focus change (debounced). With capture_tree this walks
+        // the full window tree; without it we only refresh the focused element —
+        // a single cross-process call, same cost class as per-click ElementFromPoint —
+        // so click/app-switch/window-focus enrichment stays fresh without the
+        // foreground-app freezes full walks cause (see capture_tree in config.rs).
+        if (config.capture_tree || config.capture_context) && !skip_capture {
+            let should_capture = {
+                let pending = pending_focus.lock();
+                if let Some(ref pf) = *pending {
+                    pf.time.elapsed() >= debounce_dur
+                } else {
+                    false
+                }
+            };
+
+            if should_capture {
+                let hwnd = {
+                    let mut pending = pending_focus.lock();
+                    pending.take().map(|pf| pf.hwnd)
+                };
+                if let Some(hwnd) = hwnd {
+                    if config.capture_tree {
+                        capture_and_send(
+                            &uia,
+                            hwnd,
+                            &config,
+                            &tree_tx,
+                            &focused_element,
+                            &mut last_captured_hwnd,
+                            &mut last_tree_hash,
+                            &mut last_capture_time,
+                        );
+                    } else {
+                        refresh_focused_element(&uia, &config, &focused_element);
+                    }
+                }
+            }
+        }
+
+        // Periodic safety-net re-capture — full tree walks only.
+        if config.capture_tree
+            && !skip_capture
+            && config.tree_capture_interval_ms > 0
+            && last_capture_time.elapsed() >= interval_dur
+        {
+            let hwnd = unsafe { GetForegroundWindow() };
+            if !hwnd.is_invalid() {
+                capture_and_send(
+                    &uia,
+                    hwnd,
+                    &config,
+                    &tree_tx,
+                    &focused_element,
+                    &mut last_captured_hwnd,
+                    &mut last_tree_hash,
+                    &mut last_capture_time,
+                );
+            } else {
+                last_capture_time = Instant::now();
             }
         }
 
@@ -817,8 +1014,9 @@ pub fn run_uia_thread(
 
 /// Compute the next timeout for MsgWaitForMultipleObjects.
 /// Returns the minimum of:
-/// - Time until debounce fires (if pending focus exists)
-/// - Time until periodic re-capture
+/// - Time until debounce fires (if pending focus exists) — drives tree walks
+///   (capture_tree) and focused-element refresh (capture_context)
+/// - Time until periodic re-capture (tree walks only)
 /// - Max 1000ms safety ceiling
 fn compute_next_timeout(
     pending_focus: &Arc<Mutex<Option<PendingFocus>>>,
@@ -829,22 +1027,20 @@ fn compute_next_timeout(
 ) -> u64 {
     let mut min_ms: u64 = 1000; // safety ceiling
 
-    if !config.capture_tree {
-        return min_ms;
-    }
-
     // Time until debounce fires
-    if let Some(ref pf) = *pending_focus.lock() {
-        let elapsed = pf.time.elapsed();
-        if elapsed >= debounce_dur {
-            return 0; // Ready now
+    if config.capture_tree || config.capture_context {
+        if let Some(ref pf) = *pending_focus.lock() {
+            let elapsed = pf.time.elapsed();
+            if elapsed >= debounce_dur {
+                return 0; // Ready now
+            }
+            let remaining = (debounce_dur - elapsed).as_millis() as u64;
+            min_ms = min_ms.min(remaining);
         }
-        let remaining = (debounce_dur - elapsed).as_millis() as u64;
-        min_ms = min_ms.min(remaining);
     }
 
     // Time until periodic re-capture
-    if config.tree_capture_interval_ms > 0 {
+    if config.capture_tree && config.tree_capture_interval_ms > 0 {
         let elapsed = last_capture_time.elapsed();
         if elapsed >= interval_dur {
             return 0; // Ready now
@@ -854,6 +1050,32 @@ fn compute_next_timeout(
     }
 
     min_ms.max(1) // avoid 0 (which means infinite in Win32)
+}
+
+/// Refresh the shared focused-element context without walking the window tree.
+/// One `GetFocusedElement` call is the same cost class as the per-click
+/// `ElementFromPoint` enrichment (a single cross-process request), unlike a
+/// full subtree walk which is serviced synchronously on the target app's UI
+/// thread and measurably freezes it. Used when `capture_tree` is off so
+/// click/app-switch/window-focus events keep their element context.
+fn refresh_focused_element(
+    uia: &UiaContext,
+    config: &UiCaptureConfig,
+    focused_element: &Arc<Mutex<Option<ElementContext>>>,
+) {
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_invalid() {
+        return;
+    }
+
+    let (app_name, window_title, _pid) = get_window_info(hwnd);
+    if !config.should_capture_target(&app_name, window_title.as_deref()) {
+        return;
+    }
+
+    if let Some(ctx) = uia.get_focused_element() {
+        *focused_element.lock() = Some(ctx);
+    }
 }
 
 /// Process names (lowercased, with extension) of apps whose in-process UI Automation
@@ -878,7 +1100,7 @@ const FRAGILE_UIA_TREE_PROVIDERS: &[&str] = &["outlook.exe"];
 
 /// Returns true if `app_name` is a process whose UIA provider can crash when we capture
 /// its full accessibility tree. See [`FRAGILE_UIA_TREE_PROVIDERS`].
-fn is_fragile_uia_tree_provider(app_name: &str) -> bool {
+pub(crate) fn is_fragile_uia_tree_provider(app_name: &str) -> bool {
     let lower = app_name.to_ascii_lowercase();
     FRAGILE_UIA_TREE_PROVIDERS.iter().any(|p| lower == *p)
 }
@@ -921,9 +1143,24 @@ fn capture_and_send(
         return;
     }
 
-    // Capture the tree
-    let root = match uia.capture_window_tree(hwnd, config.tree_max_elements) {
-        Some(root) => root,
+    // Capture the tree, bounded by a wall-clock deadline: the per-element
+    // TreeWalker fallback (Chromium/Electron) is serviced synchronously on the
+    // target app's UI thread, so an unbounded walk visibly freezes the app.
+    const PERIODIC_TREE_WALK_TIMEOUT: Duration = Duration::from_millis(250);
+    let root = match uia.capture_window_tree_bounded(
+        hwnd,
+        config.tree_max_elements,
+        PERIODIC_TREE_WALK_TIMEOUT,
+    ) {
+        Some(captured) => {
+            if captured.truncation != TruncationReason::None {
+                debug!(
+                    "Tree capture for {} truncated ({:?})",
+                    app_name, captured.truncation
+                );
+            }
+            captured.root
+        }
         None => {
             trace!("Failed to capture tree for hwnd {:?}", hwnd.0);
             return;
@@ -1115,6 +1352,107 @@ mod tests {
     }
 
     #[test]
+    fn test_tree_budget_max_nodes() {
+        let mut budget = TreeBudget::new(2, Instant::now() + Duration::from_secs(60));
+        assert!(!budget.exhausted());
+        assert_eq!(budget.truncation, TruncationReason::None);
+
+        budget.count = 2;
+        assert!(budget.exhausted());
+        assert_eq!(budget.truncation, TruncationReason::MaxNodes);
+
+        // First-hit reason sticks even if the deadline also passes later.
+        budget.deadline = Some(Instant::now() - Duration::from_secs(1));
+        assert!(budget.exhausted());
+        assert_eq!(budget.truncation, TruncationReason::MaxNodes);
+    }
+
+    #[test]
+    fn test_tree_budget_deadline() {
+        let mut budget = TreeBudget::new(10_000, Instant::now() - Duration::from_millis(1));
+        assert!(budget.exhausted());
+        assert_eq!(budget.truncation, TruncationReason::Timeout);
+    }
+
+    #[test]
+    fn test_tree_budget_node_capped_ignores_time() {
+        // Cached-path budget: no deadline, only the node cap binds.
+        let mut budget = TreeBudget::node_capped(3);
+        assert!(!budget.exhausted());
+        budget.count = 3;
+        assert!(budget.exhausted());
+        assert_eq!(budget.truncation, TruncationReason::MaxNodes);
+    }
+
+    #[test]
+    fn test_walker_fallback_memo_roundtrip() {
+        // Distinct pointer value so parallel tests sharing the process-wide
+        // memo can't interfere.
+        let hwnd = HWND(0x5EED_F00D_usize as *mut _);
+
+        assert!(!needs_walker_fallback(hwnd));
+        remember_walker_fallback(hwnd);
+        assert!(needs_walker_fallback(hwnd));
+        forget_walker_fallback(hwnd);
+        assert!(!needs_walker_fallback(hwnd));
+    }
+
+    /// Live test: the wall-clock deadline bounds a real capture.
+    /// Focus a Chromium/Electron window (whose provider forces the
+    /// per-element TreeWalker fallback) to see `Timeout` truncation — the
+    /// deadline binds that path. Windows served by the cached path return
+    /// their full (node-capped) tree regardless of the deadline, since the
+    /// subtree arrives in one COM call. Run:
+    /// cargo test -p screenpipe-a11y test_live_bounded_capture -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn test_live_bounded_capture_truncates() {
+        unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+                .ok()
+                .expect("COM init failed");
+        }
+        let uia = UiaContext::new().expect("UIA init failed");
+        let hwnd = unsafe { GetForegroundWindow() };
+        assert!(!hwnd.is_invalid(), "No foreground window");
+
+        // Reference walk with a generous budget.
+        let start = std::time::Instant::now();
+        let full = uia
+            .capture_window_tree_bounded(hwnd, 10_000, Duration::from_secs(10))
+            .expect("capture failed");
+        let full_ms = start.elapsed().as_millis();
+        println!(
+            "full walk:    {} nodes in {}ms (truncation: {:?})",
+            full.root.node_count(),
+            full_ms,
+            full.truncation
+        );
+
+        // Tightly bounded walk must come back promptly. The deadline can't
+        // interrupt the initial ElementFromHandleBuildCache COM call, so the
+        // assertion is loose — the point is it doesn't run for seconds.
+        let start = std::time::Instant::now();
+        let bounded = uia
+            .capture_window_tree_bounded(hwnd, 10_000, Duration::from_millis(50))
+            .expect("capture failed");
+        let bounded_ms = start.elapsed().as_millis();
+        println!(
+            "bounded 50ms: {} nodes in {}ms (truncation: {:?})",
+            bounded.root.node_count(),
+            bounded_ms,
+            bounded.truncation
+        );
+
+        assert!(
+            bounded_ms < 5_000,
+            "bounded walk took {}ms — deadline not honored",
+            bounded_ms
+        );
+        unsafe { CoUninitialize() };
+    }
+
+    #[test]
     fn test_tree_hash_differs() {
         let node1 = AccessibilityNode {
             control_type: "Button".to_string(),
@@ -1293,6 +1631,51 @@ mod tests {
             hwnd: HWND::default(),
             time: Instant::now() - Duration::from_secs(1),
         })));
+        let mut config = UiCaptureConfig::new();
+        config.capture_tree = false;
+        config.capture_context = false;
+        config.tree_capture_interval_ms = 1;
+
+        let wait_ms = compute_next_timeout(
+            &pending_focus,
+            Duration::from_millis(10),
+            &(Instant::now() - Duration::from_secs(1)),
+            Duration::from_millis(1),
+            &config,
+        );
+
+        assert_eq!(wait_ms, 1000);
+    }
+
+    #[test]
+    fn test_compute_next_timeout_honors_focus_debounce_for_element_refresh() {
+        // capture_tree off + capture_context on (the default config): a pending
+        // focus change must still wake the worker so the focused-element
+        // refresh runs — enrichment for clicks/app-switches depends on it.
+        let pending_focus = Arc::new(Mutex::new(Some(PendingFocus {
+            hwnd: HWND::default(),
+            time: Instant::now() - Duration::from_secs(1),
+        })));
+        let config = UiCaptureConfig::new();
+        assert!(!config.capture_tree);
+        assert!(config.capture_context);
+
+        let wait_ms = compute_next_timeout(
+            &pending_focus,
+            Duration::from_millis(10),
+            &(Instant::now() - Duration::from_secs(1)),
+            Duration::from_millis(1),
+            &config,
+        );
+
+        assert_eq!(wait_ms, 0); // debounce elapsed — ready now
+    }
+
+    #[test]
+    fn test_compute_next_timeout_ignores_periodic_interval_without_capture_tree() {
+        // Even with an interval configured, the periodic timer only drives full
+        // tree walks — it must not wake the worker when capture_tree is off.
+        let pending_focus = Arc::new(Mutex::new(None::<PendingFocus>));
         let mut config = UiCaptureConfig::new();
         config.capture_tree = false;
         config.tree_capture_interval_ms = 1;
@@ -1738,7 +2121,11 @@ mod tests {
     #[test]
     #[ignore]
     fn test_live_uia_thread_lifecycle() {
-        let config = UiCaptureConfig::new();
+        // Tree capture is off by default (freezes foreground apps) — this test
+        // exercises the tree-walk machinery, so opt in explicitly.
+        let mut config = UiCaptureConfig::new();
+        config.capture_tree = true;
+        config.tree_capture_interval_ms = 2000;
         let (tree_tx, tree_rx) = crossbeam_channel::bounded::<WindowTreeSnapshot>(64);
         let (element_tx, _element_rx) =
             crossbeam_channel::bounded::<(ClickElementRequest, ElementContext)>(64);
@@ -1782,7 +2169,7 @@ mod tests {
         assert!(snap.element_count >= 1, "Should have elements");
         assert!(!snap.app_name.is_empty(), "Should have app name");
 
-        // Wait for periodic re-capture (interval_ms=2000 by default, but dedup will skip if same)
+        // Wait for periodic re-capture (interval_ms=2000 set above, but dedup will skip if same)
         // Sleep 3s to allow interval to fire
         std::thread::sleep(std::time::Duration::from_secs(3));
 
@@ -1846,7 +2233,10 @@ mod tests {
             }
         }
 
-        let config = UiCaptureConfig::new();
+        // Opt into tree capture — off by default, and this test asserts snapshots.
+        let mut config = UiCaptureConfig::new();
+        config.capture_tree = true;
+        config.tree_capture_interval_ms = 2000;
         let (tree_tx, tree_rx) = crossbeam_channel::bounded::<WindowTreeSnapshot>(256);
         let (element_tx, _element_rx) =
             crossbeam_channel::bounded::<(ClickElementRequest, ElementContext)>(64);

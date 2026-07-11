@@ -9,7 +9,7 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
-use screenpipe_connect::connections::render_context;
+use screenpipe_connect::{connections, mcp_servers};
 use screenpipe_core::pipes::{
     describe_schedule_config, next_occurrences, PipeManager, ScheduleConfig,
 };
@@ -51,11 +51,13 @@ pub struct ConfigUpdateRequest {
 #[derive(Deserialize)]
 pub struct ExecutionsQuery {
     pub limit: Option<i32>,
+    pub before_id: Option<i64>,
 }
 
 #[derive(Deserialize)]
 pub struct ListPipesQuery {
     pub include_executions: Option<bool>,
+    pub execution_limit: Option<i32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -74,7 +76,8 @@ pub async fn list_pipes(
         tracing::warn!("failed to reload pipes from disk: {}", e);
     }
     if query.include_executions.unwrap_or(false) {
-        let pipes_with_execs = mgr.list_pipes_with_executions(5).await;
+        let execution_limit = query.execution_limit.unwrap_or(5).clamp(1, 100);
+        let pipes_with_execs = mgr.list_pipes_with_executions(execution_limit).await;
         let total = pipes_with_execs.len();
         let data: Vec<Value> = pipes_with_execs
             .into_iter()
@@ -188,7 +191,7 @@ pub async fn run_pipe_now(
         if !missing.is_empty() {
             return Json(json!({
                 "error": format!(
-                    "pipe '{}' requires unconfigured connections: {} — set them up in Settings → Connections",
+                    "pipe '{}' requires unconfigured connections: {} — set them up from the Connections page in the desktop app",
                     id,
                     missing.join(", ")
                 )
@@ -197,7 +200,7 @@ pub async fn run_pipe_now(
     }
 
     // Refresh connections context so the pipe system prompt includes currently
-    // connected integrations (Google Calendar, Google Docs, etc.).
+    // connected integrations (Google Calendar, Google Docs, MCP servers, etc.).
     let screenpipe_dir = mgr
         .pipes_dir()
         .parent()
@@ -205,7 +208,10 @@ pub async fn run_pipe_now(
         .to_path_buf();
     let api_port = mgr.api_port();
     let ss = secret_store.as_ref().map(|e| e.0.as_ref());
-    let conn_ctx = render_context(&screenpipe_dir, api_port, ss).await;
+    let conn_ctx = join_context_blocks([
+        connections::render_context(&screenpipe_dir, api_port, ss).await,
+        mcp_servers::render_context(&screenpipe_dir, api_port).await,
+    ]);
     mgr.set_connections_context(conn_ctx);
 
     let result = mgr.start_pipe_background(&id).await;
@@ -220,6 +226,15 @@ pub async fn run_pipe_now(
         Ok(()) => Json(json!({ "success": true })),
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
+}
+
+fn join_context_blocks(contexts: impl IntoIterator<Item = String>) -> String {
+    contexts
+        .into_iter()
+        .map(|ctx| ctx.trim().to_string())
+        .filter(|ctx| !ctx.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 /// POST /pipes/:id/stop — stop a running pipe.
@@ -255,8 +270,8 @@ pub async fn get_pipe_executions(
     Query(query): Query<ExecutionsQuery>,
 ) -> Json<Value> {
     let mgr = pm.lock().await;
-    let limit = query.limit.unwrap_or(20).min(100);
-    match mgr.get_executions(&id, limit).await {
+    let limit = query.limit.unwrap_or(100).clamp(1, 500);
+    match mgr.get_executions(&id, limit, query.before_id).await {
         Ok(executions) => Json(json!({ "data": executions })),
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
@@ -268,7 +283,7 @@ pub async fn get_pipe_session(
     Path((id, exec_id)): Path<(String, i64)>,
 ) -> (StatusCode, Json<Value>) {
     let mgr = pm.lock().await;
-    let execs = match mgr.get_executions(&id, 100).await {
+    let execs = match mgr.get_executions(&id, 1, exec_id.checked_add(1)).await {
         Ok(e) => e,
         Err(e) => {
             return (
@@ -423,6 +438,17 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::Notify;
     use tower::ServiceExt;
+
+    #[test]
+    fn joins_non_empty_connection_context_blocks() {
+        let out = join_context_blocks([
+            "  built-in connection context  ".to_string(),
+            "".to_string(),
+            "\nuser mcp context\n".to_string(),
+        ]);
+
+        assert_eq!(out, "built-in connection context\n\nuser mcp context");
+    }
 
     #[derive(Clone, Copy)]
     enum FakePublishMode {

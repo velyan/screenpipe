@@ -82,7 +82,7 @@ impl Integration for Jira {
         let token = oauth::get_valid_token_instance(secret_store, client, "jira", None)
             .await
             .ok_or_else(|| {
-                anyhow!("not connected — use 'Connect with Jira' in Settings > Connections")
+                anyhow!("not connected — use 'Connect with Jira' from the Connections page in the desktop app")
             })?;
 
         let oauth_json = oauth::load_oauth_json(secret_store, "jira", None)

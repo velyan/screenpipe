@@ -137,7 +137,7 @@ fn is_loopback_request(req: &axum::extract::Request) -> bool {
 // Re-export types from route modules for backward compatibility
 pub use crate::routes::content::{ContentItem, PaginatedResponse};
 pub use crate::routes::health::{HealthCheckResponse, MonitorInfo};
-pub use crate::routes::search::SearchResponse;
+pub use crate::routes::search::{SearchCacheEntry, SearchResponse};
 
 // Re-export handlers that are referenced from lib.rs
 pub use crate::routes::health::{
@@ -147,7 +147,7 @@ pub use crate::routes::health::{
 pub type FrameImageCache = LruCache<i64, (String, std::time::Instant)>;
 
 /// Cache key for search results (hash of query parameters)
-pub type SearchCache = MokaCache<u64, Arc<SearchResponse>>;
+pub type SearchCache = MokaCache<u64, Arc<SearchCacheEntry>>;
 
 pub struct AppState {
     pub db: Arc<DatabaseManager>,
@@ -240,9 +240,9 @@ pub struct AppState {
     /// `--disable-vision`).
     pub high_fps_controller: Option<Arc<crate::high_fps_controller::HighFpsController>>,
     /// Shared VisionManager so the `/vision/device/*` routes can pause/resume
-    /// individual monitors from the recording popover. `None` when vision is
-    /// disabled or on headless configs that run no capture.
-    pub vision_manager: Option<Arc<crate::vision_manager::VisionManager>>,
+    /// individual monitors. Updated at runtime when the desktop app's
+    /// CaptureSession starts/stops; set once at boot for the CLI engine.
+    pub vision_manager: Arc<ArcSwap<Option<Arc<crate::vision_manager::VisionManager>>>>,
 }
 
 pub struct SCServer {
@@ -302,10 +302,10 @@ pub struct SCServer {
     /// Shared high-FPS controller. Set before `start()` so AppState and
     /// the per-monitor capture loops point at the same instance.
     pub high_fps_controller: Option<Arc<crate::high_fps_controller::HighFpsController>>,
-    /// Shared VisionManager. Set before `start()` so the `/vision/device/*`
-    /// routes can pause/resume individual monitors. `None` on vision-disabled
-    /// or headless configs that run no capture.
-    pub vision_manager: Option<Arc<crate::vision_manager::VisionManager>>,
+    /// Handle to the active VisionManager. CaptureSession registers its
+    /// instance here on start and clears on stop so `/vision/device/*` hits
+    /// the manager that is actually capturing.
+    pub vision_manager: Arc<ArcSwap<Option<Arc<crate::vision_manager::VisionManager>>>>,
     /// When true, the timeline / rewind feature is disabled. The server skips
     /// warming the hot frame cache from the DB at startup (the cache is only
     /// read by the timeline streaming endpoint). Set before `start()`.
@@ -404,7 +404,7 @@ impl SCServer {
             oauth_refresher: None,
             external_memory_sync: None,
             high_fps_controller: None,
-            vision_manager: None,
+            vision_manager: Arc::new(ArcSwap::from_pointee(None)),
             timeline_disabled: false,
             advertise_mdns: should_advertise_mdns(addr),
         }
@@ -633,6 +633,12 @@ impl SCServer {
                     }
                 }
             });
+
+            // Permanent subscriber that forwards allowlisted piggyback telemetry
+            // (meeting summaries + mic capture health) from the in-process events
+            // bus to PostHog. Runs in both CLI and app-embedded modes since it's
+            // spawned here rather than gated behind an app websocket connection.
+            crate::piggyback_telemetry::spawn_piggyback_telemetry_forwarder();
         }
 
         // Use pre-set hot frame cache or create a new one, then warm from DB.
@@ -682,10 +688,12 @@ impl SCServer {
                 NonZeroUsize::new(1000).unwrap(),
             )))),
             ws_connection_count: Arc::new(AtomicUsize::new(0)),
-            // Search cache: 1000 entries, 60 second TTL
+            // Search cache: short-lived and intentionally small. Search payloads
+            // can contain large OCR/audio text blobs; the route also skips
+            // caching oversized responses before they reach this cache.
             search_cache: MokaCache::builder()
-                .max_capacity(1000)
-                .time_to_live(Duration::from_secs(60))
+                .max_capacity(128)
+                .time_to_live(Duration::from_secs(30))
                 .build(),
             use_pii_removal: self.use_pii_removal,
             // Cloud search client (disabled by default, can be enabled via API)

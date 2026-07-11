@@ -14,6 +14,7 @@ import { listen } from "@tauri-apps/api/event";
 import { showNotificationPanel } from "@/lib/hooks/use-notification-panel";
 import { showChatWithPrefill } from "@/lib/chat-utils";
 import { localFetch } from "@/lib/api";
+import { routeNotificationDeeplink } from "@/lib/notifications/actions";
 
 // notify_rust on Linux calls block_on for D-Bus inside the tokio runtime,
 // which panics and kills the worker thread. Skip OS notifications on Linux.
@@ -26,13 +27,6 @@ type NotificationRequested = {
   title: string;
   body: string;
 };
-
-function windowForDeeplink(url: string) {
-  return url.startsWith("screenpipe://meeting/") ||
-    url.startsWith("screenpipe://meeting?")
-    ? { Home: { page: "meetings" } }
-    : "Main";
-}
 
 const NotificationHandler: React.FC = () => {
 
@@ -178,10 +172,7 @@ const NotificationHandler: React.FC = () => {
             action.deeplinkUrl;
           if (!url) return;
           if (typeof url === "string" && url.startsWith("screenpipe://")) {
-            await commands.showWindowActivated(windowForDeeplink(url));
-            await new Promise((r) => setTimeout(r, 150));
-            const { emit } = await import("@tauri-apps/api/event");
-            await emit("deep-link-received", url);
+            await routeNotificationDeeplink(url);
           } else {
             const { open } = await import("@tauri-apps/plugin-shell");
             await open(url);
@@ -235,10 +226,7 @@ const NotificationHandler: React.FC = () => {
             // deeplink action below. No-op for the prewarm "+ HD" (no url).
             const noteUrl = action.deeplinkUrl || action.deeplink_url;
             if (typeof noteUrl === "string" && noteUrl.startsWith("screenpipe://")) {
-              await commands.showWindowActivated(windowForDeeplink(noteUrl));
-              await new Promise((r) => setTimeout(r, 150));
-              const { emit } = await import("@tauri-apps/api/event");
-              await emit("deep-link-received", noteUrl);
+              await routeNotificationDeeplink(noteUrl);
             }
           }
           return;
@@ -250,10 +238,7 @@ const NotificationHandler: React.FC = () => {
 
           const deeplink = action.deeplink_url || action.deeplinkUrl;
           if (typeof deeplink === "string" && deeplink.startsWith("screenpipe://")) {
-            await commands.showWindowActivated(windowForDeeplink(deeplink));
-            await new Promise((r) => setTimeout(r, 150));
-            const { emit } = await import("@tauri-apps/api/event");
-            await emit("deep-link-received", deeplink);
+            await routeNotificationDeeplink(deeplink);
           }
           return;
         }
@@ -270,10 +255,7 @@ const NotificationHandler: React.FC = () => {
         // payload still works.
         if ((action.type === "link" || action.type === "deeplink") && action.url) {
           if (typeof action.url === "string" && action.url.startsWith("screenpipe://")) {
-            await commands.showWindowActivated(windowForDeeplink(action.url));
-            await new Promise((r) => setTimeout(r, 150));
-            const { emit } = await import("@tauri-apps/api/event");
-            await emit("deep-link-received", action.url);
+            await routeNotificationDeeplink(action.url);
           } else {
             const { open } = await import("@tauri-apps/plugin-shell");
             await open(action.url);

@@ -6,7 +6,7 @@
 //!
 //! This module is the core of event-driven capture. When an event triggers
 //! (click, app switch, typing pause, etc.), it:
-//! 1. Takes a screenshot
+//! 1. Receives a screenshot from the caller when image capture is enabled
 //! 2. Walks the accessibility tree (in parallel)
 //! 3. Writes the JPEG snapshot to disk
 //! 4. Inserts a frame with accessibility text + snapshot path into the DB
@@ -81,9 +81,10 @@ pub struct CaptureContext<'a> {
     pub languages: Vec<screenpipe_core::Language>,
     /// When Some, this frame references another frame's elements (dedup).
     pub elements_ref_frame_id: Option<i64>,
-    /// When true, skip screenshot acquisition and JPEG encode.
+    /// When true, skip JPEG encode and OCR fallback. The caller also skips
+    /// screenshot acquisition and supplies a tiny placeholder image.
     /// The accessibility tree walk still runs — metadata row is still written.
-    /// Set by AudioPaused and FullPause power profiles.
+    /// Set by AudioPaused / FullPause power profiles and enterprise policy.
     pub screenshot_disabled: bool,
 }
 
@@ -163,19 +164,20 @@ pub async fn paired_capture(
     // which returns non-empty but low-quality text (raw buffer content
     // without visual formatting). For these apps we always run OCR to get
     // proper bounding-box text positions for the selectable overlay.
-    let app_prefers_ocr = ctx.app_name.is_some_and(|name| {
-        let n = name.to_lowercase();
-        // Terminal emulators whose AX text is raw buffer and not useful
-        // for bounding-box overlay. OCR produces better results.
-        // Note: Ghostty, iTerm2, and Terminal.app were removed — they have
-        // full AX support and the thin-detection heuristic handles them
-        // correctly. See https://github.com/screenpipe/screenpipe/issues/2685
-        n.contains("wezterm")
-            || n.contains("alacritty")
-            || n.contains("kitty")
-            || n.contains("hyper")
-            || n.contains("warp")
-    });
+    let app_prefers_ocr = !ctx.screenshot_disabled
+        && ctx.app_name.is_some_and(|name| {
+            let n = name.to_lowercase();
+            // Terminal emulators whose AX text is raw buffer and not useful
+            // for bounding-box overlay. OCR produces better results.
+            // Note: Ghostty, iTerm2, and Terminal.app were removed — they have
+            // full AX support and the thin-detection heuristic handles them
+            // correctly. See https://github.com/screenpipe/screenpipe/issues/2685
+            n.contains("wezterm")
+                || n.contains("alacritty")
+                || n.contains("kitty")
+                || n.contains("hyper")
+                || n.contains("warp")
+        });
     let has_accessibility_text = !app_prefers_ocr
         && tree_snapshot
             .map(|s| !s.text_content.is_empty())
@@ -190,11 +192,15 @@ pub async fn paired_capture(
             .map(|s| a11y_content_is_thin(s, ctx.window_name, ctx.browser_url, ctx.app_name))
             .unwrap_or(false);
 
-    // Run OCR when: forced, no a11y text, app prefers OCR, OR a11y text is thin (hybrid).
+    // Run OCR when screenshots are available and: forced, no a11y text,
+    // app prefers OCR, OR a11y text is thin (hybrid). With screenshots
+    // disabled we keep a11y-only frames and never burn CPU on OCR over a
+    // placeholder image.
     // Time the OCR step so the caller can feed `PipelineMetrics::record_ocr`
     // (ocr_completed / avg_ocr_latency_ms). `ocr_duration_ms` is Some only when
     // OCR actually ran — None when accessibility text was sufficient.
-    let ocr_ran = ctx.force_ocr || !has_accessibility_text || a11y_is_thin;
+    let ocr_ran =
+        !ctx.screenshot_disabled && (ctx.force_ocr || !has_accessibility_text || a11y_is_thin);
     let ocr_started = Instant::now();
     let (ocr_text, ocr_text_json) = if ocr_ran {
         // Windows native OCR is async, so call it directly (not inside spawn_blocking)
@@ -742,6 +748,43 @@ mod tests {
         assert_eq!(result.capture_trigger, "click");
         assert!(result.accessibility_text.is_none());
         assert!(result.text_source.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_paired_capture_screenshot_disabled_skips_snapshot_and_ocr() {
+        let tmp = TempDir::new().unwrap();
+        let snapshot_writer = SnapshotWriter::new(tmp.path(), 80, 1920);
+        let db = DatabaseManager::new("sqlite::memory:", Default::default())
+            .await
+            .unwrap();
+
+        let ctx = CaptureContext {
+            db: &db,
+            snapshot_writer: &snapshot_writer,
+            image: test_image(),
+            captured_at: Utc::now(),
+            monitor_id: 0,
+            device_name: "test_monitor",
+            app_name: Some("TestApp"),
+            window_name: Some("TestWindow"),
+            browser_url: None,
+            document_path: None,
+            focused: true,
+            capture_trigger: "click",
+            use_pii_removal: false,
+            languages: vec![],
+            elements_ref_frame_id: None,
+            screenshot_disabled: true,
+        };
+
+        let result = paired_capture(&ctx, None).await.unwrap();
+
+        assert!(result.frame_id > 0);
+        assert_eq!(result.snapshot_path, "");
+        assert!(result.accessibility_text.is_none());
+        assert!(result.text_source.is_none());
+        assert!(result.ocr_duration_ms.is_none());
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]

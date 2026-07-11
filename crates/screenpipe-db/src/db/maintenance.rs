@@ -173,7 +173,7 @@ impl DatabaseManager {
 
         // 6. Delete orphaned video_chunks (no frames reference them anymore)
         let video_chunks_result = sqlx::query(
-            "DELETE FROM video_chunks WHERE id NOT IN (SELECT DISTINCT video_chunk_id FROM frames)",
+            "DELETE FROM video_chunks WHERE id NOT IN (SELECT DISTINCT video_chunk_id FROM frames WHERE video_chunk_id IS NOT NULL)",
         )
         .execute(&mut **tx.conn())
         .await?;
@@ -190,7 +190,7 @@ impl DatabaseManager {
 
         // 8. Delete orphaned audio_chunks — audio_tags CASCADE'd automatically
         let audio_chunks_result = sqlx::query(
-            "DELETE FROM audio_chunks WHERE id NOT IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions)",
+            "DELETE FROM audio_chunks WHERE id NOT IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions WHERE audio_chunk_id IS NOT NULL)",
         )
         .execute(&mut **tx.conn())
         .await?;
@@ -207,6 +207,22 @@ impl DatabaseManager {
                 .execute(&mut **tx.conn())
                 .await?;
         let ui_events_deleted = ui_events_result.rows_affected();
+
+        // display_layout follows user deletions instead of living forever
+        // (rows carry personal device names) — but KEEP the newest snapshot
+        // in range: consumers resolve "layout at time T" as the latest row
+        // <= T, so the newest in-range row still describes the arrangement
+        // in effect for everything retained after the range.
+        sqlx::query(
+            r#"DELETE FROM display_layout WHERE timestamp BETWEEN ?1 AND ?2
+               AND id NOT IN (SELECT id FROM display_layout
+                              WHERE timestamp BETWEEN ?1 AND ?2
+                              ORDER BY timestamp DESC, id DESC LIMIT 1)"#,
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .execute(&mut **tx.conn())
+        .await?;
 
         // 11. Commit — if this fails, no files are touched (auto-rollback)
         tx.commit().await.map_err(|e| {
@@ -361,7 +377,7 @@ impl DatabaseManager {
 
         // 8. Delete orphaned video_chunks
         let video_chunks_result = sqlx::query(
-            "DELETE FROM video_chunks WHERE id NOT IN (SELECT DISTINCT video_chunk_id FROM frames)",
+            "DELETE FROM video_chunks WHERE id NOT IN (SELECT DISTINCT video_chunk_id FROM frames WHERE video_chunk_id IS NOT NULL)",
         )
         .execute(&mut **tx.conn())
         .await?;
@@ -378,7 +394,7 @@ impl DatabaseManager {
 
         // 10. Delete orphaned audio_chunks
         let audio_chunks_result = sqlx::query(
-            "DELETE FROM audio_chunks WHERE id NOT IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions)",
+            "DELETE FROM audio_chunks WHERE id NOT IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions WHERE audio_chunk_id IS NOT NULL)",
         )
         .execute(&mut **tx.conn())
         .await?;
@@ -395,6 +411,22 @@ impl DatabaseManager {
                 .execute(&mut **tx.conn())
                 .await?;
         let ui_events_deleted = ui_events_result.rows_affected();
+
+        // display_layout follows user deletions instead of living forever
+        // (rows carry personal device names) — but KEEP the newest snapshot
+        // in range: consumers resolve "layout at time T" as the latest row
+        // <= T, so the newest in-range row still describes the arrangement
+        // in effect for everything retained after the range.
+        sqlx::query(
+            r#"DELETE FROM display_layout WHERE timestamp BETWEEN ?1 AND ?2
+               AND id NOT IN (SELECT id FROM display_layout
+                              WHERE timestamp BETWEEN ?1 AND ?2
+                              ORDER BY timestamp DESC, id DESC LIMIT 1)"#,
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .execute(&mut **tx.conn())
+        .await?;
 
         // 12. Commit — if this fails, no files are touched
         tx.commit().await.map_err(|e| {
@@ -491,15 +523,23 @@ impl DatabaseManager {
         .fetch_all(&mut **tx.conn())
         .await?;
 
-        // Mark video_chunks as evicted (file_path -> '', evicted_at -> now)
+        // Mark video_chunks as evicted (file_path -> '', evicted_at -> now).
+        // Both video_chunk_id columns below must exclude NULLs from the
+        // anti-join subquery: `x NOT IN (set containing NULL)` evaluates to
+        // NULL (not TRUE) for every row in SQL's three-valued logic, so a
+        // single frame outside the range with a NULL video_chunk_id would
+        // silently zero out every match and the UPDATE would never fire —
+        // the same trap the SELECT above already guards against.
         let video_evict = sqlx::query(
             r#"UPDATE video_chunks
                SET file_path = '', evicted_at = CURRENT_TIMESTAMP
                WHERE evicted_at IS NULL
                AND file_path != ''
                AND file_path NOT LIKE 'cloud://%'
-               AND id IN (SELECT DISTINCT video_chunk_id FROM frames WHERE timestamp BETWEEN ?1 AND ?2)
-               AND id NOT IN (SELECT DISTINCT video_chunk_id FROM frames WHERE timestamp NOT BETWEEN ?1 AND ?2)"#,
+               AND id IN (SELECT DISTINCT video_chunk_id FROM frames
+                          WHERE timestamp BETWEEN ?1 AND ?2 AND video_chunk_id IS NOT NULL)
+               AND id NOT IN (SELECT DISTINCT video_chunk_id FROM frames
+                              WHERE timestamp NOT BETWEEN ?1 AND ?2 AND video_chunk_id IS NOT NULL)"#,
         )
         .bind(&start_str)
         .bind(&end_str)
@@ -512,8 +552,10 @@ impl DatabaseManager {
                WHERE evicted_at IS NULL
                AND file_path != ''
                AND file_path NOT LIKE 'cloud://%'
-               AND id IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions WHERE timestamp BETWEEN ?1 AND ?2)
-               AND id NOT IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions WHERE timestamp NOT BETWEEN ?1 AND ?2)"#,
+               AND id IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions
+                          WHERE timestamp BETWEEN ?1 AND ?2 AND audio_chunk_id IS NOT NULL)
+               AND id NOT IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions
+                              WHERE timestamp NOT BETWEEN ?1 AND ?2 AND audio_chunk_id IS NOT NULL)"#,
         )
         .bind(&start_str)
         .bind(&end_str)
@@ -669,6 +711,22 @@ impl DatabaseManager {
                 .await?;
         let ui_events_deleted = ui_events_result.rows_affected();
 
+        // display_layout follows user deletions instead of living forever
+        // (rows carry personal device names) — but KEEP the newest snapshot
+        // in range: consumers resolve "layout at time T" as the latest row
+        // <= T, so the newest in-range row still describes the arrangement
+        // in effect for everything retained after the range.
+        sqlx::query(
+            r#"DELETE FROM display_layout WHERE timestamp BETWEEN ?1 AND ?2
+               AND id NOT IN (SELECT id FROM display_layout
+                              WHERE timestamp BETWEEN ?1 AND ?2
+                              ORDER BY timestamp DESC, id DESC LIMIT 1)"#,
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .execute(&mut **tx.conn())
+        .await?;
+
         tx.commit().await.map_err(|e| {
             error!(
                 "failed to commit strip_heavy_text_in_range transaction: {}",
@@ -701,13 +759,20 @@ impl DatabaseManager {
         let start_str = start.to_rfc3339();
         let end_str = end.to_rfc3339();
 
+        // Same NULL-guard as evict_media_in_range (#4843): frames.video_chunk_id
+        // is nullable, so the anti-join subquery must exclude NULLs or a single
+        // out-of-range snapshot frame silently zeroes out this whole estimate —
+        // the retention settings UI would show "0 bytes reclaimable" even when
+        // eviction would free real space.
         let mut paths: Vec<String> = sqlx::query_scalar(
             r#"SELECT file_path FROM video_chunks
                WHERE evicted_at IS NULL
                AND file_path != ''
                AND file_path NOT LIKE 'cloud://%'
-               AND id IN (SELECT DISTINCT video_chunk_id FROM frames WHERE timestamp BETWEEN ?1 AND ?2)
-               AND id NOT IN (SELECT DISTINCT video_chunk_id FROM frames WHERE timestamp NOT BETWEEN ?1 AND ?2)"#,
+               AND id IN (SELECT DISTINCT video_chunk_id FROM frames
+                          WHERE timestamp BETWEEN ?1 AND ?2 AND video_chunk_id IS NOT NULL)
+               AND id NOT IN (SELECT DISTINCT video_chunk_id FROM frames
+                              WHERE timestamp NOT BETWEEN ?1 AND ?2 AND video_chunk_id IS NOT NULL)"#,
         )
         .bind(&start_str)
         .bind(&end_str)
@@ -719,8 +784,10 @@ impl DatabaseManager {
                WHERE evicted_at IS NULL
                AND file_path != ''
                AND file_path NOT LIKE 'cloud://%'
-               AND id IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions WHERE timestamp BETWEEN ?1 AND ?2)
-               AND id NOT IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions WHERE timestamp NOT BETWEEN ?1 AND ?2)"#,
+               AND id IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions
+                          WHERE timestamp BETWEEN ?1 AND ?2 AND audio_chunk_id IS NOT NULL)
+               AND id NOT IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions
+                              WHERE timestamp NOT BETWEEN ?1 AND ?2 AND audio_chunk_id IS NOT NULL)"#,
         )
         .bind(&start_str)
         .bind(&end_str)
@@ -779,18 +846,26 @@ impl DatabaseManager {
         .fetch_all(&mut **tx.conn())
         .await?;
 
-        // Collect video files that are fully within this batch (all frames in chunk are in range)
+        // Collect video files that are fully within this batch (all frames in chunk are in range).
+        // NULL-guard the anti-join subqueries — same trap as evict_media_in_range
+        // (#4843): frames.video_chunk_id is nullable, and an unguarded
+        // `NOT IN (SELECT ... WHERE timestamp NOT BETWEEN ...)` is poisoned by
+        // any out-of-range snapshot frame, silently returning zero files.
         let video_query = if collect_all_files {
             // Local retention: collect all files regardless of cloud status
             r#"SELECT file_path FROM video_chunks
-               WHERE id IN (SELECT DISTINCT video_chunk_id FROM frames WHERE timestamp BETWEEN ?1 AND ?2)
-               AND id NOT IN (SELECT DISTINCT video_chunk_id FROM frames WHERE timestamp NOT BETWEEN ?1 AND ?2)
+               WHERE id IN (SELECT DISTINCT video_chunk_id FROM frames
+                            WHERE timestamp BETWEEN ?1 AND ?2 AND video_chunk_id IS NOT NULL)
+               AND id NOT IN (SELECT DISTINCT video_chunk_id FROM frames
+                              WHERE timestamp NOT BETWEEN ?1 AND ?2 AND video_chunk_id IS NOT NULL)
                AND file_path NOT LIKE 'cloud://%'"#
         } else {
             // Archive: only collect cloud-uploaded files
             r#"SELECT file_path FROM video_chunks
-               WHERE id IN (SELECT DISTINCT video_chunk_id FROM frames WHERE timestamp BETWEEN ?1 AND ?2)
-               AND id NOT IN (SELECT DISTINCT video_chunk_id FROM frames WHERE timestamp NOT BETWEEN ?1 AND ?2)
+               WHERE id IN (SELECT DISTINCT video_chunk_id FROM frames
+                            WHERE timestamp BETWEEN ?1 AND ?2 AND video_chunk_id IS NOT NULL)
+               AND id NOT IN (SELECT DISTINCT video_chunk_id FROM frames
+                              WHERE timestamp NOT BETWEEN ?1 AND ?2 AND video_chunk_id IS NOT NULL)
                AND (cloud_blob_id IS NOT NULL OR file_path LIKE 'cloud://%')"#
         };
         let video_files: Vec<String> = sqlx::query_scalar(video_query)
@@ -802,8 +877,10 @@ impl DatabaseManager {
         // Collect audio files
         let audio_files: Vec<String> = sqlx::query_scalar(
             r#"SELECT file_path FROM audio_chunks
-               WHERE id IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions WHERE timestamp BETWEEN ?1 AND ?2)
-               AND id NOT IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions WHERE timestamp NOT BETWEEN ?1 AND ?2)
+               WHERE id IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions
+                            WHERE timestamp BETWEEN ?1 AND ?2 AND audio_chunk_id IS NOT NULL)
+               AND id NOT IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions
+                              WHERE timestamp NOT BETWEEN ?1 AND ?2 AND audio_chunk_id IS NOT NULL)
                AND file_path NOT LIKE 'cloud://%'"#,
         )
         .bind(&start_str)
@@ -901,6 +978,22 @@ impl DatabaseManager {
                 .await?;
         let ui_events_deleted = ui_events_result.rows_affected();
 
+        // display_layout follows user deletions instead of living forever
+        // (rows carry personal device names) — but KEEP the newest snapshot
+        // in range: consumers resolve "layout at time T" as the latest row
+        // <= T, so the newest in-range row still describes the arrangement
+        // in effect for everything retained after the range.
+        sqlx::query(
+            r#"DELETE FROM display_layout WHERE timestamp BETWEEN ?1 AND ?2
+               AND id NOT IN (SELECT id FROM display_layout
+                              WHERE timestamp BETWEEN ?1 AND ?2
+                              ORDER BY timestamp DESC, id DESC LIMIT 1)"#,
+        )
+        .bind(&start_str)
+        .bind(&end_str)
+        .execute(&mut **tx.conn())
+        .await?;
+
         tx.commit().await.map_err(|e| {
             error!(
                 "failed to commit delete_time_range_batch transaction: {}",
@@ -935,14 +1028,14 @@ impl DatabaseManager {
         let mut tx = self.begin_immediate_with_retry().await?;
 
         let video_chunks_result = sqlx::query(
-            "DELETE FROM video_chunks WHERE id NOT IN (SELECT DISTINCT video_chunk_id FROM frames)",
+            "DELETE FROM video_chunks WHERE id NOT IN (SELECT DISTINCT video_chunk_id FROM frames WHERE video_chunk_id IS NOT NULL)",
         )
         .execute(&mut **tx.conn())
         .await?;
         let video_chunks_deleted = video_chunks_result.rows_affected();
 
         let audio_chunks_result = sqlx::query(
-            "DELETE FROM audio_chunks WHERE id NOT IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions)",
+            "DELETE FROM audio_chunks WHERE id NOT IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions WHERE audio_chunk_id IS NOT NULL)",
         )
         .execute(&mut **tx.conn())
         .await?;
@@ -1010,7 +1103,7 @@ impl DatabaseManager {
 
         // 3. Delete orphaned video_chunks (cloud:// placeholders from sync)
         let video_chunks_result = sqlx::query(
-            "DELETE FROM video_chunks WHERE machine_id = ?1 AND id NOT IN (SELECT DISTINCT video_chunk_id FROM frames)",
+            "DELETE FROM video_chunks WHERE machine_id = ?1 AND id NOT IN (SELECT DISTINCT video_chunk_id FROM frames WHERE video_chunk_id IS NOT NULL)",
         )
         .bind(machine_id)
         .execute(&mut **tx.conn())
@@ -1028,7 +1121,7 @@ impl DatabaseManager {
 
         // 5. Delete orphaned audio_chunks from this machine (audio_tags CASCADE automatically)
         let audio_chunks_result = sqlx::query(
-            "DELETE FROM audio_chunks WHERE machine_id = ?1 AND id NOT IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions)",
+            "DELETE FROM audio_chunks WHERE machine_id = ?1 AND id NOT IN (SELECT DISTINCT audio_chunk_id FROM audio_transcriptions WHERE audio_chunk_id IS NOT NULL)",
         )
         .bind(machine_id)
         .execute(&mut **tx.conn())
@@ -1225,7 +1318,10 @@ impl DatabaseManager {
         let restore_steps = [
             "PRAGMA synchronous = NORMAL;",
             "PRAGMA journal_mode = WAL;",
-            "PRAGMA wal_autocheckpoint = 1000;",
+            // 0 = no inline auto-checkpoint (matches WAL_SAFETY_PRAGMAS); the
+            // maintenance task owns checkpointing. Must NOT re-enable inline
+            // auto-checkpoint here or a repaired DB re-opens the corruption path.
+            "PRAGMA wal_autocheckpoint = 0;",
             "PRAGMA cache_size = -2000;", // Back to 2MB cache
             "PRAGMA locking_mode = NORMAL;",
             "PRAGMA busy_timeout = 5000;", // Back to 5s timeout
@@ -1259,14 +1355,44 @@ impl DatabaseManager {
         }
     }
 
-    /// Spawn a background task that runs `PRAGMA wal_checkpoint(TRUNCATE)` every 5 minutes.
-    /// This prevents unbounded WAL growth when long-running readers block auto-checkpoint.
+    /// Spawn the background task that owns ALL WAL checkpointing.
+    ///
+    /// Since `wal_autocheckpoint = 0` (see [`WAL_SAFETY_PRAGMAS`]) no committing
+    /// connection ever checkpoints inline — that under-load path could copy a
+    /// desynced `-shm` frame onto the wrong main-DB page. This task is therefore
+    /// the SOLE checkpointer, and it must (a) run often enough to keep the WAL
+    /// small and (b) never let the WAL grow without bound when readers keep a
+    /// plain `TRUNCATE` busy. It does a normal `TRUNCATE` each tick, and if the
+    /// WAL is over a hard page cap while still busy it escalates to the
+    /// serialized exclusive checkpoint (hold the single write permit so writers
+    /// queue, bump `busy_timeout` to wait out short-lived readers) — the same
+    /// reliable mechanism `compact()` uses. That escalation is the ceiling that
+    /// keeps `autocheckpoint = 0` from trading the corruption cliff for an
+    /// unbounded-WAL cliff on the heaviest install.
     pub fn start_wal_maintenance(&self) {
         let pool = self.pool.clone();
+        let shutdown = self.close_token.clone();
+        let write_semaphore = std::sync::Arc::clone(&self.write_semaphore);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            // 60s (not 300s): with inline auto-checkpoint off, the WAL grows for
+            // the whole interval between ticks, so check more often to keep it
+            // small under sustained write load.
+            const INTERVAL: Duration = Duration::from_secs(60);
+            // ~40k pages * 4KB ≈ 160MB. Above this we force the checkpoint
+            // through rather than tolerate more growth.
+            const WAL_HARD_CAP_PAGES: i32 = 40_000;
+            let mut interval = tokio::time::interval(INTERVAL);
             loop {
-                interval.tick().await;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    // Exit on DatabaseManager::close() — this task's pool clone
+                    // would otherwise keep SQLite connections (and the shared
+                    // -shm WAL-index) alive across an engine restart.
+                    _ = shutdown.cancelled() => {
+                        debug!("wal maintenance: shutting down");
+                        return;
+                    }
+                }
                 match sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
                     .fetch_one(&pool)
                     .await
@@ -1275,8 +1401,45 @@ impl DatabaseManager {
                         let busy: i32 = row.get(0);
                         let log_pages: i32 = row.get(1);
                         let checkpointed: i32 = row.get(2);
-                        if busy == 1 {
+                        if busy == 1 && log_pages > WAL_HARD_CAP_PAGES {
+                            // Readers kept the plain TRUNCATE busy and the WAL is
+                            // over the cap. Force it: hold the single write
+                            // permit (writers queue — a brief pause, like the
+                            // compact path) and wait out short-lived readers.
                             warn!(
+                                "wal checkpoint: busy with {} pages (> {} cap) — forcing exclusive checkpoint",
+                                log_pages, WAL_HARD_CAP_PAGES
+                            );
+                            let _write_guard = write_semaphore.acquire().await.ok();
+                            match pool.acquire().await {
+                                Ok(mut conn) => {
+                                    let _ = sqlx::query("PRAGMA busy_timeout = 60000")
+                                        .execute(&mut *conn)
+                                        .await;
+                                    match sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+                                        .fetch_one(&mut *conn)
+                                        .await
+                                    {
+                                        Ok(r2) => {
+                                            let b2: i32 = r2.get(0);
+                                            let lp2: i32 = r2.get(1);
+                                            warn!(
+                                                "forced wal checkpoint done: busy={}, {} pages remain",
+                                                b2, lp2
+                                            );
+                                        }
+                                        Err(e) => warn!("forced wal checkpoint failed: {}", e),
+                                    }
+                                    // Restore the default busy_timeout before the
+                                    // connection returns to the pool.
+                                    let _ = sqlx::query("PRAGMA busy_timeout = 5000")
+                                        .execute(&mut *conn)
+                                        .await;
+                                }
+                                Err(e) => warn!("forced wal checkpoint: acquire failed: {}", e),
+                            }
+                        } else if busy == 1 {
+                            debug!(
                                 "wal checkpoint: busy (could not truncate), {} pages in WAL",
                                 log_pages
                             );

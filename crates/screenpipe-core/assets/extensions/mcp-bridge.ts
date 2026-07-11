@@ -115,7 +115,7 @@ export default function (pi: ExtensionAPI) {
         if (targets.length === 0) {
           const text = params.server_id
             ? `No enabled MCP server with id="${params.server_id}".`
-            : "No MCP servers are registered. Ask the user to add one in Settings → Connections → Custom MCP Server.";
+            : "No MCP servers are registered. Ask the user to add one from the Connections page in the desktop app under Custom MCP Server.";
           return { content: [{ type: "text" as const, text }] };
         }
 

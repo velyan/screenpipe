@@ -47,8 +47,30 @@ mod tests {
             element_description: None,
             element_automation_id: None,
             element_bounds: None,
+            element_ancestors: None,
             frame_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn element_ancestors_round_trips_through_batch_insert() {
+        let db = setup_test_db().await;
+        let mut ev = text_event(0, "click carrier");
+        ev.event_type = UiEventType::Click;
+        ev.text_content = None;
+        ev.element_ancestors =
+            Some(r#"[{"role":"AXWindow","name":"Inbox"},{"role":"AXGroup"}]"#.to_string());
+        db.insert_ui_events_batch(&[ev]).await.unwrap();
+
+        let (stored,): (Option<String>,) =
+            sqlx::query_as("SELECT element_ancestors FROM ui_events LIMIT 1")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some(r#"[{"role":"AXWindow","name":"Inbox"},{"role":"AXGroup"}]"#)
+        );
     }
 
     #[tokio::test]

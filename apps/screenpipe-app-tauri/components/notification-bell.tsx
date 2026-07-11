@@ -175,12 +175,24 @@ export function NotificationBell() {
 
   const unreadCount = history.filter((n) => !n.read).length;
 
-  const markAllRead = async () => {
-    setHistory((prev) => prev.map((n) => ({ ...n, read: true })));
+  // Mark a single notification read once the user actually engages with it
+  // (expands it). Opening the bell no longer blanket-marks everything read —
+  // glancing at the bell shouldn't clear unread state you never looked at.
+  const markRead = useCallback(async (id: string) => {
+    let wasUnread = false;
+    setHistory((prev) =>
+      prev.map((n) => {
+        if (n.id === id && !n.read) wasUnread = true;
+        return n.id === id ? { ...n, read: true } : n;
+      }),
+    );
+    if (!wasUnread) return;
     try {
-      await notificationFetch("/notifications", { method: "POST" });
+      await notificationFetch(`/notifications/${encodeURIComponent(id)}/read`, {
+        method: "POST",
+      });
     } catch {}
-  };
+  }, []);
 
   const clearAll = async () => {
     posthog.capture("notification_bell_clear_all", { count: history.length });
@@ -275,7 +287,6 @@ export function NotificationBell() {
             unread_count: unreadCount,
             total_count: history.length,
           });
-          markAllRead();
         }
       }}
     >
@@ -355,6 +366,7 @@ export function NotificationBell() {
                       const willExpand = !isExpanded;
                       setExpandedId(willExpand ? entry.id : null);
                       if (willExpand) {
+                        markRead(entry.id);
                         posthog.capture("notification_bell_expand", {
                           notification_type: entry.type,
                           pipe_name: entry.pipe_name,
@@ -367,6 +379,7 @@ export function NotificationBell() {
                       e.preventDefault();
                       const willExpand = !isExpanded;
                       setExpandedId(willExpand ? entry.id : null);
+                      if (willExpand) markRead(entry.id);
                     }}
                   >
                     <div className="flex items-start justify-between gap-2">

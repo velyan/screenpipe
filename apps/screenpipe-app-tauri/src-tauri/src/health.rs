@@ -206,6 +206,9 @@ pub struct DeviceInfo {
     pub kind: DeviceKind,
     pub active: bool,
     pub last_seen_secs_ago: u64,
+    /// Numeric monitor id from `/vision/device/status`. Present only when the
+    /// sidecar exposes per-display pause; absent on older engines (display-only).
+    pub monitor_id: Option<u32>,
 }
 
 /// Full recording info including per-device status
@@ -256,6 +259,32 @@ pub fn get_audio_device_status() -> Vec<AudioDeviceEntry> {
 
 pub fn set_audio_device_status(devices: Vec<AudioDeviceEntry>) {
     let mut guard = AUDIO_DEVICE_STATUS
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    *guard = devices;
+}
+
+/// Cached vision/monitor device status from `/vision/device/status`.
+/// Updated by the health polling loop so the tray can toggle displays without blocking.
+#[derive(Clone, Debug)]
+pub struct VisionDeviceEntry {
+    pub id: u32,
+    pub name: String,
+    pub user_disabled: bool,
+}
+
+static VISION_DEVICE_STATUS: Lazy<RwLock<Vec<VisionDeviceEntry>>> =
+    Lazy::new(|| RwLock::new(Vec::new()));
+
+pub fn get_vision_device_status() -> Vec<VisionDeviceEntry> {
+    VISION_DEVICE_STATUS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+pub fn set_vision_device_status(devices: Vec<VisionDeviceEntry>) {
+    let mut guard = VISION_DEVICE_STATUS
         .write()
         .unwrap_or_else(|e| e.into_inner());
     *guard = devices;
@@ -551,14 +580,22 @@ fn respawn_engine_if_crashed(
     *last_restart_triggered = Some(now);
     let app_for_respawn = app.clone();
     tokio::spawn(async move {
-        if let Err(e) = crate::recording::spawn_screenpipe(
+        match crate::recording::spawn_screenpipe(
             app_for_respawn.state::<crate::recording::RecordingState>(),
             app_for_respawn.clone(),
             None,
         )
         .await
         {
-            warn!("engine auto-respawn failed: {}", e);
+            Ok(()) => crate::db_relaunch::reset_db_boot_failures(),
+            Err(e) => {
+                warn!("engine auto-respawn failed: {}", e);
+                // Repeated DB-init failures mean a poisoned WAL-index pinned
+                // by a leaked connection — unrecoverable in-process. Surface
+                // manual recovery instead of looping a doomed respawn every 5
+                // minutes forever (2026-07-02).
+                crate::db_relaunch::note_respawn_failure(&app_for_respawn, &e).await;
+            }
         }
     });
 }
@@ -601,6 +638,7 @@ fn apply_capture_session_status(
     capture_running: Option<bool>,
     start_in_progress: bool,
     schedule_paused: bool,
+    capture_intended: bool,
 ) -> RecordingStatus {
     if !server_responding {
         return base_status;
@@ -625,7 +663,20 @@ fn apply_capture_session_status(
     }
 
     match capture_running {
-        Some(false) => RecordingStatus::Paused,
+        // Capture handle reads absent. Distinguish a real user pause from a
+        // handle/engine desync using capture intent (`wants_recording`), the
+        // same signal the crash watchdog uses to tell a deliberate stop from a
+        // crash:
+        //   - intent OFF → the user stopped capture (tray/shortcut "stop
+        //     recording", which keeps the server up) → honest Paused.
+        //   - intent ON  → the local handle is stale while the engine is
+        //     healthy and /health already derived Recording. Happens when
+        //     capture is torn down and re-spawned out-of-band (audio-toggle
+        //     restart, health-watchdog engine respawn) without the handle being
+        //     re-stored, or when `capture.try_lock()` briefly contends. Trust
+        //     /health instead of pinning the tray on Paused/"Starting…" forever
+        //     (2026-06-11 device 40af21d0, 2026-07-03 enterprise field reports).
+        Some(false) if !capture_intended => RecordingStatus::Paused,
         _ => base_status,
     }
 }
@@ -666,6 +717,7 @@ fn parse_devices_from_health(health_result: &Result<HealthCheckResponse>) -> Vec
                 kind: DeviceKind::Monitor,
                 active: health.frame_status.as_deref() == Some("ok"),
                 last_seen_secs_ago: 0,
+                monitor_id: None,
             });
         }
     }
@@ -711,6 +763,7 @@ fn parse_devices_from_health(health_result: &Result<HealthCheckResponse>) -> Vec
                 kind,
                 active,
                 last_seen_secs_ago: last_seen,
+                monitor_id: None,
             });
         }
     }
@@ -802,20 +855,29 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
                 current_status,
             );
 
-            let (capture_running, start_in_progress_raw) = if let Some(recording_state) =
-                app.try_state::<crate::recording::RecordingState>()
-            {
-                let start_in_progress = recording_state.is_starting.load(Ordering::SeqCst)
-                    || recording_state.is_starting_capture.load(Ordering::SeqCst);
-                let capture_running = recording_state
-                    .capture
-                    .try_lock()
-                    .ok()
-                    .map(|capture| capture.is_some());
-                (capture_running, start_in_progress)
-            } else {
-                (None, false)
-            };
+            let (capture_running, start_in_progress_raw, capture_intended) =
+                if let Some(recording_state) =
+                    app.try_state::<crate::recording::RecordingState>()
+                {
+                    let start_in_progress = recording_state.is_starting.load(Ordering::SeqCst)
+                        || recording_state.is_starting_capture.load(Ordering::SeqCst);
+                    let capture_running = recording_state
+                        .capture
+                        .try_lock()
+                        .ok()
+                        .map(|capture| capture.is_some());
+                    // Source of truth for "the user wants capture on" — lets the
+                    // tray tell a deliberate pause (intent OFF → Paused) from a
+                    // handle desync while the engine is healthy (intent ON →
+                    // trust /health, don't stick on "Starting…"/Paused).
+                    (
+                        capture_running,
+                        start_in_progress,
+                        recording_state.capture_intended(),
+                    )
+                } else {
+                    (None, false, false)
+                };
             // Clamp the flag so a leaked atomic / contended capture lock can't
             // pin the tray on "Starting…" forever while capture is actually
             // flowing (see START_PIN_CEILING).
@@ -848,6 +910,7 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
                 capture_running,
                 start_in_progress,
                 schedule_paused,
+                capture_intended,
             );
 
             // Bring the embedded engine back if it has crashed while capture
@@ -873,38 +936,9 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
             // returns stale results. The app now subscribes to `permission_lost`
             // / `permission_restored` events via /ws/events (see engine_events.rs).
 
-            // Parse device info from health response, filtered by monitor settings
+            // Parse device info from health response; monitor allowlist applied
+            // after vision status replaces monitor rows (below).
             let mut devices = parse_devices_from_health(&health_result);
-
-            // Filter monitors to only show actively recording ones
-            if let Ok(Some(store)) = crate::store::SettingsStore::get(&app) {
-                if !store.recording.use_all_monitors
-                    && !store.recording.monitor_ids.is_empty()
-                    && store.recording.monitor_ids != vec!["default".to_string()]
-                {
-                    devices.retain(|d| {
-                        if d.kind != DeviceKind::Monitor {
-                            return true;
-                        }
-                        store.recording.monitor_ids.iter().any(|allowed| {
-                            // Stable ID format: "Display 3_1920x1080_0,0"
-                            // Extract name prefix before last '_' (position coords)
-                            let allowed_name = allowed.rsplitn(2, '_').last().unwrap_or(allowed);
-                            // Health monitor format: "Display 3 (1920x1080)"
-                            // Extract just the display name
-                            let health_name = d.name.split(" (").next().unwrap_or(&d.name);
-                            let allowed_short =
-                                allowed_name.split('_').next().unwrap_or(allowed_name);
-                            // Also match numeric monitor IDs from CLI -m flag
-                            // e.g. allowed="3" should match health_name="Display 3"
-                            let numeric_match = health_name
-                                .strip_prefix("Display ")
-                                .map_or(false, |id| id == *allowed);
-                            health_name == allowed_short || numeric_match
-                        })
-                    });
-                }
-            }
 
             // Fetch all audio devices (including user-disabled) for tray display
             let api = local_api_context_from_app(&app);
@@ -954,12 +988,88 @@ pub async fn start_health_check(app: tauri::AppHandle) -> Result<()> {
                                     kind,
                                     active: false,
                                     last_seen_secs_ago: 0,
+                                    monitor_id: None,
                                 });
                             }
                         }
                     }
 
                     set_audio_device_status(entries);
+                }
+            }
+
+            // Per-monitor vision status — replaces health-derived monitor rows when
+            // available so the tray can toggle individual displays.
+            match api
+                .apply_auth(
+                    reqwest::Client::new().get(api.url("/vision/device/status")),
+                )
+                .send()
+                .await
+            {
+                Ok(res) if res.status().is_success() => {
+                    if let Ok(devs) = res.json::<Vec<serde_json::Value>>().await {
+                        if devs.is_empty() {
+                            set_vision_device_status(Vec::new());
+                        } else {
+                            devices.retain(|d| d.kind != DeviceKind::Monitor);
+                            let mut vision_entries = Vec::new();
+                            for d in &devs {
+                                let id = d["id"].as_u64().unwrap_or(0) as u32;
+                                let name = d["name"].as_str().unwrap_or("").to_string();
+                                let user_disabled =
+                                    d["user_disabled"].as_bool().unwrap_or(false);
+                                vision_entries.push(VisionDeviceEntry {
+                                    id,
+                                    name: name.clone(),
+                                    user_disabled,
+                                });
+                                devices.push(DeviceInfo {
+                                    name,
+                                    kind: DeviceKind::Monitor,
+                                    active: !user_disabled,
+                                    last_seen_secs_ago: 0,
+                                    monitor_id: Some(id),
+                                });
+                            }
+                            set_vision_device_status(vision_entries);
+                        }
+                    } else {
+                        set_vision_device_status(Vec::new());
+                    }
+                }
+                _ => {
+                    set_vision_device_status(Vec::new());
+                }
+            }
+
+            // Filter monitors to only show those selected in recording settings.
+            if let Ok(Some(store)) = crate::store::SettingsStore::get(&app) {
+                if !store.recording.use_all_monitors
+                    && !store.recording.monitor_ids.is_empty()
+                    && store.recording.monitor_ids != vec!["default".to_string()]
+                {
+                    devices.retain(|d| {
+                        if d.kind != DeviceKind::Monitor {
+                            return true;
+                        }
+                        store.recording.monitor_ids.iter().any(|allowed| {
+                            // Stable ID format: "Display 3_1920x1080_0,0"
+                            // Extract name prefix before last '_' (position coords)
+                            let allowed_name = allowed.rsplitn(2, '_').last().unwrap_or(allowed);
+                            // Health monitor format: "Display 3 (1920x1080)"
+                            // Extract just the display name
+                            let health_name = d.name.split(" (").next().unwrap_or(&d.name);
+                            let allowed_short =
+                                allowed_name.split('_').next().unwrap_or(allowed_name);
+                            // Also match numeric monitor IDs from CLI -m flag
+                            // e.g. allowed="3" should match health_name="Display 3"
+                            let numeric_match = health_name
+                                .strip_prefix("Display ")
+                                .map_or(false, |id| id == *allowed);
+                            health_name == allowed_short || numeric_match
+                        })
+                    });
                 }
             }
 
@@ -1550,37 +1660,218 @@ mod tests {
 
     #[test]
     fn test_capture_absent_with_live_server_is_paused() {
-        let status =
-            apply_capture_session_status(RecordingStatus::Recording, true, Some(false), false, false);
+        // Genuine user pause: handle absent AND intent OFF → honest Paused.
+        let status = apply_capture_session_status(
+            RecordingStatus::Recording,
+            true,
+            Some(false),
+            false,
+            false,
+            false, // capture_intended = false (user stopped capture)
+        );
         assert_eq!(status, RecordingStatus::Paused);
     }
 
     #[test]
     fn test_capture_absent_while_starting_stays_starting() {
-        let status =
-            apply_capture_session_status(RecordingStatus::Recording, true, Some(false), true, false);
+        // Start flag asserted (intent ON while starting) → Starting wins over
+        // both the Paused and the desync branches.
+        let status = apply_capture_session_status(
+            RecordingStatus::Recording,
+            true,
+            Some(false),
+            true,
+            false,
+            true,
+        );
         assert_eq!(status, RecordingStatus::Starting);
     }
 
     #[test]
     fn test_capture_status_does_not_mask_connection_error() {
-        let status =
-            apply_capture_session_status(RecordingStatus::Stopped, false, Some(false), false, false);
+        let status = apply_capture_session_status(
+            RecordingStatus::Stopped,
+            false,
+            Some(false),
+            false,
+            false,
+            true,
+        );
         assert_eq!(status, RecordingStatus::Stopped);
     }
 
     #[test]
     fn test_running_capture_keeps_recording_status() {
-        let status =
-            apply_capture_session_status(RecordingStatus::Recording, true, Some(true), false, false);
+        let status = apply_capture_session_status(
+            RecordingStatus::Recording,
+            true,
+            Some(true),
+            false,
+            false,
+            true,
+        );
         assert_eq!(status, RecordingStatus::Recording);
     }
 
     #[test]
     fn test_running_capture_wins_over_stale_starting_flag() {
-        let status =
-            apply_capture_session_status(RecordingStatus::Recording, true, Some(true), true, false);
+        let status = apply_capture_session_status(
+            RecordingStatus::Recording,
+            true,
+            Some(true),
+            true,
+            false,
+            true,
+        );
         assert_eq!(status, RecordingStatus::Recording);
+    }
+
+    // ── Capture-intent desync (the "stuck on Starting…" tray bug) ───────────
+    //
+    // Field report (2026-07-03, Windows enterprise): after toggling audio the
+    // engine restarted, the app's in-memory `capture` handle was left None
+    // while the engine kept recording and /health stayed healthy. The tray read
+    // `capture_running == Some(false)` → Paused → the "starting" icon and sat
+    // there forever. The fix: only surface Paused when the user actually stopped
+    // capture (intent OFF); when intent is still ON, a None handle means a
+    // handle/engine desync, so trust /health (base_status) instead.
+    //
+    // Helper to keep the truth-table tests readable.
+    fn capture_status(capture_running: Option<bool>, intended: bool) -> RecordingStatus {
+        apply_capture_session_status(
+            RecordingStatus::Recording, // base_status derived from a healthy /health
+            true,                       // server_responding
+            capture_running,
+            false, // start_in_progress
+            false, // schedule_paused
+            intended,
+        )
+    }
+
+    #[test]
+    fn test_handle_absent_intent_on_is_recording_not_paused() {
+        // THE FIX / primary regression guard: healthy engine, handle desynced to
+        // None, user still wants recording → must show Recording, never Paused.
+        assert_eq!(
+            capture_status(Some(false), true),
+            RecordingStatus::Recording,
+            "desynced handle with intent ON must trust /health, not stick on Paused"
+        );
+    }
+
+    #[test]
+    fn test_handle_absent_intent_off_is_paused() {
+        // The genuine pause the Paused state exists for.
+        assert_eq!(capture_status(Some(false), false), RecordingStatus::Paused);
+    }
+
+    #[test]
+    fn test_handle_present_is_recording_regardless_of_intent() {
+        // A live handle is authoritative: Some(true) → Recording either way.
+        assert_eq!(capture_status(Some(true), true), RecordingStatus::Recording);
+        assert_eq!(capture_status(Some(true), false), RecordingStatus::Recording);
+    }
+
+    #[test]
+    fn test_lock_contended_is_recording_regardless_of_intent() {
+        // None = `capture.try_lock()` failed (contention). Never Paused — falls
+        // through to base_status for both intent values.
+        assert_eq!(capture_status(None, true), RecordingStatus::Recording);
+        assert_eq!(capture_status(None, false), RecordingStatus::Recording);
+    }
+
+    #[test]
+    fn test_start_flag_beats_desync_trust() {
+        // While genuinely starting (flag asserted), Starting wins even with
+        // intent ON and a None handle — we don't want to prematurely claim
+        // Recording before the first capture is up.
+        let status = apply_capture_session_status(
+            RecordingStatus::Recording,
+            true,
+            Some(false),
+            true, // start_in_progress
+            false,
+            true, // intended
+        );
+        assert_eq!(status, RecordingStatus::Starting);
+    }
+
+    #[test]
+    fn test_schedule_pause_beats_desync_trust() {
+        // Schedule pause is the honest state even when intent is ON and the
+        // handle is None — never leak a misleading Recording outside work hours.
+        let status = apply_capture_session_status(
+            RecordingStatus::Recording,
+            true,
+            Some(false),
+            false,
+            true, // schedule_paused
+            true, // intended
+        );
+        assert_eq!(status, RecordingStatus::ScheduledPause);
+    }
+
+    #[test]
+    fn test_server_down_beats_desync_trust() {
+        // Connection error short-circuits before the intent logic: surface the
+        // real base_status (Stopped/boot), never a desync-"Recording".
+        let status = apply_capture_session_status(
+            RecordingStatus::Stopped,
+            false, // server_responding = false
+            Some(false),
+            false,
+            false,
+            true, // intended
+        );
+        assert_eq!(status, RecordingStatus::Stopped);
+    }
+
+    #[test]
+    fn test_paused_and_starting_share_starting_icon() {
+        // Both non-recording "amber" states render the same icon, which is why a
+        // Paused desync was indistinguishable from a real "Starting…" and the
+        // fix (not entering Paused on desync) is what actually clears the tray.
+        assert_eq!(status_to_icon_key(RecordingStatus::Paused), "starting");
+        assert_eq!(status_to_icon_key(RecordingStatus::Starting), "starting");
+        assert_eq!(status_to_icon_key(RecordingStatus::Recording), "healthy");
+        assert!(!is_unhealthy_icon(status_to_icon_key(RecordingStatus::Paused)));
+    }
+
+    #[test]
+    fn test_audio_toggle_restart_scenario_never_sticks_on_starting() {
+        // Replays the reported sequence tick-by-tick. After an audio-toggle
+        // restart: server healthy, intent stays ON, but the capture handle is
+        // left None (desync). Across every subsequent poll the tray must resolve
+        // to Recording — never latch Paused/Starting.
+        let base = decide_status(
+            &make_healthy_response(),
+            Duration::from_secs(600), // well past any startup grace
+            STARTUP_GRACE_PERIOD,
+            true,
+            0,
+            CONSECUTIVE_FAILURES_THRESHOLD,
+            0,
+            CONSECUTIVE_UNHEALTHY_THRESHOLD,
+            RecordingStatus::Recording,
+        );
+        assert_eq!(base, RecordingStatus::Recording);
+
+        for tick in 0..10 {
+            // is_starting cleared after the 300s clamp trips, so start flag = false.
+            let status = apply_capture_session_status(
+                base,
+                true,
+                Some(false), // handle desynced to None post-restart
+                false,       // start flag no longer asserted
+                false,       // no schedule
+                true,        // intent ON — user never stopped recording
+            );
+            assert_eq!(
+                status,
+                RecordingStatus::Recording,
+                "tick {tick}: desync must not pin the tray on a non-recording state"
+            );
+        }
     }
 
     // ── Work-hours schedule pause ───────────────────────────────────────────
@@ -1595,8 +1886,14 @@ mod tests {
     // honest ScheduledPause so the tray can say "outside work hours".
     #[test]
     fn test_schedule_paused_overrides_stuck_starting() {
-        let status =
-            apply_capture_session_status(RecordingStatus::Recording, true, Some(false), true, true);
+        let status = apply_capture_session_status(
+            RecordingStatus::Recording,
+            true,
+            Some(false),
+            true,
+            true,
+            true,
+        );
         assert_eq!(status, RecordingStatus::ScheduledPause);
     }
 
@@ -1605,8 +1902,14 @@ mod tests {
     // recording but nothing is captured" footgun. schedule_paused wins.
     #[test]
     fn test_schedule_paused_overrides_recording() {
-        let status =
-            apply_capture_session_status(RecordingStatus::Recording, true, Some(true), false, true);
+        let status = apply_capture_session_status(
+            RecordingStatus::Recording,
+            true,
+            Some(true),
+            false,
+            true,
+            true,
+        );
         assert_eq!(status, RecordingStatus::ScheduledPause);
     }
 
@@ -1614,8 +1917,14 @@ mod tests {
     // the stale-start-flag path still yields Starting, exactly as before.
     #[test]
     fn test_within_schedule_leaves_starting_untouched() {
-        let status =
-            apply_capture_session_status(RecordingStatus::Recording, true, Some(false), true, false);
+        let status = apply_capture_session_status(
+            RecordingStatus::Recording,
+            true,
+            Some(false),
+            true,
+            false,
+            true,
+        );
         assert_eq!(status, RecordingStatus::Starting);
     }
 
@@ -1624,8 +1933,14 @@ mod tests {
     // state, never a stale "outside work hours".
     #[test]
     fn test_schedule_paused_ignored_when_server_down() {
-        let status =
-            apply_capture_session_status(RecordingStatus::Stopped, false, Some(false), false, true);
+        let status = apply_capture_session_status(
+            RecordingStatus::Stopped,
+            false,
+            Some(false),
+            false,
+            true,
+            true,
+        );
         assert_eq!(status, RecordingStatus::Stopped);
     }
 

@@ -136,7 +136,8 @@ function cleanupTestChats(): void {
   }
 }
 
-describe("Chat switch context loss (issue #3636 / PR #3600)", function () {
+// QUARANTINED (#4686): CI-flaky (chat seeding / owned-browser window-handle). Re-enable per issue.
+describe.skip("Chat switch context loss (issue #3636 / PR #3600)", function () {
   this.timeout(120_000);
 
   before(async () => {

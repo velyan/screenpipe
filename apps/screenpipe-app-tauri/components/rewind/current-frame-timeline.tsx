@@ -105,6 +105,17 @@ export const CurrentFrameTimeline: FC<CurrentFrameTimelineProps> = ({
 
 	const device = currentFrame?.devices?.[0];
 	const frameId = device?.frame_id;
+	const filePath = device?.metadata?.file_path?.trim() ?? "";
+	const frameText =
+		device?.metadata?.text?.trim() ||
+		device?.metadata?.ocr_text?.trim() ||
+		"";
+	const frameTimeLabel = useMemo(() => {
+		if (!currentFrame?.timestamp) return null;
+		const date = new Date(currentFrame.timestamp);
+		if (Number.isNaN(date.getTime())) return null;
+		return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+	}, [currentFrame?.timestamp]);
 
 	// --- Frame loading hook (debounce, video seek, fallback, snapshot, resize) ---
 	const {
@@ -290,6 +301,16 @@ export const CurrentFrameTimeline: FC<CurrentFrameTimelineProps> = ({
 		disabled: settings?.disableTimeline === true,
 	});
 
+	const handleContextMenu = useCallback(
+		(e: React.MouseEvent) => {
+			e.preventDefault();
+			if (!debouncedFrame?.frameId) return;
+			contextMenuPositionRef.current = { x: e.clientX, y: e.clientY };
+			setContextMenuOpen(true);
+		},
+		[debouncedFrame?.frameId],
+	);
+
 	if (!frameId) {
 		return (
 			<div className="absolute inset-0 overflow-hidden bg-background">
@@ -328,17 +349,78 @@ export const CurrentFrameTimeline: FC<CurrentFrameTimelineProps> = ({
 		);
 	}
 
-	// eslint-disable-next-line react-hooks/rules-of-hooks
-	// biome-ignore lint/correctness/useHookAtTopLevel: hook called after a stable conditional return guarded by render-stable refs; matches the eslint suppression above
-	const handleContextMenu = useCallback(
-		(e: React.MouseEvent) => {
-			e.preventDefault();
-			if (!debouncedFrame?.frameId) return;
-			contextMenuPositionRef.current = { x: e.clientX, y: e.clientY };
-			setContextMenuOpen(true);
-		},
-		[debouncedFrame?.frameId],
-	);
+	if (!filePath) {
+		const appName = device?.metadata?.app_name?.trim();
+		return (
+			<div className="absolute inset-0 overflow-hidden bg-black text-white">
+				<div className="absolute inset-0 bg-[radial-gradient(circle_at_center,rgba(255,255,255,0.08),transparent_46%)]" />
+				<div className="absolute inset-0 flex items-center justify-center p-6">
+					<div className="w-full max-w-md border border-white/10 bg-black/60 px-6 py-6 shadow-2xl backdrop-blur-xl">
+						<div className="flex items-start gap-4">
+							<div className="shrink-0 border border-white/20 bg-white/10 p-3">
+								<ImageOff className="h-6 w-6 text-white/75" />
+							</div>
+							<div className="min-w-0 space-y-2">
+								<div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] font-mono uppercase tracking-wide text-white/45">
+									{frameTimeLabel && <span>{frameTimeLabel}</span>}
+									{appName && (
+										<>
+											<span aria-hidden="true">/</span>
+											<span className="max-w-[18rem] truncate">{appName}</span>
+										</>
+									)}
+								</div>
+								<h3 className="text-lg font-mono font-semibold uppercase tracking-wide">
+									Screenshot paused
+								</h3>
+								<p className="text-sm font-mono leading-relaxed text-white/65">
+									screenpipe saved activity for this moment, but no image was saved.
+									This usually happens during low-battery or privacy pause modes.
+								</p>
+							</div>
+						</div>
+						<div className="mt-6 flex flex-wrap gap-2">
+							{frameText && (
+								<button
+									type="button"
+									onClick={() => {
+										commands.copyTextToClipboard(frameText).catch(() => {});
+										toast({ title: "copied text", description: "frame text copied to clipboard" });
+									}}
+									className="flex items-center justify-center gap-2 border border-white/20 bg-white/10 px-3 py-2 text-xs font-mono uppercase tracking-wide text-white/80 transition-colors hover:bg-white/20"
+								>
+									<Copy className="h-3.5 w-3.5" />
+									Copy text
+								</button>
+							)}
+							{onNavigate && (
+								<>
+									<button
+										type="button"
+										onClick={() => onNavigate("prev")}
+										disabled={!canNavigatePrev}
+										className="flex items-center justify-center gap-2 border border-white/20 bg-white/10 px-3 py-2 text-xs font-mono uppercase tracking-wide text-white/80 transition-colors hover:bg-white/20 disabled:cursor-not-allowed disabled:opacity-30"
+									>
+										<ChevronLeft className="h-3.5 w-3.5" />
+										Previous
+									</button>
+									<button
+										type="button"
+										onClick={() => onNavigate("next")}
+										disabled={!canNavigateNext}
+										className="flex items-center justify-center gap-2 border border-white/20 bg-white/10 px-3 py-2 text-xs font-mono uppercase tracking-wide text-white/80 transition-colors hover:bg-white/20 disabled:cursor-not-allowed disabled:opacity-30"
+									>
+										Next
+										<ChevronRight className="h-3.5 w-3.5" />
+									</button>
+								</>
+							)}
+						</div>
+					</div>
+				</div>
+			</div>
+		);
+	}
 
 	return (
 		<div

@@ -220,17 +220,18 @@ async fn recover_from_db_wedge(app: tauri::AppHandle, breaker: DbWedgeBreaker) {
     if let WedgeAction::GiveUp { notify } = action {
         error!(
             "db wedge auto-recovery: {} restarts within {:?} did not clear the write wedge — \
-             this looks like on-disk corruption a restart can't repair. Auto-restart suspended; \
-             quit screenpipe and run `screenpipe db recover`.",
+             in-process restarts can't fix this (poisoned WAL-index pinned by a leaked \
+             connection, or on-disk damage). Surfacing manual recovery.",
             DB_WEDGE_MAX_RESTARTS, DB_WEDGE_BREAKER_WINDOW
         );
         if notify {
-            // Publish on the event bus; the in-process `db_recovery_notifications`
-            // subscriber turns it into a notification (NOT the `/ws/events`
-            // bridge — the engine is down exactly when this fires). Deduped to
-            // once per episode by the breaker.
-            let evt = screenpipe_events::DbRecoveryEvent::needs_recovery();
-            let _ = screenpipe_events::send_event(evt.event_name(), evt);
+            // In-process restarts are proven futile for this episode. Do not
+            // surprise-relaunch the app on broad DB-shaped errors; surface a
+            // user-visible recovery state instead.
+            crate::db_relaunch::surface_manual_recovery(
+                "db wedge persisted across in-process engine restarts",
+            )
+            .await;
         }
         return;
     }
@@ -264,6 +265,11 @@ async fn recover_from_db_wedge(app: tauri::AppHandle, breaker: DbWedgeBreaker) {
         error!("db wedge auto-recovery: spawn_screenpipe failed: {}", e);
         let evt = screenpipe_events::DbRecoveryEvent::restart_failed();
         let _ = screenpipe_events::send_event(evt.event_name(), evt);
+        // A DB-init failure right after a full pool close means the WAL-index
+        // is pinned by something outside our teardown — count it toward the
+        // manual recovery threshold rather than waiting for the health
+        // watchdog to grind through more doomed respawns.
+        crate::db_relaunch::note_respawn_failure(&app, &e).await;
     }
 }
 
@@ -556,6 +562,18 @@ async fn restore_interrupted_meeting_for_capture_restart(
     }
     if let Some(detector) = server.audio_manager.meeting_detector().await {
         detector.set_v2_in_meeting(true);
+        // Restore the manual identity immediately so the piggyback sweep can
+        // re-engage without waiting for the watcher's 5s manual-skip tick
+        // (auto meetings re-publish via the reattach path instead).
+        if interrupted.manual {
+            detector.set_active_meeting(Some(
+                screenpipe_audio::meeting_detector::ActiveMeeting {
+                    pid: None,
+                    bundle_id: None,
+                    manual: true,
+                },
+            ));
+        }
     }
 
     info!(
@@ -563,6 +581,40 @@ async fn restore_interrupted_meeting_for_capture_restart(
         interrupted.id, interrupted.app, interrupted.detection_source, interrupted.title
     );
     Ok(())
+}
+
+/// Probe `/health`, retrying once before declaring the server dead. A single
+/// 2s one-shot false-negatives when the server is briefly busy (e.g. SQLite
+/// `BEGIN IMMEDIATE` contention pushes the handler past the deadline) — and a
+/// false negative here triggers a needless *full engine restart*, which is
+/// exactly the teardown/bind race that stranded #4726 in a boot-error state.
+async fn probe_server_health(health_url: &str, api_key: Option<&str>) -> bool {
+    // Second attempt gets a longer deadline: transient contention clears in
+    // well under this, while a truly dead server fails both fast.
+    for timeout_secs in [2u64, 4] {
+        let mut req = reqwest::Client::new()
+            .get(health_url)
+            .timeout(std::time::Duration::from_secs(timeout_secs));
+        if let Some(key) = api_key {
+            req = req.header("Authorization", format!("Bearer {}", key));
+        }
+        match req.send().await {
+            Ok(r) if r.status().is_success() => return true,
+            _ => {
+                warn!(
+                    "health probe {} failed (timeout {}s), {}",
+                    health_url,
+                    timeout_secs,
+                    if timeout_secs == 2 {
+                        "retrying once before declaring the server dead"
+                    } else {
+                        "server considered dead"
+                    }
+                );
+            }
+        }
+    }
+    false
 }
 
 /// Start recording. Requires the server to be running.
@@ -625,13 +677,11 @@ pub async fn start_capture(
         (core.port, core.local_api_key.clone())
     };
 
-    let mut req = reqwest::Client::new()
-        .get(format!("http://localhost:{}/health", port))
-        .timeout(std::time::Duration::from_secs(2));
-    if let Some(ref key) = api_key {
-        req = req.header("Authorization", format!("Bearer {}", key));
-    }
-    let healthy = matches!(req.send().await, Ok(r) if r.status().is_success());
+    let healthy = probe_server_health(
+        &format!("http://localhost:{}/health", port),
+        api_key.as_deref(),
+    )
+    .await;
     if !healthy {
         warn!(
             "Server unresponsive on port {} — requesting full restart",
@@ -841,9 +891,14 @@ pub async fn spawn_screenpipe(
     //
     // A 30-minute safety ceiling prevents a wedged start from hanging the app
     // forever; for context, even a 100GB migration finishes in ~1 minute.
+    // If the phase is already "ready" but HTTP is unreachable, treat that as
+    // stale state after a short grace period. This happens when a restart dies
+    // before publishing a fresh boot phase, leaving "ready" from the previous
+    // server instance behind.
     if state.is_starting.swap(true, Ordering::SeqCst) {
         info!("Server start already in progress, waiting for boot phase...");
         const MAX_WAIT_SECS: u64 = 1800; // 30 minutes
+        const STALE_READY_TAKEOVER_SECS: u64 = 10;
         const POLL_MS: u64 = 500;
         let start_wait = std::time::Instant::now();
         loop {
@@ -863,7 +918,21 @@ pub async fn spawn_screenpipe(
             match phase.phase.as_str() {
                 "ready" => {
                     // Phase says ready — HTTP may be binding right now. Loop
-                    // once more without extra wait; it'll resolve on next poll.
+                    // briefly, but do not let stale "ready" state mask a dead
+                    // server forever.
+                    if start_wait.elapsed()
+                        > std::time::Duration::from_secs(STALE_READY_TAKEOVER_SECS)
+                    {
+                        warn!(
+                            "In-flight server start still unreachable after {}s despite boot phase=ready — taking over stale start",
+                            STALE_READY_TAKEOVER_SECS
+                        );
+                        state.is_starting.store(false, Ordering::SeqCst);
+                        if state.is_starting.swap(true, Ordering::SeqCst) {
+                            return Ok(());
+                        }
+                        break;
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(POLL_MS)).await;
                     continue;
                 }
@@ -920,29 +989,28 @@ pub async fn spawn_screenpipe(
     {
         let server_guard = state.server.lock().await;
         if server_guard.is_some() {
-            match reqwest::Client::new()
-                .get(&health_url)
-                .timeout(std::time::Duration::from_secs(2))
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    info!("Server already running and healthy on port {}", port);
-                    // Server is fine — just ensure capture is running
-                    drop(server_guard);
-                    let capture_guard = state.capture.lock().await;
-                    if capture_guard.is_some() {
-                        state.is_starting.store(false, Ordering::SeqCst);
-                        return Ok(());
-                    }
-                    drop(capture_guard);
-                    // Start capture on existing server
-                    return start_capture_internal(&state, &app).await;
+            let api_key = server_guard
+                .as_ref()
+                .and_then(|core| core.local_api_key.clone());
+            if probe_server_health(&health_url, api_key.as_deref()).await {
+                info!("Server already running and healthy on port {}", port);
+                // Server is fine — just ensure capture is running
+                drop(server_guard);
+                let capture_guard = state.capture.lock().await;
+                if capture_guard.is_some() {
+                    state.is_starting.store(false, Ordering::SeqCst);
+                    return Ok(());
                 }
-                _ => {
-                    warn!("Server exists but not responding, will do full restart");
-                }
+                drop(capture_guard);
+                // Start capture on existing server. If this fails before
+                // start_capture_internal reaches its success cleanup, clear
+                // startup flags so the next retry is not wedged.
+                let result = start_capture_internal(&state, &app).await;
+                state.is_starting.store(false, Ordering::SeqCst);
+                state.is_starting_capture.store(false, Ordering::SeqCst);
+                return result;
             }
+            warn!("Server exists but not responding, will do full restart");
         }
     }
 
@@ -959,8 +1027,21 @@ pub async fn spawn_screenpipe(
         }
     }
 
-    // Kill orphaned processes
-    kill_process_on_port(port).await;
+    // Kill orphaned processes. Bound the cleanup so a hung OS helper cannot
+    // leak `is_starting=true` and wedge future restarts behind the
+    // "start already in progress" guard.
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        kill_process_on_port(port),
+    )
+    .await
+    .is_err()
+    {
+        warn!(
+            "Timed out while killing orphaned process(es) on port {}; continuing with port-release wait",
+            port
+        );
+    }
 
     // Wait for port release
     let max_poll_iters = if cfg!(windows) { 40 } else { 20 };
@@ -1178,6 +1259,8 @@ pub async fn spawn_screenpipe(
     match result_rx.await {
         Ok(Ok(())) => {
             info!("Screenpipe started successfully");
+            state.is_starting.store(false, Ordering::SeqCst);
+            state.is_starting_capture.store(false, Ordering::SeqCst);
             let spawn_epoch = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1195,6 +1278,7 @@ pub async fn spawn_screenpipe(
         }
         Err(_) => {
             state.is_starting.store(false, Ordering::SeqCst);
+            state.is_starting_capture.store(false, Ordering::SeqCst);
             Err("Server startup channel dropped unexpectedly".to_string())
         }
     }

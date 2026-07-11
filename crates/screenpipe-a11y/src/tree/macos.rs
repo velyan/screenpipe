@@ -1835,10 +1835,7 @@ fn resolve_focused_ax_app() -> Option<(Retained<ax::UiElement>, i32, String)> {
     let sys = ax::UiElement::sys_wide();
     if let Ok(focused_app) = sys.focused_app() {
         if let Ok(pid) = focused_app.pid() {
-            let app_name = ns::RunningApp::with_pid(pid)
-                .and_then(|app| app.localized_name())
-                .map(|s| s.to_string())
-                .unwrap_or_default();
+            let app_name = localized_app_name_for_pid(pid);
             return Some((focused_app, pid, app_name));
         }
     }
@@ -1847,16 +1844,23 @@ fn resolve_focused_ax_app() -> Option<(Retained<ax::UiElement>, i32, String)> {
     // correctly reports them active. Build the app AX element from the active
     // process pid so Obsidian/Discord can still be walked instead of falling
     // straight to OCR.
-    let workspace = ns::Workspace::shared();
-    for app in workspace.running_apps().iter() {
-        if !app.is_active() {
-            continue;
+    let active_app = cidre::objc::ar_pool(|| -> Option<(i32, String)> {
+        let workspace = ns::Workspace::shared();
+        for app in workspace.running_apps().iter() {
+            if !app.is_active() {
+                continue;
+            }
+            let pid = app.pid();
+            let app_name = app
+                .localized_name()
+                .map(|s| s.to_string())
+                .unwrap_or_default();
+            return Some((pid, app_name));
         }
-        let pid = app.pid();
-        let app_name = app
-            .localized_name()
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+        None
+    });
+
+    if let Some((pid, app_name)) = active_app {
         let ax_app = ax::UiElement::with_app_pid(pid);
         debug!(
             "focused AX app fallback via NSWorkspace: pid={} app={}",
@@ -1866,6 +1870,15 @@ fn resolve_focused_ax_app() -> Option<(Retained<ax::UiElement>, i32, String)> {
     }
 
     None
+}
+
+fn localized_app_name_for_pid(pid: i32) -> String {
+    cidre::objc::ar_pool(|| {
+        ns::RunningApp::with_pid(pid)
+            .and_then(|app| app.localized_name())
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    })
 }
 
 fn ui_element_attr(elem: &ax::UiElement, attr: &ax::Attr) -> Option<Retained<ax::UiElement>> {

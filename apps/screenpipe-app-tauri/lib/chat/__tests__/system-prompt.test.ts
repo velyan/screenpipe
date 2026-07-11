@@ -7,7 +7,7 @@
 // existing contract so future refactors can't silently change it.
 
 import { describe, expect, it } from "vitest";
-import { buildSystemPrompt, buildConnectionsContext } from "../system-prompt";
+import { buildAppAwarenessContext, buildSystemPrompt, buildConnectionsContext } from "../system-prompt";
 
 describe("buildSystemPrompt", () => {
   const prompt = buildSystemPrompt();
@@ -22,6 +22,12 @@ describe("buildSystemPrompt", () => {
     expect(prompt).toContain("# Activity recaps");
     expect(prompt).toContain("# Connection write policy");
     expect(prompt).toContain("# Tool selection");
+  });
+
+  it("does not restate connection-gating guidance already carried by the tools", () => {
+    // gating/connect instructions live on the screenpipe_connect_app tool
+    // (promptGuidelines) — keep them out of the static prompt to avoid duplication.
+    expect(prompt).not.toContain("# Connection gating");
     expect(prompt).toContain("# Local server auth");
     expect(prompt).toContain("# Search rules");
     expect(prompt).toContain("# Speakers");
@@ -83,5 +89,108 @@ describe("buildConnectionsContext", () => {
     ]);
     expect(out).toContain("## A (a)\ndesc-a");
     expect(out).toContain("## B (b)\ndesc-b");
+  });
+});
+
+describe("buildAppAwarenessContext", () => {
+  it("returns empty context when there are no recent apps", () => {
+    expect(buildAppAwarenessContext({ apps: [], connections: [] })).toBe("");
+  });
+
+  it("tags recent apps with their connection id and leaves live state to the tools", () => {
+    const out = buildAppAwarenessContext({
+      apps: [
+        { name: "Linear", count: 8 },
+        { name: "Notion", count: 4 },
+        { name: "Preview", count: 2 },
+      ],
+      connections: [
+        { id: "linear", name: "Linear", connected: false },
+        { id: "notion", name: "Notion", connected: true },
+      ],
+    });
+
+    expect(out).toContain("# User app context");
+    expect(out).toContain("- Linear (connection id: linear)");
+    expect(out).toContain("- Notion (connection id: notion)");
+    expect(out).toContain("- Preview");
+    // no static connection state on the entries — the agent resolves that via the tools
+    expect(out).not.toContain(") is connected");
+    expect(out).not.toContain(") is not connected");
+    expect(out).toContain("screenpipe_list_connections");
+  });
+
+  it("does not restate MCP proxy guidance per app (the tool carries it)", () => {
+    const out = buildAppAwarenessContext({
+      apps: [{ name: "Linear", count: 8 }],
+      connections: [
+        {
+          id: "linear",
+          name: "Linear",
+          connected: true,
+          mcp: true,
+          mcp_server_id: "mcp-linear-123",
+        },
+      ],
+    });
+
+    expect(out).toContain("- Linear (connection id: linear)");
+    expect(out).not.toContain("sp_mcp_list_tools");
+    expect(out).not.toContain("/connections/linear/proxy");
+  });
+
+  it("does not match connections by substring inside unrelated app names", () => {
+    const out = buildAppAwarenessContext({
+      apps: [
+        { name: "Linearity Curve", count: 8 },
+        { name: "Google Chrome", count: 5 },
+      ],
+      connections: [
+        { id: "linear", name: "Linear", connected: true },
+        { id: "google-calendar", name: "Google Calendar", connected: true },
+      ],
+    });
+
+    expect(out).toContain("- Linearity Curve");
+    expect(out).toContain("- Google Chrome");
+    expect(out).not.toContain("(connection id: linear)");
+    expect(out).not.toContain("(connection id: google-calendar)");
+  });
+
+  it("matches connection names and hyphenated ids as exact token sequences", () => {
+    const out = buildAppAwarenessContext({
+      apps: [
+        { name: "Linear.app", count: 8 },
+        { name: "Google Calendar", count: 5 },
+      ],
+      connections: [
+        { id: "linear", name: "Linear", connected: true },
+        { id: "google-calendar", name: "Google Calendar", connected: true },
+      ],
+    });
+
+    expect(out).toContain("- Linear.app (connection id: linear)");
+    expect(out).toContain("- Google Calendar (connection id: google-calendar)");
+  });
+
+  it("orders apps by activity count and caps the list", () => {
+    const out = buildAppAwarenessContext({
+      maxApps: 2,
+      apps: [
+        { name: "Slack", count: 1 },
+        { name: "Linear", count: 5 },
+        { name: "Notion", count: 3 },
+      ],
+      connections: [
+        { id: "slack", name: "Slack", connected: false },
+        { id: "linear", name: "Linear", connected: false },
+        { id: "notion", name: "Notion", connected: true },
+      ],
+    });
+
+    expect(out).toContain("- Linear (connection id: linear)");
+    expect(out).toContain("- Notion (connection id: notion)");
+    expect(out).not.toContain("- Slack");
+    expect(out.indexOf("- Linear")).toBeLessThan(out.indexOf("- Notion"));
   });
 });

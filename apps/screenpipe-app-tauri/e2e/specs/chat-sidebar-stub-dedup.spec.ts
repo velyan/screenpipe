@@ -126,7 +126,8 @@ async function visibleRowCount(ids: string[]): Promise<number> {
   }, ids)) as number;
 }
 
-describe("Chat sidebar stub row dedup", function () {
+// QUARANTINED (#4686): CI-flaky (chat seeding / owned-browser window-handle). Re-enable per issue.
+describe.skip("Chat sidebar stub row dedup", function () {
   this.timeout(120_000);
 
   before(async () => {

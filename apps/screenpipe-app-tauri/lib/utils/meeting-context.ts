@@ -850,7 +850,7 @@ export async function fetchMeetingAudio(
   return mergeMeetingAudioChunks(routedRows, out, cap);
 }
 
-function mergeMeetingAudioChunks(
+export function mergeMeetingAudioChunks(
   liveRows: MeetingAudioChunk[],
   backgroundRows: MeetingAudioChunk[],
   cap: number,
@@ -863,10 +863,15 @@ function mergeMeetingAudioChunks(
     // /search returns DeviceType as "Input"/"Output" (PascalCase enum), while
     // /meetings/:id/transcript returns the raw DB column "input"/"output".
     // Lowercase both so the same chunk pulled from both endpoints collapses.
+    // Speaker label is deliberately NOT part of the key: the same utterance
+    // carries different labels across sources (Deepgram's live "speaker N" on
+    // the routed segment vs. NULL/global-speaker on the mirrored
+    // audio_transcriptions row /search returns), which used to double every
+    // line after a meeting ended. sortAudioChunks puts live rows first, so the
+    // labeled routed copy is the one that survives.
     const key = [
       Math.round(timestampMs(chunk.timestamp) / 1000),
       chunk.deviceType.toLowerCase(),
-      chunk.speakerName,
       chunk.transcription.replace(/\s+/g, " ").trim().toLowerCase(),
     ].join("|");
     if (seen.has(key)) continue;

@@ -253,6 +253,10 @@ pub async fn run_server(app_handle: tauri::AppHandle, port: u16) {
             "/notifications/:id",
             axum::routing::delete(crate::notifications::routes::dismiss),
         )
+        .route(
+            "/notifications/:id/read",
+            axum::routing::post(crate::notifications::routes::mark_one_read),
+        )
         .route("/inbox", axum::routing::post(send_inbox_message))
         .route("/log", axum::routing::post(log_message))
         .route("/auth", axum::routing::post(handle_auth))

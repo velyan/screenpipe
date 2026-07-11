@@ -54,7 +54,7 @@ AI Prompt Journal watches your screen and captures every prompt you type into AI
 ## Setup
 
 1. Install this pipe from the screenpipe store
-2. (Optional) Connect Obsidian in Settings > Connections — set your vault path
+2. (Optional) Connect Obsidian from the Connections page in the desktop app — set your vault path
 3. The pipe runs every hour automatically and captures any AI prompts from the last hour
 4. Check your journal at `{vault}/screenpipe/ai-prompts/YYYY-MM-DD.md`
 

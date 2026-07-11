@@ -16,12 +16,39 @@ import {
 } from "@/components/chat/standalone/message-content";
 import {
   buildCollapsedSteerRenderItems,
+  hasAssistantTextBody,
   getMessageIntentLabel,
+  isNormalUserMessage,
   isSteeredAssistantMessage,
+  hasRenderableAssistantBody,
 } from "@/lib/chat/message-rendering";
 import { cn } from "@/lib/utils";
-import type { Message } from "@/lib/chat/types";
+import type { ContentBlock, Message } from "@/lib/chat/types";
+import type { ConnectionListItem } from "@/lib/chat/connection-suggestions";
+import type { InlineConnectStatus } from "@/lib/connections/inline-connect";
 import type { MarkdownCitationPlan } from "@/lib/chat/markdown-export";
+
+function messageDate(timestamp: number): Date | null {
+  const date = new Date(timestamp);
+  return Number.isFinite(date.getTime()) ? date : null;
+}
+
+function formatMessageHoverTime(timestamp: number): string | null {
+  const date = messageDate(timestamp);
+  if (!date) return null;
+  return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+function formatMessageFullTime(timestamp: number): string | null {
+  const date = messageDate(timestamp);
+  if (!date) return null;
+  return date.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
 
 export interface ChatMessageListProps {
   messages: Message[];
@@ -53,6 +80,12 @@ export interface ChatMessageListProps {
   sendMessage: (message: string, displayLabel?: string, imageDataUrls?: string[]) => Promise<void>;
   openFilePreview: (path: string) => void;
   branchConversation: (messageId: string) => Promise<void> | void;
+  connectionItems?: ConnectionListItem[];
+  onOpenConnectionSetup?: (connectionId: string) => void | Promise<void>;
+  onConnectConnectionAction?: (connectionId: string, block?: Extract<ContentBlock, { type: "connection_action" }>) => Promise<InlineConnectStatus | void> | InlineConnectStatus | void;
+  onContinueConnectionAction?: (prompt: string, label?: string) => void | Promise<void>;
+  onDismissConnectionAction?: (messageId: string, connectionId: string) => void;
+  onAskUserReply?: (reply: string, displayLabel: string) => Promise<void> | void;
   suppressSourceFooters?: boolean;
 }
 
@@ -86,6 +119,12 @@ export function ChatMessageList({
   sendMessage,
   openFilePreview,
   branchConversation,
+  connectionItems = [],
+  onOpenConnectionSetup,
+  onConnectConnectionAction,
+  onContinueConnectionAction,
+  onDismissConnectionAction,
+  onAskUserReply,
   suppressSourceFooters = false,
 }: ChatMessageListProps) {
   return (
@@ -94,14 +133,49 @@ export function ChatMessageList({
         {(() => {
           const visibleMessages = messages.filter((m) => {
             if (m.role !== "assistant") return true;
-            if (m.content === "Processing..." && !m.contentBlocks?.length) return false;
-            if (!m.content && !m.contentBlocks?.length && !isSteeredAssistantMessage(m)) return false;
+            if (!hasRenderableAssistantBody(m) && !isSteeredAssistantMessage(m)) return false;
             return true;
           });
 
           const renderItems = buildCollapsedSteerRenderItems(visibleMessages, {
             canCollapseSteerWork: !isLoading && !isStreaming && !activeSourceFooterMessageId,
           });
+          // Fall back to the newest visible assistant message — but only when
+          // it is also the newest assistant message overall. Right after a
+          // send, the fresh assistant row is still the invisible
+          // "Processing..." placeholder (filtered above), so the newest
+          // *visible* assistant is the previous turn's completed answer;
+          // marking that one live would hide its action bar and tick a bogus
+          // "Working for …" header on it until the first token arrives.
+          const lastVisibleAssistantId = [...visibleMessages]
+            .reverse()
+            .find((candidate) => candidate.role === "assistant")?.id;
+          const lastAssistantId = [...messages]
+            .reverse()
+            .find((candidate) => candidate.role === "assistant")?.id;
+          const activeAssistantMessageId =
+            activeSourceFooterMessageId ??
+            (lastVisibleAssistantId === lastAssistantId ? lastVisibleAssistantId : undefined);
+
+          // Find parent assistant IDs whose steered child is currently streaming.
+          // Walk backwards from the active streaming assistant to find the
+          // preceding non-steered assistant in the same turn — that's the parent
+          // whose ToolCallGroup should also show "Working".
+          const steerChildActiveParentIds = new Set<string>();
+          if ((isLoading || isStreaming) && activeAssistantMessageId) {
+            const activeIdx = visibleMessages.findIndex((m) => m.id === activeAssistantMessageId);
+            const activeMsg = activeIdx >= 0 ? visibleMessages[activeIdx] : undefined;
+            if (activeMsg && isSteeredAssistantMessage(activeMsg)) {
+              for (let j = activeIdx - 1; j >= 0; j -= 1) {
+                const prev = visibleMessages[j];
+                if (prev.role === "user" && prev.intent !== "steer") break;
+                if (prev.role === "assistant" && !isSteeredAssistantMessage(prev)) {
+                  steerChildActiveParentIds.add(prev.id);
+                  break;
+                }
+              }
+            }
+          }
 
           return renderItems.map((item) => {
             if (item.type === "collapsed-steer-work") {
@@ -128,12 +202,14 @@ export function ChatMessageList({
             const canEditMessage = message.role === "user" && !isSteerUserMessage && !isLoading;
             const canShowMessageActions = !item.showActionsWhenExpandedBy ||
               expandedSteerWorkIds.has(item.showActionsWhenExpandedBy);
+            const hasActiveSteerChild = steerChildActiveParentIds.has(message.id);
             const isActiveStreamingAssistantMessage =
               message.role === "assistant" &&
               (isLoading || isStreaming) &&
-              message.id === activeSourceFooterMessageId;
+              (message.id === activeAssistantMessageId || hasActiveSteerChild);
+            const shouldShowAssistantActions = message.role !== "assistant" || hasAssistantTextBody(message);
             const shouldShowMessageActionBar =
-              canShowMessageActions && !isActiveStreamingAssistantMessage;
+              canShowMessageActions && !isActiveStreamingAssistantMessage && shouldShowAssistantActions;
             const nextAssistant = visibleMessages
               .slice(messageIndex + 1)
               .find((candidate) => candidate.role === "assistant");
@@ -143,7 +219,26 @@ export function ChatMessageList({
               !message.content &&
               !message.contentBlocks?.length
             );
+            // Hide retry/branch on any assistant that has a steered assistant
+            // after it *within the same turn segment*.  A normal (non-steer) user
+            // message starts a new segment, so stop searching there.
+            let nextSameSegmentAssistant: Message | undefined;
+            if (message.role === "assistant") {
+              const tail = visibleMessages.slice(messageIndex + 1);
+              for (const candidate of tail) {
+                if (isNormalUserMessage(candidate)) break; // new turn
+                if (candidate.role === "assistant") {
+                  nextSameSegmentAssistant = candidate;
+                  break;
+                }
+              }
+            }
+            const hasFollowingSteeredAssistant = Boolean(
+              nextSameSegmentAssistant && isSteeredAssistantMessage(nextSameSegmentAssistant)
+            );
             const turnAggregatedCitations = citationPlan.aggregatedAfter.get(message.id);
+            const messageHoverTime = formatMessageHoverTime(message.timestamp);
+            const messageFullTime = formatMessageFullTime(message.timestamp);
 
             return [
               <motion.div
@@ -201,7 +296,7 @@ export function ChatMessageList({
                         "relative rounded-xl text-sm overflow-hidden max-w-full transition-all",
                         message.role === "user"
                           ? "bg-muted/60 text-foreground px-4 py-3"
-                          : "bg-background text-foreground py-1",
+                          : "bg-background text-foreground py-1 w-full",
                         canEditMessage && editingMessageId !== message.id && "cursor-text",
                         editingMessageId === message.id && message.role === "user" && "w-full"
                       )}
@@ -264,14 +359,27 @@ export function ChatMessageList({
                       ) : (
                         <MessageContent
                           message={message}
+                          isGenerating={isActiveStreamingAssistantMessage}
                           deferSourceFooter={
                             suppressSourceFooters ||
                             citationPlan.deferredMessageIds.has(message.id) ||
                             message.id === activeSourceFooterMessageId
                           }
+                          hideToolSummary={item.hideToolSummary || isSteeredAssistantMessage(message)}
+                          forceCollapseTools={
+                            item.collapseToolsWithSteerWork
+                              ? !expandedSteerWorkIds.has(item.collapseToolsWithSteerWork)
+                              : false
+                          }
                           onImageClick={onOpenImageViewer}
                           onRetry={(prompt) => sendMessage(prompt)}
                           onOpenViewerPath={openFilePreview}
+                          connectionItems={connectionItems}
+                          onOpenConnectionSetup={onOpenConnectionSetup}
+                          onConnectConnectionAction={onConnectConnectionAction}
+                          onContinueConnectionAction={onContinueConnectionAction}
+                          onDismissConnectionAction={onDismissConnectionAction}
+                          onAskUserReply={onAskUserReply}
                         />
                       )}
                     </div>
@@ -279,7 +387,21 @@ export function ChatMessageList({
                   {!hideSupersededSteerBody && shouldShowMessageActionBar ? (
                     <>
                       {editingMessageId !== message.id && (
-                        <div className="flex items-center gap-0.5 self-end mt-1 opacity-0 group-hover/message:opacity-100 group-focus-within/message:opacity-100 transition-all duration-200">
+                        <div
+                          className={cn(
+                            "flex items-center gap-0.5 mt-1 opacity-0 group-hover/message:opacity-100 group-focus-within/message:opacity-100 transition-all duration-200",
+                            message.role === "assistant" ? "self-start" : "self-end"
+                          )}
+                        >
+                          {messageHoverTime ? (
+                            <time
+                              dateTime={messageDate(message.timestamp)?.toISOString()}
+                              title={messageFullTime ?? undefined}
+                              className="mr-1 text-[11px] leading-none text-muted-foreground/70 select-none"
+                            >
+                              {messageHoverTime}
+                            </time>
+                          ) : null}
                           <button
                             onClick={() => onCopyMessage(message)}
                             className="p-1 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground"
@@ -305,7 +427,7 @@ export function ChatMessageList({
                               <Pencil className="h-3 w-3" />
                             </button>
                           )}
-                          {message.role === "assistant" && !isLoading && (
+                          {message.role === "assistant" && !isLoading && !hasFollowingSteeredAssistant && (
                             <button
                               onClick={() => onRetryAssistantMessage(message.id)}
                               className="p-1 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground"
@@ -314,7 +436,7 @@ export function ChatMessageList({
                               <RefreshCw className="h-3 w-3" />
                             </button>
                           )}
-                          {message.role === "assistant" && (
+                          {message.role === "assistant" && !hasFollowingSteeredAssistant && (
                             <Popover
                               open={openMessageMenuId === message.id}
                               onOpenChange={(open) => onMessageMenuOpenChange(message.id, open)}
@@ -329,7 +451,7 @@ export function ChatMessageList({
                               </PopoverTrigger>
                               <PopoverContent className="w-48 p-1" align="end" side="top">
                                 <div className="text-xs text-muted-foreground px-2 py-1 mb-1">
-                                  {new Date(message.timestamp).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                                  {messageFullTime}
                                 </div>
                                 {!message.content.includes("used all your free queries") &&
                                   !message.content.startsWith("Error") &&
@@ -390,13 +512,10 @@ export function ChatMessageList({
           const blocks = lastAssistant?.contentBlocks;
           let loaderPhase: LoaderPhase = "analyzing";
           let toolName: string | undefined;
-          const thinkingSecs: number | undefined = undefined;
 
           if (blocks && blocks.length > 0) {
             const lastBlock = blocks[blocks.length - 1];
-            if (lastBlock.type === "thinking" && lastBlock.isThinking) {
-              loaderPhase = "thinking";
-            } else if (lastBlock.type === "tool" && lastBlock.toolCall.isRunning) {
+            if (lastBlock.type === "tool" && lastBlock.toolCall.isRunning) {
               loaderPhase = "tool";
               toolName = lastBlock.toolCall.toolName;
             } else if (lastBlock.type === "text" && lastBlock.text) {
@@ -411,8 +530,8 @@ export function ChatMessageList({
               exit={{ opacity: 0, y: -5 }}
               transition={{ duration: 0.15 }}
               className={cn(
-                "w-fit ml-auto",
-                loaderPhase === "streaming"
+                "w-fit self-start",
+                loaderPhase === "streaming" || loaderPhase === "analyzing"
                   ? "px-2 py-1"
                   : "px-3 py-2 border border-border/50"
               )}
@@ -420,7 +539,6 @@ export function ChatMessageList({
               <GridDissolveLoader
                 phase={loaderPhase}
                 toolName={toolName}
-                thinkingSecs={thinkingSecs}
               />
             </motion.div>
           );

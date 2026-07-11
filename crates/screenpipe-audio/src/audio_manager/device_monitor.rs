@@ -36,7 +36,14 @@ fn is_legacy_display_output(device_name: &str) -> bool {
 /// the first audio frame — so we also require a live stream handle. Streams that
 /// failed to open never get inserted; streams that died (timeout, zero-fill hijack)
 /// set `is_disconnected` and are treated as not running so recovery can retry.
-fn is_device_actively_streaming(device_manager: &DeviceManager, device: &AudioDevice) -> bool {
+///
+/// `pub(crate)` so the piggyback sweep can observe stream liveness through the
+/// thin [`AudioManager::is_device_actively_streaming`] wrapper without
+/// duplicating this logic.
+pub(crate) fn is_device_actively_streaming(
+    device_manager: &DeviceManager,
+    device: &AudioDevice,
+) -> bool {
     if !device_manager.is_running(device) {
         return false;
     }
@@ -58,6 +65,26 @@ fn is_device_type_running(
             .ok()
             .filter(|d| d.device_type == device_type)
             .is_some_and(|d| is_device_actively_streaming(device_manager, &d))
+    })
+}
+
+/// True when a meeting-SESSION device of `device_type` is actively streaming.
+/// During a piggybacked meeting the normally-captured default input / "System
+/// Audio (output)" is suspended and its capture runs through a session stream
+/// (the resolved mic / Meeting Tap) that is NOT in `enabled_devices`. Without
+/// counting those, [`is_device_type_running`] reads "nothing running" and the
+/// recovery blocks below fire every 2s. Empty session set ⇒ this is a cheap
+/// `false`, so the non-piggyback path is byte-identical.
+fn is_session_type_streaming(
+    audio_manager: &AudioManager,
+    session_devices: &HashSet<String>,
+    device_type: DeviceType,
+) -> bool {
+    session_devices.iter().any(|name| {
+        parse_audio_device(name)
+            .ok()
+            .filter(|d| d.device_type == device_type)
+            .is_some_and(|d| audio_manager.is_device_actively_streaming(&d))
     })
 }
 
@@ -91,6 +118,13 @@ impl DeviceRecoveryBackoff {
         Self::new(Self::TRANSIENT_MAX_SECS, Self::OUTPUT_PERMANENT_MAX_SECS)
     }
 
+    fn for_device_type(device_type: &DeviceType) -> Self {
+        match device_type {
+            DeviceType::Input => Self::for_input(),
+            DeviceType::Output => Self::for_output(),
+        }
+    }
+
     fn new(transient_max_secs: u64, permanent_max_secs: u64) -> Self {
         Self {
             attempts: 0,
@@ -116,6 +150,15 @@ impl DeviceRecoveryBackoff {
         self.is_permanent = false;
     }
 
+    fn should_attempt(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_attempt)
+            >= Duration::from_secs(self.next_delay_secs())
+    }
+
+    fn record_attempt_at(&mut self, now: Instant) {
+        self.last_attempt = now;
+    }
+
     fn next_delay_secs(&self) -> u64 {
         if self.attempts == 0 {
             return 0;
@@ -131,6 +174,29 @@ impl DeviceRecoveryBackoff {
     }
 }
 
+fn default_switch_retry_delay_secs(attempts: u32) -> u64 {
+    if attempts == 0 {
+        return 0;
+    }
+    2u64.saturating_pow(attempts.min(10))
+        .min(DeviceRecoveryBackoff::TRANSIENT_MAX_SECS)
+}
+
+fn default_switch_retry_backoff_active(
+    failed_devices: &HashMap<String, (u32, Instant)>,
+    device_name: &str,
+    now: Instant,
+) -> bool {
+    let Some((attempts, last_attempt)) = failed_devices.get(device_name) else {
+        return false;
+    };
+    let delay = Duration::from_secs(default_switch_retry_delay_secs(*attempts));
+    let elapsed = now
+        .checked_duration_since(*last_attempt)
+        .unwrap_or_default();
+    elapsed < delay
+}
+
 /// Returns true if the error from `default_output_device()` indicates a
 /// permanent condition that won't resolve without hardware changes.
 fn is_permanent_output_error(err: &anyhow::Error) -> bool {
@@ -143,6 +209,47 @@ fn is_permanent_output_error(err: &anyhow::Error) -> bool {
 fn is_permanent_input_error(err: &anyhow::Error) -> bool {
     let msg = err.to_string();
     msg.contains("No default input device detected")
+}
+
+fn is_permanent_device_start_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_lowercase();
+    msg.contains("not found")
+        || msg.contains("no default input device detected")
+        || msg.contains("no display audio device found")
+}
+
+fn should_log_recovery_attempt(attempts: u32) -> bool {
+    attempts <= 3 || attempts.is_multiple_of(30)
+}
+
+fn should_attempt_disconnected_device_recovery(
+    backoffs: &mut HashMap<String, DeviceRecoveryBackoff>,
+    device_name: &str,
+    device_type: &DeviceType,
+    now: Instant,
+) -> bool {
+    let backoff = backoffs
+        .entry(device_name.to_string())
+        .or_insert_with(|| DeviceRecoveryBackoff::for_device_type(device_type));
+    if backoff.should_attempt(now) {
+        backoff.record_attempt_at(now);
+        true
+    } else {
+        false
+    }
+}
+
+fn record_disconnected_device_failure(
+    backoffs: &mut HashMap<String, DeviceRecoveryBackoff>,
+    device_name: &str,
+    device_type: &DeviceType,
+    permanent: bool,
+) -> (u32, u64) {
+    let backoff = backoffs
+        .entry(device_name.to_string())
+        .or_insert_with(|| DeviceRecoveryBackoff::for_device_type(device_type));
+    backoff.record_failure(permanent);
+    (backoff.attempts, backoff.next_delay_secs())
 }
 
 /// Heuristic: does this input device name look like an on-board mic? Used to
@@ -385,6 +492,10 @@ impl SystemDefaultTracker {
     /// Check if system default input device has changed
     fn check_input_changed(&mut self) -> Option<String> {
         let current = default_input_device().ok().map(|d| d.to_string());
+        self.check_input_changed_from_current(current)
+    }
+
+    fn check_input_changed_from_current(&mut self, current: Option<String>) -> Option<String> {
         if current != self.last_input {
             let changed = current.clone();
             self.last_input = current;
@@ -397,6 +508,10 @@ impl SystemDefaultTracker {
     /// Check if system default output device has changed
     async fn check_output_changed(&mut self) -> Option<String> {
         let current = default_output_device().await.ok().map(|d| d.to_string());
+        self.check_output_changed_from_current(current)
+    }
+
+    fn check_output_changed_from_current(&mut self, current: Option<String>) -> Option<String> {
         if current != self.last_output {
             let changed = current.clone();
             self.last_output = current;
@@ -437,6 +552,8 @@ pub async fn start_device_monitor(
         let mut failed_devices: HashMap<String, (u32, Instant)> = HashMap::new();
         let mut input_recovery_backoff = DeviceRecoveryBackoff::for_input();
         let mut output_recovery_backoff = DeviceRecoveryBackoff::for_output();
+        let mut disconnected_device_backoffs: HashMap<String, DeviceRecoveryBackoff> =
+            HashMap::new();
 
         // Central handler restart cooldown: max 3 restarts in a 5-minute window
         let mut central_restart_times: Vec<Instant> = Vec::new();
@@ -462,6 +579,11 @@ pub async fn start_device_monitor(
         let mut logged_pinned_fallback_default_disabled: HashSet<String> = HashSet::new();
         // One-shot guard for the "no microphone available" alert (see the sweep).
         let mut pinned_input_unavailable_notified = false;
+
+        // Meeting piggyback state (experimental flag). Owns the per-process
+        // tap + resolved-mic capture during meetings, with total fallback to
+        // the stable path on any gap. Pure decider in `meeting_piggyback.rs`.
+        let mut piggyback_state = super::meeting_piggyback::PiggybackState::default();
 
         // Initialize tracker with current defaults
         let _ = default_tracker.check_input_changed();
@@ -700,6 +822,7 @@ pub async fn start_device_monitor(
                     }
 
                     // Check if system default input changed
+                    let previous_default_input = default_tracker.last_input.clone();
                     if let Some(new_default_input) = default_tracker.check_input_changed() {
                         if audio_manager
                             .user_disabled_devices()
@@ -716,12 +839,20 @@ pub async fn start_device_monitor(
                             // nothing if the new device failed to start — a silent
                             // mic loss with no recovery. Mirrors the output swap
                             // below, which has always been start-first.
-                            let new_started = if let Ok(new_device) =
-                                parse_audio_device(&new_default_input)
-                            {
-                                failed_devices.remove(&new_default_input);
+                            let new_started = if default_switch_retry_backoff_active(
+                                &failed_devices,
+                                &new_default_input,
+                                Instant::now(),
+                            ) {
+                                debug!(
+                                    "[DEVICE_RECOVERY] default input switch retry backing off: {}",
+                                    new_default_input
+                                );
+                                false
+                            } else if let Ok(new_device) = parse_audio_device(&new_default_input) {
                                 match audio_manager.start_device(&new_device).await {
                                     Ok(()) => {
+                                        failed_devices.remove(&new_default_input);
                                         info!(
                                             "switched to new system default input: {}",
                                             new_default_input
@@ -747,9 +878,21 @@ pub async fn start_device_monitor(
 
                             // Only stop the old inputs once the new one is live.
                             if new_started {
+                                // Never stop meeting-session or piggyback-suspended
+                                // devices during a default swap: they are not user
+                                // intent and the sweep owns their lifecycle. (They
+                                // are already absent from enabled_devices; this is a
+                                // belt-and-suspenders skip that also documents it.)
+                                let session = audio_manager.session_devices();
+                                let suspended = audio_manager.suspended_devices();
                                 for device_name in enabled_devices.iter() {
                                     if *device_name == new_default_input {
                                         continue; // don't stop the one we just started
+                                    }
+                                    if session.contains(device_name)
+                                        || suspended.contains(device_name)
+                                    {
+                                        continue;
                                     }
                                     if let Ok(device) = parse_audio_device(device_name) {
                                         if device.device_type == DeviceType::Input {
@@ -757,6 +900,8 @@ pub async fn start_device_monitor(
                                         }
                                     }
                                 }
+                            } else {
+                                default_tracker.last_input = previous_default_input;
                             }
                         } // else: skip user-disabled
                     }
@@ -765,6 +910,7 @@ pub async fn start_device_monitor(
                     // Atomic swap: start new device FIRST, then stop old ones.
                     // This ensures continuous audio capture — if the new device
                     // fails to start, the old devices keep running as fallback.
+                    let previous_default_output = default_tracker.last_output.clone();
                     if let Some(new_default_output) = default_tracker.check_output_changed().await {
                         // Skip if new default is user-disabled
                         if audio_manager
@@ -779,12 +925,20 @@ pub async fn start_device_monitor(
                                 new_default_output
                             );
 
-                            let new_started = if let Ok(new_device) =
-                                parse_audio_device(&new_default_output)
-                            {
-                                failed_devices.remove(&new_default_output);
+                            let new_started = if default_switch_retry_backoff_active(
+                                &failed_devices,
+                                &new_default_output,
+                                Instant::now(),
+                            ) {
+                                debug!(
+                                    "[DEVICE_RECOVERY] default output switch retry backing off: {}",
+                                    new_default_output
+                                );
+                                false
+                            } else if let Ok(new_device) = parse_audio_device(&new_default_output) {
                                 match audio_manager.start_device(&new_device).await {
                                     Ok(()) => {
+                                        failed_devices.remove(&new_default_output);
                                         info!(
                                         "[DEVICE_RECOVERY] started new system default output: {}",
                                         new_default_output
@@ -792,6 +946,11 @@ pub async fn start_device_monitor(
                                         true
                                     }
                                     Err(e) => {
+                                        let count = failed_devices
+                                            .entry(new_default_output.clone())
+                                            .or_insert((0, Instant::now()));
+                                        count.0 += 1;
+                                        count.1 = Instant::now();
                                         warn!(
                                             "[DEVICE_RECOVERY] failed to start new default output {}: {} — keeping old devices running",
                                             new_default_output, e
@@ -808,6 +967,13 @@ pub async fn start_device_monitor(
                                 // Don't stop the communications output device during swap
                                 #[cfg(target_os = "windows")]
                                 let comm_name = default_tracker.last_communications_output.clone();
+                                // Never stop the Meeting Tap or other meeting-session /
+                                // piggyback-suspended outputs during a default swap: they
+                                // are meeting-lifetime, not user intent, and the sweep owns
+                                // their teardown. Misattributing/stopping the Meeting Tap
+                                // here would drop far-end call audio mid-meeting.
+                                let session = audio_manager.session_devices();
+                                let suspended = audio_manager.suspended_devices();
                                 for device_name in audio_manager.enabled_devices().await.iter() {
                                     if *device_name == new_default_output {
                                         continue; // don't stop the one we just started
@@ -815,6 +981,11 @@ pub async fn start_device_monitor(
                                     #[cfg(target_os = "windows")]
                                     if comm_name.as_deref() == Some(device_name.as_str()) {
                                         continue; // don't stop the communications device
+                                    }
+                                    if session.contains(device_name)
+                                        || suspended.contains(device_name)
+                                    {
+                                        continue;
                                     }
                                     if let Ok(device) = parse_audio_device(device_name) {
                                         if device.device_type == DeviceType::Output {
@@ -826,6 +997,8 @@ pub async fn start_device_monitor(
                                         }
                                     }
                                 }
+                            } else {
+                                default_tracker.last_output = previous_default_output;
                             }
                         } // else: skip user-disabled
                     }
@@ -881,9 +1054,18 @@ pub async fn start_device_monitor(
                     // probing audio hardware every monitor tick forever.
                     {
                         let current_enabled = audio_manager.enabled_devices().await;
+                        let session_devices = audio_manager.session_devices();
+                        // A piggybacked meeting captures the mic through a
+                        // session stream (the resolved mic) that isn't in
+                        // enabled_devices; count it so we don't declare "no
+                        // input" and storm recovery. Empty set ⇒ no-op.
                         let has_input = is_device_type_running(
                             &device_manager,
                             &current_enabled,
+                            DeviceType::Input,
+                        ) || is_session_type_streaming(
+                            &audio_manager,
+                            &session_devices,
                             DeviceType::Input,
                         );
                         if !has_input {
@@ -898,7 +1080,17 @@ pub async fn start_device_monitor(
                                         let device_name = default_input.to_string();
                                         let user_disabled =
                                             audio_manager.user_disabled_devices().await;
-                                        if user_disabled.contains(&device_name) {
+                                        // Piggyback suspended the default input for
+                                        // the meeting (its capture rides a session
+                                        // stream). Starting it here would be
+                                        // silently no-op'd by the suspension guard,
+                                        // then mis-logged as "restored" with a
+                                        // backoff reset — a 2s log/reset storm.
+                                        // Skip this tick entirely, no log, no reset.
+                                        if audio_manager.suspended_devices().contains(&device_name)
+                                        {
+                                            // leave backoff untouched
+                                        } else if user_disabled.contains(&device_name) {
                                             input_recovery_backoff.record_failure(true);
                                         } else {
                                             warn!(
@@ -956,9 +1148,19 @@ pub async fn start_device_monitor(
                     {
                         let current_enabled = audio_manager.enabled_devices().await;
                         let user_disabled = audio_manager.user_disabled_devices().await;
+                        let session_devices = audio_manager.session_devices();
+                        // During a piggybacked meeting the far end is captured
+                        // by the "Meeting Tap (output)" session stream while the
+                        // stable "System Audio (output)" is suspended; count the
+                        // streaming session output so recovery doesn't storm.
+                        // Empty set ⇒ no-op.
                         let has_output = is_device_type_running(
                             &device_manager,
                             &current_enabled,
+                            DeviceType::Output,
+                        ) || is_session_type_streaming(
+                            &audio_manager,
+                            &session_devices,
                             DeviceType::Output,
                         );
                         // Don't try to recover if user explicitly disabled output
@@ -982,27 +1184,43 @@ pub async fn start_device_monitor(
                                 match default_output_device().await {
                                     Ok(default_output) => {
                                         let device_name = default_output.to_string();
-                                        info!(
-                                            "[DEVICE_RECOVERY] no output device running (attempt {}), starting default: {}",
-                                            output_recovery_backoff.attempts, device_name
-                                        );
-                                        match audio_manager.start_device(&default_output).await {
-                                            Ok(()) => {
-                                                failed_devices.remove(&device_name);
-                                                default_tracker.last_output =
-                                                    Some(device_name.clone());
-                                                output_recovery_backoff.reset();
-                                                info!(
-                                                    "[DEVICE_RECOVERY] output device restored, device={}", device_name
-                                                );
-                                            }
-                                            Err(e) => {
-                                                output_recovery_backoff.record_failure(false);
-                                                warn!(
-                                                    "[DEVICE_RECOVERY] failed to start output device {} (attempt {}, next retry in {}s): {}",
-                                                    device_name, output_recovery_backoff.attempts,
-                                                    output_recovery_backoff.next_delay_secs(), e
-                                                );
+                                        // Piggyback suspended the stable output for
+                                        // the meeting (the Meeting Tap rides a
+                                        // session stream). Starting it here would be
+                                        // silently no-op'd by the suspension guard,
+                                        // then mis-logged as "restored" with a
+                                        // backoff reset — a 2s log/reset storm. Skip
+                                        // just the recovery attempt this tick: no
+                                        // log, no reset (must NOT `continue`, which
+                                        // would skip the rest of the monitor pass
+                                        // incl. the piggyback sweep itself).
+                                        if audio_manager.suspended_devices().contains(&device_name)
+                                        {
+                                            // leave backoff untouched
+                                        } else {
+                                            info!(
+                                                "[DEVICE_RECOVERY] no output device running (attempt {}), starting default: {}",
+                                                output_recovery_backoff.attempts, device_name
+                                            );
+                                            match audio_manager.start_device(&default_output).await
+                                            {
+                                                Ok(()) => {
+                                                    failed_devices.remove(&device_name);
+                                                    default_tracker.last_output =
+                                                        Some(device_name.clone());
+                                                    output_recovery_backoff.reset();
+                                                    info!(
+                                                        "[DEVICE_RECOVERY] output device restored, device={}", device_name
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    output_recovery_backoff.record_failure(false);
+                                                    warn!(
+                                                        "[DEVICE_RECOVERY] failed to start output device {} (attempt {}, next retry in {}s): {}",
+                                                        device_name, output_recovery_backoff.attempts,
+                                                        output_recovery_backoff.next_delay_secs(), e
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -1191,10 +1409,12 @@ pub async fn start_device_monitor(
                 }
 
                 let user_disabled_for_reconnect = audio_manager.user_disabled_devices().await;
+                let reconnect_now = Instant::now();
                 for device_name in disconnected_devices.clone() {
                     // Skip user-disabled devices — they're intentionally stopped
                     if user_disabled_for_reconnect.contains(&device_name) {
                         disconnected_devices.remove(&device_name);
+                        disconnected_device_backoffs.remove(&device_name);
                         continue;
                     }
 
@@ -1202,24 +1422,144 @@ pub async fn start_device_monitor(
                         Ok(device) => device,
                         Err(e) => {
                             debug!("Device name {} invalid: {}", device_name, e);
+                            disconnected_devices.remove(&device_name);
+                            disconnected_device_backoffs.remove(&device_name);
                             continue;
                         }
                     };
 
+                    // Gate reconnect attempts behind per-device exponential backoff.
+                    // A device that stays gone (AirPods removed with no other input
+                    // selected) would otherwise be re-probed + re-logged on every
+                    // 2s tick — thousands of identical "not found" lines. The
+                    // backoff settles it to a handful.
+                    //
+                    // BUT if the device is back in the available set (user
+                    // reconnected it), bypass the backoff and retry immediately so
+                    // recovery is instant, not delayed by up to the permanent-error cap.
+                    let device_back = currently_available_devices.contains(&device);
+                    if !device_back
+                        && !should_attempt_disconnected_device_recovery(
+                            &mut disconnected_device_backoffs,
+                            &device_name,
+                            &device.device_type,
+                            reconnect_now,
+                        )
+                    {
+                        continue;
+                    }
+
                     // In system default mode, try to restart with current default instead
                     if audio_manager.use_system_default_audio().await {
-                        let current_default = match device.device_type {
-                            DeviceType::Input => default_input_device().ok(),
-                            DeviceType::Output => default_output_device().await.ok(),
-                        };
-
-                        if let Some(default_device) = current_default {
-                            if audio_manager.start_device(&default_device).await.is_ok() {
-                                info!("restarted with system default device: {}", default_device);
-                                disconnected_devices.remove(&device_name);
-                                continue;
-                            }
+                        match &device.device_type {
+                            DeviceType::Input => match default_input_device() {
+                                Ok(default_device) => {
+                                    match audio_manager.start_device(&default_device).await {
+                                        Ok(()) => {
+                                            info!(
+                                                "restarted with system default device: {}",
+                                                default_device
+                                            );
+                                            disconnected_devices.remove(&device_name);
+                                            disconnected_device_backoffs.remove(&device_name);
+                                        }
+                                        Err(e) => {
+                                            let permanent = is_permanent_device_start_error(&e);
+                                            let (attempts, delay) =
+                                                record_disconnected_device_failure(
+                                                    &mut disconnected_device_backoffs,
+                                                    &device_name,
+                                                    &device.device_type,
+                                                    permanent,
+                                                );
+                                            if should_log_recovery_attempt(attempts) {
+                                                warn!(
+                                                    "[DEVICE_RECOVERY] failed to restart current system default {} for stale {} (attempt {}, next retry in {}s): {}",
+                                                    default_device,
+                                                    device_name,
+                                                    attempts,
+                                                    delay,
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let permanent = is_permanent_input_error(&e);
+                                    let (attempts, delay) = record_disconnected_device_failure(
+                                        &mut disconnected_device_backoffs,
+                                        &device_name,
+                                        &device.device_type,
+                                        permanent,
+                                    );
+                                    if should_log_recovery_attempt(attempts) {
+                                        warn!(
+                                            "[DEVICE_RECOVERY] no system default input while recovering stale {} (attempt {}, {}, next retry in {}s): {}",
+                                            device_name,
+                                            attempts,
+                                            if permanent { "permanent" } else { "transient" },
+                                            delay,
+                                            e
+                                        );
+                                    }
+                                }
+                            },
+                            DeviceType::Output => match default_output_device().await {
+                                Ok(default_device) => {
+                                    match audio_manager.start_device(&default_device).await {
+                                        Ok(()) => {
+                                            info!(
+                                                "restarted with system default device: {}",
+                                                default_device
+                                            );
+                                            disconnected_devices.remove(&device_name);
+                                            disconnected_device_backoffs.remove(&device_name);
+                                        }
+                                        Err(e) => {
+                                            let permanent = is_permanent_device_start_error(&e);
+                                            let (attempts, delay) =
+                                                record_disconnected_device_failure(
+                                                    &mut disconnected_device_backoffs,
+                                                    &device_name,
+                                                    &device.device_type,
+                                                    permanent,
+                                                );
+                                            if should_log_recovery_attempt(attempts) {
+                                                warn!(
+                                                    "[DEVICE_RECOVERY] failed to restart current system default {} for stale {} (attempt {}, next retry in {}s): {}",
+                                                    default_device,
+                                                    device_name,
+                                                    attempts,
+                                                    delay,
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let permanent = is_permanent_output_error(&e);
+                                    let (attempts, delay) = record_disconnected_device_failure(
+                                        &mut disconnected_device_backoffs,
+                                        &device_name,
+                                        &device.device_type,
+                                        permanent,
+                                    );
+                                    if should_log_recovery_attempt(attempts) {
+                                        warn!(
+                                            "[DEVICE_RECOVERY] no system default output while recovering stale {} (attempt {}, {}, next retry in {}s): {}",
+                                            device_name,
+                                            attempts,
+                                            if permanent { "permanent" } else { "transient" },
+                                            delay,
+                                            e
+                                        );
+                                    }
+                                }
+                            },
                         }
+                        continue;
                     }
 
                     match audio_manager.start_device(&device).await {
@@ -1229,12 +1569,50 @@ pub async fn start_device_monitor(
                                 device_name
                             );
                             disconnected_devices.remove(&device_name);
+                            disconnected_device_backoffs.remove(&device_name);
                         }
                         Err(e) => {
-                            warn!(
-                                "[DEVICE_RECOVERY] failed to restart device {}: {}",
-                                device_name, e
+                            let e_str = e.to_string();
+                            if e_str.contains("already running") {
+                                disconnected_devices.remove(&device_name);
+                                disconnected_device_backoffs.remove(&device_name);
+                                continue;
+                            }
+                            let permanent = is_permanent_device_start_error(&e);
+                            let (attempts, delay) = record_disconnected_device_failure(
+                                &mut disconnected_device_backoffs,
+                                &device_name,
+                                &device.device_type,
+                                permanent,
                             );
+                            if attempts == 1 {
+                                // Surface the dead-end ONCE, loudly: if this was the
+                                // user's only selected device there is nothing to fall
+                                // back to and capture has stopped until the device
+                                // returns or another is selected.
+                                warn!(
+                                    "[DEVICE_RECOVERY] '{}' is no longer available and could not \
+                                     be restarted — if it was your only selected {} device, \
+                                     capture has stopped until you reconnect it or select another \
+                                     device (backing off, next retry in {}s): {}",
+                                    device_name,
+                                    match device.device_type {
+                                        DeviceType::Input => "input",
+                                        DeviceType::Output => "output",
+                                    },
+                                    delay,
+                                    e
+                                );
+                            } else if should_log_recovery_attempt(attempts) {
+                                warn!(
+                                    "[DEVICE_RECOVERY] failed to restart device {} (attempt {}, {}, next retry in {}s): {}",
+                                    device_name,
+                                    attempts,
+                                    if permanent { "permanent" } else { "transient" },
+                                    delay,
+                                    e
+                                );
+                            }
                         }
                     }
                 }
@@ -1331,18 +1709,43 @@ pub async fn start_device_monitor(
                 )
                 .await;
 
+                // Meeting piggyback: per-process tap + resolved mic during
+                // meetings (experimental flag). Owns its own fallback — every
+                // failure path lands on the stable capture. Pure decider in
+                // meeting_piggyback.rs; this call only applies side effects.
+                let piggyback_far_end_active =
+                    super::meeting_piggyback::run_meeting_piggyback_sweep(
+                        &audio_manager,
+                        &mut piggyback_state,
+                    )
+                    .await;
+
                 // Capture whichever render endpoint audio actually plays
                 // through, and notify if a meeting's speaker audio isn't
                 // reaching the pipeline. Inert outside Windows — see
-                // `windows_output_follow.rs`.
+                // `windows_output_follow.rs`. Skipped entirely while the
+                // piggyback tap is the far end (would double-capture).
                 super::windows_output_follow::run_output_follow_sweep(
+                    piggyback_far_end_active,
                     &audio_manager,
                     &mut output_follow_state,
                     &mut speaker_watchdog_state,
                 )
                 .await;
             }
-            sleep(Duration::from_secs(2)).await;
+            // Event-driven wake (macOS): while the piggyback sweep is engaged
+            // it registers CoreAudio property listeners (default input device;
+            // the meeting processes' input-device-list / is-running-input)
+            // that poke this Notify the instant anything changes — so a mic
+            // switch in Meet/Zoom is followed on the very next pass instead
+            // of up to a poll interval later. The 2s tick remains as the
+            // reconciliation fallback and is the only wake source on Windows.
+            // A wake that fires mid-pass is stored (single permit) and drains
+            // here immediately, so no event is ever lost to timing.
+            tokio::select! {
+                _ = sleep(Duration::from_secs(2)) => {}
+                _ = super::piggyback_listeners::sweep_wake_notified() => {}
+            }
         }
     }));
     Ok(())
@@ -1729,6 +2132,75 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_input_backoff_suppresses_two_second_retry_storm() {
+        let mut backoffs = HashMap::new();
+        let device_name = "Microphone (USB Composite Device) (input)";
+        let start = Instant::now();
+        let mut attempted_at_secs = Vec::new();
+
+        // Reproduce the monitor's 2s cadence for one minute while Windows has
+        // no default input device and the stale USB mic cannot be restarted.
+        // Before this backoff, the monitor attempted all 30 ticks.
+        for tick in 0_u64..30 {
+            let now = start + Duration::from_secs(tick * 2);
+            if should_attempt_disconnected_device_recovery(
+                &mut backoffs,
+                device_name,
+                &DeviceType::Input,
+                now,
+            ) {
+                attempted_at_secs.push(tick * 2);
+                record_disconnected_device_failure(
+                    &mut backoffs,
+                    device_name,
+                    &DeviceType::Input,
+                    true,
+                );
+            }
+        }
+
+        assert_eq!(attempted_at_secs, vec![0, 2, 6, 14, 30]);
+        let backoff = backoffs.get(device_name).unwrap();
+        assert_eq!(backoff.attempts, attempted_at_secs.len() as u32);
+        assert_eq!(backoff.next_delay_secs(), 30);
+    }
+
+    #[test]
+    fn disconnected_transient_backoff_keeps_recovery_responsive() {
+        let mut backoff = DeviceRecoveryBackoff::for_input();
+        let start = Instant::now();
+        let mut attempted_at_secs = Vec::new();
+
+        // Transient failures stay capped at 8s so a briefly flapping device can
+        // still recover quickly without retrying every monitor cycle.
+        for tick in 0_u64..10 {
+            let now = start + Duration::from_secs(tick * 2);
+            if backoff.should_attempt(now) {
+                attempted_at_secs.push(tick * 2);
+                backoff.record_attempt_at(now);
+                backoff.record_failure(false);
+            }
+        }
+
+        assert_eq!(attempted_at_secs, vec![0, 2, 6, 14]);
+        assert_eq!(backoff.next_delay_secs(), 8);
+    }
+
+    #[test]
+    fn disconnected_backoff_allows_immediate_attempt_after_success_reset() {
+        let mut backoff = DeviceRecoveryBackoff::for_input();
+        let start = Instant::now();
+
+        assert!(backoff.should_attempt(start));
+        backoff.record_attempt_at(start);
+        backoff.record_failure(true);
+        assert!(!backoff.should_attempt(start + Duration::from_secs(1)));
+
+        backoff.reset();
+        assert!(backoff.should_attempt(start + Duration::from_secs(1)));
+    }
+
+    #[test]
     fn test_backoff_transient_then_permanent_escalates() {
         let mut b = DeviceRecoveryBackoff::for_output();
         b.record_failure(false); // transient
@@ -1739,6 +2211,49 @@ mod tests {
         assert_eq!(b.next_delay_secs(), 8); // 2^3 = 8, under 120 cap
         b.record_failure(true);
         assert_eq!(b.next_delay_secs(), 16);
+    }
+
+    #[test]
+    fn backoff_throttles_a_permanently_missing_device_instead_of_every_tick() {
+        // REGRESSION: a disconnected device that stays "not found" (e.g. AirPods
+        // removed from the recording set with no other device selected) must NOT
+        // be re-probed + re-logged on every 2s monitor tick. Before this fix the
+        // `disconnected_devices` retry loop had no backoff and produced thousands
+        // of `[DEVICE_RECOVERY] failed to restart ... not found` lines. With the
+        // exponential backoff gate it should settle to a handful over the same
+        // window.
+        let mut b = DeviceRecoveryBackoff::for_input();
+        let start = Instant::now();
+        let mut attempts = 0;
+        // 60s of the monitor's 2-second ticks against a permanently-gone device.
+        for i in 0..30u64 {
+            let now = start + Duration::from_secs(i * 2);
+            if b.should_attempt(now) {
+                attempts += 1;
+                b.record_attempt_at(now);
+                b.record_failure(true); // still "not found"
+            }
+        }
+        // No backoff = 30 (one per tick = the spam bug). Exponential backoff
+        // capped at 30s should be ~5.
+        assert!(
+            attempts <= 8,
+            "permanently-missing device retried {attempts} times in 60s — backoff not applied (spam regression)"
+        );
+        // ...but it must still retry a few times so a genuinely-transient drop recovers.
+        assert!(
+            attempts >= 3,
+            "device retried only {attempts} times — backoff too aggressive, transient drops won't recover"
+        );
+    }
+
+    #[test]
+    fn default_switch_retry_backoff_caps_at_8s() {
+        assert_eq!(default_switch_retry_delay_secs(0), 0);
+        assert_eq!(default_switch_retry_delay_secs(1), 2);
+        assert_eq!(default_switch_retry_delay_secs(2), 4);
+        assert_eq!(default_switch_retry_delay_secs(3), 8);
+        assert_eq!(default_switch_retry_delay_secs(4), 8);
     }
 
     #[test]
@@ -1767,6 +2282,31 @@ mod tests {
     }
 
     #[test]
+    fn test_permanent_device_start_error_detection() {
+        assert!(is_permanent_device_start_error(&anyhow::anyhow!(
+            "device Microphone (USB Composite Device) (input) not found"
+        )));
+        assert!(is_permanent_device_start_error(&anyhow::anyhow!(
+            "No default input device detected"
+        )));
+        assert!(is_permanent_device_start_error(&anyhow::anyhow!(
+            "no display audio device found"
+        )));
+        assert!(!is_permanent_device_start_error(&anyhow::anyhow!(
+            "callback never fired"
+        )));
+    }
+
+    #[test]
+    fn test_recovery_attempt_log_throttling() {
+        assert!(should_log_recovery_attempt(1));
+        assert!(should_log_recovery_attempt(3));
+        assert!(!should_log_recovery_attempt(4));
+        assert!(should_log_recovery_attempt(30));
+        assert!(!should_log_recovery_attempt(31));
+    }
+
+    #[test]
     fn test_cooldown_evicts_old_entries() {
         let mut cd = RestartCooldown::new(3, Duration::from_secs(0)); // 0s window: everything expires instantly
         cd.record_restart();
@@ -1786,6 +2326,90 @@ mod tests {
 
     fn set(items: &[&str]) -> HashSet<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    struct DefaultInputSwitchRepro {
+        tracker: SystemDefaultTracker,
+        failed_devices: HashMap<String, (u32, Instant)>,
+        running_input: String,
+        start_attempts: usize,
+    }
+
+    impl DefaultInputSwitchRepro {
+        fn new(initial_default: &str) -> Self {
+            let mut tracker = SystemDefaultTracker::new();
+            tracker.last_input = Some(initial_default.to_string());
+            Self {
+                tracker,
+                failed_devices: HashMap::new(),
+                running_input: initial_default.to_string(),
+                start_attempts: 0,
+            }
+        }
+
+        fn poll(&mut self, current_default: &str, default_is_startable: bool, now: Instant) {
+            let previous_default = self.tracker.last_input.clone();
+            if let Some(new_default) = self
+                .tracker
+                .check_input_changed_from_current(Some(current_default.to_string()))
+            {
+                if default_switch_retry_backoff_active(&self.failed_devices, &new_default, now) {
+                    self.tracker.last_input = previous_default;
+                    return;
+                }
+
+                self.start_attempts += 1;
+
+                if default_is_startable {
+                    self.failed_devices.remove(&new_default);
+                    self.running_input = new_default;
+                } else {
+                    let count = self.failed_devices.entry(new_default).or_insert((0, now));
+                    count.0 += 1;
+                    count.1 = now;
+                    self.tracker.last_input = previous_default;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn default_input_change_retries_after_transient_not_found() {
+        let realtek = "Microphone (Realtek(R) Audio) (input)";
+        let krisp = "Krisp Microphone (Krisp Audio) (input)";
+        let now = Instant::now();
+
+        let mut repro = DefaultInputSwitchRepro::new(realtek);
+
+        // Windows reports Krisp as the new default before the audio device list
+        // can start it, matching the observed "device ... not found" log.
+        repro.poll(krisp, false, now);
+        assert_eq!(repro.start_attempts, 1);
+        assert_eq!(repro.running_input, realtek);
+
+        // A too-early monitor tick should keep the old mic and avoid hammering
+        // the device list.
+        repro.poll(
+            krisp,
+            true,
+            now.checked_add(Duration::from_secs(1)).unwrap(),
+        );
+        assert_eq!(repro.start_attempts, 1);
+        assert_eq!(repro.running_input, realtek);
+
+        // Once the small retry backoff has elapsed, the still-pending default
+        // switch should be attempted again.
+        repro.poll(
+            krisp,
+            true,
+            now.checked_add(Duration::from_secs(2)).unwrap(),
+        );
+
+        assert_eq!(
+            repro.start_attempts, 2,
+            "failed default-device switches must stay pending and retry even when the old mic is still running"
+        );
+        assert_eq!(repro.running_input, krisp);
     }
 
     fn build_inputs<'a>(
