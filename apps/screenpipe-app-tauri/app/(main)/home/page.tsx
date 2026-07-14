@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 import { emit } from "@tauri-apps/api/event";
 import {
+  getOrCreateEmptyChatId,
   applyChatSessionActivity,
   sessionRecordFromMeta,
   useChatStore,
@@ -133,23 +134,30 @@ function HomeContent() {
   }, [setActiveSection]);
 
   const startNewChat = useCallback(() => {
-    const id = crypto.randomUUID();
     const store = useChatStore.getState();
+    // Reuse an existing empty chat instead of minting a fresh uuid every
+    // time (#4719). Repeatedly hitting "+ new chat" otherwise floods the
+    // sidebar with stray untitled rows and mints ids that the panel and the
+    // other window then have to reconcile.
+    const { id, isNew } = getOrCreateEmptyChatId();
+    // Clean up any *other* stray empty drafts, keeping the one we reuse.
     Object.values(store.sessions).forEach((s) => {
-      if (s.draft) store.actions.drop(s.id);
+      if (s.draft && s.id !== id) store.actions.drop(s.id);
     });
-    store.actions.upsert({
-      id,
-      title: "untitled",
-      preview: "",
-      status: "idle",
-      messageCount: 0,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      pinned: false,
-      unread: false,
-      draft: true,
-    });
+    if (isNew) {
+      store.actions.upsert({
+        id,
+        title: "untitled",
+        preview: "",
+        status: "idle",
+        messageCount: 0,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        pinned: false,
+        unread: false,
+        draft: true,
+      });
+    }
     store.actions.setCurrent(id);
     void emit("chat-load-conversation", { conversationId: id });
   }, [setActiveSection]);
@@ -401,14 +409,16 @@ function HomeContent() {
     user_disabled: boolean;
   }
   const [recordingDevices, setRecordingDevices] = useState<RecordingDevice[]>([]);
+  const [isCapturePaused, setIsCapturePaused] = useState(false);
   const recordingDevicesSnapshotRef = useRef("");
 
   const refreshRecordingDevices = useCallback(async () => {
     try {
-      const [health, audioStatus, visionStatus]: [
+      const [health, audioStatus, visionStatus, capturePausedResult]: [
         { monitors?: string[]; device_status_details?: string } | null,
         AudioDeviceStatus[] | null,
         VisionDeviceStatus[] | null,
+        Awaited<ReturnType<typeof commands.isCapturePaused>>,
       ] = await Promise.all([
         localFetch("/health")
           .then((r) => r.ok ? r.json() : null)
@@ -419,7 +429,14 @@ function HomeContent() {
         localFetch("/vision/device/status")
           .then((r) => r.ok ? r.json() : null)
           .catch(() => null),
+        commands.isCapturePaused(),
       ]);
+
+      // Read the backend's recording status — same source of truth as
+      // the tray menu. When capture is globally paused/stopped the sidecar
+      // per-device endpoints still report devices as active, so override.
+      const capturePaused = capturePausedResult === true;
+      setIsCapturePaused(capturePaused);
 
       const devices: RecordingDevice[] = [];
       // Prefer /vision/device/status: it carries the numeric monitor id (so each
@@ -489,10 +506,14 @@ function HomeContent() {
         }
       }
 
-      const snapshot = JSON.stringify(devices);
+      const effective = capturePaused
+        ? devices.map((d) => ({ ...d, active: false }))
+        : devices;
+
+      const snapshot = JSON.stringify(effective);
       if (snapshot !== recordingDevicesSnapshotRef.current) {
         recordingDevicesSnapshotRef.current = snapshot;
-        setRecordingDevices(devices);
+        setRecordingDevices(effective);
       }
     } catch {
       // Device status is advisory UI state; keep the last known snapshot.
@@ -511,8 +532,27 @@ function HomeContent() {
     void refreshRecordingDevices();
   });
 
+  // Covers pause/resume from tray, keyboard shortcut, or deeplink — the same
+  // events that trigger the "recording paused"/"recording started" toasts.
+  // Refresh reads is_capture_paused from the backend so it always has the
+  // real state — no fragile frontend ref needed.
+  useTauriEvent("shortcut-stop-recording", () => {
+    void refreshRecordingDevices();
+  });
+
+  useTauriEvent("shortcut-start-recording", () => {
+    void refreshRecordingDevices();
+  });
+
   const pauseRecording = useCallback(async () => {
     await emit("shortcut-stop-recording", {});
+    window.setTimeout(() => {
+      void refreshRecordingDevices();
+    }, 500);
+  }, [refreshRecordingDevices]);
+
+  const resumeRecording = useCallback(async () => {
+    await emit("shortcut-start-recording", {});
     window.setTimeout(() => {
       void refreshRecordingDevices();
     }, 500);
@@ -951,6 +991,8 @@ function HomeContent() {
               meetingLoading={meetingLoading}
               onToggleMeeting={() => void toggleMeeting()}
               onPauseRecording={pauseRecording}
+              onResumeRecording={resumeRecording}
+              isGloballyPaused={isCapturePaused}
               isTranslucent={isTranslucent}
               floatingOverMedia={sidebarCollapsed && activeSection === "timeline"}
             />

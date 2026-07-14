@@ -2528,7 +2528,9 @@ extern "C" fn activity_only_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread::sleep;
     use std::sync::{Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
 
     static CLIPBOARD_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -2536,6 +2538,17 @@ mod tests {
         CLIPBOARD_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn read_clipboard_eventually() -> Option<String> {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let result = get_clipboard();
+            if result.is_some() || Instant::now() >= deadline {
+                return result;
+            }
+            sleep(Duration::from_millis(25));
+        }
     }
 
     #[test]
@@ -2631,7 +2644,7 @@ mod tests {
             let mut clipboard = arboard::Clipboard::new().expect("clipboard init");
             clipboard.set_text(test_text).expect("clipboard set");
         }
-        let result = get_clipboard();
+        let result = read_clipboard_eventually();
         assert_eq!(result, Some(test_text.to_string()));
     }
 
@@ -2657,7 +2670,7 @@ mod tests {
                 .set_text(unicode_text)
                 .expect("clipboard set unicode");
         }
-        let result = get_clipboard();
+        let result = read_clipboard_eventually();
         assert_eq!(result, Some(unicode_text.to_string()));
     }
 
@@ -2672,7 +2685,7 @@ mod tests {
                 .set_text(&large_text)
                 .expect("clipboard set large");
         }
-        let result = get_clipboard();
+        let result = read_clipboard_eventually();
         assert_eq!(result, Some(large_text));
     }
 

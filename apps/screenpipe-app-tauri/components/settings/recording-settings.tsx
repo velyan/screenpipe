@@ -7,6 +7,8 @@
 const DEFAULT_OPENAI_COMPATIBLE_ENDPOINT = "http://127.0.0.1:8080";
 
 import React, { useEffect, useState, useMemo, useCallback } from "react";
+import { useEventListener } from "@/lib/hooks/use-event-listener";
+import { useInterval } from "@/lib/hooks/use-interval";
 import { useSettingsIndexDriftCheck, type SettingsField } from "./settings-search";
 import { CaptureFrequencyPreview, AudioCaptureModePreview } from "./setting-previews";
 
@@ -260,7 +262,7 @@ const getAudioEngineResolution = (
 ): AudioEngineResolution => {
   const requested = settings.audioTranscriptionEngine;
   const fallback = FALLBACK_TRANSCRIPTION_ENGINE;
-  const hasCloudAuth = Boolean(settings.user?.token || settings.user?.id);
+  const hasCloudAuth = Boolean(settings.user?.token);
   const hasDeepgramKey = Boolean(
     settings.deepgramApiKey && settings.deepgramApiKey !== "default"
   );
@@ -1567,9 +1569,8 @@ function HighFpsCard({
 
   React.useEffect(() => {
     fetchState();
-    const id = setInterval(fetchState, 2000);
-    return () => clearInterval(id);
   }, [fetchState]);
+  useInterval(fetchState, 2000);
 
   const pushSettings = React.useCallback(
     async (patch: Partial<{ defaultMode: HdDefaultMode; intervalMs: number }>): Promise<PushOutcome> => {
@@ -1880,9 +1881,10 @@ export function RecordingSettings() {
     }
   }, [addAudioExclusion, toast]);
 
-  useEffect(() => {
-    if (!selectedBundleId) return;
-    const handler = (e: KeyboardEvent) => {
+  useEventListener(
+    "keydown",
+    (e) => {
+      if (!selectedBundleId) return;
       if (e.key === "Delete" || e.key === "Backspace") {
         e.preventDefault();
         removeAudioExclusion(selectedBundleId);
@@ -1890,10 +1892,9 @@ export function RecordingSettings() {
       } else if (e.key === "Escape") {
         setSelectedBundleId(null);
       }
-    };
-    document.addEventListener("keydown", handler);
-    return () => document.removeEventListener("keydown", handler);
-  }, [selectedBundleId, removeAudioExclusion]);
+    },
+    selectedBundleId ? document : null,
+  );
 
   const [isUpdating, setIsUpdating] = useState(false);
   const { health } = useHealthCheck();
@@ -3289,8 +3290,7 @@ Your screen is a pipe. Everything you see, hear, and type flows through it. Scre
             </div>
             {(settings.meetingLiveTranscriptionEnabled ?? true) &&
               (settings.meetingLiveTranscriptionProvider ?? "selected-engine") === "screenpipe-cloud" &&
-              !settings.user?.token &&
-              !settings.user?.id && (
+              !settings.user?.token && (
               <p className="mt-2 ml-[26px] text-xs text-muted-foreground">
                 Log in to screenpipe cloud to use the cloud live provider.
               </p>

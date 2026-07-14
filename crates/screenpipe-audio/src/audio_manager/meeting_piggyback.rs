@@ -1651,7 +1651,12 @@ mod tests {
         );
         // Delay elapsed: decider now sees the new set.
         assert_eq!(
-            delay_retap_pids(&mut candidate, &tap_built, vec![100, 200], t0 + RETAP_DELAY_MS),
+            delay_retap_pids(
+                &mut candidate,
+                &tap_built,
+                vec![100, 200],
+                t0 + RETAP_DELAY_MS
+            ),
             vec![100, 200]
         );
     }

@@ -132,7 +132,7 @@ export function StandaloneChat({
   const { items: appItems, isLoading: appsLoading, refresh: refreshAppItems } = useSqlAutocomplete("app");
   const { items: tagItems, isLoading: tagsLoading, refresh: refreshTagItems } = useTagAutocomplete();
   const { suggestions: autoSuggestions, refreshing: suggestionsRefreshing, forceRefresh: refreshSuggestions } = useAutoSuggestions();
-  const { templatePipes } = usePipes();
+  const { pipes, templatePipes } = usePipes();
   // Connected integrations (google-calendar, google-docs, slack, etc.) surfaced in the
   // filter popover so users can mention them directly with @id — helps the
   // agent pick the right connection for a query instead of having to guess.
@@ -142,7 +142,6 @@ export function StandaloneChat({
   const {
     allConnectionItems,
     connectionAwareSuggestions,
-    connectionSetupSuggestions,
     connections,
     refreshConnectionState,
     refreshVisibleSuggestions,
@@ -498,6 +497,24 @@ export function StandaloneChat({
   const [conversationId, setConversationId] = useState<string | null>(
     initialSessionIdRef.current,
   );
+
+  // Single source of truth for the active chat id (#4719). The panel mints
+  // `initialSessionIdRef` and seeds `conversationId` / `piSessionIdRef` from
+  // it, and `panelSessionId` follows `conversationId` via
+  // useChatConversationEvents — but the store's `currentId` was never set at
+  // mount, so it diverged from the id the panel is actually rendering. Publish
+  // the panel's id to `currentId` once so all four sources agree from message
+  // 0. Guarded on `!currentId` so a pending cross-window restore (which runs
+  // its own async load + setCurrent) is never clobbered. The panel is mounted
+  // once for the app's lifetime (hidden via display:none on non-chat sections,
+  // never unmounted), so this runs exactly once and can't fork on remount.
+  useEffect(() => {
+    const store = useChatStore.getState();
+    if (!store.currentId) {
+      store.actions.setCurrent(initialSessionIdRef.current);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Pipe-watch sessions keep their messages in the chat store, not in this
   // component's local state. Read them from the store directly and fall back to
@@ -886,6 +903,7 @@ export function StandaloneChat({
     activePresetRef,
     attachedDocsRef,
     autoSendBypassRef,
+    setConversationId,
     buildProviderConfig,
     canChat,
     cancelStreamingMessageRender,
@@ -947,6 +965,15 @@ export function StandaloneChat({
     takeQueuedDisplayById,
     turnIntentLedgerRef,
   });
+
+  // E2E-only: expose the stop action so specs can end a turn and drive sends
+  // back-to-back without the Pi subprocess staying busy. Render assignment (the
+  // repo's preferred pattern over mirror effects); harmless no-op in production.
+  // `handleStop` closes over stable refs, so no cleanup is needed.
+  if (typeof window !== "undefined") {
+    (window as any).__e2eStopChat = handleStop;
+  }
+
 
   const answerPiExtensionUiRequest = useCallback(async (
     requestId: string | undefined,
@@ -1347,16 +1374,26 @@ export function StandaloneChat({
         }}
         summaryCardsProps={{
           onSendMessage: sendMessage,
-          onOpenConnection: openConnectionSetup,
-          connectionSetupSuggestions,
-          autoSuggestions: connectionAwareSuggestions,
-          suggestionsRefreshing,
-          onRefreshSuggestions: refreshVisibleSuggestions,
           customTemplates,
           onSaveCustomTemplate: saveCustomTemplate,
           onDeleteCustomTemplate: deleteCustomTemplate,
           userName: settings.userName,
           templatePipes,
+          existingPipes: pipes
+            .filter((pipe) => pipe.config.config?.template !== true)
+            .map((pipe) => ({
+              name: pipe.config.name,
+              title:
+                typeof pipe.config.config?.title === "string"
+                  ? pipe.config.config.title
+                  : pipe.config.name,
+              description:
+                typeof pipe.config.config?.description === "string"
+                  ? pipe.config.config.description
+                  : "",
+              enabled: pipe.config.enabled,
+              schedule: pipe.config.schedule,
+            })),
         }}
         messageListProps={messageListProps}
         isUserScrolledUp={isUserScrolledUp}

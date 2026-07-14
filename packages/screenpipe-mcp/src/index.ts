@@ -20,6 +20,14 @@ import {
   NOTIFICATION_DAEMON_TIMEOUT_MS,
   NOTIFICATION_DAEMON_URL,
 } from "./notification-request";
+import {
+  captureMcpException,
+  captureMcpMessage,
+  flushMcpTelemetry,
+  initMcpTelemetry,
+} from "./telemetry";
+
+initMcpTelemetry({ transport: "stdio" });
 
 // Parse command line arguments
 const args = process.argv.slice(2);
@@ -213,6 +221,14 @@ function discoverApiKey(): string {
       "",
     ].join("\n"),
   );
+  // This is a user-side misconfiguration (no key set + no desktop app / CLI /
+  // local DB), not a screenpipe defect — the stderr hint above tells the user
+  // how to fix it. Log it as `info` for activation signal, and throttle to one
+  // event per machine per day so a respawning MCP host can't escalate it.
+  captureMcpMessage("api key discovery failed", "info", {
+    phase: "api_key_discovery",
+    throttleKey: "api_key_discovery",
+  });
   return "";
 }
 
@@ -2191,6 +2207,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
+    if (!(error instanceof BackendDownError) && !(error instanceof BackendHttpError)) {
+      captureMcpMessage("tool call failed", "error", { phase: "tool_call", tool: name });
+    }
     // isError flags the result as a failure so the model retries with a
     // different approach instead of treating the error text as data.
     return {
@@ -2207,7 +2226,9 @@ async function main() {
   console.error("Screenpipe MCP server running on stdio");
 }
 
-main().catch((error) => {
+main().catch(async (error) => {
+  captureMcpException(error, { phase: "stdio_startup" });
+  await flushMcpTelemetry();
   console.error("Fatal error:", error);
   process.exit(1);
 });

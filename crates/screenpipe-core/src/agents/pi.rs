@@ -21,6 +21,15 @@ const PI_AI_PACKAGE: &str = "@earendil-works/pi-ai@0.75.4";
 const PI_NAMESPACE_DIR: &str = "@earendil-works";
 pub const SCREENPIPE_API_URL: &str = "https://api.screenpipe.com/v1";
 
+/// Windows creation flags for background agent spawns: CREATE_NO_WINDOW
+/// (0x08000000) so no console flashes, plus BELOW_NORMAL_PRIORITY_CLASS
+/// (0x00004000) so the bun→pi→tool-call subtree yields CPU to whatever the
+/// user is doing (#4849) — children inherit the class. Interactive chat is
+/// NOT this path: the desktop app manages its own pi sidecar
+/// (src-tauri/src/pi.rs) at Normal.
+#[cfg(windows)]
+const BACKGROUND_SPAWN_FLAGS: u32 = 0x08000000 | 0x00004000;
+
 /// Bounded retries for provider rate limiting (HTTP 429) in streaming runs.
 const MAX_RATE_LIMIT_RETRIES: usize = 3;
 /// Fallback wait when the 429 payload carries no `reset_in` hint.
@@ -115,8 +124,19 @@ async fn fetch_models_from_gateway(
     let body: serde_json::Value = resp.json().await.ok()?;
     let data = body.get("data")?.as_array()?;
 
-    let models: Vec<serde_json::Value> = data
-        .iter()
+    let models = gateway_models_to_pi_models(data);
+
+    info!("fetched {} models from gateway", models.len());
+    Some(json!(models))
+}
+
+/// Turn the gateway catalog into Pi's provider catalog. The gateway retains
+/// locked models for UI upgrade prompts, while Pi treats every listed model as
+/// selectable. Omit locked entries here so a pipe never appears to select a
+/// model only for the gateway to silently rewrite it to `auto`.
+fn gateway_models_to_pi_models(data: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    data.iter()
+        .filter(|m| !m.get("locked").and_then(|v| v.as_bool()).unwrap_or(false))
         .map(|m| {
             let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
             let name = m.get("name").and_then(|v| v.as_str()).unwrap_or(id);
@@ -140,10 +160,7 @@ async fn fetch_models_from_gateway(
                 "maxTokens": 32000,
             })
         })
-        .collect();
-
-    info!("fetched {} models from gateway", models.len());
-    Some(json!(models))
+        .collect()
 }
 
 /// Minimal fallback when the gateway is unreachable.
@@ -1255,10 +1272,7 @@ impl PiExecutor {
         }
 
         #[cfg(windows)]
-        {
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
+        cmd.creation_flags(BACKGROUND_SPAWN_FLAGS);
 
         let child = cmd.spawn()?;
         let pid = child.id();
@@ -1406,10 +1420,7 @@ impl PiExecutor {
         }
 
         #[cfg(windows)]
-        {
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
+        cmd.creation_flags(BACKGROUND_SPAWN_FLAGS);
 
         let mut child = cmd.spawn()?;
         let pid = child.id();
@@ -1843,8 +1854,8 @@ impl AgentExecutor for PiExecutor {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
+            // CPU/IO-heavy dependency install — background bootstrap work.
+            cmd.creation_flags(BACKGROUND_SPAWN_FLAGS);
         }
 
         let output = cmd.output().map_err(|e| {
@@ -3390,6 +3401,38 @@ mod tests {
         assert!(!PiExecutor::is_gateway_fallback_catalog(&[
             "claude-haiku-4-5".to_string()
         ]));
+    }
+
+    #[test]
+    fn gateway_catalog_omits_locked_models_from_pi() {
+        let models = gateway_models_to_pi_models(&[
+            json!({
+                "id": "auto",
+                "name": "Auto",
+                "context_window": 128000,
+                "intelligence": "standard",
+            }),
+            json!({
+                "id": "gpt-5.6-terra",
+                "name": "GPT-5.6 Terra",
+                "locked": true,
+                "context_window": 128000,
+                "intelligence": "highest",
+            }),
+            json!({
+                "id": "gpt-5.6-luna",
+                "name": "GPT-5.6 Luna",
+                "locked": null,
+                "context_window": 128000,
+                "intelligence": "high",
+            }),
+        ]);
+
+        let ids: Vec<&str> = models
+            .iter()
+            .filter_map(|model| model.get("id").and_then(|id| id.as_str()))
+            .collect();
+        assert_eq!(ids, vec!["auto", "gpt-5.6-luna"]);
     }
 
     #[test]
