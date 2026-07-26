@@ -675,21 +675,28 @@ pub async fn get_frame_context(
         .await
         .unwrap_or_default();
 
-    let text = if text_positions.is_empty() {
-        None
+    // Unified frames can retain useful `full_text` even when `text_json` is
+    // absent or malformed. Positions are richer when available, but raw OCR is
+    // a valid frame-context fallback and must not disappear just because boxes
+    // cannot be parsed.
+    let raw_ocr_text = if text_positions.is_empty() {
+        state
+            .db
+            .get_frame_ocr_data(frame_id)
+            .await
+            .ok()
+            .and_then(|(text, _)| text)
     } else {
-        Some(
-            text_positions
-                .iter()
-                .map(|p| p.text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
+        None
     };
+    let text = select_ocr_context_text(
+        text_positions.iter().map(|position| position.text.as_str()),
+        raw_ocr_text,
+    );
 
     let mut urls = Vec::new();
-    for pos in &text_positions {
-        for url in extract_urls_regex(&pos.text) {
+    if let Some(text) = text.as_deref() {
+        for url in extract_urls_regex(text) {
             if !urls.contains(&url) {
                 urls.push(url);
             }
@@ -703,6 +710,23 @@ pub async fn get_frame_context(
         urls,
         text_source: "ocr".to_string(),
     }))
+}
+
+fn select_ocr_context_text<'a>(
+    position_texts: impl Iterator<Item = &'a str>,
+    raw_ocr_text: Option<String>,
+) -> Option<String> {
+    let positioned = position_texts
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    if !positioned.is_empty() {
+        return Some(positioned.join("\n"));
+    }
+    raw_ocr_text.and_then(|text| {
+        let trimmed = text.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    })
 }
 
 /// Extract a URL from text if it looks like one
@@ -1139,3 +1163,35 @@ pub use super::content::FrameContent;
 
 /// extract_high_quality_frame re-export for video export
 pub use crate::video_utils::extract_high_quality_frame as extract_hq_frame;
+
+#[cfg(test)]
+mod context_fallback_tests {
+    use super::{extract_urls_regex, select_ocr_context_text};
+
+    #[test]
+    fn raw_ocr_text_survives_missing_positions() {
+        let text = select_ocr_context_text(
+            std::iter::empty(),
+            Some("Example evidence https://example.com/review".to_string()),
+        );
+
+        assert_eq!(
+            text.as_deref(),
+            Some("Example evidence https://example.com/review")
+        );
+        assert_eq!(
+            extract_urls_regex(text.as_deref().unwrap()),
+            vec!["https://example.com/review"]
+        );
+    }
+
+    #[test]
+    fn parsed_positions_remain_preferred() {
+        let text = select_ocr_context_text(
+            ["First line", "Second line"].into_iter(),
+            Some("Raw fallback".to_string()),
+        );
+
+        assert_eq!(text.as_deref(), Some("First line\nSecond line"));
+    }
+}

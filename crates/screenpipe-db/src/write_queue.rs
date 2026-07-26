@@ -18,6 +18,7 @@
 //! This reduces per-write overhead from ~5ms (semaphore + BEGIN + COMMIT + fsync)
 //! to ~5ms amortized over the entire batch.
 
+use crate::ocr_storage::OcrStorage;
 use chrono::{DateTime, Utc};
 use sqlx::{Pool, Sqlite};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -98,6 +99,7 @@ pub(crate) enum WriteOp {
         is_duplicate: bool,
     },
     InsertSnapshotFrameWithOcr {
+        ocr_storage: OcrStorage,
         device_name: String,
         timestamp: DateTime<Utc>,
         snapshot_path: String,
@@ -274,6 +276,7 @@ pub(crate) enum WriteOp {
     /// `begin_immediate_with_retry` call in `insert_frames_with_ocr_batch`
     /// so that frame inserts go through the coalescing queue.
     InsertFramesBatch {
+        ocr_storage: OcrStorage,
         video_chunk_id: i64,
         file_path: String,
         device_name: String,
@@ -728,6 +731,7 @@ async fn execute_single_write(
         }
 
         WriteOp::InsertSnapshotFrameWithOcr {
+            ocr_storage,
             device_name,
             timestamp,
             snapshot_path,
@@ -748,41 +752,79 @@ async fn execute_single_write(
             full_text,
             elements_ref_frame_id,
         } => {
-            let id = sqlx::query(
-                r#"INSERT INTO frames (
-                    video_chunk_id, offset_index, timestamp, name,
-                    browser_url, app_name, window_name, focused, device_name,
-                    snapshot_path, capture_trigger, accessibility_text, text_source,
-                    accessibility_tree_json, content_hash, simhash, full_text,
-                    elements_ref_frame_id, document_path
-                ) VALUES (
-                    NULL, 0, ?1, ?2,
-                    ?3, ?4, ?5, ?6, ?7,
-                    ?8, ?9, ?10, ?11,
-                    ?12, ?13, ?14, ?15,
-                    ?16, ?17
-                )"#,
-            )
-            .bind(timestamp)
-            .bind(snapshot_path.as_str())
-            .bind(browser_url.as_deref())
-            .bind(app_name.as_deref())
-            .bind(window_name.as_deref())
-            .bind(focused)
-            .bind(device_name.as_str())
-            .bind(snapshot_path.as_str())
-            .bind(capture_trigger.as_deref())
-            .bind(accessibility_text.as_deref())
-            .bind(text_source.as_deref())
-            .bind(accessibility_tree_json.as_deref())
-            .bind(content_hash)
-            .bind(simhash)
-            .bind(full_text.as_deref())
-            .bind(elements_ref_frame_id)
-            .bind(document_path.as_deref())
-            .execute(&mut **conn)
-            .await?
-            .last_insert_rowid();
+            let id = match ocr_storage {
+                OcrStorage::LegacyTable => sqlx::query(
+                    r#"INSERT INTO frames (
+                        video_chunk_id, offset_index, timestamp, name,
+                        browser_url, app_name, window_name, focused, device_name,
+                        snapshot_path, capture_trigger, accessibility_text, text_source,
+                        accessibility_tree_json, content_hash, simhash, full_text,
+                        elements_ref_frame_id, document_path
+                    ) VALUES (
+                        NULL, 0, ?1, ?2,
+                        ?3, ?4, ?5, ?6, ?7,
+                        ?8, ?9, ?10, ?11,
+                        ?12, ?13, ?14, ?15,
+                        ?16, ?17
+                    )"#,
+                )
+                .bind(timestamp)
+                .bind(snapshot_path.as_str())
+                .bind(browser_url.as_deref())
+                .bind(app_name.as_deref())
+                .bind(window_name.as_deref())
+                .bind(focused)
+                .bind(device_name.as_str())
+                .bind(snapshot_path.as_str())
+                .bind(capture_trigger.as_deref())
+                .bind(accessibility_text.as_deref())
+                .bind(text_source.as_deref())
+                .bind(accessibility_tree_json.as_deref())
+                .bind(content_hash)
+                .bind(simhash)
+                .bind(full_text.as_deref())
+                .bind(elements_ref_frame_id)
+                .bind(document_path.as_deref())
+                .execute(&mut **conn)
+                .await?
+                .last_insert_rowid(),
+                OcrStorage::UnifiedFrames => sqlx::query(
+                    r#"INSERT INTO frames (
+                        video_chunk_id, offset_index, timestamp, name,
+                        browser_url, app_name, window_name, focused, device_name,
+                        snapshot_path, capture_trigger, accessibility_text, text_source,
+                        accessibility_tree_json, content_hash, simhash, full_text,
+                        text_json, elements_ref_frame_id, document_path
+                    ) VALUES (
+                        NULL, 0, ?1, ?2,
+                        ?3, ?4, ?5, ?6, ?7,
+                        ?8, ?9, ?10, ?11,
+                        ?12, ?13, ?14, ?15,
+                        ?16, ?17, ?18
+                    )"#,
+                )
+                .bind(timestamp)
+                .bind(snapshot_path.as_str())
+                .bind(browser_url.as_deref())
+                .bind(app_name.as_deref())
+                .bind(window_name.as_deref())
+                .bind(focused)
+                .bind(device_name.as_str())
+                .bind(snapshot_path.as_str())
+                .bind(capture_trigger.as_deref())
+                .bind(accessibility_text.as_deref())
+                .bind(text_source.as_deref())
+                .bind(accessibility_tree_json.as_deref())
+                .bind(content_hash)
+                .bind(simhash)
+                .bind(full_text.as_deref())
+                .bind(ocr_text_json.as_deref())
+                .bind(elements_ref_frame_id)
+                .bind(document_path.as_deref())
+                .execute(&mut **conn)
+                .await?
+                .last_insert_rowid(),
+            };
 
             // Insert OCR text in same transaction (always — needed for search)
             // Element inserts are deferred to a separate transaction (see caller).
@@ -791,13 +833,14 @@ async fn execute_single_write(
             // actually return results. Without these binds the columns fall back
             // to their schema defaults ('' / NULL / false), making OCR data
             // effectively untagged even though the parent frame has the metadata.
-            if let (Some(text), Some(text_json), Some(engine)) = (
-                ocr_text.as_deref(),
-                ocr_text_json.as_deref(),
-                ocr_engine.as_deref(),
-            ) {
-                let text_length = text.len() as i64;
-                sqlx::query(
+            if ocr_storage.is_legacy() {
+                if let (Some(text), Some(text_json), Some(engine)) = (
+                    ocr_text.as_deref(),
+                    ocr_text_json.as_deref(),
+                    ocr_engine.as_deref(),
+                ) {
+                    let text_length = text.len() as i64;
+                    sqlx::query(
                     "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine, text_length, app_name, window_name, focused) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 )
                 .bind(id)
@@ -810,6 +853,7 @@ async fn execute_single_write(
                 .bind(focused)
                 .execute(&mut **conn)
                 .await?;
+                }
             }
 
             if let Some(ref_id) = elements_ref_frame_id {
@@ -1166,6 +1210,7 @@ async fn execute_single_write(
         }
 
         WriteOp::InsertFramesBatch {
+            ocr_storage,
             video_chunk_id,
             file_path,
             device_name,
@@ -1182,39 +1227,60 @@ async fn execute_single_write(
                     Some(window.text.as_str())
                 };
 
-                let frame_id = sqlx::query(
-                    "INSERT INTO frames (video_chunk_id, offset_index, timestamp, name, browser_url, app_name, window_name, focused, device_name, full_text) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                )
-                .bind(video_chunk_id)
-                .bind(offset_index)
-                .bind(timestamp)
-                .bind(file_path.as_str())
-                .bind(window.browser_url.as_deref())
-                .bind(window.app_name.as_deref())
-                .bind(window.window_name.as_deref())
-                .bind(window.focused)
-                .bind(device_name.as_str())
-                .bind(full_text)
-                .execute(&mut **conn)
-                .await?
-                .last_insert_rowid();
+                let frame_id = match ocr_storage {
+                    OcrStorage::LegacyTable => sqlx::query(
+                        "INSERT INTO frames (video_chunk_id, offset_index, timestamp, name, browser_url, app_name, window_name, focused, device_name, full_text) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    )
+                    .bind(video_chunk_id)
+                    .bind(offset_index)
+                    .bind(timestamp)
+                    .bind(file_path.as_str())
+                    .bind(window.browser_url.as_deref())
+                    .bind(window.app_name.as_deref())
+                    .bind(window.window_name.as_deref())
+                    .bind(window.focused)
+                    .bind(device_name.as_str())
+                    .bind(full_text)
+                    .execute(&mut **conn)
+                    .await?
+                    .last_insert_rowid(),
+                    OcrStorage::UnifiedFrames => sqlx::query(
+                        "INSERT INTO frames (video_chunk_id, offset_index, timestamp, name, browser_url, app_name, window_name, focused, device_name, full_text, text_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    )
+                    .bind(video_chunk_id)
+                    .bind(offset_index)
+                    .bind(timestamp)
+                    .bind(file_path.as_str())
+                    .bind(window.browser_url.as_deref())
+                    .bind(window.app_name.as_deref())
+                    .bind(window.window_name.as_deref())
+                    .bind(window.focused)
+                    .bind(device_name.as_str())
+                    .bind(full_text)
+                    .bind(&window.text_json)
+                    .execute(&mut **conn)
+                    .await?
+                    .last_insert_rowid(),
+                };
 
                 // Insert OCR text — duplicate app/window/focused from frame so
                 // OCR rows are filterable (see handler above for rationale).
-                let text_length = window.text.len() as i64;
-                sqlx::query(
-                    "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine, text_length, app_name, window_name, focused) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                )
-                .bind(frame_id)
-                .bind(&window.text)
-                .bind(&window.text_json)
-                .bind(ocr_engine_str.as_str())
-                .bind(text_length)
-                .bind(window.app_name.as_deref().unwrap_or(""))
-                .bind(window.window_name.as_deref())
-                .bind(window.focused)
-                .execute(&mut **conn)
-                .await?;
+                if ocr_storage.is_legacy() {
+                    let text_length = window.text.len() as i64;
+                    sqlx::query(
+                        "INSERT INTO ocr_text (frame_id, text, text_json, ocr_engine, text_length, app_name, window_name, focused) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    )
+                    .bind(frame_id)
+                    .bind(&window.text)
+                    .bind(&window.text_json)
+                    .bind(ocr_engine_str.as_str())
+                    .bind(text_length)
+                    .bind(window.app_name.as_deref().unwrap_or(""))
+                    .bind(window.window_name.as_deref())
+                    .bind(window.focused)
+                    .execute(&mut **conn)
+                    .await?;
+                }
 
                 // Dual-write: insert OCR elements into unified elements table
                 if !window.text_json.is_empty() {
@@ -1735,6 +1801,7 @@ mod tests {
 
         let result = queue
             .submit(WriteOp::InsertSnapshotFrameWithOcr {
+                ocr_storage: OcrStorage::LegacyTable,
                 device_name: "monitor1".to_string(),
                 timestamp: Utc::now(),
                 snapshot_path: "/tmp/frame.jpg".to_string(),
