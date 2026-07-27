@@ -43,6 +43,20 @@ pub fn video_quality_to_preset(quality: &str) -> &'static str {
     }
 }
 
+/// Map the user-facing quality preset to VideoToolbox's 0-100 quality scale.
+///
+/// The macOS sidecar uses Apple's built-in HEVC encoder so its bundled FFmpeg
+/// can remain LGPL-only instead of depending on GPL or nonfree codecs.
+#[cfg(target_os = "macos")]
+pub fn video_quality_to_videotoolbox_q(quality: &str) -> &'static str {
+    match quality {
+        "low" => "35",
+        "high" => "75",
+        "max" => "90",
+        _ => "55", // "balanced" or any unknown
+    }
+}
+
 /// Map video quality preset to JPEG quality for frame extraction.
 /// Lower value = higher quality (scale 2-31).
 pub fn video_quality_to_jpeg_q(quality: &str) -> &'static str {
@@ -116,30 +130,56 @@ pub async fn start_ffmpeg_process(
         "scale=trunc(iw/2)*2:trunc(ih/2)*2",
     ];
 
-    let crf = video_quality_to_crf(video_quality);
-    let preset = video_quality_to_preset(video_quality);
+    #[cfg(target_os = "macos")]
+    {
+        let quality = video_quality_to_videotoolbox_q(video_quality);
+        info!(
+            "FFmpeg encoding: quality={}, videotoolbox_q={}",
+            video_quality, quality
+        );
+        args.extend_from_slice(&[
+            "-vcodec",
+            "hevc_videotoolbox",
+            "-tag:v",
+            "hvc1",
+            "-q:v",
+            quality,
+            "-allow_sw",
+            "1",
+            "-realtime",
+            "1",
+            // Screenshot captures are independent frames. Avoid encoder delay
+            // so persisted timestamps remain aligned with the source frames.
+            "-bf",
+            "0",
+        ]);
+    }
 
-    info!(
-        "FFmpeg encoding: quality={}, crf={}, preset={}",
-        video_quality, crf, preset
-    );
-
-    args.extend_from_slice(&[
-        "-vcodec",
-        "libx265",
-        "-tag:v",
-        "hvc1",
-        "-preset",
-        preset,
-        "-crf",
-        crf,
-        // Disable B-frames: libx265 default B-frame buffering shifts PTS by 2 frames
-        // (e.g. first frame at 4s instead of 0s at 0.5fps). This causes the frontend
-        // to seek to the wrong frame. B-frames provide no benefit for screenshot
-        // captures anyway since every frame is visually independent.
-        "-x265-params",
-        "bframes=0",
-    ]);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let crf = video_quality_to_crf(video_quality);
+        let preset = video_quality_to_preset(video_quality);
+        info!(
+            "FFmpeg encoding: quality={}, crf={}, preset={}",
+            video_quality, crf, preset
+        );
+        args.extend_from_slice(&[
+            "-vcodec",
+            "libx265",
+            "-tag:v",
+            "hvc1",
+            "-preset",
+            preset,
+            "-crf",
+            crf,
+            // Disable B-frames: libx265 default B-frame buffering shifts PTS by 2 frames
+            // (e.g. first frame at 4s instead of 0s at 0.5fps). This causes the frontend
+            // to seek to the wrong frame. B-frames provide no benefit for screenshot
+            // captures anyway since every frame is visually independent.
+            "-x265-params",
+            "bframes=0",
+        ]);
+    }
 
     // Use fragmented MP4 to allow reading frames while file is still being written
     args.extend_from_slice(&["-movflags", "frag_keyframe+empty_moov+default_base_moof"]);
@@ -188,5 +228,32 @@ pub async fn finish_ffmpeg_process(child: Child, stdin: Option<ChildStdin>) {
             }
         }
         Err(e) => error!("Failed to wait for FFmpeg process: {}", e),
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::video_quality_to_videotoolbox_q;
+
+    #[test]
+    fn videotoolbox_quality_presets_are_ordered_and_bounded() {
+        let low = video_quality_to_videotoolbox_q("low")
+            .parse::<u8>()
+            .unwrap();
+        let balanced = video_quality_to_videotoolbox_q("balanced")
+            .parse::<u8>()
+            .unwrap();
+        let high = video_quality_to_videotoolbox_q("high")
+            .parse::<u8>()
+            .unwrap();
+        let max = video_quality_to_videotoolbox_q("max")
+            .parse::<u8>()
+            .unwrap();
+
+        assert!(low < balanced);
+        assert!(balanced < high);
+        assert!(high < max);
+        assert!(max <= 100);
+        assert_eq!(video_quality_to_videotoolbox_q("unknown"), "55");
     }
 }

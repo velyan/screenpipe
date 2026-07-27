@@ -22,7 +22,11 @@ use tracing::{debug, error, info, warn};
 
 use crate::hot_frame_cache::HotFrameCache;
 use crate::power::{PowerManagerHandle, ThermalState};
-use crate::video::{finish_ffmpeg_process, video_quality_to_crf, write_frame_to_ffmpeg};
+#[cfg(not(target_os = "macos"))]
+use crate::video::video_quality_to_crf;
+#[cfg(target_os = "macos")]
+use crate::video::video_quality_to_videotoolbox_q;
+use crate::video::{finish_ffmpeg_process, write_frame_to_ffmpeg};
 
 /// Minimum age before a snapshot is eligible for compaction.
 /// Recent snapshots stay as JPEGs for fast Tauri asset loading.
@@ -375,7 +379,7 @@ async fn compact_chunk(
 /// Spawn ffmpeg with low CPU priority for background compaction.
 /// Uses `nice` on unix / IDLE_PRIORITY_CLASS on Windows.
 /// Accepts JPEG passthrough (image2pipe mjpeg) so Rust doesn't need to decode.
-/// Limits x265 internal threading to 1 pool with 1 thread.
+/// Uses VideoToolbox on macOS and limits x265 to one thread elsewhere.
 async fn start_ffmpeg_lowpri(
     output_file: &str,
     fps: f64,
@@ -385,8 +389,6 @@ async fn start_ffmpeg_lowpri(
         screenpipe_core::find_ffmpeg_path().ok_or_else(|| anyhow::anyhow!("ffmpeg not found"))?;
 
     let fps_str = fps.to_string();
-    let crf = video_quality_to_crf(video_quality);
-
     // On unix, wrap with `nice -n 19` for lowest scheduling priority
     #[cfg(unix)]
     let mut command = {
@@ -398,31 +400,54 @@ async fn start_ffmpeg_lowpri(
     #[cfg(not(unix))]
     let mut command = screenpipe_core::ffmpeg_cmd_async(ffmpeg_path);
 
+    command.args([
+        "-f",
+        "image2pipe",
+        "-vcodec",
+        "mjpeg",
+        "-r",
+        &fps_str,
+        "-i",
+        "-",
+        "-vf",
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+    ]);
+
+    #[cfg(target_os = "macos")]
+    command.args([
+        "-vcodec",
+        "hevc_videotoolbox",
+        "-tag:v",
+        "hvc1",
+        "-q:v",
+        video_quality_to_videotoolbox_q(video_quality),
+        "-allow_sw",
+        "1",
+        "-realtime",
+        "0",
+        "-bf",
+        "0",
+    ]);
+
+    #[cfg(not(target_os = "macos"))]
+    command.args([
+        "-vcodec",
+        "libx265",
+        "-tag:v",
+        "hvc1",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        video_quality_to_crf(video_quality),
+        // Limit x265 internal threading to 1 pool with 1 thread.
+        "-x265-params",
+        "pools=1:frame-threads=1:bframes=0",
+        "-threads",
+        "1",
+    ]);
+
     command
         .args([
-            "-f",
-            "image2pipe",
-            "-vcodec",
-            "mjpeg",
-            "-r",
-            &fps_str,
-            "-i",
-            "-",
-            "-vf",
-            "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            "-vcodec",
-            "libx265",
-            "-tag:v",
-            "hvc1",
-            "-preset",
-            "ultrafast",
-            "-crf",
-            crf,
-            // Limit x265 internal threading to 1 pool with 1 thread
-            "-x265-params",
-            "pools=1:frame-threads=1:bframes=0",
-            "-threads",
-            "1",
             "-movflags",
             "frag_keyframe+empty_moov+default_base_moof",
             "-pix_fmt",
