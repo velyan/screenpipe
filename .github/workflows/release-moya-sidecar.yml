@@ -86,16 +86,31 @@ jobs:
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build-macos:
-    runs-on: macos-latest
+    runs-on: ${{ matrix.runner }}
     needs: resolve-release
     strategy:
       matrix:
-        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.resolve-release.outputs.resolved_ref }}
+          ref: ${{ needs.resolve-release.outputs.resolved_sha }}
+
+      - name: Verify source checkout
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ needs.resolve-release.outputs.resolved_sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$(git rev-parse HEAD)" != "${SOURCE_COMMIT}" ]]; then
+            echo "Checked out source does not match resolved commit ${SOURCE_COMMIT}." >&2
+            exit 1
+          fi
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
@@ -106,13 +121,14 @@ jobs:
         shell: bash
         run: |
           brew unlink pkg-config@0.29.2 || true
-          brew install ffmpeg pkg-config
+          brew install ffmpeg nasm pkg-config
           brew link --overwrite pkg-config
 
       - name: Build screenpipe server binary
         shell: bash
         run: |
-          export PKG_CONFIG_PATH="/usr/local/opt/ffmpeg/lib/pkgconfig:$PKG_CONFIG_PATH"
+          BREW_PREFIX="$(brew --prefix)"
+          export PKG_CONFIG_PATH="${BREW_PREFIX}/opt/ffmpeg/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           export PKG_CONFIG_ALLOW_CROSS=1
           if [[ "${{ matrix.target }}" == "aarch64-apple-darwin" ]]; then
             export CFLAGS="-mcpu=apple-m1 -U__ARM_FEATURE_MATMUL_INT8"
@@ -125,20 +141,18 @@ jobs:
         run: |
           set -euo pipefail
 
+          FFMPEG_VERSION="6.1.1"
+          FFMPEG_SOURCE_URL="https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
+          FFMPEG_SOURCE_SHA="8684f4b00f94b85461884c3719382f1261f0d9eb3d59640a1f4ac0873616f968"
+
           case "${{ matrix.target }}" in
             aarch64-apple-darwin)
               ARCH="arm64"
-              FFMPEG_URL="https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-darwin-arm64"
-              FFMPEG_SHA="a90e3db6a3fd35f6074b013f948b1aa45b31c6375489d39e572bea3f18336584"
-              FFPROBE_URL="https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffprobe-darwin-arm64"
-              FFPROBE_SHA="bb2db6f5d8cef919da12fbf592119a987202a8c060a886f3cab091f9cab90b64"
+              FFMPEG_ARCH="arm64"
               ;;
             x86_64-apple-darwin)
               ARCH="x64"
-              FFMPEG_URL="https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffmpeg-darwin-x64"
-              FFMPEG_SHA="ebdddc936f61e14049a2d4b549a412b8a40deeff6540e58a9f2a2da9e6b18894"
-              FFPROBE_URL="https://github.com/eugeneware/ffmpeg-static/releases/download/b6.1.1/ffprobe-darwin-x64"
-              FFPROBE_SHA="fa3add0ce901f7241abe0dfc0155d958fc834aca3f8ce61f87cc712ae669c1e0"
+              FFMPEG_ARCH="x86_64"
               ;;
             *)
               echo "Unsupported target: ${{ matrix.target }}" >&2
@@ -150,19 +164,154 @@ jobs:
           cp "target/${{ matrix.target }}/release/screenpipe" "out/screenpipe-darwin-${ARCH}"
           chmod +x "out/screenpipe-darwin-${ARCH}"
 
-          curl -fsSL "${FFMPEG_URL}" -o "out/ffmpeg-darwin-${ARCH}"
-          curl -fsSL "${FFPROBE_URL}" -o "out/ffprobe-darwin-${ARCH}"
-          chmod +x "out/ffmpeg-darwin-${ARCH}" "out/ffprobe-darwin-${ARCH}"
-
-          ACTUAL_FFMPEG_SHA="$(shasum -a 256 "out/ffmpeg-darwin-${ARCH}" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
-          ACTUAL_FFPROBE_SHA="$(shasum -a 256 "out/ffprobe-darwin-${ARCH}" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
-          if [[ "${ACTUAL_FFMPEG_SHA}" != "${FFMPEG_SHA}" ]]; then
-            echo "ffmpeg checksum mismatch for ${ARCH}" >&2
+          curl -fsSL "${FFMPEG_SOURCE_URL}" -o "ffmpeg-source.tar.xz"
+          ACTUAL_SOURCE_SHA="$(shasum -a 256 ffmpeg-source.tar.xz | awk '{print $1}' | tr '[:upper:]' '[:lower:]')"
+          if [[ "${ACTUAL_SOURCE_SHA}" != "${FFMPEG_SOURCE_SHA}" ]]; then
+            echo "FFmpeg source checksum mismatch: expected ${FFMPEG_SOURCE_SHA}, got ${ACTUAL_SOURCE_SHA}" >&2
             exit 1
           fi
-          if [[ "${ACTUAL_FFPROBE_SHA}" != "${FFPROBE_SHA}" ]]; then
-            echo "ffprobe checksum mismatch for ${ARCH}" >&2
+          tar -xf ffmpeg-source.tar.xz
+
+          pushd "ffmpeg-${FFMPEG_VERSION}"
+          ./configure \
+            --prefix="${PWD}/../ffmpeg-install" \
+            --target-os=darwin \
+            --arch="${FFMPEG_ARCH}" \
+            --cc=clang \
+            --extra-cflags="-arch ${FFMPEG_ARCH}" \
+            --extra-ldflags="-arch ${FFMPEG_ARCH}" \
+            --enable-cross-compile \
+            --enable-static \
+            --disable-shared \
+            --disable-debug \
+            --disable-doc \
+            --disable-ffplay \
+            --enable-audiotoolbox \
+            --enable-videotoolbox
+
+          if grep -Eq '^CONFIG_(GPL|NONFREE)=yes$' ffbuild/config.mak; then
+            echo "Refusing to package FFmpeg with GPL or nonfree components enabled." >&2
             exit 1
+          fi
+
+          make -j"$(sysctl -n hw.ncpu)" ffmpeg ffprobe
+          popd
+
+          cp "ffmpeg-${FFMPEG_VERSION}/ffmpeg" "out/ffmpeg-darwin-${ARCH}"
+          cp "ffmpeg-${FFMPEG_VERSION}/ffprobe" "out/ffprobe-darwin-${ARCH}"
+          chmod +x "out/ffmpeg-darwin-${ARCH}" "out/ffprobe-darwin-${ARCH}"
+
+          if ! lipo "out/ffmpeg-darwin-${ARCH}" -verify_arch "${FFMPEG_ARCH}" >/dev/null 2>&1; then
+            echo "FFmpeg payload is missing required architecture ${FFMPEG_ARCH}." >&2
+            exit 1
+          fi
+
+          if [[ "$(uname -m)" == "${FFMPEG_ARCH}" ]]; then
+            FFMPEG_VERSION_OUTPUT="$(out/ffmpeg-darwin-${ARCH} -version)"
+            printf '%s\n' "${FFMPEG_VERSION_OUTPUT}"
+            if grep -Eq -- '--enable-(gpl|nonfree)' <<<"${FFMPEG_VERSION_OUTPUT}"; then
+              echo "Refusing to package FFmpeg built with GPL or nonfree options." >&2
+              exit 1
+            fi
+            if ! out/ffmpeg-darwin-${ARCH} -hide_banner -encoders 2>/dev/null | grep -q 'hevc_videotoolbox'; then
+              echo "FFmpeg payload is missing the required hevc_videotoolbox encoder." >&2
+              exit 1
+            fi
+
+            mkdir -p ffmpeg-smoke
+            out/ffmpeg-darwin-${ARCH} \
+              -hide_banner \
+              -loglevel error \
+              -f lavfi \
+              -i "color=size=321x241:rate=1" \
+              -frames:v 1 \
+              ffmpeg-smoke/input.png
+            out/ffmpeg-darwin-${ARCH} \
+              -hide_banner \
+              -loglevel error \
+              -f lavfi \
+              -i "color=size=321x241:rate=1" \
+              -frames:v 1 \
+              ffmpeg-smoke/input.jpg
+
+            cat ffmpeg-smoke/input.png ffmpeg-smoke/input.png |
+              out/ffmpeg-darwin-${ARCH} \
+                -hide_banner \
+                -loglevel error \
+                -f image2pipe \
+                -vcodec png \
+                -r 1 \
+                -i - \
+                -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" \
+                -vcodec hevc_videotoolbox \
+                -tag:v hvc1 \
+                -q:v 55 \
+                -allow_sw 1 \
+                -realtime 1 \
+                -bf 0 \
+                -movflags frag_keyframe+empty_moov+default_base_moof \
+                -pix_fmt yuv420p \
+                ffmpeg-smoke/png-pipeline.mp4
+
+            cat ffmpeg-smoke/input.jpg ffmpeg-smoke/input.jpg |
+              out/ffmpeg-darwin-${ARCH} \
+                -hide_banner \
+                -loglevel error \
+                -f image2pipe \
+                -vcodec mjpeg \
+                -r 1 \
+                -i - \
+                -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" \
+                -vcodec hevc_videotoolbox \
+                -tag:v hvc1 \
+                -q:v 55 \
+                -allow_sw 1 \
+                -realtime 0 \
+                -bf 0 \
+                -movflags frag_keyframe+empty_moov+default_base_moof \
+                -pix_fmt yuv420p \
+                ffmpeg-smoke/mjpeg-pipeline.mp4
+
+            assert_stream_contract() {
+              local media_path="$1"
+              local probe_json
+              probe_json="$(
+                out/ffprobe-darwin-${ARCH} \
+                  -v error \
+                  -select_streams v:0 \
+                  -show_entries stream=codec_name,codec_tag_string,pix_fmt,has_b_frames \
+                  -of json \
+                  "${media_path}"
+              )"
+              PROBE_JSON="${probe_json}" python3 - "${media_path}" <<'PY'
+          import json
+          import os
+          import sys
+
+          media_path = sys.argv[1]
+          streams = json.loads(os.environ["PROBE_JSON"]).get("streams", [])
+          if len(streams) != 1:
+              raise SystemExit(f"{media_path}: expected one video stream, got {len(streams)}")
+
+          stream = streams[0]
+          expected = {
+              "codec_name": "hevc",
+              "codec_tag_string": "hvc1",
+              "pix_fmt": "yuv420p",
+              "has_b_frames": 0,
+          }
+          actual = {key: stream.get(key) for key in expected}
+          if actual != expected:
+              raise SystemExit(
+                  f"{media_path}: unexpected stream contract: {actual}, expected {expected}"
+              )
+          PY
+            }
+
+            assert_stream_contract ffmpeg-smoke/png-pipeline.mp4
+            assert_stream_contract ffmpeg-smoke/mjpeg-pipeline.mp4
+          else
+            echo "Skipping execution of cross-compiled ${FFMPEG_ARCH} FFmpeg slice on $(uname -m) host."
           fi
 
       - name: Upload sidecar artifact
@@ -210,6 +359,44 @@ jobs:
           create_universal_binary ffmpeg
           create_universal_binary ffprobe
 
+          FFMPEG_VERSION_OUTPUT="$(out/ffmpeg-darwin-universal -version)"
+          printf '%s\n' "${FFMPEG_VERSION_OUTPUT}"
+          if grep -Eq -- '--enable-(gpl|nonfree)' <<<"${FFMPEG_VERSION_OUTPUT}"; then
+            echo "Refusing to package universal FFmpeg with GPL or nonfree options." >&2
+            exit 1
+          fi
+          if ! out/ffmpeg-darwin-universal -hide_banner -encoders 2>/dev/null | grep -q 'hevc_videotoolbox'; then
+            echo "Universal FFmpeg payload is missing the required hevc_videotoolbox encoder." >&2
+            exit 1
+          fi
+
+          mkdir -p ffmpeg-smoke
+          out/ffmpeg-darwin-universal \
+            -hide_banner \
+            -loglevel error \
+            -f lavfi \
+            -i "color=size=320x240:rate=1" \
+            -frames:v 2 \
+            -c:v hevc_videotoolbox \
+            -tag:v hvc1 \
+            -q:v 55 \
+            -allow_sw 1 \
+            -bf 0 \
+            -pix_fmt yuv420p \
+            ffmpeg-smoke/test.mp4
+          CODEC="$(
+            out/ffprobe-darwin-universal \
+              -v error \
+              -select_streams v:0 \
+              -show_entries stream=codec_name \
+              -of default=noprint_wrappers=1:nokey=1 \
+              ffmpeg-smoke/test.mp4
+          )"
+          if [[ "${CODEC}" != "hevc" ]]; then
+            echo "Universal FFmpeg VideoToolbox smoke test produced unexpected codec: ${CODEC}" >&2
+            exit 1
+          fi
+
       - name: Upload universal sidecar artifact
         uses: actions/upload-artifact@v4
         with:
@@ -219,9 +406,33 @@ jobs:
   publish-release:
     runs-on: ubuntu-latest
     needs: [resolve-release, build-macos, package-universal]
+    concurrency:
+      group: moya-sidecar-release-${{ needs.resolve-release.outputs.version }}
+      cancel-in-progress: false
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-release.outputs.resolved_sha }}
+
+      - name: Verify source checkout and license
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ needs.resolve-release.outputs.resolved_sha }}
+        run: |
+          set -euo pipefail
+          EXPECTED_LICENSE_SHA="688c84ab8bed8b9b60d75e8486eb9e19e3e1f049bf6f9c24f1c5e3fad86777e0"
+
+          if [[ "$(git rev-parse HEAD)" != "${SOURCE_COMMIT}" ]]; then
+            echo "Checked out source does not match resolved commit ${SOURCE_COMMIT}." >&2
+            exit 1
+          fi
+
+          ACTUAL_LICENSE_SHA="$(sha256sum LICENSE.md | awk '{print $1}')"
+          if [[ "${ACTUAL_LICENSE_SHA}" != "${EXPECTED_LICENSE_SHA}" ]]; then
+            echo "Refusing to publish source without the reviewed Screenpipe MIT license." >&2
+            exit 1
+          fi
 
       - name: Download build artifacts
         uses: actions/download-artifact@v4
@@ -238,7 +449,6 @@ jobs:
           set -euo pipefail
 
           export VERSION
-          TAG="moya-sidecar-v${VERSION}"
 
           mkdir -p release-assets
           cp artifacts/moya-sidecar-aarch64-apple-darwin/screenpipe-darwin-arm64 release-assets/
@@ -250,6 +460,44 @@ jobs:
           cp artifacts/moya-sidecar-darwin-universal/screenpipe-darwin-universal release-assets/
           cp artifacts/moya-sidecar-darwin-universal/ffmpeg-darwin-universal release-assets/
           cp artifacts/moya-sidecar-darwin-universal/ffprobe-darwin-universal release-assets/
+          cp LICENSE.md release-assets/LICENSE-screenpipe-MIT.md
+
+          FFMPEG_VERSION="6.1.1"
+          FFMPEG_SOURCE_URL="https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
+          FFMPEG_SOURCE_SHA="8684f4b00f94b85461884c3719382f1261f0d9eb3d59640a1f4ac0873616f968"
+          curl -fsSL "${FFMPEG_SOURCE_URL}" -o "release-assets/ffmpeg-${FFMPEG_VERSION}.tar.xz"
+          ACTUAL_SOURCE_SHA="$(
+            sha256sum "release-assets/ffmpeg-${FFMPEG_VERSION}.tar.xz" | awk '{print $1}'
+          )"
+          if [[ "${ACTUAL_SOURCE_SHA}" != "${FFMPEG_SOURCE_SHA}" ]]; then
+            echo "FFmpeg source checksum mismatch: expected ${FFMPEG_SOURCE_SHA}, got ${ACTUAL_SOURCE_SHA}" >&2
+            exit 1
+          fi
+          tar -xOf "release-assets/ffmpeg-${FFMPEG_VERSION}.tar.xz" \
+            "ffmpeg-${FFMPEG_VERSION}/COPYING.LGPLv2.1" \
+            > release-assets/LICENSE-FFmpeg-LGPL-2.1.txt
+          tar -xOf "release-assets/ffmpeg-${FFMPEG_VERSION}.tar.xz" \
+            "ffmpeg-${FFMPEG_VERSION}/COPYING.LGPLv3" \
+            > release-assets/LICENSE-FFmpeg-LGPL-3.txt
+          cat > release-assets/FFmpeg-build-info.txt <<EOF
+          FFmpeg source: ${FFMPEG_SOURCE_URL}
+          FFmpeg source SHA-256: ${FFMPEG_SOURCE_SHA}
+          FFmpeg version: ${FFMPEG_VERSION}
+
+          These FFmpeg and FFprobe executables are separate programs invoked by
+          Screenpipe. They were built without --enable-gpl or --enable-nonfree.
+
+          Common configure arguments:
+            --target-os=darwin --cc=clang --enable-cross-compile
+            --enable-static --disable-shared --disable-debug --disable-doc
+            --disable-ffplay --enable-audiotoolbox --enable-videotoolbox
+
+          arm64 additions:
+            --arch=arm64 --extra-cflags="-arch arm64" --extra-ldflags="-arch arm64"
+
+          x86_64 additions:
+            --arch=x86_64 --extra-cflags="-arch x86_64" --extra-ldflags="-arch x86_64"
+          EOF
 
           python3 - <<'PY'
           import hashlib
@@ -293,6 +541,13 @@ jobs:
                       "ffprobe": entry("ffprobe-darwin-universal"),
                   },
               },
+              "notices": {
+                  "screenpipeLicense": entry("LICENSE-screenpipe-MIT.md"),
+                  "ffmpegLGPL21": entry("LICENSE-FFmpeg-LGPL-2.1.txt"),
+                  "ffmpegLGPL3": entry("LICENSE-FFmpeg-LGPL-3.txt"),
+                  "ffmpegBuildInfo": entry("FFmpeg-build-info.txt"),
+                  "ffmpegSource": entry("ffmpeg-6.1.1.tar.xz"),
+              },
           }
 
           manifest_path = root / "moya-sidecar-manifest.json"
@@ -315,25 +570,84 @@ jobs:
           set -euo pipefail
           TAG="moya-sidecar-v${VERSION}"
           TITLE="Moya Sidecar ${VERSION}"
+          NOTES_FILE="release-assets/release-notes.md"
 
-          if gh release view "${TAG}" >/dev/null 2>&1; then
-            echo "Release ${TAG} already exists; reusing."
-          else
-            if [[ "${{ github.event.inputs.prerelease }}" == "true" ]]; then
-              gh release create "${TAG}" --target "${SOURCE_COMMIT}" --title "${TITLE}" --notes "Moya sidecar release ${VERSION}" --prerelease
-            else
-              gh release create "${TAG}" --target "${SOURCE_COMMIT}" --title "${TITLE}" --notes "Moya sidecar release ${VERSION}"
+          cat > "${NOTES_FILE}" <<EOF
+          Moya sidecar release ${VERSION}
+
+          Source commit: https://github.com/${GITHUB_REPOSITORY}/commit/${SOURCE_COMMIT}
+
+          Licensing:
+          - Screenpipe source in this release is from the MIT-licensed lineage; see LICENSE-screenpipe-MIT.md.
+          - Bundled FFmpeg and FFprobe are LGPL-only builds made from the attached, checksum-pinned FFmpeg 6.1.1 source.
+          - FFmpeg was built without --enable-gpl and without --enable-nonfree. Exact configure arguments are in FFmpeg-build-info.txt.
+          EOF
+
+          if TAG_COMMIT="$(
+            gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG}" --jq .sha 2>/dev/null
+          )"; then
+            if [[ "${TAG_COMMIT}" != "${SOURCE_COMMIT}" ]]; then
+              echo "Existing tag ${TAG} points to ${TAG_COMMIT}, not ${SOURCE_COMMIT}." >&2
+              exit 1
             fi
           fi
 
-          gh release upload "${TAG}" release-assets/screenpipe-darwin-arm64 --clobber
-          gh release upload "${TAG}" release-assets/ffmpeg-darwin-arm64 --clobber
-          gh release upload "${TAG}" release-assets/ffprobe-darwin-arm64 --clobber
-          gh release upload "${TAG}" release-assets/screenpipe-darwin-x64 --clobber
-          gh release upload "${TAG}" release-assets/ffmpeg-darwin-x64 --clobber
-          gh release upload "${TAG}" release-assets/ffprobe-darwin-x64 --clobber
-          gh release upload "${TAG}" release-assets/screenpipe-darwin-universal --clobber
-          gh release upload "${TAG}" release-assets/ffmpeg-darwin-universal --clobber
-          gh release upload "${TAG}" release-assets/ffprobe-darwin-universal --clobber
-          gh release upload "${TAG}" release-assets/moya-sidecar-manifest.json --clobber
-          gh release upload "${TAG}" release-assets/moya-sidecar-manifest.sha256 --clobber
+          if gh release view "${TAG}" --json isDraft,targetCommitish >/dev/null 2>&1; then
+            RELEASE_JSON="$(gh release view "${TAG}" --json isDraft,targetCommitish)"
+            IS_DRAFT="$(jq -r .isDraft <<<"${RELEASE_JSON}")"
+            RELEASE_TARGET="$(jq -r .targetCommitish <<<"${RELEASE_JSON}")"
+            if [[ "${IS_DRAFT}" != "true" ]]; then
+              echo "Refusing to overwrite already-published release ${TAG}." >&2
+              exit 1
+            fi
+            if [[ "${RELEASE_TARGET}" != "${SOURCE_COMMIT}" ]]; then
+              echo "Draft ${TAG} targets ${RELEASE_TARGET}, not ${SOURCE_COMMIT}." >&2
+              exit 1
+            fi
+            echo "Reusing existing draft release ${TAG}."
+          else
+            gh release create "${TAG}" \
+              --target "${SOURCE_COMMIT}" \
+              --title "${TITLE}" \
+              --notes-file "${NOTES_FILE}" \
+              --draft
+          fi
+
+          gh release upload "${TAG}" \
+            release-assets/screenpipe-darwin-arm64 \
+            release-assets/ffmpeg-darwin-arm64 \
+            release-assets/ffprobe-darwin-arm64 \
+            release-assets/screenpipe-darwin-x64 \
+            release-assets/ffmpeg-darwin-x64 \
+            release-assets/ffprobe-darwin-x64 \
+            release-assets/screenpipe-darwin-universal \
+            release-assets/ffmpeg-darwin-universal \
+            release-assets/ffprobe-darwin-universal \
+            release-assets/LICENSE-screenpipe-MIT.md \
+            release-assets/LICENSE-FFmpeg-LGPL-2.1.txt \
+            release-assets/LICENSE-FFmpeg-LGPL-3.txt \
+            release-assets/FFmpeg-build-info.txt \
+            release-assets/ffmpeg-6.1.1.tar.xz \
+            release-assets/moya-sidecar-manifest.json \
+            release-assets/moya-sidecar-manifest.sha256 \
+            --clobber
+
+          if [[ "${{ github.event.inputs.prerelease }}" == "true" ]]; then
+            gh release edit "${TAG}" \
+              --notes-file "${NOTES_FILE}" \
+              --draft=false \
+              --prerelease
+          else
+            gh release edit "${TAG}" \
+              --notes-file "${NOTES_FILE}" \
+              --draft=false \
+              --prerelease=false
+          fi
+
+          PUBLISHED_TAG_COMMIT="$(
+            gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG}" --jq .sha
+          )"
+          if [[ "${PUBLISHED_TAG_COMMIT}" != "${SOURCE_COMMIT}" ]]; then
+            echo "Published tag ${TAG} points to ${PUBLISHED_TAG_COMMIT}, not ${SOURCE_COMMIT}." >&2
+            exit 1
+          fi
