@@ -156,7 +156,14 @@ pub async fn start_ffmpeg_process(
             "FFmpeg encoding: quality={}, videotoolbox_bitrate={}",
             video_quality, videotoolbox_bitrate
         );
-        args.extend_from_slice(&["-vcodec", "hevc_videotoolbox", "-tag:v", "hvc1"]);
+        args.extend_from_slice(&[
+            "-vcodec",
+            "hevc_videotoolbox",
+            "-profile:v",
+            "main",
+            "-tag:v",
+            "hvc1",
+        ]);
         args.extend_from_slice(&[
             "-b:v",
             &videotoolbox_bitrate,

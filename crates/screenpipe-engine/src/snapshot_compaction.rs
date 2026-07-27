@@ -423,7 +423,14 @@ async fn start_ffmpeg_lowpri(
     ]);
 
     #[cfg(target_os = "macos")]
-    command.args(["-vcodec", "hevc_videotoolbox", "-tag:v", "hvc1"]);
+    command.args([
+        "-vcodec",
+        "hevc_videotoolbox",
+        "-profile:v",
+        "main",
+        "-tag:v",
+        "hvc1",
+    ]);
 
     #[cfg(target_os = "macos")]
     command.args(["-b:v", &videotoolbox_bitrate]);
