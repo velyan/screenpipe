@@ -320,6 +320,7 @@ jobs:
                 -i - \
                 -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" \
                 -vcodec hevc_videotoolbox \
+                -profile:v main \
                 -tag:v hvc1 \
                 -b:v 500k \
                 -allow_sw 1 \
@@ -339,6 +340,7 @@ jobs:
                 -i - \
                 -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" \
                 -vcodec hevc_videotoolbox \
+                -profile:v main \
                 -tag:v hvc1 \
                 -b:v 500k \
                 -allow_sw 1 \
@@ -355,7 +357,7 @@ jobs:
                 out/ffprobe-darwin-${ARCH} \
                   -v error \
                   -select_streams v:0 \
-                  -show_entries stream=codec_name,codec_tag_string,pix_fmt,has_b_frames \
+                  -show_entries stream=codec_name,profile,codec_tag_string,pix_fmt,has_b_frames \
                   -of json \
                   "${media_path}"
               )"
@@ -372,6 +374,7 @@ jobs:
           stream = streams[0]
           expected = {
               "codec_name": "hevc",
+              "profile": "Main",
               "codec_tag_string": "hvc1",
               "pix_fmt": "yuv420p",
               "has_b_frames": 0,
@@ -409,6 +412,7 @@ jobs:
                   -loglevel error \
                   -i "${source_path}" \
                   -c:v hevc_videotoolbox \
+                  -profile:v main \
                   -tag:v hvc1 \
                   -b:v "${bitrate}" \
                   -allow_sw 1 \
@@ -511,6 +515,7 @@ jobs:
             -i "color=size=320x240:rate=1" \
             -frames:v 2 \
             -c:v hevc_videotoolbox \
+            -profile:v main \
             -tag:v hvc1 \
             -b:v 500k \
             -allow_sw 1 \
