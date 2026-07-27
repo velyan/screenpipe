@@ -43,18 +43,30 @@ pub fn video_quality_to_preset(quality: &str) -> &'static str {
     }
 }
 
-/// Map the user-facing quality preset to VideoToolbox's 0-100 quality scale.
+/// Map the user-facing quality preset to a VideoToolbox bitrate.
 ///
-/// The macOS sidecar uses Apple's built-in HEVC encoder so its bundled FFmpeg
-/// can remain LGPL-only instead of depending on GPL or nonfree codecs.
+/// Intel's VideoToolbox implementation rejects FFmpeg's quality-scale mode,
+/// while variable bitrate control works on both supported macOS architectures.
+/// Scale by pixel rate so high-resolution/high-FPS content does not lose screen
+/// text, while retaining conservative floors for low-FPS screenshot capture.
 #[cfg(target_os = "macos")]
-pub fn video_quality_to_videotoolbox_q(quality: &str) -> &'static str {
-    match quality {
-        "low" => "35",
-        "high" => "75",
-        "max" => "90",
-        _ => "55", // "balanced" or any unknown
-    }
+pub fn video_quality_to_videotoolbox_bitrate(
+    quality: &str,
+    fps: f64,
+    width: u32,
+    height: u32,
+) -> String {
+    let (floor_bps, bits_per_pixel) = match quality {
+        "low" => (250_000_u64, 0.035_f64),
+        "high" => (1_000_000_u64, 0.10_f64),
+        "max" => (2_000_000_u64, 0.16_f64),
+        _ => (500_000_u64, 0.06_f64), // "balanced" or any unknown
+    };
+    let bounded_fps = fps.clamp(0.1, MAX_FPS);
+    let pixel_rate = f64::from(width.max(2)) * f64::from(height.max(2)) * bounded_fps;
+    let scaled_bps = (pixel_rate * bits_per_pixel).ceil() as u64;
+    let bitrate_kbps = floor_bps.max(scaled_bps).div_ceil(1_000);
+    format!("{bitrate_kbps}k")
 }
 
 /// Map video quality preset to JPEG quality for frame extraction.
@@ -104,7 +116,12 @@ pub async fn start_ffmpeg_process(
     output_file: &str,
     fps: f64,
     video_quality: &str,
+    width: u32,
+    height: u32,
 ) -> Result<Child, anyhow::Error> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = (width, height);
+
     let fps = if fps > MAX_FPS {
         warn!("Overriding FPS from {} to {}", fps, MAX_FPS);
         MAX_FPS
@@ -114,6 +131,9 @@ pub async fn start_ffmpeg_process(
 
     info!("Starting FFmpeg process for file: {}", output_file);
     let fps_str = fps.to_string();
+    #[cfg(target_os = "macos")]
+    let videotoolbox_bitrate =
+        video_quality_to_videotoolbox_bitrate(video_quality, fps, width, height);
     let mut command = crate::ffmpeg_cmd_async(find_ffmpeg_path().unwrap());
     let mut args = vec![
         "-f",
@@ -132,18 +152,14 @@ pub async fn start_ffmpeg_process(
 
     #[cfg(target_os = "macos")]
     {
-        let quality = video_quality_to_videotoolbox_q(video_quality);
         info!(
-            "FFmpeg encoding: quality={}, videotoolbox_q={}",
-            video_quality, quality
+            "FFmpeg encoding: quality={}, videotoolbox_bitrate={}",
+            video_quality, videotoolbox_bitrate
         );
+        args.extend_from_slice(&["-vcodec", "hevc_videotoolbox", "-tag:v", "hvc1"]);
         args.extend_from_slice(&[
-            "-vcodec",
-            "hevc_videotoolbox",
-            "-tag:v",
-            "hvc1",
-            "-q:v",
-            quality,
+            "-b:v",
+            &videotoolbox_bitrate,
             "-allow_sw",
             "1",
             "-realtime",
@@ -233,27 +249,42 @@ pub async fn finish_ffmpeg_process(child: Child, stdin: Option<ChildStdin>) {
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::video_quality_to_videotoolbox_q;
+    use super::video_quality_to_videotoolbox_bitrate;
 
     #[test]
-    fn videotoolbox_quality_presets_are_ordered_and_bounded() {
-        let low = video_quality_to_videotoolbox_q("low")
-            .parse::<u8>()
-            .unwrap();
-        let balanced = video_quality_to_videotoolbox_q("balanced")
-            .parse::<u8>()
-            .unwrap();
-        let high = video_quality_to_videotoolbox_q("high")
-            .parse::<u8>()
-            .unwrap();
-        let max = video_quality_to_videotoolbox_q("max")
-            .parse::<u8>()
-            .unwrap();
+    fn videotoolbox_bitrate_scales_with_quality_and_pixel_rate() {
+        let parse_kbps = |value: String| value.strip_suffix('k').unwrap().parse::<u32>().unwrap();
+        let low = parse_kbps(video_quality_to_videotoolbox_bitrate(
+            "low", 30.0, 1920, 1080,
+        ));
+        let balanced = parse_kbps(video_quality_to_videotoolbox_bitrate(
+            "balanced", 30.0, 1920, 1080,
+        ));
+        let high = parse_kbps(video_quality_to_videotoolbox_bitrate(
+            "high", 30.0, 1920, 1080,
+        ));
+        let max = parse_kbps(video_quality_to_videotoolbox_bitrate(
+            "max", 30.0, 1920, 1080,
+        ));
 
         assert!(low < balanced);
         assert!(balanced < high);
         assert!(high < max);
-        assert!(max <= 100);
-        assert_eq!(video_quality_to_videotoolbox_q("unknown"), "55");
+        assert_eq!(
+            video_quality_to_videotoolbox_bitrate("unknown", 1.0, 1920, 1080),
+            "500k"
+        );
+        assert_eq!(
+            video_quality_to_videotoolbox_bitrate("balanced", 30.0, 1920, 1080),
+            "3733k"
+        );
+        assert_eq!(
+            video_quality_to_videotoolbox_bitrate("balanced", 30.0, 3840, 2160),
+            "14930k"
+        );
+        assert_eq!(
+            video_quality_to_videotoolbox_bitrate("balanced", 60.0, 1920, 1080),
+            "3733k"
+        );
     }
 }

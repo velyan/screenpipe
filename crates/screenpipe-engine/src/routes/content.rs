@@ -366,7 +366,12 @@ pub(crate) async fn write_frames_to_video(
     video_file_path: &str,
     fps: f64,
 ) -> Result<(), anyhow::Error> {
-    let mut ffmpeg_child = start_ffmpeg_process(video_file_path, fps, "balanced").await?;
+    let first_frame = frames
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("cannot encode an empty frame list"))?;
+    let (width, height) = image::image_dimensions(&first_frame.file_path)?;
+    let mut ffmpeg_child =
+        start_ffmpeg_process(video_file_path, fps, "balanced", width, height).await?;
     let mut ffmpeg_stdin = ffmpeg_child
         .stdin
         .take()

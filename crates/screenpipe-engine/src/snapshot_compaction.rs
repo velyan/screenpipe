@@ -25,7 +25,7 @@ use crate::power::{PowerManagerHandle, ThermalState};
 #[cfg(not(target_os = "macos"))]
 use crate::video::video_quality_to_crf;
 #[cfg(target_os = "macos")]
-use crate::video::video_quality_to_videotoolbox_q;
+use crate::video::video_quality_to_videotoolbox_bitrate;
 use crate::video::{finish_ffmpeg_process, write_frame_to_ffmpeg};
 
 /// Minimum age before a snapshot is eligible for compaction.
@@ -258,7 +258,8 @@ async fn compact_chunk(
     );
 
     // Encode JPEGs → MP4 via ffmpeg (low-priority, capped threads, JPEG passthrough)
-    let mut child = start_ffmpeg_lowpri(&mp4_path_str, fps, video_quality).await?;
+    let mut child =
+        start_ffmpeg_lowpri(&mp4_path_str, fps, video_quality, frame_w, frame_h).await?;
     let mut stdin = child
         .stdin
         .take()
@@ -384,11 +385,19 @@ async fn start_ffmpeg_lowpri(
     output_file: &str,
     fps: f64,
     video_quality: &str,
+    width: u32,
+    height: u32,
 ) -> Result<tokio::process::Child> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = (width, height);
+
     let ffmpeg_path =
         screenpipe_core::find_ffmpeg_path().ok_or_else(|| anyhow::anyhow!("ffmpeg not found"))?;
 
     let fps_str = fps.to_string();
+    #[cfg(target_os = "macos")]
+    let videotoolbox_bitrate =
+        video_quality_to_videotoolbox_bitrate(video_quality, fps, width, height);
     // On unix, wrap with `nice -n 19` for lowest scheduling priority
     #[cfg(unix)]
     let mut command = {
@@ -414,20 +423,13 @@ async fn start_ffmpeg_lowpri(
     ]);
 
     #[cfg(target_os = "macos")]
-    command.args([
-        "-vcodec",
-        "hevc_videotoolbox",
-        "-tag:v",
-        "hvc1",
-        "-q:v",
-        video_quality_to_videotoolbox_q(video_quality),
-        "-allow_sw",
-        "1",
-        "-realtime",
-        "0",
-        "-bf",
-        "0",
-    ]);
+    command.args(["-vcodec", "hevc_videotoolbox", "-tag:v", "hvc1"]);
+
+    #[cfg(target_os = "macos")]
+    command.args(["-b:v", &videotoolbox_bitrate]);
+
+    #[cfg(target_os = "macos")]
+    command.args(["-allow_sw", "1", "-realtime", "0", "-bf", "0"]);
 
     #[cfg(not(target_os = "macos"))]
     command.args([
