@@ -321,7 +321,7 @@ jobs:
                 -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" \
                 -vcodec hevc_videotoolbox \
                 -tag:v hvc1 \
-                -q:v 55 \
+                -b:v 500k \
                 -allow_sw 1 \
                 -realtime 1 \
                 -bf 0 \
@@ -340,7 +340,7 @@ jobs:
                 -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" \
                 -vcodec hevc_videotoolbox \
                 -tag:v hvc1 \
-                -q:v 55 \
+                -b:v 500k \
                 -allow_sw 1 \
                 -realtime 0 \
                 -bf 0 \
@@ -386,6 +386,63 @@ jobs:
 
             assert_stream_contract ffmpeg-smoke/png-pipeline.mp4
             assert_stream_contract ffmpeg-smoke/mjpeg-pipeline.mp4
+
+            if [[ "${FFMPEG_ARCH}" == "x86_64" ]]; then
+              verify_pixel_rate_quality() {
+                local case_name="$1"
+                local frame_size="$2"
+                local bitrate="$3"
+                local source_path="ffmpeg-smoke/${case_name}-source.mkv"
+                local encoded_path="ffmpeg-smoke/${case_name}.mp4"
+                local ssim_output
+                local ssim
+
+                out/ffmpeg-darwin-${ARCH} \
+                  -hide_banner \
+                  -loglevel error \
+                  -f lavfi \
+                  -i "testsrc2=size=${frame_size}:rate=30:duration=1" \
+                  -c:v ffv1 \
+                  "${source_path}"
+                out/ffmpeg-darwin-${ARCH} \
+                  -hide_banner \
+                  -loglevel error \
+                  -i "${source_path}" \
+                  -c:v hevc_videotoolbox \
+                  -tag:v hvc1 \
+                  -b:v "${bitrate}" \
+                  -allow_sw 1 \
+                  -realtime 1 \
+                  -bf 0 \
+                  -pix_fmt yuv420p \
+                  "${encoded_path}"
+
+                assert_stream_contract "${encoded_path}"
+                ssim_output="$(
+                  out/ffmpeg-darwin-${ARCH} \
+                    -hide_banner \
+                    -i "${encoded_path}" \
+                    -i "${source_path}" \
+                    -lavfi ssim \
+                    -f null \
+                    - 2>&1
+                )"
+                ssim="$(
+                  sed -n 's/.*All:\([0-9.]*\).*/\1/p' <<<"${ssim_output}" |
+                    tail -n 1
+                )"
+                if [[ -z "${ssim}" ]] || ! awk -v value="${ssim}" 'BEGIN { exit !(value >= 0.97) }'; then
+                  echo "${case_name}: Intel VideoToolbox SSIM ${ssim:-missing} is below 0.97." >&2
+                  exit 1
+                fi
+                echo "${case_name}: Intel VideoToolbox SSIM ${ssim} at ${bitrate}."
+              }
+
+              # These rates mirror the balanced Rust pixel-rate calculation:
+              # max(500 kbps, width * height * 30 fps * 0.06 bits/pixel).
+              verify_pixel_rate_quality 1080p30 1920x1080 3733k
+              verify_pixel_rate_quality 4k30 3840x2160 14930k
+            fi
           else
             echo "Skipping execution of cross-compiled ${FFMPEG_ARCH} FFmpeg slice on $(uname -m) host."
           fi
@@ -455,7 +512,7 @@ jobs:
             -frames:v 2 \
             -c:v hevc_videotoolbox \
             -tag:v hvc1 \
-            -q:v 55 \
+            -b:v 500k \
             -allow_sw 1 \
             -bf 0 \
             -pix_fmt yuv420p \
