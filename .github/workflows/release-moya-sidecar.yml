@@ -89,6 +89,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     needs: resolve-release
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: aarch64-apple-darwin
@@ -112,6 +113,26 @@ jobs:
             exit 1
           fi
 
+          ORT_SYS_VERSION="$(
+            python3 - <<'PY'
+          import tomllib
+
+          with open("Cargo.lock", "rb") as cargo_lock:
+              packages = tomllib.load(cargo_lock)["package"]
+
+          versions = sorted(
+              {package["version"] for package in packages if package["name"] == "ort-sys"}
+          )
+          if len(versions) != 1:
+              raise SystemExit(f"expected exactly one ort-sys version, got {versions}")
+          print(versions[0])
+          PY
+          )"
+          if [[ "${ORT_SYS_VERSION}" != "2.0.0-rc.10" ]]; then
+            echo "Unsupported ort-sys version ${ORT_SYS_VERSION}; update the pinned ONNX Runtime contract." >&2
+            exit 1
+          fi
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -123,6 +144,61 @@ jobs:
           brew unlink pkg-config@0.29.2 || true
           brew install ffmpeg nasm pkg-config
           brew link --overwrite pkg-config
+
+      - name: Prefetch checksum-pinned ONNX Runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ORT_VERSION="1.22.0"
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin)
+              ORT_ARCHIVE_SHA="00FBFD6F08BAC2A4E28C66723AF900D58D1B4B1C73EFBA6290637CD3019883D5"
+              EXPECTED_ARCH="arm64"
+              ;;
+            x86_64-apple-darwin)
+              ORT_ARCHIVE_SHA="E0538783248BBB77D2E97556134B8CC47CFC35AC3D762067D51EAF8355C0F48E"
+              EXPECTED_ARCH="x86_64"
+              ;;
+            *)
+              echo "Unsupported target: ${{ matrix.target }}" >&2
+              exit 1
+              ;;
+          esac
+
+          ORT_ARCHIVE_URL="https://cdn.pyke.io/0/pyke:ort-rs/ms@${ORT_VERSION}/${{ matrix.target }}.tgz"
+          ORT_EXTRACT_DIR="${RUNNER_TEMP}/onnxruntime-${{ matrix.target }}-${ORT_ARCHIVE_SHA}"
+          ORT_ARCHIVE="${RUNNER_TEMP}/onnxruntime-${{ matrix.target }}.tgz"
+
+          curl \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            --retry 10 \
+            --retry-all-errors \
+            --retry-delay 3 \
+            --output "${ORT_ARCHIVE}" \
+            "${ORT_ARCHIVE_URL}"
+
+          ACTUAL_ORT_SHA="$(shasum -a 256 "${ORT_ARCHIVE}" | awk '{print toupper($1)}')"
+          if [[ "${ACTUAL_ORT_SHA}" != "${ORT_ARCHIVE_SHA}" ]]; then
+            echo "ONNX Runtime checksum mismatch: expected ${ORT_ARCHIVE_SHA}, got ${ACTUAL_ORT_SHA}." >&2
+            exit 1
+          fi
+
+          mkdir -p "${ORT_EXTRACT_DIR}"
+          tar -xzf "${ORT_ARCHIVE}" -C "${ORT_EXTRACT_DIR}"
+          ORT_LIBRARY="${ORT_EXTRACT_DIR}/onnxruntime/lib/libonnxruntime.a"
+          if [[ ! -f "${ORT_LIBRARY}" ]]; then
+            echo "ONNX Runtime archive did not contain ${ORT_LIBRARY}." >&2
+            exit 1
+          fi
+          if ! lipo "${ORT_LIBRARY}" -verify_arch "${EXPECTED_ARCH}" >/dev/null 2>&1; then
+            echo "ONNX Runtime library is missing required architecture ${EXPECTED_ARCH}." >&2
+            exit 1
+          fi
+          echo "ORT_LIB_LOCATION=${ORT_EXTRACT_DIR}/onnxruntime" >> "${GITHUB_ENV}"
 
       - name: Build screenpipe server binary
         shell: bash
@@ -479,6 +555,30 @@ jobs:
           tar -xOf "release-assets/ffmpeg-${FFMPEG_VERSION}.tar.xz" \
             "ffmpeg-${FFMPEG_VERSION}/COPYING.LGPLv3" \
             > release-assets/LICENSE-FFmpeg-LGPL-3.txt
+
+          ORT_VERSION="1.22.0"
+          ORT_LICENSE_URL="https://raw.githubusercontent.com/microsoft/onnxruntime/v${ORT_VERSION}/LICENSE"
+          ORT_LICENSE_SHA="2f07c72751aed99790b8a4869cf2311df85a860b22ded05fa22803587a48922c"
+          ORT_NOTICES_URL="https://raw.githubusercontent.com/microsoft/onnxruntime/v${ORT_VERSION}/ThirdPartyNotices.txt"
+          ORT_NOTICES_SHA="e9e90971a8e75a9a8ac0c6412e29c1202d079998389915aa485f46c816c3b4cc"
+
+          curl -fsSL "${ORT_LICENSE_URL}" -o release-assets/LICENSE-ONNX-Runtime-MIT.txt
+          curl -fsSL "${ORT_NOTICES_URL}" -o release-assets/THIRD-PARTY-NOTICES-ONNX-Runtime.txt
+          ACTUAL_ORT_LICENSE_SHA="$(
+            sha256sum release-assets/LICENSE-ONNX-Runtime-MIT.txt | awk '{print $1}'
+          )"
+          ACTUAL_ORT_NOTICES_SHA="$(
+            sha256sum release-assets/THIRD-PARTY-NOTICES-ONNX-Runtime.txt | awk '{print $1}'
+          )"
+          if [[ "${ACTUAL_ORT_LICENSE_SHA}" != "${ORT_LICENSE_SHA}" ]]; then
+            echo "ONNX Runtime license checksum mismatch." >&2
+            exit 1
+          fi
+          if [[ "${ACTUAL_ORT_NOTICES_SHA}" != "${ORT_NOTICES_SHA}" ]]; then
+            echo "ONNX Runtime third-party notices checksum mismatch." >&2
+            exit 1
+          fi
+
           cat > release-assets/FFmpeg-build-info.txt <<EOF
           FFmpeg source: ${FFMPEG_SOURCE_URL}
           FFmpeg source SHA-256: ${FFMPEG_SOURCE_SHA}
@@ -497,6 +597,21 @@ jobs:
 
           x86_64 additions:
             --arch=x86_64 --extra-cflags="-arch x86_64" --extra-ldflags="-arch x86_64"
+          EOF
+          cat > release-assets/ONNX-Runtime-build-info.txt <<EOF
+          ONNX Runtime version: ${ORT_VERSION}
+          ONNX Runtime source: https://github.com/microsoft/onnxruntime/tree/v${ORT_VERSION}
+
+          The Screenpipe executable statically links checksum-pinned ONNX Runtime
+          archives supplied by the ort-rs distribution service:
+
+          arm64:
+            https://cdn.pyke.io/0/pyke:ort-rs/ms@${ORT_VERSION}/aarch64-apple-darwin.tgz
+            SHA-256: 00fbfd6f08bac2a4e28c66723af900d58d1b4b1c73efba6290637cd3019883d5
+
+          x86_64:
+            https://cdn.pyke.io/0/pyke:ort-rs/ms@${ORT_VERSION}/x86_64-apple-darwin.tgz
+            SHA-256: e0538783248bbb77d2e97556134b8cc47cfc35ac3d762067d51eaf8355c0f48e
           EOF
 
           python3 - <<'PY'
@@ -547,6 +662,9 @@ jobs:
                   "ffmpegLGPL3": entry("LICENSE-FFmpeg-LGPL-3.txt"),
                   "ffmpegBuildInfo": entry("FFmpeg-build-info.txt"),
                   "ffmpegSource": entry("ffmpeg-6.1.1.tar.xz"),
+                  "onnxRuntimeLicense": entry("LICENSE-ONNX-Runtime-MIT.txt"),
+                  "onnxRuntimeThirdPartyNotices": entry("THIRD-PARTY-NOTICES-ONNX-Runtime.txt"),
+                  "onnxRuntimeBuildInfo": entry("ONNX-Runtime-build-info.txt"),
               },
           }
 
@@ -581,6 +699,7 @@ jobs:
           - Screenpipe source in this release is from the MIT-licensed lineage; see LICENSE-screenpipe-MIT.md.
           - Bundled FFmpeg and FFprobe are LGPL-only builds made from the attached, checksum-pinned FFmpeg 6.1.1 source.
           - FFmpeg was built without --enable-gpl and without --enable-nonfree. Exact configure arguments are in FFmpeg-build-info.txt.
+          - Screenpipe statically links checksum-pinned ONNX Runtime 1.22.0 archives. Its MIT license, third-party notices, and build provenance are attached.
           EOF
 
           if TAG_COMMIT="$(
@@ -628,6 +747,9 @@ jobs:
             release-assets/LICENSE-FFmpeg-LGPL-3.txt \
             release-assets/FFmpeg-build-info.txt \
             release-assets/ffmpeg-6.1.1.tar.xz \
+            release-assets/LICENSE-ONNX-Runtime-MIT.txt \
+            release-assets/THIRD-PARTY-NOTICES-ONNX-Runtime.txt \
+            release-assets/ONNX-Runtime-build-info.txt \
             release-assets/moya-sidecar-manifest.json \
             release-assets/moya-sidecar-manifest.sha256 \
             --clobber
