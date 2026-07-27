@@ -259,9 +259,11 @@ jobs:
             --enable-cross-compile \
             --enable-static \
             --disable-shared \
+            --disable-autodetect \
             --disable-debug \
             --disable-doc \
             --disable-ffplay \
+            --enable-zlib \
             --enable-audiotoolbox \
             --enable-videotoolbox
 
@@ -276,6 +278,27 @@ jobs:
           cp "ffmpeg-${FFMPEG_VERSION}/ffmpeg" "out/ffmpeg-darwin-${ARCH}"
           cp "ffmpeg-${FFMPEG_VERSION}/ffprobe" "out/ffprobe-darwin-${ARCH}"
           chmod +x "out/ffmpeg-darwin-${ARCH}" "out/ffprobe-darwin-${ARCH}"
+
+          assert_system_only_dependencies() {
+            local binary_path="$1"
+            local dependencies
+            local unexpected_dependencies
+            dependencies="$(
+              otool -L "${binary_path}" |
+                awk '/^[[:space:]]/ { print $1 }'
+            )"
+            unexpected_dependencies="$(
+              grep -Ev '^(/System/Library/|/usr/lib/)' <<<"${dependencies}" || true
+            )"
+            if [[ -n "${unexpected_dependencies}" ]]; then
+              echo "${binary_path} has non-system dynamic dependencies:" >&2
+              printf '%s\n' "${unexpected_dependencies}" >&2
+              exit 1
+            fi
+          }
+
+          assert_system_only_dependencies "out/ffmpeg-darwin-${ARCH}"
+          assert_system_only_dependencies "out/ffprobe-darwin-${ARCH}"
 
           if ! lipo "out/ffmpeg-darwin-${ARCH}" -verify_arch "${FFMPEG_ARCH}" >/dev/null 2>&1; then
             echo "FFmpeg payload is missing required architecture ${FFMPEG_ARCH}." >&2
@@ -496,6 +519,27 @@ jobs:
           create_universal_binary ffmpeg
           create_universal_binary ffprobe
 
+          assert_system_only_dependencies() {
+            local binary_path="$1"
+            local dependencies
+            local unexpected_dependencies
+            dependencies="$(
+              otool -L "${binary_path}" |
+                awk '/^[[:space:]]/ { print $1 }'
+            )"
+            unexpected_dependencies="$(
+              grep -Ev '^(/System/Library/|/usr/lib/)' <<<"${dependencies}" || true
+            )"
+            if [[ -n "${unexpected_dependencies}" ]]; then
+              echo "${binary_path} has non-system dynamic dependencies:" >&2
+              printf '%s\n' "${unexpected_dependencies}" >&2
+              exit 1
+            fi
+          }
+
+          assert_system_only_dependencies out/ffmpeg-darwin-universal
+          assert_system_only_dependencies out/ffprobe-darwin-universal
+
           FFMPEG_VERSION_OUTPUT="$(out/ffmpeg-darwin-universal -version)"
           printf '%s\n' "${FFMPEG_VERSION_OUTPUT}"
           if grep -Eq -- '--enable-(gpl|nonfree)' <<<"${FFMPEG_VERSION_OUTPUT}"; then
@@ -651,8 +695,10 @@ jobs:
 
           Common configure arguments:
             --target-os=darwin --cc=clang --enable-cross-compile
-            --enable-static --disable-shared --disable-debug --disable-doc
-            --disable-ffplay --enable-audiotoolbox --enable-videotoolbox
+            --enable-static --disable-shared --disable-autodetect
+            --disable-debug --disable-doc
+            --disable-ffplay --enable-zlib
+            --enable-audiotoolbox --enable-videotoolbox
 
           arm64 additions:
             --arch=arm64 --extra-cflags="-arch arm64" --extra-ldflags="-arch arm64"
