@@ -8,7 +8,7 @@ use oasgen::Server;
 use chrono::{DateTime, Utc};
 use screenpipe_db::DatabaseManager;
 
-use screenpipe_audio::audio_manager::AudioManager;
+use crate::audio::audio_manager::AudioManager;
 use screenpipe_core::sync::SyncServiceHandle;
 use tracing::{debug, error, info};
 
@@ -175,7 +175,7 @@ pub struct AppState {
     /// Vision pipeline metrics (shared across all monitors)
     pub vision_metrics: Arc<screenpipe_screen::PipelineMetrics>,
     /// Audio pipeline metrics (shared across all devices)
-    pub audio_metrics: Arc<screenpipe_audio::metrics::AudioPipelineMetrics>,
+    pub audio_metrics: Arc<crate::audio::metrics::AudioPipelineMetrics>,
     /// Window filters used by active-window capture endpoints.
     pub ignored_windows: Vec<String>,
     pub included_windows: Vec<String>,
@@ -240,7 +240,7 @@ pub struct SCServer {
     video_quality: String,
     pipe_manager: Option<crate::pipes_api::SharedPipeManager>,
     pub vision_metrics: Arc<screenpipe_screen::PipelineMetrics>,
-    pub audio_metrics: Arc<screenpipe_audio::metrics::AudioPipelineMetrics>,
+    pub audio_metrics: Arc<crate::audio::metrics::AudioPipelineMetrics>,
     pub ignored_windows: Vec<String>,
     pub included_windows: Vec<String>,
     pub blocked_apps: Vec<String>,

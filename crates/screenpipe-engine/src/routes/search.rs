@@ -480,8 +480,20 @@ pub(crate) async fn search(
     }
 
     // Redact PII on the final item set (post-dedup, pre-frame-extract) so we
-    // don't pay for Tinfoil calls on entries we're about to discard or on
+    // don't pay for remote calls on entries we're about to discard or on
     // binary frame data. Fail closed — return 503 rather than leak raw text.
+    #[cfg(not(feature = "tinfoil"))]
+    if query.filter_pii {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            JsonResponse(json!({
+                "error": "privacy_filter_unavailable",
+                "message": "this binary was built without remote PII filtering",
+            })),
+        ));
+    }
+
+    #[cfg(feature = "tinfoil")]
     if query.filter_pii {
         let filter = crate::privacy_filter::global();
 

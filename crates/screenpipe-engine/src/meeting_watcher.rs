@@ -7,8 +7,8 @@
 //! Periodically scans the accessibility tree of running meeting app processes
 //! for call control elements (mute, leave, hangup buttons).
 
+use crate::audio::meeting_detector::MeetingDetector;
 use crate::meeting_detector;
-use screenpipe_audio::meeting_detector::MeetingDetector;
 use screenpipe_db::DatabaseManager;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;

@@ -130,6 +130,7 @@ async fn test_extract_frames_and_ocr() -> Result<()> {
         app_name: "test_app".to_string(),
         is_focused: true,
         process_id: 1234,
+        window_id: None,
         browser_url: None,
         window_x: 0,
         window_y: 0,

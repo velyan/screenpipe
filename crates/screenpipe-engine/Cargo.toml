@@ -21,10 +21,10 @@ oasgen = { workspace = true }
 
 screenpipe-events = { path = "../screenpipe-events" }
 screenpipe-screen = { path = "../screenpipe-screen" }
-screenpipe-audio = { path = "../screenpipe-audio" }
+screenpipe-audio = { path = "../screenpipe-audio", optional = true }
 screenpipe-core = { path = "../screenpipe-core", features = ["security", "cloud-sync", "secrets"] }
 screenpipe-db = { path = "../screenpipe-db" }
-screenpipe-redact = { path = "../screenpipe-redact", features = ["opf-text"] }
+screenpipe-redact = { path = "../screenpipe-redact" }
 screenpipe-a11y = { path = "../screenpipe-a11y", features = ["db"] }
 screenpipe-apple-intelligence = { path = "../screenpipe-apple-intelligence", optional = true }
 screenpipe-config = { path = "../screenpipe-config" }
@@ -93,7 +93,7 @@ reqwest = { workspace = true }
 # (see src/privacy_filter.rs). Without this, a MITM or compromised CA could
 # observe unredacted text on its way to the enclave.
 # Upstream tinfoilsh/tinfoil-rs main, post-#21 (the ring-backend fix).
-tinfoil = { git = "https://github.com/tinfoilsh/tinfoil-rs" }
+tinfoil = { git = "https://github.com/tinfoilsh/tinfoil-rs", optional = true }
 
 # Concurrency
 crossbeam = { workspace = true }
@@ -152,18 +152,21 @@ tower = { version = "0.4", features = ["util"] }
 criterion = { workspace = true }
 
 [features]
-default = ["qwen3-asr", "parakeet"]
-metal = ["screenpipe-audio/metal"]
+default = ["audio", "qwen3-asr", "parakeet"]
+audio = ["dep:screenpipe-audio"]
+metal = ["audio", "screenpipe-audio/metal"]
 heap-prof = ["dhat"]
-cuda = ["screenpipe-audio/cuda"]
-directml = ["screenpipe-audio/directml"]
-vulkan = ["screenpipe-audio/vulkan"]
+cuda = ["audio", "screenpipe-audio/cuda"]
+directml = ["audio", "screenpipe-audio/directml"]
+vulkan = ["audio", "screenpipe-audio/vulkan"]
 debug-console = ["console-subscriber"]
-pulseaudio = ["screenpipe-audio/pulseaudio"]
+pulseaudio = ["audio", "screenpipe-audio/pulseaudio"]
 apple-intelligence = ["dep:screenpipe-apple-intelligence"]
-qwen3-asr = ["screenpipe-audio/qwen3-asr"]
-parakeet = ["screenpipe-audio/parakeet"]
-parakeet-mlx = ["screenpipe-audio/parakeet-mlx"]
+tinfoil = ["dep:tinfoil", "screenpipe-redact/tinfoil"]
+opf-text = ["screenpipe-redact/opf-text"]
+qwen3-asr = ["audio", "screenpipe-audio/qwen3-asr"]
+parakeet = ["audio", "screenpipe-audio/parakeet"]
+parakeet-mlx = ["audio", "screenpipe-audio/parakeet-mlx"]
 # Image-PII detector via MLX (Apple Silicon-only). Off by default;
 # Mac release builds opt in to pick up the ~6× speedup over the ONNX
 # CoreML EP path.

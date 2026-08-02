@@ -163,6 +163,12 @@ pub struct ActiveWindowCaptureResponse {
     pub capture_provenance: String,
     pub focused: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_pid: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_number: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_bundle_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub app_name: Option<String>,
@@ -205,6 +211,92 @@ struct ResolvedActiveWindow {
     tree_snapshot: TreeSnapshot,
     monitor_id: u32,
     captured_window: CapturedWindow,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ActiveWindowIdentity {
+    owner_pid: Option<i32>,
+    window_number: Option<u32>,
+    app_bundle_id: Option<String>,
+}
+
+impl ActiveWindowIdentity {
+    fn from_tree_snapshot(snapshot: &TreeSnapshot) -> Self {
+        active_window_identity_from_tree_snapshot_with(snapshot, app_bundle_id_for_pid)
+    }
+
+    fn from_target(target: &FocusedWindowTarget) -> Self {
+        active_window_identity_from_target_with(target, app_bundle_id_for_pid)
+    }
+
+    fn apply_to(self, response: &mut ActiveWindowCaptureResponse) {
+        response.owner_pid = self.owner_pid;
+        response.window_number = self.window_number;
+        response.app_bundle_id = self.app_bundle_id;
+    }
+}
+
+fn active_window_identity_from_tree_snapshot_with(
+    snapshot: &TreeSnapshot,
+    app_bundle_id_lookup: impl FnOnce(i32) -> Option<String>,
+) -> ActiveWindowIdentity {
+    let owner_pid = snapshot.process_id.and_then(|pid| i32::try_from(pid).ok());
+    ActiveWindowIdentity {
+        owner_pid,
+        window_number: snapshot.window_id,
+        app_bundle_id: owner_pid.and_then(app_bundle_id_lookup),
+    }
+}
+
+fn active_window_identity_from_target_with(
+    target: &FocusedWindowTarget,
+    app_bundle_id_lookup: impl FnOnce(i32) -> Option<String>,
+) -> ActiveWindowIdentity {
+    let owner_pid = (target.process_id > 0).then_some(target.process_id);
+    ActiveWindowIdentity {
+        owner_pid,
+        window_number: target.window_id,
+        app_bundle_id: owner_pid.and_then(app_bundle_id_lookup),
+    }
+}
+
+fn verified_identity_for_captured_window(
+    identity: ActiveWindowIdentity,
+    captured_window: &CapturedWindow,
+) -> ActiveWindowIdentity {
+    if identity.owner_pid != Some(captured_window.process_id) {
+        return ActiveWindowIdentity::default();
+    }
+
+    if let Some(expected_window_number) = identity.window_number {
+        if captured_window.window_id != Some(expected_window_number) {
+            return ActiveWindowIdentity::default();
+        }
+    }
+
+    ActiveWindowIdentity {
+        window_number: captured_window.window_id.or(identity.window_number),
+        ..identity
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn app_bundle_id_for_pid(pid: i32) -> Option<String> {
+    if pid <= 0 {
+        return None;
+    }
+
+    cidre::objc::ar_pool(|| {
+        cidre::ns::RunningApp::with_pid(pid)
+            .and_then(|app| app.bundle_id())
+            .map(|bundle_id| bundle_id.to_string())
+            .filter(|bundle_id| !bundle_id.trim().is_empty())
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn app_bundle_id_for_pid(_pid: i32) -> Option<String> {
+    None
 }
 
 enum ActiveWindowResolution {
@@ -661,6 +753,7 @@ async fn active_window_response_from_tree_snapshot(
     main_body_distillation_threshold: f32,
     tree_snapshot: TreeSnapshot,
 ) -> JsonResponse<ActiveWindowCaptureResponse> {
+    let identity = ActiveWindowIdentity::from_tree_snapshot(&tree_snapshot);
     let now = Utc::now();
     let age_ms = (now - tree_snapshot.timestamp).num_milliseconds().max(0);
     let text = tree_snapshot.text_content.clone();
@@ -719,12 +812,15 @@ async fn active_window_response_from_tree_snapshot(
         (None, None, None)
     };
 
-    Json(ActiveWindowCaptureResponse {
+    let mut response = ActiveWindowCaptureResponse {
         frame_id: -1,
         captured_at: tree_snapshot.timestamp,
         age_ms,
         capture_provenance: PROVENANCE_FOCUSED_WINDOW.to_string(),
         focused: true,
+        owner_pid: None,
+        window_number: None,
+        app_bundle_id: None,
         snapshot_path: None,
         app_name: Some(tree_snapshot.app_name),
         window_name: Some(tree_snapshot.window_name),
@@ -739,7 +835,9 @@ async fn active_window_response_from_tree_snapshot(
         content_kind,
         structured_messages,
         structured_meta,
-    })
+    };
+    identity.apply_to(&mut response);
+    Json(response)
 }
 
 #[derive(Debug, Clone)]
@@ -880,6 +978,9 @@ async fn build_capture_response(
         age_ms,
         capture_provenance,
         focused: meta.focused.unwrap_or(false),
+        owner_pid: None,
+        window_number: None,
+        app_bundle_id: None,
         snapshot_path: meta.snapshot_path,
         app_name: meta.app_name,
         window_name: meta.window_name,
@@ -1071,8 +1172,13 @@ pub(crate) async fn capture_active_window(
         browser_url,
         focused,
         capture_provenance,
+        response_identity,
     ) = match resolution {
         ActiveWindowResolution::Resolved(resolved) => {
+            let response_identity = verified_identity_for_captured_window(
+                ActiveWindowIdentity::from_tree_snapshot(&resolved.tree_snapshot),
+                &resolved.captured_window,
+            );
             let CapturedWindow {
                 image,
                 app_name,
@@ -1101,6 +1207,7 @@ pub(crate) async fn capture_active_window(
                 browser_url,
                 is_focused,
                 Some(PROVENANCE_FOCUSED_WINDOW),
+                response_identity,
             )
         }
         ActiveWindowResolution::Fallback {
@@ -1202,6 +1309,11 @@ pub(crate) async fn capture_active_window(
                         window.window_name
                     );
 
+                    let response_identity = verified_identity_for_captured_window(
+                        ActiveWindowIdentity::from_target(&target),
+                        &window,
+                    );
+
                     (
                         window.image,
                         selected_monitor_id,
@@ -1211,6 +1323,7 @@ pub(crate) async fn capture_active_window(
                         window.browser_url,
                         window.is_focused,
                         Some(PROVENANCE_MONITOR_FALLBACK),
+                        response_identity,
                     )
                 } else {
                     let monitor = best_fallback_monitor(&tree_walker_config, monitor_id).await;
@@ -1252,6 +1365,7 @@ pub(crate) async fn capture_active_window(
                         None,
                         false,
                         Some(PROVENANCE_MONITOR_FALLBACK),
+                        ActiveWindowIdentity::default(),
                     )
                 }
             } else {
@@ -1293,6 +1407,7 @@ pub(crate) async fn capture_active_window(
                     None,
                     false,
                     Some(PROVENANCE_MONITOR_FALLBACK),
+                    ActiveWindowIdentity::default(),
                 )
             }
         }
@@ -1343,7 +1458,7 @@ pub(crate) async fn capture_active_window(
         },
     };
 
-    let response = build_capture_response(&state, result.frame_id, &build_opts)
+    let mut response = build_capture_response(&state, result.frame_id, &build_opts)
         .await
         .map_err(|error| {
             (
@@ -1363,6 +1478,8 @@ pub(crate) async fn capture_active_window(
                 })),
             )
         })?;
+
+    response_identity.apply_to(&mut response);
 
     Ok(Json(response))
 }
@@ -1560,6 +1677,113 @@ mod tests {
         assert_eq!(target.app_name, "Slack");
         assert_eq!(target.window_name, "asks");
         assert_eq!(target.window_id, Some(7));
+    }
+
+    #[test]
+    fn same_process_arc_windows_keep_the_focused_window_number() {
+        let windows = vec![
+            VisibleWindowMetadata {
+                app_name: "Arc".to_string(),
+                window_name: "Example Article One".to_string(),
+                process_id: 84,
+                window_id: Some(701),
+                is_focused: false,
+                window_x: 0,
+                window_y: 0,
+                window_width: 1200,
+                window_height: 700,
+            },
+            VisibleWindowMetadata {
+                app_name: "Arc".to_string(),
+                window_name: "Example Article Two".to_string(),
+                process_id: 84,
+                window_id: Some(702),
+                is_focused: true,
+                window_x: 0,
+                window_y: 0,
+                window_width: 1200,
+                window_height: 700,
+            },
+        ];
+        let monitors = vec![MonitorCandidate {
+            id: 1,
+            bounds: Rect {
+                x: 0,
+                y: 0,
+                width: 1440,
+                height: 900,
+            },
+        }];
+
+        let (target, _) =
+            select_best_fallback_window_target(&windows, &monitors, Some(84)).unwrap();
+        let identity = active_window_identity_from_target_with(&target, |pid| {
+            assert_eq!(pid, 84);
+            Some("company.thebrowser.Browser".to_string())
+        });
+
+        assert_eq!(identity.owner_pid, Some(84));
+        assert_eq!(identity.window_number, Some(702));
+        assert_eq!(
+            identity.app_bundle_id.as_deref(),
+            Some("company.thebrowser.Browser")
+        );
+
+        let focused_capture = CapturedWindow {
+            image: image::DynamicImage::new_rgba8(1, 1),
+            app_name: "Arc".to_string(),
+            window_name: "Example Article Two".to_string(),
+            process_id: 84,
+            window_id: Some(702),
+            is_focused: true,
+            browser_url: Some("https://example.com/articles/two".to_string()),
+            window_x: 0,
+            window_y: 0,
+            window_width: 1,
+            window_height: 1,
+        };
+        assert_eq!(
+            verified_identity_for_captured_window(identity.clone(), &focused_capture),
+            identity
+        );
+
+        let other_arc_window = CapturedWindow {
+            window_id: Some(701),
+            window_name: "Example Article One".to_string(),
+            browser_url: Some("https://example.com/articles/one".to_string()),
+            ..focused_capture
+        };
+        assert_eq!(
+            verified_identity_for_captured_window(identity, &other_arc_window),
+            ActiveWindowIdentity::default()
+        );
+    }
+
+    #[test]
+    fn captured_window_pid_mismatch_discards_identity() {
+        let identity = ActiveWindowIdentity {
+            owner_pid: Some(84),
+            window_number: Some(702),
+            app_bundle_id: Some("company.thebrowser.Browser".to_string()),
+        };
+        let captured_window = CapturedWindow {
+            image: image::DynamicImage::new_rgba8(1, 1),
+            app_name: "Example Browser".to_string(),
+            window_name: "Example Article".to_string(),
+            process_id: 85,
+            window_id: Some(702),
+            is_focused: true,
+            browser_url: Some("https://example.com/article".to_string()),
+            window_x: 0,
+            window_y: 0,
+            window_width: 1,
+            window_height: 1,
+        };
+
+        assert_eq!(
+            verified_identity_for_captured_window(identity, &captured_window),
+            ActiveWindowIdentity::default()
+        );
     }
 
     #[test]
@@ -1800,8 +2024,14 @@ mod tests {
 
         let JsonResponse(response) =
             active_window_response_from_tree_snapshot(&req, true, 0.60, snapshot).await;
+        let serialized = serde_json::to_value(&response).expect("response should serialize");
         let main_body = response.main_body_text.unwrap_or_default();
 
+        assert_eq!(response.owner_pid, Some(42));
+        assert_eq!(response.window_number, Some(7));
+        assert_eq!(serialized["owner_pid"], json!(42));
+        assert_eq!(serialized["window_number"], json!(7));
+        assert!(serialized.get("app_bundle_id").is_none());
         assert!(main_body.contains("Example Article"));
         assert!(main_body.contains("workflow in detail"));
         assert!(!main_body.contains("Hide sidebar"));

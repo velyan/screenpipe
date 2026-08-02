@@ -9,8 +9,8 @@ use axum::{
 };
 use oasgen::{oasgen, OaSchema};
 
+use crate::audio::core::device::DeviceType;
 use chrono::{DateTime, Utc};
-use screenpipe_audio::core::device::DeviceType;
 use screenpipe_db::{Speaker, TagContentType};
 
 use image::ImageFormat;

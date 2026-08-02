@@ -10,9 +10,7 @@ use axum::{
 };
 use oasgen::{oasgen, OaSchema};
 
-use screenpipe_audio::core::device::{
-    default_input_device, default_output_device, list_audio_devices,
-};
+use crate::audio::core::device::{default_input_device, default_output_device, list_audio_devices};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

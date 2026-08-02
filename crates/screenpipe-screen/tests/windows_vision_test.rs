@@ -37,6 +37,7 @@ mod tests {
             image: image.clone(),
             is_focused: true,
             process_id: 1234,
+            window_id: None,
             browser_url: None,
             window_x: 0,
             window_y: 0,

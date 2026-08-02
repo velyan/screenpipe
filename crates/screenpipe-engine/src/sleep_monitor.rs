@@ -385,7 +385,7 @@ pub fn start_sleep_monitor() {
             // and audio streams (CoreAudio can go silent after display changes)
             #[cfg(target_os = "macos")]
             screenpipe_screen::stream_invalidation::request();
-            screenpipe_audio::stream_invalidation::request();
+            crate::audio::stream_invalidation::request();
             // Wake any waiters (e.g. monitor_watcher) so they re-scan the
             // monitor list immediately instead of waiting on a poll timer.
             DISPLAY_RECONFIG_NOTIFY.notify_one();
@@ -506,7 +506,7 @@ fn on_did_wake(handle: &tokio::runtime::Handle) {
     // Invalidate audio streams so the device monitor force-restarts all
     // audio devices. CoreAudio streams can go silent after sleep/wake
     // without triggering error callbacks.
-    screenpipe_audio::stream_invalidation::request();
+    crate::audio::stream_invalidation::request();
 
     // Spawn a task on the captured tokio runtime handle to check recording
     // health after a short delay. We can't use bare tokio::spawn() here
@@ -750,7 +750,7 @@ mod tests {
     async fn test_on_did_wake_sets_audio_invalidation() {
         let _guard = GLOBAL_FLAG_TEST_LOCK.lock().unwrap();
         // Clear stale flags
-        let _ = screenpipe_audio::stream_invalidation::take();
+        let _ = crate::audio::stream_invalidation::take();
         let _ = screenpipe_screen::stream_invalidation::take();
         RECENTLY_WOKE.store(false, Ordering::SeqCst);
 
@@ -762,7 +762,7 @@ mod tests {
             "RECENTLY_WOKE should be set after on_did_wake"
         );
         assert!(
-            screenpipe_audio::stream_invalidation::take(),
+            crate::audio::stream_invalidation::take(),
             "Audio stream invalidation flag must be set after wake"
         );
         assert!(
@@ -771,7 +771,7 @@ mod tests {
         );
         // Flags should be cleared after take()
         assert!(
-            !screenpipe_audio::stream_invalidation::take(),
+            !crate::audio::stream_invalidation::take(),
             "Audio flag should be cleared after take()"
         );
     }
