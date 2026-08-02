@@ -9,7 +9,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use clap::{CommandFactory, FromArgMatches};
 #[allow(unused_imports)]
-use colored::Colorize;
+use screenpipe_engine::terminal_style::Colorize;
 use futures::pin_mut;
 use port_check::is_local_ipv4_port_free;
 use screenpipe_core::agents::AgentExecutor;

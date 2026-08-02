@@ -8,7 +8,7 @@
 //!
 //! Opt out with `SCREENPIPE_NO_REMINDERS=1`.
 
-use colored::Colorize;
+use crate::terminal_style::Colorize;
 use std::env;
 use std::time::Duration;
 

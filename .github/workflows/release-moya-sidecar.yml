@@ -132,9 +132,9 @@ jobs:
             grep -Ei '(^|[[:space:]])(AGPL|GPL)-' <<<"${TREE}" >&2
             exit 1
           fi
-          if grep -Eiq '(^|[[:space:]])(screenpipe-audio|mp3lame|symphonia|tinfoil|opf-rs)[[:space:]]' <<<"${TREE}"; then
+          if grep -Eiq '(^|[[:space:]])(screenpipe-audio|mp3lame|symphonia|tinfoil|opf-rs|colored)[[:space:]]' <<<"${TREE}"; then
             echo "Moya sidecar dependency closure contains an excluded capability:" >&2
-            grep -Ei '(^|[[:space:]])(screenpipe-audio|mp3lame|symphonia|tinfoil|opf-rs)[[:space:]]' <<<"${TREE}" >&2
+            grep -Ei '(^|[[:space:]])(screenpipe-audio|mp3lame|symphonia|tinfoil|opf-rs|colored)[[:space:]]' <<<"${TREE}" >&2
             exit 1
           fi
 
