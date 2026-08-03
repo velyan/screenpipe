@@ -18,6 +18,13 @@ use tracing;
 static CACHED_MONITOR_DESCRIPTIONS: Lazy<RwLock<Vec<String>>> =
     Lazy::new(|| RwLock::new(Vec::new()));
 
+/// WindowServer/replayd mediates every macOS display capture. Serializing
+/// those calls prevents event broadcasts from starting one expensive capture
+/// per monitor at the same instant.
+#[cfg(target_os = "macos")]
+static MACOS_CAPTURE_SEMAPHORE: Lazy<tokio::sync::Semaphore> =
+    Lazy::new(|| tokio::sync::Semaphore::new(1));
+
 /// Get cached monitor descriptions without blocking system calls.
 /// Returns the list last updated by `list_monitors_detailed()`.
 pub fn get_cached_monitor_descriptions() -> Vec<String> {
@@ -223,6 +230,10 @@ impl SafeMonitor {
     /// If the cache is empty (shouldn't happen in normal flow), falls back to enumeration.
     #[cfg(target_os = "macos")]
     pub async fn capture_image(&self) -> Result<DynamicImage> {
+        let _permit = MACOS_CAPTURE_SEMAPHORE
+            .acquire()
+            .await
+            .map_err(|error| anyhow::anyhow!("macOS capture semaphore closed: {}", error))?;
         let monitor_id = self.monitor_id;
         let use_sck = self.use_sck;
         let cached_sck = self.cached_sck.clone();

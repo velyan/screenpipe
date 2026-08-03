@@ -32,7 +32,7 @@ thiserror = "1"
 # redaction service. See adapters/tinfoil.rs for the threat model
 # (without this a compromised CA can still observe unredacted text in
 # transit even though the enclave itself is honest).
-tinfoil = { git = "https://github.com/tinfoilsh/tinfoil-rs" }
+tinfoil = { git = "https://github.com/tinfoilsh/tinfoil-rs", optional = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
@@ -50,6 +50,11 @@ image = "0.25"
 #     the local `opf-rs` crate at ../../../opf-rs)
 [features]
 default = []
+
+# Remote confidential-compute redaction. This is deliberately opt-in:
+# distributable capture-only binaries such as Moya's sidecar must not pull
+# the AGPL-3.0 Tinfoil SDK into their dependency closure accidentally.
+tinfoil = ["dep:tinfoil"]
 
 # Enable the ONNX-based image redactor (rfdetr). CPU-only baseline.
 onnx-cpu = ["dep:ort", "dep:ndarray", "ort/download-binaries"]

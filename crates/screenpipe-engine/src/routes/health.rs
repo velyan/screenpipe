@@ -273,7 +273,7 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
     // Check each device
     for device in &audio_devices {
         let device_name = device.to_string();
-        let last_capture = screenpipe_audio::core::get_device_capture_time(&device_name);
+        let last_capture = crate::audio::core::get_device_capture_time(&device_name);
 
         // Update the most recent timestamp
         most_recent_audio_timestamp = most_recent_audio_timestamp.max(last_capture);
@@ -295,7 +295,7 @@ async fn health_check_inner(state: &Arc<AppState>) -> HealthCheckResponse {
 
     // Fallback to global timestamp if no devices are detected
     if audio_devices.is_empty() {
-        let last_capture = screenpipe_audio::core::LAST_AUDIO_CAPTURE.load(Ordering::Relaxed);
+        let last_capture = crate::audio::core::LAST_AUDIO_CAPTURE.load(Ordering::Relaxed);
         global_audio_active = if app_uptime < grace_period {
             true // Consider active during grace period
         } else {
@@ -835,10 +835,22 @@ pub(crate) async fn vision_metrics_handler(
 
 /// Returns raw audio pipeline metrics snapshot.
 /// Use this for monitoring dashboards and local dev benchmarking.
+#[cfg(feature = "audio")]
 pub(crate) async fn audio_metrics_handler(
     State(state): State<Arc<AppState>>,
-) -> JsonResponse<screenpipe_audio::metrics::AudioMetricsSnapshot> {
+) -> JsonResponse<crate::audio::metrics::AudioMetricsSnapshot> {
     JsonResponse(state.audio_metrics.snapshot())
+}
+
+#[cfg(not(feature = "audio"))]
+pub(crate) async fn audio_metrics_handler() -> (StatusCode, JsonResponse<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        JsonResponse(json!({
+            "error": "audio_unavailable",
+            "message": "audio support is not included in this build"
+        })),
+    )
 }
 
 pub(crate) fn get_verbose_instructions(unhealthy_systems: &[&str]) -> String {

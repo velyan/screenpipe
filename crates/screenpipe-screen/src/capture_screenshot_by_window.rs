@@ -213,6 +213,7 @@ pub struct CapturedWindow {
     pub app_name: String,
     pub window_name: String,
     pub process_id: i32,
+    pub window_id: Option<u32>,
     pub is_focused: bool,
     /// Browser URL captured atomically with the screenshot to prevent timing mismatches
     pub browser_url: Option<String>,
@@ -1472,6 +1473,7 @@ fn capture_focused_window_sck(
         String,
         String,
         i32,
+        Option<u32>,
         bool,
         i32,
         i32,
@@ -1531,7 +1533,7 @@ fn capture_focused_window_sck(
 
         let should_replace = best
             .as_ref()
-            .map(|(best_score, _, _, _, _, _, _, _, _, _)| score > *best_score)
+            .map(|(best_score, _, _, _, _, _, _, _, _, _, _)| score > *best_score)
             .unwrap_or(true);
         if should_replace {
             best = Some((
@@ -1540,6 +1542,7 @@ fn capture_focused_window_sck(
                 app_name,
                 window_name,
                 process_id,
+                window_id,
                 is_focused,
                 window_x,
                 window_y,
@@ -1555,6 +1558,7 @@ fn capture_focused_window_sck(
         app_name,
         window_name,
         process_id,
+        window_id,
         is_focused,
         window_x,
         window_y,
@@ -1592,6 +1596,7 @@ fn capture_focused_window_sck(
         app_name,
         window_name,
         process_id,
+        window_id,
         is_focused,
         browser_url,
         window_x,
@@ -1615,6 +1620,7 @@ fn capture_focused_window_xcap_macos(
         String,
         String,
         i32,
+        Option<u32>,
         bool,
         i32,
         i32,
@@ -1674,7 +1680,7 @@ fn capture_focused_window_xcap_macos(
 
         let should_replace = best
             .as_ref()
-            .map(|(best_score, _, _, _, _, _, _, _, _, _)| score > *best_score)
+            .map(|(best_score, _, _, _, _, _, _, _, _, _, _)| score > *best_score)
             .unwrap_or(true);
         if should_replace {
             best = Some((
@@ -1683,6 +1689,7 @@ fn capture_focused_window_xcap_macos(
                 app_name,
                 window_name,
                 process_id,
+                window_id,
                 is_focused,
                 window_x,
                 window_y,
@@ -1698,6 +1705,7 @@ fn capture_focused_window_xcap_macos(
         app_name,
         window_name,
         process_id,
+        window_id,
         is_focused,
         window_x,
         window_y,
@@ -1735,6 +1743,7 @@ fn capture_focused_window_xcap_macos(
         app_name,
         window_name,
         process_id,
+        window_id,
         is_focused,
         browser_url,
         window_x,
@@ -1757,6 +1766,7 @@ fn capture_focused_window_xcap(
         String,
         String,
         i32,
+        Option<u32>,
         bool,
         i32,
         i32,
@@ -1824,7 +1834,7 @@ fn capture_focused_window_xcap(
 
         let should_replace = best
             .as_ref()
-            .map(|(best_score, _, _, _, _, _, _, _, _, _)| score > *best_score)
+            .map(|(best_score, _, _, _, _, _, _, _, _, _, _)| score > *best_score)
             .unwrap_or(true);
         if should_replace {
             best = Some((
@@ -1833,6 +1843,7 @@ fn capture_focused_window_xcap(
                 app_name,
                 window_name,
                 process_id,
+                window_id,
                 is_focused,
                 window_x,
                 window_y,
@@ -1848,6 +1859,7 @@ fn capture_focused_window_xcap(
         app_name,
         window_name,
         process_id,
+        window_id,
         is_focused,
         window_x,
         window_y,
@@ -1885,6 +1897,7 @@ fn capture_focused_window_xcap(
         app_name,
         window_name,
         process_id,
+        window_id,
         is_focused,
         browser_url,
         window_x,
@@ -2066,6 +2079,7 @@ pub async fn capture_all_visible_windows(
                 app_name,
                 window_name,
                 process_id,
+                window_id: None,
                 is_focused,
                 browser_url,
                 window_x,

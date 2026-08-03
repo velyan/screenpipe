@@ -119,7 +119,7 @@ pub fn start_power_manager_with_pref(initial_pref: PowerMode) -> Arc<PowerManage
             profile.name, power_state.on_ac, power_state.battery_pct
         );
         // Apply audio VAD threshold from initial profile
-        screenpipe_audio::vad::set_min_speech_ratio(profile.vad_min_speech_ratio);
+        crate::audio::vad::set_min_speech_ratio(profile.vad_min_speech_ratio);
         let _ = handle_ref.profile_tx.send(profile);
 
         loop {
@@ -153,7 +153,7 @@ pub fn start_power_manager_with_pref(initial_pref: PowerMode) -> Arc<PowerManage
             }
 
             // Apply audio VAD threshold from profile
-            screenpipe_audio::vad::set_min_speech_ratio(new_profile.vad_min_speech_ratio);
+            crate::audio::vad::set_min_speech_ratio(new_profile.vad_min_speech_ratio);
 
             let _ = handle_ref.profile_tx.send(new_profile);
         }

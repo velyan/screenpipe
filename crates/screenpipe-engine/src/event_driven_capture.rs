@@ -18,7 +18,7 @@ use screenpipe_a11y::ActivityFeed;
 use screenpipe_db::DatabaseManager;
 use screenpipe_screen::capture_screenshot_by_window::{get_excluded_sck_window_ids, WindowFilters};
 use screenpipe_screen::frame_comparison::{FrameComparer, FrameComparisonConfig};
-use screenpipe_screen::monitor::SafeMonitor;
+use screenpipe_screen::monitor::{list_monitors, SafeMonitor};
 use screenpipe_screen::snapshot_writer::SnapshotWriter;
 use screenpipe_screen::utils::capture_monitor_image;
 use std::collections::HashMap;
@@ -51,8 +51,8 @@ pub enum CaptureTrigger {
     AppSwitch { app_name: String },
     /// Window focus changed within the same app
     WindowFocus { window_name: String },
-    /// Mouse click detected
-    Click,
+    /// Mouse click detected at global screen coordinates
+    Click { x: i32, y: i32 },
     /// User stopped typing (pause after keyboard activity)
     TypingPause,
     /// User stopped scrolling
@@ -73,7 +73,7 @@ impl CaptureTrigger {
         match self {
             CaptureTrigger::AppSwitch { .. } => "app_switch",
             CaptureTrigger::WindowFocus { .. } => "window_focus",
-            CaptureTrigger::Click => "click",
+            CaptureTrigger::Click { .. } => "click",
             CaptureTrigger::TypingPause => "typing_pause",
             CaptureTrigger::ScrollStop => "scroll_stop",
             CaptureTrigger::Clipboard => "clipboard",
@@ -82,6 +82,48 @@ impl CaptureTrigger {
             CaptureTrigger::Manual => "manual",
         }
     }
+
+    fn target_point(&self) -> Option<(i32, i32)> {
+        match self {
+            CaptureTrigger::Click { x, y } => Some((*x, *y)),
+            _ => None,
+        }
+    }
+}
+
+type MonitorBounds = (i32, i32, i32, i32);
+
+fn monitor_bounds(monitor: &SafeMonitor) -> MonitorBounds {
+    let left = monitor.x();
+    let top = monitor.y();
+    let right = left.saturating_add(monitor.width() as i32);
+    let bottom = top.saturating_add(monitor.height() as i32);
+    (left, top, right, bottom)
+}
+
+fn point_in_bounds((left, top, right, bottom): MonitorBounds, x: i32, y: i32) -> bool {
+    x >= left && x < right && y >= top && y < bottom
+}
+
+fn trigger_applies_to_monitor(
+    trigger: &CaptureTrigger,
+    monitor: &SafeMonitor,
+    all_monitor_bounds: &[MonitorBounds],
+) -> bool {
+    let Some((x, y)) = trigger.target_point() else {
+        return true;
+    };
+
+    // Coordinates outside every known display can be stale during a display
+    // reconfiguration. Preserve capture rather than silently dropping it.
+    if !all_monitor_bounds
+        .iter()
+        .any(|bounds| point_in_bounds(*bounds, x, y))
+    {
+        return true;
+    }
+
+    point_in_bounds(monitor_bounds(monitor), x, y)
 }
 
 /// Configuration for event-driven capture.
@@ -248,8 +290,16 @@ pub async fn event_driven_capture_loop(
 
     let mut state = EventDrivenCapture::new(config);
     let mut power_profile_rx = power_profile_rx;
-    let poll_interval = Duration::from_millis(50);
+    // Activity transitions do not need a 20 Hz busy poll. A 250 ms cadence
+    // still observes the configured 500 ms typing pause while cutting idle
+    // wakeups by 80%, multiplied across every attached monitor.
+    let poll_interval = Duration::from_millis(250);
     let mut trigger_channel_closed = false;
+    let all_monitor_bounds = list_monitors()
+        .await
+        .iter()
+        .map(monitor_bounds)
+        .collect::<Vec<_>>();
 
     // Adaptive accessibility throttle: tracks per-app walk cost and backs off
     // for expensive apps (e.g., Electron apps whose UIA providers block the UI thread).
@@ -539,7 +589,18 @@ pub async fn event_driven_capture_loop(
             state.poll_activity(&activity_feed)
         } else {
             match trigger_rx.try_recv() {
-                Ok(trigger) => Some(trigger),
+                Ok(trigger)
+                    if trigger_applies_to_monitor(&trigger, &monitor, &all_monitor_bounds) =>
+                {
+                    Some(trigger)
+                }
+                Ok(_) => {
+                    // A positioned event belongs to a different display. The
+                    // broadcast channel intentionally reaches every monitor,
+                    // so filter it before visual diff, OCR, or AX traversal.
+                    tokio::time::sleep(poll_interval).await;
+                    continue;
+                }
                 Err(broadcast::error::TryRecvError::Empty) => {
                     // Poll activity feed for state transitions
                     state.poll_activity(&activity_feed)
@@ -1455,11 +1516,28 @@ mod tests {
             .as_str(),
             "app_switch"
         );
-        assert_eq!(CaptureTrigger::Click.as_str(), "click");
+        assert_eq!(CaptureTrigger::Click { x: 10, y: 20 }.as_str(), "click");
         assert_eq!(CaptureTrigger::TypingPause.as_str(), "typing_pause");
         assert_eq!(CaptureTrigger::VisualChange.as_str(), "visual_change");
         assert_eq!(CaptureTrigger::Idle.as_str(), "idle");
         assert_eq!(CaptureTrigger::Manual.as_str(), "manual");
+    }
+
+    #[test]
+    fn click_trigger_retains_global_target() {
+        let trigger = CaptureTrigger::Click { x: -120, y: 640 };
+        assert_eq!(trigger.target_point(), Some((-120, 640)));
+        assert!(point_in_bounds((-1920, 0, 0, 1080), -120, 640));
+        assert!(!point_in_bounds((0, 0, 1920, 1080), -120, 640));
+    }
+
+    #[test]
+    fn monitor_bounds_are_half_open() {
+        let bounds = (0, 0, 1920, 1080);
+        assert!(point_in_bounds(bounds, 0, 0));
+        assert!(point_in_bounds(bounds, 1919, 1079));
+        assert!(!point_in_bounds(bounds, 1920, 1079));
+        assert!(!point_in_bounds(bounds, 1919, 1080));
     }
 
     #[test]
@@ -1515,13 +1593,16 @@ mod tests {
     fn test_trigger_channel() {
         let (tx, mut rx) = trigger_channel();
 
-        tx.send(CaptureTrigger::Click).unwrap();
+        tx.send(CaptureTrigger::Click { x: 10, y: 20 }).unwrap();
         tx.send(CaptureTrigger::AppSwitch {
             app_name: "Code".to_string(),
         })
         .unwrap();
 
-        assert_eq!(rx.try_recv().unwrap(), CaptureTrigger::Click);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            CaptureTrigger::Click { x: 10, y: 20 }
+        );
         match rx.try_recv().unwrap() {
             CaptureTrigger::AppSwitch { app_name } => assert_eq!(app_name, "Code"),
             _ => panic!("expected AppSwitch"),
@@ -1533,10 +1614,16 @@ mod tests {
         let (tx, mut rx1) = trigger_channel();
         let mut rx2 = tx.subscribe();
 
-        tx.send(CaptureTrigger::Click).unwrap();
+        tx.send(CaptureTrigger::Click { x: 10, y: 20 }).unwrap();
 
-        assert_eq!(rx1.try_recv().unwrap(), CaptureTrigger::Click);
-        assert_eq!(rx2.try_recv().unwrap(), CaptureTrigger::Click);
+        assert_eq!(
+            rx1.try_recv().unwrap(),
+            CaptureTrigger::Click { x: 10, y: 20 }
+        );
+        assert_eq!(
+            rx2.try_recv().unwrap(),
+            CaptureTrigger::Click { x: 10, y: 20 }
+        );
     }
 
     #[test]

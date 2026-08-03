@@ -19,8 +19,8 @@
 //! exists because installing pipes runs code, so manifests should come from
 //! sources the user controls.
 
+use crate::terminal_style::Colorize;
 use anyhow::{anyhow, Result};
-use colored::Colorize;
 use screenpipe_core::agents::pi::PiExecutor;
 use screenpipe_core::agents::AgentExecutor;
 use screenpipe_core::pipes::{parse_frontmatter, PipeManager};

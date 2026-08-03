@@ -15,13 +15,13 @@
 //! The `model` field is accepted for compatibility but ignored — the user's
 //! configured engine is always used unless `engine` is explicitly provided.
 
+use crate::audio::transcription::engine::TranscriptionEngine;
+use crate::audio::utils::ffmpeg::read_audio_from_file;
 use axum::{
     extract::{Multipart, State},
     http::StatusCode,
     response::{IntoResponse, Json as JsonResponse, Response},
 };
-use screenpipe_audio::transcription::engine::TranscriptionEngine;
-use screenpipe_audio::utils::ffmpeg::read_audio_from_file;
 use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
@@ -170,7 +170,7 @@ pub async fn transcribe_handler(
 
     let transcription_engine = if let Some(ref engine_str) = engine_override {
         // Explicit engine override — must create a new instance
-        use screenpipe_audio::core::engine::AudioTranscriptionEngine;
+        use crate::audio::core::engine::AudioTranscriptionEngine;
         let engine = match engine_str.parse::<AudioTranscriptionEngine>() {
             Ok(e) => Arc::new(e),
             Err(_) => {

@@ -15,7 +15,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, error};
 
 use cidre::cg::event::access as cg_access;
@@ -769,6 +769,27 @@ struct ObserverCallbackState {
     current_window: Arc<ArcSwap<Option<String>>>,
     focus: Mutex<FocusState>,
     refresh_requested: Arc<AtomicBool>,
+    focus_refresh_requested: Arc<AtomicBool>,
+}
+
+/// A browser can emit a burst of AX focus notifications for one logical UI
+/// change. Gmail is a particularly noisy example because its virtualized web
+/// UI moves focus through several transient descendants. Keep AX work out of
+/// the callback and collapse those bursts into at most four focused-window
+/// refreshes per second.
+const FOCUS_REFRESH_DEBOUNCE: Duration = Duration::from_millis(250);
+
+fn focus_refresh_due(pending: bool, since_last_refresh: Duration) -> bool {
+    pending && since_last_refresh >= FOCUS_REFRESH_DEBOUNCE
+}
+
+fn app_observer_notifications() -> [&'static ax::Notification; 4] {
+    [
+        ax::notification::app_activated(),
+        ax::notification::app_deactivated(),
+        ax::notification::focused_window_changed(),
+        ax::notification::focused_ui_element_changed(),
+    ]
 }
 
 fn emit_focus_state(state: &ObserverCallbackState) {
@@ -854,7 +875,11 @@ extern "C" fn ax_focus_observer_callback(
         state.refresh_requested.store(true, Ordering::SeqCst);
     }
 
-    emit_focus_state(state);
+    // Never issue AX queries from the notification callback. Chromium web
+    // apps can dispatch these faster than AX can answer them, which otherwise
+    // keeps the observer run loop pegged. The observer thread coalesces and
+    // services this flag below.
+    state.focus_refresh_requested.store(true, Ordering::Release);
 }
 
 fn run_app_observer(
@@ -868,6 +893,7 @@ fn run_app_observer(
     let workspace = ns::Workspace::shared();
     let mut notification_center = workspace.notification_center();
     let refresh_requested = Arc::new(AtomicBool::new(true));
+    let focus_refresh_requested = Arc::new(AtomicBool::new(true));
     let callback_state = Box::new(ObserverCallbackState {
         tx,
         start,
@@ -880,6 +906,7 @@ fn run_app_observer(
             last_window: None,
         }),
         refresh_requested: refresh_requested.clone(),
+        focus_refresh_requested: focus_refresh_requested.clone(),
     });
     let callback_state_ptr = Box::into_raw(callback_state);
 
@@ -973,12 +1000,10 @@ fn run_app_observer(
         };
 
         let context = callback_state_ptr as *mut std::ffi::c_void;
-        for notification in [
-            ax::notification::app_activated(),
-            ax::notification::app_deactivated(),
-            ax::notification::focused_window_changed(),
-            ax::notification::focused_ui_element_changed(),
-        ] {
+        // Keep focused-element notifications for current UI context, but the
+        // callback only marks a dirty flag. Gmail/Chromium can emit these in
+        // large bursts, which are coalesced by the bounded run-loop slice.
+        for notification in app_observer_notifications() {
             if let Err(err) = new_observer.add_notification(&app, notification, context) {
                 debug!(
                     "failed to register AX notification {:?} for pid {}: {:?}",
@@ -993,11 +1018,27 @@ fn run_app_observer(
         emit_focus_state(unsafe { &*callback_state_ptr });
     };
 
+    let mut last_focus_refresh = Instant::now()
+        .checked_sub(FOCUS_REFRESH_DEBOUNCE)
+        .unwrap_or_else(Instant::now);
+
     while !stop.load(Ordering::Relaxed) {
-        cf::RunLoop::run_in_mode(run_loop_mode, 0.1, true);
+        // Do not return after each individual source. Under Gmail's AX focus
+        // storm that behavior spins the outer loop as fast as callbacks arrive.
+        // Drain a bounded slice, then perform at most one coalesced AX refresh.
+        cf::RunLoop::run_in_mode(run_loop_mode, 0.1, false);
 
         if refresh_requested.swap(false, Ordering::SeqCst) {
             reattach_observer();
+            focus_refresh_requested.store(false, Ordering::Release);
+            last_focus_refresh = Instant::now();
+        } else if focus_refresh_due(
+            focus_refresh_requested.load(Ordering::Acquire),
+            last_focus_refresh.elapsed(),
+        ) && focus_refresh_requested.swap(false, Ordering::AcqRel)
+        {
+            emit_focus_state(unsafe { &*callback_state_ptr });
+            last_focus_refresh = Instant::now();
         }
     }
 
@@ -1690,6 +1731,26 @@ extern "C" fn activity_only_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_observer_keeps_focus_freshness_notifications() {
+        let notifications = app_observer_notifications();
+
+        assert!(notifications.contains(&ax::notification::app_activated()));
+        assert!(notifications.contains(&ax::notification::app_deactivated()));
+        assert!(notifications.contains(&ax::notification::focused_window_changed()));
+        assert!(notifications.contains(&ax::notification::focused_ui_element_changed()));
+    }
+
+    #[test]
+    fn focused_window_refreshes_are_debounced() {
+        assert!(!focus_refresh_due(
+            true,
+            FOCUS_REFRESH_DEBOUNCE - Duration::from_millis(1)
+        ));
+        assert!(focus_refresh_due(true, FOCUS_REFRESH_DEBOUNCE));
+        assert!(!focus_refresh_due(false, FOCUS_REFRESH_DEBOUNCE));
+    }
 
     #[test]
     fn test_permission_check() {

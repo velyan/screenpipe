@@ -26,7 +26,7 @@ static MONITOR_WATCHER: Lazy<Mutex<Option<JoinHandle<()>>>> = Lazy::new(|| Mutex
 /// stopped/restarted alongside vision during DRM pause/resume.
 pub async fn start_monitor_watcher(
     vision_manager: Arc<VisionManager>,
-    audio_manager: Option<screenpipe_audio::audio_manager::AudioManager>,
+    audio_manager: Option<crate::audio::audio_manager::AudioManager>,
 ) -> anyhow::Result<()> {
     // Stop existing watcher if any
     stop_monitor_watcher().await?;
