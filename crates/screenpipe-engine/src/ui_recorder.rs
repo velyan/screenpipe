@@ -307,7 +307,14 @@ pub async fn start_ui_recording(
                                     Some(CaptureTrigger::WindowFocus { window_name: title })
                                 }
                             }
-                            screenpipe_db::UiEventType::Click => Some(CaptureTrigger::Click),
+                            screenpipe_db::UiEventType::Click => {
+                                match (db_event.x, db_event.y) {
+                                    (Some(x), Some(y)) => Some(CaptureTrigger::Click { x, y }),
+                                    // Preserve the old behavior if a platform
+                                    // cannot provide global click coordinates.
+                                    _ => Some(CaptureTrigger::Manual),
+                                }
+                            }
                             screenpipe_db::UiEventType::Clipboard => {
                                 Some(CaptureTrigger::Clipboard)
                             }

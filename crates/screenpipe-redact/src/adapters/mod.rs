@@ -39,7 +39,9 @@
 //! Vulkan / GPU-vendor SDKs bundled.**
 
 pub mod regex;
+#[cfg(feature = "tinfoil")]
 pub mod tinfoil;
+#[cfg(feature = "tinfoil")]
 pub mod tinfoil_image;
 
 #[cfg(feature = "onnx-cpu")]

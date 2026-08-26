@@ -2237,7 +2237,7 @@ pub async fn run_meeting_detection_loop(
     manual_meeting: Arc<tokio::sync::RwLock<Option<i64>>>,
     mut shutdown_rx: broadcast::Receiver<()>,
     scan_interval: Option<Duration>,
-    detector: Option<Arc<screenpipe_audio::meeting_detector::MeetingDetector>>,
+    detector: Option<Arc<crate::audio::meeting_detector::MeetingDetector>>,
     close_orphaned_meetings_on_start: bool,
 ) {
     let profiles = load_detection_profiles();
@@ -2829,7 +2829,7 @@ fn handle_no_apps_running(state: MeetingState) -> (MeetingState, Option<i64>) {
 fn sync_meeting_flag(
     in_meeting: bool,
     flag: &AtomicBool,
-    detector: &Option<Arc<screenpipe_audio::meeting_detector::MeetingDetector>>,
+    detector: &Option<Arc<crate::audio::meeting_detector::MeetingDetector>>,
 ) {
     flag.store(in_meeting, Ordering::Relaxed);
     if let Some(ref det) = detector {

@@ -8,22 +8,22 @@
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use clap::{CommandFactory, FromArgMatches};
-#[allow(unused_imports)]
-use colored::Colorize;
 use futures::pin_mut;
 use port_check::is_local_ipv4_port_free;
-#[cfg(target_os = "macos")]
-use screenpipe_audio::core::device::{
-    get_cpal_device_and_config, AudioDevice, DeviceType, MACOS_OUTPUT_AUDIO_DEVICE_NAME,
-};
-use screenpipe_audio::{
-    core::device::{default_input_device, default_output_device, parse_audio_device},
-    meeting_detector::MeetingDetector,
-};
 use screenpipe_core::agents::AgentExecutor;
 use screenpipe_core::find_ffmpeg_path;
 use screenpipe_core::paths;
 use screenpipe_db::DatabaseManager;
+#[cfg(target_os = "macos")]
+use screenpipe_engine::audio::core::device::{
+    get_cpal_device_and_config, AudioDevice, DeviceType, MACOS_OUTPUT_AUDIO_DEVICE_NAME,
+};
+use screenpipe_engine::audio::{
+    core::device::{default_input_device, default_output_device, parse_audio_device},
+    meeting_detector::MeetingDetector,
+};
+#[allow(unused_imports)]
+use screenpipe_engine::terminal_style::Colorize;
 use screenpipe_engine::{
     analytics,
     cli::{
@@ -424,6 +424,17 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .into_recording_config(local_data_dir.clone(), &record_arg_sources)
         .await?;
+    #[cfg(not(feature = "audio"))]
+    let config = {
+        let mut config = config;
+        // A vision-only distribution must never request microphone permission,
+        // advertise audio health, or start an audio loop even when launched by
+        // an older caller that did not pass --disable-audio.
+        config.disable_audio = true;
+        config.audio_transcription_engine =
+            screenpipe_engine::audio::core::engine::AudioTranscriptionEngine::Disabled;
+        config
+    };
 
     // Store the guard in a variable that lives for the entire main function
     let _log_guard = Some(setup_logging(
@@ -591,14 +602,20 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Replace the current conditional check with:
-    let ffmpeg_path = find_ffmpeg_path();
-    if ffmpeg_path.is_none() {
-        // Try one more time, which might trigger the installation
+    // Snapshot-first capture does not invoke FFmpeg. Only require the external
+    // binary when the JPEG-to-MP4 compaction worker is enabled; Moya disables
+    // that worker and can therefore ship without the large FFmpeg payload.
+    if !config.disable_snapshot_compaction {
         let ffmpeg_path = find_ffmpeg_path();
         if ffmpeg_path.is_none() {
-            eprintln!("ffmpeg not found and installation failed. please install ffmpeg manually.");
-            std::process::exit(1);
+            // Try one more time, which might trigger the installation.
+            let ffmpeg_path = find_ffmpeg_path();
+            if ffmpeg_path.is_none() {
+                eprintln!(
+                    "ffmpeg not found and installation failed. please install ffmpeg manually."
+                );
+                std::process::exit(1);
+            }
         }
     }
 
@@ -1609,12 +1626,10 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     if config.async_pii_redaction {
+        #[cfg(any(feature = "opf-text", feature = "tinfoil"))]
+        use screenpipe_redact::pipeline::PipelineConfig;
         use screenpipe_redact::{
-            adapters::{
-                opf::{OpfAdapter, OpfConfig},
-                tinfoil::TinfoilRedactor,
-            },
-            pipeline::{Pipeline, PipelineConfig},
+            pipeline::Pipeline,
             worker::{Worker, WorkerConfig, ALL_TARGET_TABLES},
             Redactor,
         };
@@ -1641,35 +1656,86 @@ async fn main() -> anyhow::Result<()> {
                 "fetching local OPF v6 checkpoint (~2.8 GB on first run, cached at \
                  ~/.screenpipe/models/opf-v6/)"
             );
-            let pipeline = match OpfAdapter::load_or_download(OpfConfig::default()).await {
-                Ok(adapter) => {
-                    info!(
-                        "text-PII AI step: local opf-rs (candle) — lazy load on first \
+            #[cfg(feature = "opf-text")]
+            let pipeline = {
+                use screenpipe_redact::adapters::opf::{OpfAdapter, OpfConfig};
+
+                let pipeline = match OpfAdapter::load_or_download(OpfConfig::default()).await {
+                    Ok(adapter) => {
+                        info!(
+                            "text-PII AI step: local opf-rs (candle) — lazy load on first \
                          batch, idle-unload after 60s of no work"
-                    );
-                    // Wrap in Arc first so we can spawn the idle
-                    // unloader (which needs `Arc<Self>`) and still
-                    // hand the same Arc to the Pipeline.
-                    let adapter = Arc::new(adapter);
-                    let _unloader = Arc::clone(&adapter).spawn_idle_unloader();
-                    let ai: Arc<dyn Redactor> = adapter;
-                    Pipeline::regex_then_ai(ai, PipelineConfig::default())
-                }
-                Err(e) => {
-                    if std::env::var("TINFOIL_API_KEY").is_ok()
-                        || std::env::var("TINFOIL_BASE_URL").is_ok()
-                    {
-                        info!("text-PII AI step: tinfoil enclave (local opf-rs unavailable: {e})");
-                        let ai: Arc<dyn Redactor> = Arc::new(TinfoilRedactor::from_env());
-                        Pipeline::regex_then_ai(ai, PipelineConfig::default())
-                    } else {
-                        tracing::warn!(
-                            "text-PII AI step disabled — local opf-rs unavailable ({e}) and no \
-                             TINFOIL_* env vars set. Worker will run regex-only."
                         );
-                        Pipeline::regex_only()
+                        // Wrap in Arc first so we can spawn the idle
+                        // unloader (which needs `Arc<Self>`) and still
+                        // hand the same Arc to the Pipeline.
+                        let adapter = Arc::new(adapter);
+                        let _unloader = Arc::clone(&adapter).spawn_idle_unloader();
+                        let ai: Arc<dyn Redactor> = adapter;
+                        Pipeline::regex_then_ai(ai, PipelineConfig::default())
                     }
+                    Err(e) => {
+                        #[cfg(feature = "tinfoil")]
+                        {
+                            use screenpipe_redact::adapters::tinfoil::TinfoilRedactor;
+
+                            if std::env::var("TINFOIL_API_KEY").is_ok()
+                                || std::env::var("TINFOIL_BASE_URL").is_ok()
+                            {
+                                info!(
+                                "text-PII AI step: tinfoil enclave (local opf-rs unavailable: {e})"
+                            );
+                                let ai: Arc<dyn Redactor> = Arc::new(TinfoilRedactor::from_env());
+                                Pipeline::regex_then_ai(ai, PipelineConfig::default())
+                            } else {
+                                tracing::warn!(
+                                "text-PII AI step disabled — local opf-rs unavailable ({e}) and no \
+                                 TINFOIL_* env vars set. Worker will run regex-only."
+                            );
+                                Pipeline::regex_only()
+                            }
+                        }
+
+                        #[cfg(not(feature = "tinfoil"))]
+                        {
+                            tracing::warn!(
+                            "text-PII AI step disabled — local opf-rs unavailable ({e}) and this \
+                             binary was built without remote PII filtering. Worker will run \
+                             regex-only."
+                        );
+                            Pipeline::regex_only()
+                        }
+                    }
+                };
+                pipeline
+            };
+
+            #[cfg(all(not(feature = "opf-text"), feature = "tinfoil"))]
+            let pipeline = {
+                use screenpipe_redact::adapters::tinfoil::TinfoilRedactor;
+
+                if std::env::var("TINFOIL_API_KEY").is_ok()
+                    || std::env::var("TINFOIL_BASE_URL").is_ok()
+                {
+                    info!("text-PII AI step: tinfoil enclave (local OPF not built)");
+                    let ai: Arc<dyn Redactor> = Arc::new(TinfoilRedactor::from_env());
+                    Pipeline::regex_then_ai(ai, PipelineConfig::default())
+                } else {
+                    tracing::warn!(
+                        "text-PII AI step disabled — local OPF was not built and no TINFOIL_* \
+                         env vars are set. Worker will run regex-only."
+                    );
+                    Pipeline::regex_only()
                 }
+            };
+
+            #[cfg(all(not(feature = "opf-text"), not(feature = "tinfoil")))]
+            let pipeline = {
+                tracing::warn!(
+                    "text-PII AI step disabled — this binary was built without model-backed PII \
+                     redaction. Worker will run regex-only."
+                );
+                Pipeline::regex_only()
             };
             let pipeline_arc = Arc::new(pipeline) as Arc<dyn Redactor>;
 
