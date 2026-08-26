@@ -95,7 +95,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.resolve-release.outputs.resolved_ref }}
+          ref: ${{ needs.resolve-release.outputs.resolved_sha }}
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
