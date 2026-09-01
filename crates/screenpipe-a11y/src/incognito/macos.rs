@@ -17,14 +17,13 @@
 //! detection via [`super::titles::is_title_private`].
 
 use std::collections::HashSet;
-use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tracing::debug;
 
 use crate::macos_browser_apps::{
-    is_scriptable_chromium_application, scriptable_chromium_application_name,
+    is_scriptable_chromium_application, run_osascript_bounded, scriptable_chromium_application_name,
 };
 
 use super::titles::is_title_private;
@@ -95,16 +94,12 @@ end if"#,
             name = as_name,
         );
 
-        let output = match Command::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(&script)
-            .output()
-        {
-            Ok(o) => o,
-            Err(e) => {
-                debug!("incognito: osascript spawn failed for {}: {}", as_name, e);
-                return None;
-            }
+        let Some(output) = run_osascript_bounded(&script) else {
+            debug!(
+                "incognito: osascript unavailable or timed out for {}",
+                as_name
+            );
+            return None;
         };
 
         if !output.status.success() {

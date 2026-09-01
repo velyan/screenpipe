@@ -14,13 +14,20 @@ use tracing::debug;
 use sck_rs::{Window as SckWindow, XCapError as SckXCapError};
 
 #[cfg(target_os = "macos")]
+use screenpipe_a11y::macos_browser_apps::{
+    observe_browser_tab_fresh, stable_browser_url, BrowserTabObservationLookup,
+};
+
+#[cfg(target_os = "macos")]
 use xcap::{Window as XcapWindow, XCapError as XcapXCapError};
 
 // Non-macOS only uses xcap
 #[cfg(not(target_os = "macos"))]
 use xcap::{Window, XCapError};
 
-use crate::browser_utils::create_url_detector;
+#[cfg(target_os = "macos")]
+use crate::browser_utils::MacOSUrlDetector;
+use crate::browser_utils::{create_url_detector, is_browser_application};
 use crate::monitor::SafeMonitor;
 
 #[cfg(target_os = "macos")]
@@ -29,10 +36,6 @@ use url::Url;
 
 #[cfg(target_os = "macos")]
 use std::collections::HashMap;
-
-const BROWSER_NAMES: [&str; 9] = [
-    "chrome", "firefox", "safari", "edge", "brave", "arc", "chromium", "vivaldi", "opera",
-];
 
 #[derive(Debug)]
 enum CaptureError {
@@ -534,11 +537,54 @@ struct WindowData {
     title: String,
     is_focused: bool,
     process_id: i32,
+    window_id: Option<u32>,
+    browser_url: Option<String>,
+    browser_url_was_bracketed: bool,
     window_x: i32,
     window_y: i32,
     window_width: u32,
     window_height: u32,
     image_buffer: image::RgbaImage,
+}
+
+#[cfg(target_os = "macos")]
+fn begin_browser_capture_observation(
+    app_name: &str,
+    is_focused: bool,
+    window_title: &str,
+) -> Option<BrowserTabObservationLookup> {
+    if !is_focused || !is_browser_application(app_name) {
+        return None;
+    }
+    let observation = observe_browser_tab_fresh(app_name, window_title);
+    (!matches!(
+        observation,
+        BrowserTabObservationLookup::NotScriptable | BrowserTabObservationLookup::Unavailable
+    ))
+    .then_some(observation)
+}
+
+#[cfg(target_os = "macos")]
+fn finish_browser_capture_observation<F>(
+    app_name: &str,
+    window_title: &str,
+    before: Option<&BrowserTabObservationLookup>,
+    native_window_revalidate: F,
+) -> (bool, Option<String>)
+where
+    F: FnOnce() -> bool,
+{
+    let Some(before) = before else {
+        return (!native_window_revalidate(), None);
+    };
+    let after = observe_browser_tab_fresh(app_name, window_title);
+    let native_window_is_stable = native_window_revalidate();
+    (
+        true,
+        native_window_is_stable
+            .then(|| stable_browser_url(before, &after))
+            .flatten(),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -1035,34 +1081,25 @@ fn is_valid_topmost_candidate(window: &CGWindowInfo) -> bool {
 /// Get all visible windows using the appropriate backend
 #[cfg(target_os = "macos")]
 fn get_all_windows() -> Result<Vec<WindowData>, Box<dyn Error>> {
-    let mut windows = if use_sck_rs() {
-        get_all_windows_sck()?
+    let frontmost_pid = get_frontmost_pid();
+    if use_sck_rs() {
+        get_all_windows_sck(frontmost_pid)
     } else {
-        get_all_windows_xcap()?
-    };
-
-    // Fix focus: query frontmost PID once and apply consistently to all windows.
-    // This prevents multiple apps from being marked focused in the same capture cycle.
-    if let Some(frontmost_pid) = get_frontmost_pid() {
-        for window in &mut windows {
-            window.is_focused = window.process_id == frontmost_pid;
-        }
+        get_all_windows_xcap(frontmost_pid)
     }
-
-    Ok(windows)
 }
 
 #[cfg(target_os = "macos")]
-fn get_all_windows_sck() -> Result<Vec<WindowData>, Box<dyn Error>> {
+fn get_all_windows_sck(frontmost_pid: Option<i32>) -> Result<Vec<WindowData>, Box<dyn Error>> {
     let windows = SckWindow::all()?;
     Ok(windows
         .into_iter()
-        .filter_map(extract_window_data_sck)
+        .filter_map(|window| extract_window_data_sck(window, frontmost_pid))
         .collect())
 }
 
 #[cfg(target_os = "macos")]
-fn extract_window_data_sck(window: SckWindow) -> Option<WindowData> {
+fn extract_window_data_sck(window: SckWindow, frontmost_pid: Option<i32>) -> Option<WindowData> {
     let app_name = match window.app_name() {
         Ok(name) => name.to_string(),
         Err(e) => {
@@ -1086,8 +1123,10 @@ fn extract_window_data_sck(window: SckWindow) -> Option<WindowData> {
         }
     }
 
-    let is_focused = window.is_focused().unwrap_or(false);
     let process_id = window.pid().map(|p| p as i32).unwrap_or(-1);
+    let window_id = window.id().ok();
+    let is_focused = frontmost_pid == Some(process_id)
+        && MacOSUrlDetector::focused_window_matches(process_id, &title);
     let (window_x, window_y, window_width, window_height) = (
         window.x().unwrap_or(0),
         window.y().unwrap_or(0),
@@ -1095,18 +1134,33 @@ fn extract_window_data_sck(window: SckWindow) -> Option<WindowData> {
         window.height().unwrap_or(0),
     );
 
+    let browser_observation = begin_browser_capture_observation(&app_name, is_focused, &title);
     match window.capture_image() {
-        Ok(buffer) => Some(WindowData {
-            app_name,
-            title,
-            is_focused,
-            process_id,
-            window_x,
-            window_y,
-            window_width,
-            window_height,
-            image_buffer: buffer,
-        }),
+        Ok(buffer) => {
+            let (browser_url_was_bracketed, browser_url) = finish_browser_capture_observation(
+                &app_name,
+                &title,
+                browser_observation.as_ref(),
+                || {
+                    get_frontmost_pid() == Some(process_id)
+                        && MacOSUrlDetector::focused_window_matches(process_id, &title)
+                },
+            );
+            Some(WindowData {
+                app_name,
+                title,
+                is_focused,
+                process_id,
+                window_id,
+                browser_url,
+                browser_url_was_bracketed,
+                window_x,
+                window_y,
+                window_width,
+                window_height,
+                image_buffer: buffer,
+            })
+        }
         Err(e) => {
             debug!(
                 "Failed to capture image for window {} ({}): {}",
@@ -1118,16 +1172,16 @@ fn extract_window_data_sck(window: SckWindow) -> Option<WindowData> {
 }
 
 #[cfg(target_os = "macos")]
-fn get_all_windows_xcap() -> Result<Vec<WindowData>, Box<dyn Error>> {
+fn get_all_windows_xcap(frontmost_pid: Option<i32>) -> Result<Vec<WindowData>, Box<dyn Error>> {
     let windows = XcapWindow::all()?;
     Ok(windows
         .into_iter()
-        .filter_map(extract_window_data_xcap)
+        .filter_map(|window| extract_window_data_xcap(window, frontmost_pid))
         .collect())
 }
 
 #[cfg(target_os = "macos")]
-fn extract_window_data_xcap(window: XcapWindow) -> Option<WindowData> {
+fn extract_window_data_xcap(window: XcapWindow, frontmost_pid: Option<i32>) -> Option<WindowData> {
     let app_name = match window.app_name() {
         Ok(name) => name.to_string(),
         Err(e) => {
@@ -1151,8 +1205,10 @@ fn extract_window_data_xcap(window: XcapWindow) -> Option<WindowData> {
         }
     }
 
-    let is_focused = window.is_focused().unwrap_or(false);
     let process_id = window.pid().map(|p| p as i32).unwrap_or(-1);
+    let window_id = window.id().ok();
+    let is_focused = frontmost_pid == Some(process_id)
+        && MacOSUrlDetector::focused_window_matches(process_id, &title);
     let (window_x, window_y, window_width, window_height) = (
         window.x().unwrap_or(0),
         window.y().unwrap_or(0),
@@ -1160,18 +1216,33 @@ fn extract_window_data_xcap(window: XcapWindow) -> Option<WindowData> {
         window.height().unwrap_or(0),
     );
 
+    let browser_observation = begin_browser_capture_observation(&app_name, is_focused, &title);
     match window.capture_image() {
-        Ok(buffer) => Some(WindowData {
-            app_name,
-            title,
-            is_focused,
-            process_id,
-            window_x,
-            window_y,
-            window_width,
-            window_height,
-            image_buffer: buffer,
-        }),
+        Ok(buffer) => {
+            let (browser_url_was_bracketed, browser_url) = finish_browser_capture_observation(
+                &app_name,
+                &title,
+                browser_observation.as_ref(),
+                || {
+                    get_frontmost_pid() == Some(process_id)
+                        && MacOSUrlDetector::focused_window_matches(process_id, &title)
+                },
+            );
+            Some(WindowData {
+                app_name,
+                title,
+                is_focused,
+                process_id,
+                window_id,
+                browser_url,
+                browser_url_was_bracketed,
+                window_x,
+                window_y,
+                window_width,
+                window_height,
+                image_buffer: buffer,
+            })
+        }
         Err(e) => {
             debug!(
                 "Failed to capture image for window {} ({}): {}",
@@ -1277,6 +1348,7 @@ fn get_all_windows() -> Result<Vec<WindowData>, Box<dyn Error>> {
 
             let is_focused = window.is_focused().unwrap_or(false);
             let process_id = window.pid().map(|p| p as i32).unwrap_or(-1);
+            let window_id = window.id().ok();
             let (window_x, window_y, window_width, window_height) = (
                 window.x().unwrap_or(0),
                 window.y().unwrap_or(0),
@@ -1290,6 +1362,9 @@ fn get_all_windows() -> Result<Vec<WindowData>, Box<dyn Error>> {
                     title,
                     is_focused,
                     process_id,
+                    window_id,
+                    browser_url: None,
+                    browser_url_was_bracketed: false,
                     window_x,
                     window_y,
                     window_width,
@@ -1384,11 +1459,7 @@ fn focused_browser_url_if_any(
     process_id: i32,
     window_name: &str,
 ) -> Option<String> {
-    if !is_focused
-        || !BROWSER_NAMES
-            .iter()
-            .any(|&browser| app_name.to_lowercase().contains(browser))
-    {
+    if !is_focused || !is_browser_application(app_name) {
         return None;
     }
 
@@ -1400,6 +1471,37 @@ fn focused_browser_url_if_any(
             None
         }
     }
+}
+
+async fn focused_browser_url_if_any_async(
+    app_name: &str,
+    is_focused: bool,
+    process_id: i32,
+    window_name: &str,
+) -> Option<String> {
+    if !is_focused || !is_browser_application(app_name) {
+        return None;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let app_name = app_name.to_string();
+        let window_name = window_name.to_string();
+        return match tokio::task::spawn_blocking(move || {
+            focused_browser_url_if_any(&app_name, true, process_id, &window_name)
+        })
+        .await
+        {
+            Ok(url) => url,
+            Err(error) => {
+                debug!("Browser URL lookup task failed: {}", error);
+                None
+            }
+        };
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    focused_browser_url_if_any(app_name, is_focused, process_id, window_name)
 }
 
 fn focused_window_blocked_by_privacy(
@@ -1419,9 +1521,7 @@ fn focused_window_blocked_by_privacy(
         }
     }
 
-    let is_browser = BROWSER_NAMES
-        .iter()
-        .any(|&browser| app_name.to_lowercase().contains(browser));
+    let is_browser = is_browser_application(app_name);
 
     if is_browser
         && browser_url.is_none()
@@ -1569,6 +1669,10 @@ fn capture_focused_window_sck(
         return Ok(None);
     };
 
+    let native_window_was_focused = get_frontmost_pid() == Some(process_id)
+        && MacOSUrlDetector::focused_window_matches(process_id, &window_name);
+    let browser_observation =
+        begin_browser_capture_observation(&app_name, native_window_was_focused, &window_name);
     let image = match window.capture_image() {
         Ok(buffer) => DynamicImage::ImageRgba8(buffer),
         Err(e) => {
@@ -1580,7 +1684,20 @@ fn capture_focused_window_sck(
         }
     };
 
-    let browser_url = focused_browser_url_if_any(&app_name, is_focused, process_id, &window_name);
+    let (browser_url_was_bracketed, browser_url) = finish_browser_capture_observation(
+        &app_name,
+        &window_name,
+        browser_observation.as_ref(),
+        || {
+            get_frontmost_pid() == Some(process_id)
+                && MacOSUrlDetector::focused_window_matches(process_id, &window_name)
+        },
+    );
+    let browser_url = if browser_url_was_bracketed {
+        browser_url
+    } else {
+        focused_browser_url_if_any(&app_name, is_focused, process_id, &window_name)
+    };
     if focused_window_blocked_by_privacy(
         &app_name,
         &window_name,
@@ -1716,6 +1833,10 @@ fn capture_focused_window_xcap_macos(
         return Ok(None);
     };
 
+    let native_window_was_focused = get_frontmost_pid() == Some(process_id)
+        && MacOSUrlDetector::focused_window_matches(process_id, &window_name);
+    let browser_observation =
+        begin_browser_capture_observation(&app_name, native_window_was_focused, &window_name);
     let image = match window.capture_image() {
         Ok(buffer) => DynamicImage::ImageRgba8(buffer),
         Err(e) => {
@@ -1727,7 +1848,20 @@ fn capture_focused_window_xcap_macos(
         }
     };
 
-    let browser_url = focused_browser_url_if_any(&app_name, is_focused, process_id, &window_name);
+    let (browser_url_was_bracketed, browser_url) = finish_browser_capture_observation(
+        &app_name,
+        &window_name,
+        browser_observation.as_ref(),
+        || {
+            get_frontmost_pid() == Some(process_id)
+                && MacOSUrlDetector::focused_window_matches(process_id, &window_name)
+        },
+    );
+    let browser_url = if browser_url_was_bracketed {
+        browser_url
+    } else {
+        focused_browser_url_if_any(&app_name, is_focused, process_id, &window_name)
+    };
     if focused_window_blocked_by_privacy(
         &app_name,
         &window_name,
@@ -1915,7 +2049,15 @@ pub async fn capture_all_visible_windows(
     let mut all_captured_images = Vec::new();
 
     // Get windows using the appropriate backend
-    let windows_data = get_all_windows()?;
+    let windows_data =
+        tokio::task::spawn_blocking(|| get_all_windows().map_err(|error| error.to_string()))
+            .await
+            .map_err(|error| -> Box<dyn Error> {
+                Box::new(std::io::Error::other(format!(
+                    "window capture task failed: {error}"
+                )))
+            })?
+            .map_err(|error| -> Box<dyn Error> { Box::new(std::io::Error::other(error)) })?;
 
     if windows_data.is_empty() {
         return Err(Box::new(CaptureError::NoWindows));
@@ -1962,6 +2104,9 @@ pub async fn capture_all_visible_windows(
             title: window_name,
             is_focused,
             process_id,
+            window_id,
+            browser_url,
+            browser_url_was_bracketed,
             window_x,
             window_y,
             window_width,
@@ -2028,21 +2173,11 @@ pub async fn capture_all_visible_windows(
         if is_valid {
             // Fetch browser URL atomically with screenshot for focused browser windows
             // This prevents timing mismatches where URL is fetched after navigation
-            let browser_url = if is_focused
-                && BROWSER_NAMES
-                    .iter()
-                    .any(|&browser| app_name.to_lowercase().contains(browser))
-            {
-                let detector = create_url_detector();
-                match detector.get_active_url(&app_name, process_id, &window_name) {
-                    Ok(url) => url,
-                    Err(e) => {
-                        debug!("Failed to get browser URL for {}: {}", app_name, e);
-                        None
-                    }
-                }
+            let browser_url = if browser_url_was_bracketed {
+                browser_url
             } else {
-                None
+                focused_browser_url_if_any_async(&app_name, is_focused, process_id, &window_name)
+                    .await
             };
 
             // Check if URL should be blocked for privacy (e.g., banking sites)
@@ -2058,9 +2193,7 @@ pub async fn capture_all_visible_windows(
 
             // Fallback: For unfocused browser windows where we can't get URL,
             // check if window title suggests it's a blocked site
-            let is_browser = BROWSER_NAMES
-                .iter()
-                .any(|&browser| app_name.to_lowercase().contains(browser));
+            let is_browser = is_browser_application(&app_name);
 
             if is_browser
                 && browser_url.is_none()
@@ -2079,7 +2212,7 @@ pub async fn capture_all_visible_windows(
                 app_name,
                 window_name,
                 process_id,
-                window_id: None,
+                window_id,
                 is_focused,
                 browser_url,
                 window_x,

@@ -4,7 +4,7 @@
 
 use accessibility_sys::{
     kAXChildrenAttribute, kAXDocumentAttribute, kAXFocusedWindowAttribute, kAXRoleAttribute,
-    kAXTextFieldRole, kAXValueAttribute, AXUIElementCopyAttributeValue,
+    kAXTextFieldRole, kAXTitleAttribute, kAXValueAttribute, AXUIElementCopyAttributeValue,
     AXUIElementCreateApplication, AXUIElementRef,
 };
 use anyhow::Result;
@@ -13,6 +13,7 @@ use core_foundation::{
     base::{CFRelease, CFTypeRef, TCFType},
     string::CFString,
 };
+use screenpipe_a11y::browser_titles::titles_match;
 use screenpipe_a11y::macos_browser_apps::{title_correlated_browser_url, BrowserUrlLookup};
 use tracing::debug;
 use url::Url;
@@ -30,6 +31,45 @@ impl Default for MacOSUrlDetector {
 impl MacOSUrlDetector {
     pub fn new() -> Self {
         Self
+    }
+
+    /// Verify that the process still reports a focused AX window with the
+    /// captured native title. Browser scripting, AX, and SCK expose different
+    /// window-id domains, so identity is bracketed separately by the scripted
+    /// observation and the frontmost process check at the capture call site.
+    pub fn focused_window_matches(process_id: i32, expected_title: &str) -> bool {
+        unsafe {
+            let app_element = AXUIElementCreateApplication(process_id);
+            let mut focused_window: CFTypeRef = std::ptr::null_mut();
+            let status = AXUIElementCopyAttributeValue(
+                app_element,
+                CFString::from_static_string(kAXFocusedWindowAttribute).as_concrete_TypeRef(),
+                &mut focused_window,
+            );
+            if status != accessibility_sys::kAXErrorSuccess || focused_window.is_null() {
+                CFRelease(app_element as CFTypeRef);
+                return false;
+            }
+
+            let mut title_value: CFTypeRef = std::ptr::null_mut();
+            let title_status = AXUIElementCopyAttributeValue(
+                focused_window as AXUIElementRef,
+                CFString::from_static_string(kAXTitleAttribute).as_concrete_TypeRef(),
+                &mut title_value,
+            );
+            let title_matches = if title_status == accessibility_sys::kAXErrorSuccess
+                && !title_value.is_null()
+            {
+                let current_title = CFString::wrap_under_create_rule(title_value as _).to_string();
+                titles_match(expected_title, &current_title, None)
+            } else {
+                false
+            };
+
+            CFRelease(focused_window);
+            CFRelease(app_element as CFTypeRef);
+            title_matches
+        }
     }
 
     /// Try to get the document URL from the focused window's AXDocument attribute.
@@ -201,7 +241,7 @@ impl BrowserUrlDetector for MacOSUrlDetector {
         // Chromium and Arc do not expose AXDocument reliably. Their scripting
         // API returns the title and URL together so stale tab results can be
         // rejected before the URL is attached to a frame.
-        match title_correlated_browser_url(app_name, window_title) {
+        match title_correlated_browser_url(app_name, process_id, window_title) {
             BrowserUrlLookup::Found(url) => {
                 debug!(
                     "got title-correlated browser URL via AppleScript for {}",
