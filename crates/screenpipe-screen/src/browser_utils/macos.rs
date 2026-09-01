@@ -337,7 +337,9 @@ end tell"#;
     /// 3s timeout.
     fn get_window_urls_via_accessibility(&self, process_id: i32) -> Result<Vec<String>> {
         let mut urls: Vec<String> = Vec::new();
-        if let Ok(Some(url)) = self.get_url_via_accessibility(process_id) {
+        if let Some(url) = unsafe { self.get_document_url(process_id) } {
+            urls.push(url);
+        } else if let Ok(Some(url)) = self.get_url_via_accessibility_tree(process_id) {
             urls.push(url);
         }
 

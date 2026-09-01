@@ -2041,7 +2041,7 @@ pub async fn capture_all_visible_windows(
             title: window_name,
             is_focused,
             process_id,
-            window_id,
+            window_id: _,
             browser_url,
             browser_url_was_bracketed,
             window_x,
