@@ -7,8 +7,9 @@
 //! The bug: URL is fetched AFTER screenshot via a separate system call (~107ms for Arc).
 //! If the browser navigates during that gap, the wrong URL gets associated with the frame.
 //!
-//! The fix: For Arc, fetch title+URL together and cross-check the AppleScript title
-//! against the SCK window_name. If they don't match, reject the URL (return None).
+//! The fix: fetch title+URL together and cross-check the AppleScript title
+//! against the SCK window_name. If they don't exactly match after known title
+//! normalization, reject the URL (return None).
 //!
 //! Run with: cargo test -p screenpipe-screen --test url_timing_test -- --nocapture
 
@@ -149,6 +150,7 @@ async fn test_title_mismatch_rejects_cross_domain() {
     assert!(!titles_match("Y Combinator", "mpz-fzvf-qxn"));
     assert!(!titles_match("dog", "WhatsApp"));
     assert!(!titles_match("visitor14279 | Crisp", "mpz-fzvf-qxn"));
+    assert!(!titles_match("GitHub Issues", "GitHub"));
 }
 
 #[tokio::test]

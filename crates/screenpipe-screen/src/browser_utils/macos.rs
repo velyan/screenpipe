@@ -13,10 +13,11 @@ use core_foundation::{
     base::{CFRelease, CFTypeRef, TCFType},
     string::CFString,
 };
+use screenpipe_a11y::macos_browser_apps::{title_correlated_browser_url, BrowserUrlLookup};
 use tracing::debug;
 use url::Url;
 
-use super::{titles_match, BrowserUrlDetector};
+use super::BrowserUrlDetector;
 
 pub struct MacOSUrlDetector;
 
@@ -65,7 +66,7 @@ impl MacOSUrlDetector {
             // Filter to only http/https URLs
             if doc_str.starts_with("http://") || doc_str.starts_with("https://") {
                 if Url::parse(&doc_str).is_ok() {
-                    debug!("got URL via AXDocument: {}", doc_str);
+                    debug!("got browser URL via AXDocument");
                     Some(doc_str)
                 } else {
                     None
@@ -153,52 +154,8 @@ impl MacOSUrlDetector {
         None
     }
 
-    /// Get URL + title from Arc via a single AppleScript call.
-    /// Returns (title, url) so we can cross-check the title against the SCK window name.
-    fn get_arc_title_and_url(&self) -> Result<Option<(String, String)>> {
-        let script = r#"tell application "Arc"
-    set t to title of active tab of front window
-    set u to URL of active tab of front window
-    return t & "|||" & u
-end tell"#;
-        let output = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .output()?;
-
-        if output.status.success() {
-            let raw = String::from_utf8(output.stdout)?.trim().to_string();
-            if let Some((title, url)) = raw.split_once("|||") {
-                if !url.is_empty() {
-                    return Ok(Some((title.to_string(), url.to_string())));
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    fn get_url_via_applescript(&self, script: &str) -> Result<Option<String>> {
-        let output = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .output()?;
-
-        if output.status.success() {
-            let url = String::from_utf8(output.stdout)?.trim().to_string();
-            return Ok(Some(url));
-        }
-        Ok(None)
-    }
-
-    fn get_url_via_accessibility(&self, process_id: i32) -> Result<Option<String>> {
+    fn get_url_via_accessibility_tree(&self, process_id: i32) -> Result<Option<String>> {
         unsafe {
-            // First try AXDocument — returns the loaded page URL, not address bar text.
-            // This is more reliable as it reflects what's actually rendered.
-            if let Some(url) = self.get_document_url(process_id) {
-                return Ok(Some(url));
-            }
-
-            // Fallback to AX tree walk for address bar text
             let app_element = AXUIElementCreateApplication(process_id);
 
             let mut focused_window: CFTypeRef = std::ptr::null_mut();
@@ -235,36 +192,27 @@ impl BrowserUrlDetector for MacOSUrlDetector {
         process_id: i32,
         window_title: &str,
     ) -> Result<Option<String>> {
-        if app_name == "Arc" {
-            // For Arc: fetch title+URL in a single AppleScript call, then cross-check
-            // the title against the SCK window_name to detect tab switches during the
-            // ~107ms AppleScript round-trip.
-            match self.get_arc_title_and_url() {
-                Ok(Some((arc_title, arc_url))) => {
-                    if !window_title.is_empty() && !titles_match(window_title, &arc_title) {
-                        debug!(
-                            "Arc URL rejected: title mismatch (SCK='{}', Arc='{}'). \
-                             User likely switched tabs during capture.",
-                            window_title, arc_title
-                        );
-                        return Ok(None);
-                    }
-                    Ok(Some(arc_url))
-                }
-                Ok(None) => Ok(None),
-                Err(e) => {
-                    debug!(
-                        "Arc title+URL fetch failed, falling back to URL-only: {}",
-                        e
-                    );
-                    // Fallback to the old URL-only method without title check
-                    let script =
-                        r#"tell application "Arc" to return URL of active tab of front window"#;
-                    self.get_url_via_applescript(script)
-                }
-            }
-        } else {
-            self.get_url_via_accessibility(process_id)
+        // Prefer the focused window's AXDocument value: it is fast and already
+        // bound to the captured process/window.
+        if let Some(url) = unsafe { self.get_document_url(process_id) } {
+            return Ok(Some(url));
         }
+
+        // Chromium and Arc do not expose AXDocument reliably. Their scripting
+        // API returns the title and URL together so stale tab results can be
+        // rejected before the URL is attached to a frame.
+        match title_correlated_browser_url(app_name, window_title) {
+            BrowserUrlLookup::Found(url) => {
+                debug!(
+                    "got title-correlated browser URL via AppleScript for {}",
+                    app_name
+                );
+                return Ok(Some(url));
+            }
+            BrowserUrlLookup::Rejected => return Ok(None),
+            BrowserUrlLookup::NotScriptable | BrowserUrlLookup::Unavailable => {}
+        }
+
+        self.get_url_via_accessibility_tree(process_id)
     }
 }

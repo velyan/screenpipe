@@ -49,6 +49,7 @@ rusqlite = { version = "0.29", features = ["bundled"] }
 cidre = { version = "0.13", features = ["ax", "cg", "blocks", "ns", "app", "dispatch"] }
 core-foundation = "0.10"
 core-graphics = { version = "0.24.0", features = ["highsierra"] }
+url = "2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Native Windows APIs - no rdev dependency
