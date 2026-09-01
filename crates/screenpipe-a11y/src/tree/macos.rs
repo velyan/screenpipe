@@ -8,12 +8,12 @@ use super::{
     AccessibilityTreeNode, FocusedElementContext, LineBudget, SkipReason, TreeSnapshot,
     TreeWalkResult, TreeWalkerConfig, TreeWalkerPlatform, WindowBounds,
 };
+use crate::macos_browser_apps::{title_correlated_browser_url, BrowserUrlLookup};
 use crate::tree::macos_lines::{self, NormalizeRefs};
 use anyhow::Result;
 use chrono::Utc;
 use cidre::{arc::Retained, ax, cf, ns};
 use screenpipe_core::window_pattern::{self, WindowPattern};
-use std::process::Command;
 use std::time::{Duration, Instant};
 use tracing::debug;
 
@@ -359,8 +359,8 @@ fn percent_decode_path(s: &str) -> Option<String> {
 }
 
 /// Extract the browser URL from the focused window using AX APIs.
-/// Tries AXDocument first (works for Safari, Chrome, etc.), then
-/// AppleScript for Arc, then falls back to shallow AXTextField walk.
+/// Tries AXDocument first, then title-correlated AppleScript for browsers that
+/// expose an active-tab scripting API, then falls back to a shallow AX walk.
 fn extract_browser_url(
     window: &ax::UiElement,
     app_name: &str,
@@ -369,34 +369,29 @@ fn extract_browser_url(
     // Tier 1: AXDocument attribute on the window
     if let Some(url) = get_string_attr(window, ax::attr::document()) {
         if url.starts_with("http://") || url.starts_with("https://") {
-            debug!(
-                "browser_url: tier1 AXDocument hit for {}: {}",
-                app_name, url
-            );
+            debug!("browser_url: tier1 AXDocument hit for {}", app_name);
             return Some(url);
         }
     }
 
-    // Tier 2: For Arc, use AppleScript (AXDocument may not be set). Require the
-    // reported active tab title to match the focused window so a stale Arc tab
-    // URL is not attached to the wrong capture.
-    let app_lower = app_name.to_lowercase();
-    if app_lower.contains("arc") {
-        if let Some(url) = get_arc_url_for_window(window_name) {
+    // Tier 2: Arc and Chromium browsers do not reliably expose AXDocument.
+    // Read title + URL atomically and require that title to still match the
+    // focused window, so a tab switch cannot attach a stale URL to a capture.
+    match title_correlated_browser_url(app_name, window_name) {
+        BrowserUrlLookup::Found(url) => {
             debug!(
-                "browser_url: tier2 Arc title-matched AppleScript hit: {}",
-                url
+                "browser_url: tier2 title-matched AppleScript hit for {}",
+                app_name
             );
             return Some(url);
         }
+        BrowserUrlLookup::Rejected => return None,
+        BrowserUrlLookup::NotScriptable | BrowserUrlLookup::Unavailable => {}
     }
 
     // Tier 3: Shallow walk for AXTextField with URL-like value
     if let Some(url) = find_url_in_children(window, 0, 5) {
-        debug!(
-            "browser_url: tier3 AXTextField hit for {}: {}",
-            app_name, url
-        );
+        debug!("browser_url: tier3 AXTextField hit for {}", app_name);
         return Some(url);
     }
 
@@ -405,81 +400,6 @@ fn extract_browser_url(
         app_name, window_name
     );
     None
-}
-
-fn normalize_title_for_match(title: &str) -> String {
-    title
-        .to_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c.is_whitespace() {
-                c
-            } else {
-                ' '
-            }
-        })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn browser_titles_match(window_title: &str, tab_title: &str) -> bool {
-    let window = normalize_title_for_match(window_title);
-    let tab = normalize_title_for_match(tab_title);
-    if window.is_empty() || tab.is_empty() {
-        return false;
-    }
-    window == tab || window.contains(&tab) || tab.contains(&window)
-}
-
-/// Get Arc browser's current URL via AppleScript only when the reported tab
-/// title matches the focused window title.
-fn get_arc_url_for_window(window_name: &str) -> Option<String> {
-    let script = r#"tell application "Arc"
-    set t to title of active tab of front window
-    set u to URL of active tab of front window
-    return t & "|||" & u
-end tell"#;
-
-    let output = match Command::new("osascript").arg("-e").arg(script).output() {
-        Ok(o) => o,
-        Err(e) => {
-            debug!("get_arc_url_for_window: osascript spawn failed: {}", e);
-            return None;
-        }
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        debug!(
-            "get_arc_url_for_window: osascript failed (exit={}): {}",
-            output.status,
-            stderr.trim()
-        );
-        return None;
-    }
-
-    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let Some((title, url)) = raw.split_once("|||") else {
-        debug!("get_arc_url_for_window: unexpected output: {}", raw);
-        return None;
-    };
-
-    if !browser_titles_match(window_name, title) {
-        debug!(
-            "get_arc_url_for_window: title mismatch window='{}' tab='{}'",
-            window_name, title
-        );
-        return None;
-    }
-
-    if url.starts_with("http://") || url.starts_with("https://") {
-        Some(url.to_string())
-    } else {
-        debug!("get_arc_url_for_window: URL not http(s): {}", url);
-        None
-    }
 }
 
 /// Shallow walk of AX children to find a text field containing a URL.
@@ -1650,7 +1570,7 @@ fn get_element_frame(elem: &ax::UiElement) -> Option<(f64, f64, f64, f64)> {
 fn get_u32_attr_by_name(elem: &ax::UiElement, name: &str) -> Option<u32> {
     let attr_name = cf::String::from_str(name);
     let attr = ax::Attr::with_string(&attr_name);
-    elem.attr_value(&attr)
+    elem.attr_value(attr)
         .ok()
         .and_then(|value| value.try_as_number().and_then(|number| number.to_i64()))
         .and_then(|raw| u32::try_from(raw).ok())
@@ -2156,18 +2076,6 @@ mod tests {
             percent_decode_path("/Users/me/a%2Fb.md").as_deref(),
             Some("/Users/me/a/b.md")
         );
-    }
-
-    #[test]
-    fn test_browser_titles_match_allows_window_suffixes() {
-        assert!(browser_titles_match(
-            "Owning the Workflow in B2B AI Apps | Andreessen Horowitz",
-            "Owning the Workflow in B2B AI Apps"
-        ));
-        assert!(!browser_titles_match(
-            "Owning the Workflow in B2B AI Apps | Andreessen Horowitz",
-            "AI Agents: Their Potential and Challenges"
-        ));
     }
 
     #[test]

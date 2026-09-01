@@ -23,6 +23,10 @@ use std::time::{Duration, Instant};
 
 use tracing::debug;
 
+use crate::macos_browser_apps::{
+    is_scriptable_chromium_application, scriptable_chromium_application_name,
+};
+
 use super::titles::is_title_private;
 use super::IncognitoDetector;
 
@@ -31,33 +35,6 @@ use super::IncognitoDetector;
 /// AppleScript calls take ~150-200 ms.  Caching avoids repeated round-trips
 /// within a single capture cycle (typically 1-3 s).
 const CACHE_TTL: Duration = Duration::from_secs(2);
-
-/// Chromium-based browser names (lowercased) for which the AppleScript
-/// window properties API is available.  Arc is excluded — its AppleScript
-/// bridge is broken since v1.138.
-const CHROMIUM_BROWSERS: &[&str] = &[
-    "google chrome",
-    "chrome",
-    "chromium",
-    "microsoft edge",
-    "edge",
-    "brave browser",
-    "brave",
-    "vivaldi",
-    "opera",
-    "comet",
-];
-
-/// Maps an app name to the AppleScript application identifier.
-fn applescript_app_name(app_name: &str) -> &str {
-    let lower = app_name.to_lowercase();
-    match lower.as_str() {
-        "chrome" => "Google Chrome",
-        "edge" => "Microsoft Edge",
-        "brave" => "Brave Browser",
-        _ => app_name, // "Google Chrome", "Vivaldi", "Opera" work as-is
-    }
-}
 
 /// Batch cache: stores incognito window titles from a single AppleScript call.
 struct BatchCache {
@@ -80,13 +57,12 @@ impl MacOSIncognitoDetector {
     /// Returns `true` if the app name (lowercased) is a known Chromium
     /// browser that supports window property queries (excludes Arc).
     fn is_chromium_browser(app_name: &str) -> bool {
-        let lower = app_name.to_lowercase();
-        CHROMIUM_BROWSERS.iter().any(|b| lower.contains(b))
+        is_scriptable_chromium_application(app_name)
     }
 
     /// Query all incognito window titles via AppleScript.
     fn query_incognito_titles(app_name: &str) -> Option<HashSet<String>> {
-        let as_name = applescript_app_name(app_name);
+        let as_name = scriptable_chromium_application_name(app_name)?;
 
         let script = format!(
             r#"if application "{name}" is running then
@@ -119,7 +95,11 @@ end if"#,
             name = as_name,
         );
 
-        let output = match Command::new("osascript").arg("-e").arg(&script).output() {
+        let output = match Command::new("/usr/bin/osascript")
+            .arg("-e")
+            .arg(&script)
+            .output()
+        {
             Ok(o) => o,
             Err(e) => {
                 debug!("incognito: osascript spawn failed for {}: {}", as_name, e);
@@ -230,10 +210,22 @@ mod tests {
 
     #[test]
     fn test_applescript_app_name_mapping() {
-        assert_eq!(applescript_app_name("Chrome"), "Google Chrome");
-        assert_eq!(applescript_app_name("Edge"), "Microsoft Edge");
-        assert_eq!(applescript_app_name("Brave"), "Brave Browser");
-        assert_eq!(applescript_app_name("Google Chrome"), "Google Chrome");
+        assert_eq!(
+            scriptable_chromium_application_name("Chrome"),
+            Some("Google Chrome")
+        );
+        assert_eq!(
+            scriptable_chromium_application_name("Edge"),
+            Some("Microsoft Edge")
+        );
+        assert_eq!(
+            scriptable_chromium_application_name("Brave"),
+            Some("Brave Browser")
+        );
+        assert_eq!(
+            scriptable_chromium_application_name("Google Chrome"),
+            Some("Google Chrome")
+        );
     }
 
     #[test]

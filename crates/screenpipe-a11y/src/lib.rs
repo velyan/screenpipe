@@ -59,10 +59,13 @@
 //! ```
 
 pub mod activity_feed;
+pub mod browser_titles;
 pub mod budget;
 pub mod config;
 pub mod events;
 pub mod incognito;
+#[cfg(target_os = "macos")]
+pub mod macos_browser_apps;
 pub mod platform;
 pub mod scroll;
 pub mod tree;
