@@ -8,7 +8,7 @@ on:
         required: false
         default: ""
       screenpipe_ref:
-        description: "Git ref to build (branch, tag, or commit SHA)"
+        description: "Exact 40-character commit SHA to build (defaults to this workflow commit)"
         required: false
         default: ""
       prerelease:
@@ -24,7 +24,6 @@ jobs:
   resolve-release:
     runs-on: ubuntu-latest
     outputs:
-      resolved_ref: ${{ steps.ref.outputs.value }}
       resolved_sha: ${{ steps.version.outputs.sha }}
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -32,11 +31,17 @@ jobs:
         id: ref
         shell: bash
         run: |
-          if [[ -n "${{ github.event.inputs.screenpipe_ref }}" ]]; then
-            echo "value=${{ github.event.inputs.screenpipe_ref }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "value=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+
+          REF="${{ github.event.inputs.screenpipe_ref }}"
+          if [[ -z "${REF}" ]]; then
+            REF="${GITHUB_SHA}"
           fi
+          if [[ ! "${REF}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "screenpipe_ref must be an exact 40-character commit SHA, got: ${REF}" >&2
+            exit 1
+          fi
+          echo "value=${REF,,}" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -82,8 +87,14 @@ jobs:
             exit 1
           fi
 
+          RESOLVED_SHA="$(git rev-parse HEAD)"
+          if [[ "${RESOLVED_SHA}" != "${{ steps.ref.outputs.value }}" ]]; then
+            echo "checkout mismatch: expected ${{ steps.ref.outputs.value }}, resolved ${RESOLVED_SHA}" >&2
+            exit 1
+          fi
+
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "sha=${RESOLVED_SHA}" >> "$GITHUB_OUTPUT"
 
   build-macos:
     runs-on: macos-latest
@@ -245,7 +256,6 @@ jobs:
           set -euo pipefail
 
           export VERSION
-          TAG="moya-sidecar-v${VERSION}"
 
           mkdir -p release-assets
           cp artifacts/moya-sidecar-aarch64-apple-darwin/screenpipe-darwin-arm64 release-assets/
@@ -284,7 +294,7 @@ jobs:
               "commit": commit,
               "source": {
                   "repository": f"https://github.com/{repo}.git",
-                  "ref": "${{ needs.resolve-release.outputs.resolved_ref }}",
+                  "ref": commit,
                   "commit": commit,
               },
               "assets": {
@@ -328,14 +338,64 @@ jobs:
           TAG="moya-sidecar-v${VERSION}"
           TITLE="Moya Sidecar ${VERSION}"
 
+          matching_remote_tag() {
+            local remote_tag_sha
+            remote_tag_sha="$(
+              git ls-remote --tags origin "refs/tags/${TAG}" "refs/tags/${TAG}^{}" |
+                awk \
+                  -v direct_ref="refs/tags/${TAG}" \
+                  -v peeled_ref="refs/tags/${TAG}^{}" \
+                  '$2 == direct_ref { direct = $1 } $2 == peeled_ref { peeled = $1 } END { print (peeled != "" ? peeled : direct) }'
+            )"
+            if [[ -z "${remote_tag_sha}" ]]; then
+              return 1
+            fi
+            if [[ "${remote_tag_sha}" != "${SOURCE_COMMIT}" ]]; then
+              echo "Refusing to modify ${TAG}: remote tag targets ${remote_tag_sha}, expected ${SOURCE_COMMIT}." >&2
+              return 2
+            fi
+            return 0
+          }
+
+          tag_state="missing"
+          if matching_remote_tag; then
+            tag_state="matching"
+          else
+            status=$?
+            if [[ "${status}" -eq 2 ]]; then
+              exit 1
+            fi
+          fi
+
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            echo "Release ${TAG} already exists; reusing."
+            if [[ "${tag_state}" != "matching" ]]; then
+              echo "Refusing to modify release ${TAG}: its remote tag is missing." >&2
+              exit 1
+            fi
+            echo "Release ${TAG} already exists at ${SOURCE_COMMIT}; reusing."
+          elif [[ "${tag_state}" == "matching" ]]; then
+            if [[ "${{ github.event.inputs.prerelease }}" == "true" ]]; then
+              gh release create "${TAG}" --verify-tag --title "${TITLE}" --notes "Moya sidecar release ${VERSION}" --prerelease
+            else
+              gh release create "${TAG}" --verify-tag --title "${TITLE}" --notes "Moya sidecar release ${VERSION}"
+            fi
           else
             if [[ "${{ github.event.inputs.prerelease }}" == "true" ]]; then
               gh release create "${TAG}" --target "${SOURCE_COMMIT}" --title "${TITLE}" --notes "Moya sidecar release ${VERSION}" --prerelease
             else
               gh release create "${TAG}" --target "${SOURCE_COMMIT}" --title "${TITLE}" --notes "Moya sidecar release ${VERSION}"
             fi
+          fi
+
+          # Re-check after creation to close the race before any --clobber upload.
+          if matching_remote_tag; then
+            :
+          else
+            status=$?
+            if [[ "${status}" -eq 1 ]]; then
+              echo "Refusing to upload release assets: ${TAG} was not created." >&2
+            fi
+            exit 1
           fi
 
           gh release upload "${TAG}" release-assets/screenpipe-darwin-arm64 --clobber
