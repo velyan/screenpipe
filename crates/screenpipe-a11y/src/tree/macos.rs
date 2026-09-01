@@ -8,7 +8,11 @@ use super::{
     AccessibilityTreeNode, FocusedElementContext, LineBudget, SkipReason, TreeSnapshot,
     TreeWalkResult, TreeWalkerConfig, TreeWalkerPlatform, WindowBounds,
 };
-use crate::macos_browser_apps::{title_correlated_browser_url, BrowserUrlLookup};
+use crate::browser_titles::is_browser_application;
+use crate::macos_browser_apps::{
+    observe_browser_tab_fresh, stable_browser_url, title_correlated_browser_url,
+    BrowserTabObservationLookup, BrowserUrlLookup,
+};
 use crate::tree::macos_lines::{self, NormalizeRefs};
 use anyhow::Result;
 use chrono::Utc;
@@ -17,24 +21,6 @@ use screenpipe_core::window_pattern::{self, WindowPattern};
 use std::time::{Duration, Instant};
 use tracing::debug;
 
-/// Known browser app names (lowercase). Matches vision crate's list.
-const BROWSER_NAMES: &[&str] = &[
-    "chrome",
-    "firefox",
-    "safari",
-    "edge",
-    "brave",
-    "arc",
-    "chromium",
-    "vivaldi",
-    "opera",
-    "zen",
-    "comet",
-    "brave browser",
-    "google chrome",
-    "microsoft edge",
-];
-
 /// Chromium/Electron apps can materialize an empty tree immediately after
 /// AXEnhancedUserInterface is enabled. Give the focused window one short,
 /// deterministic retry before OCR takes over.
@@ -42,7 +28,7 @@ const EMPTY_TREE_RETRY_DELAY: Duration = Duration::from_millis(75);
 
 /// Check if the app (lowercase name) is a known browser.
 fn is_browser(app_lower: &str) -> bool {
-    BROWSER_NAMES.iter().any(|b| app_lower.contains(b))
+    is_browser_application(app_lower)
 }
 
 fn should_retry_focused_app_lookup(error: ax::Error) -> bool {
@@ -364,20 +350,19 @@ fn percent_decode_path(s: &str) -> Option<String> {
 fn extract_browser_url(
     window: &ax::UiElement,
     app_name: &str,
+    process_id: i32,
     window_name: &str,
 ) -> Option<String> {
     // Tier 1: AXDocument attribute on the window
-    if let Some(url) = get_string_attr(window, ax::attr::document()) {
-        if url.starts_with("http://") || url.starts_with("https://") {
-            debug!("browser_url: tier1 AXDocument hit for {}", app_name);
-            return Some(url);
-        }
+    if let Some(url) = extract_ax_document_url(window) {
+        debug!("browser_url: tier1 AXDocument hit for {}", app_name);
+        return Some(url);
     }
 
     // Tier 2: Arc and Chromium browsers do not reliably expose AXDocument.
     // Read title + URL atomically and require that title to still match the
     // focused window, so a tab switch cannot attach a stale URL to a capture.
-    match title_correlated_browser_url(app_name, window_name) {
+    match title_correlated_browser_url(app_name, process_id, window_name) {
         BrowserUrlLookup::Found(url) => {
             debug!(
                 "browser_url: tier2 title-matched AppleScript hit for {}",
@@ -400,6 +385,36 @@ fn extract_browser_url(
         app_name, window_name
     );
     None
+}
+
+fn extract_ax_document_url(window: &ax::UiElement) -> Option<String> {
+    get_string_attr(window, ax::attr::document())
+        .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+}
+
+fn focused_window_still_matches(
+    app: &ax::UiElement,
+    expected_title: &str,
+    expected_window_id: Option<u32>,
+) -> bool {
+    let Ok(window_value) = app.attr_value(ax::attr::focused_window()) else {
+        return false;
+    };
+    if window_value.get_type_id() != ax::UiElement::type_id() {
+        return false;
+    }
+    let current_window: &ax::UiElement = unsafe { std::mem::transmute(&*window_value) };
+    let Some(current_title) = get_string_attr(current_window, ax::attr::title()) else {
+        return false;
+    };
+    if !crate::browser_titles::titles_match(expected_title, &current_title, None) {
+        return false;
+    }
+
+    match expected_window_id {
+        Some(expected) => get_u32_attr_by_name(current_window, "AXWindowNumber") == Some(expected),
+        None => true,
+    }
 }
 
 /// Shallow walk of AX children to find a text field containing a URL.
@@ -730,6 +745,18 @@ impl MacosTreeWalker {
             return Ok(TreeWalkResult::Skipped(SkipReason::NotInIncludeList));
         }
 
+        let ax_document_url_before = if is_browser(&app_lower) {
+            extract_ax_document_url(window)
+        } else {
+            None
+        };
+        let browser_observation_before =
+            if is_browser(&app_lower) && ax_document_url_before.is_none() {
+                Some(observe_browser_tab_fresh(&app_name, &window_name))
+            } else {
+                None
+            };
+
         let (mut state, mut window_bounds) = self.walk_window_once(
             window,
             &ax_app,
@@ -802,9 +829,35 @@ impl MacosTreeWalker {
         let simhash = TreeSnapshot::compute_simhash(&text_content);
         let walk_duration = start.elapsed();
 
-        // Extract browser URL (runs after tree walk to avoid affecting walk timeout)
+        // Prefer the in-process AXDocument value and require it to be unchanged
+        // around the tree walk. Only browsers without AXDocument pay for the
+        // slower scripted bracket.
         let browser_url = if is_browser(&app_lower) {
-            extract_browser_url(window, &app_name, &window_name)
+            if let Some(before) = ax_document_url_before.as_ref() {
+                let after = extract_ax_document_url(window);
+                (after.as_ref() == Some(before)
+                    && focused_window_still_matches(&ax_app, &window_name, window_id))
+                .then(|| before.clone())
+            } else {
+                match browser_observation_before.as_ref() {
+                    Some(
+                        BrowserTabObservationLookup::NotScriptable
+                        | BrowserTabObservationLookup::Unavailable,
+                    ) => {
+                        let fallback = extract_browser_url(window, &app_name, pid, &window_name);
+                        focused_window_still_matches(&ax_app, &window_name, window_id)
+                            .then_some(fallback)
+                            .flatten()
+                    }
+                    Some(before @ BrowserTabObservationLookup::Found(_)) => {
+                        let after = observe_browser_tab_fresh(&app_name, &window_name);
+                        focused_window_still_matches(&ax_app, &window_name, window_id)
+                            .then(|| stable_browser_url(before, &after))
+                            .flatten()
+                    }
+                    _ => None,
+                }
+            }
         } else {
             None
         };
