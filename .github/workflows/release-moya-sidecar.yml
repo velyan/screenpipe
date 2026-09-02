@@ -369,25 +369,28 @@ jobs:
 
           if gh release view "${TAG}" >/dev/null 2>&1; then
             if [[ "${tag_state}" != "matching" ]]; then
-              echo "Refusing to modify release ${TAG}: its remote tag is missing." >&2
+              echo "Refusing to resume draft ${TAG}: its remote tag is missing." >&2
               exit 1
             fi
-            echo "Release ${TAG} already exists at ${SOURCE_COMMIT}; reusing."
-          elif [[ "${tag_state}" == "matching" ]]; then
-            if [[ "${{ github.event.inputs.prerelease }}" == "true" ]]; then
-              gh release create "${TAG}" --verify-tag --title "${TITLE}" --notes "Moya sidecar release ${VERSION}" --prerelease
-            else
-              gh release create "${TAG}" --verify-tag --title "${TITLE}" --notes "Moya sidecar release ${VERSION}"
+            if [[ "$(gh release view "${TAG}" --json isDraft --jq '.isDraft')" != "true" ]]; then
+              echo "Refusing to modify existing published release ${TAG}." >&2
+              exit 1
             fi
+            echo "Resuming matching draft release ${TAG} at ${SOURCE_COMMIT}."
           else
+            if [[ "${tag_state}" == "missing" ]]; then
+              git tag "${TAG}" "${SOURCE_COMMIT}"
+              git push origin "refs/tags/${TAG}"
+              tag_state="matching"
+            fi
             if [[ "${{ github.event.inputs.prerelease }}" == "true" ]]; then
-              gh release create "${TAG}" --target "${SOURCE_COMMIT}" --title "${TITLE}" --notes "Moya sidecar release ${VERSION}" --prerelease
+              gh release create "${TAG}" --verify-tag --draft --title "${TITLE}" --notes "Moya sidecar release ${VERSION}" --prerelease
             else
-              gh release create "${TAG}" --target "${SOURCE_COMMIT}" --title "${TITLE}" --notes "Moya sidecar release ${VERSION}"
+              gh release create "${TAG}" --verify-tag --draft --title "${TITLE}" --notes "Moya sidecar release ${VERSION}"
             fi
           fi
 
-          # Re-check after creation to close the race before any --clobber upload.
+          # Re-check after creation/resume to close the race before uploading assets.
           if matching_remote_tag; then
             :
           else
@@ -398,13 +401,36 @@ jobs:
             exit 1
           fi
 
-          gh release upload "${TAG}" release-assets/screenpipe-darwin-arm64 --clobber
-          gh release upload "${TAG}" release-assets/screenpipe-darwin-x64 --clobber
-          gh release upload "${TAG}" release-assets/screenpipe-darwin-universal --clobber
-          gh release upload "${TAG}" release-assets/LICENSE-screenpipe-MIT.md --clobber
-          gh release upload "${TAG}" release-assets/THIRD-PARTY-NOTICES-screenpipe-rust-arm64.txt --clobber
-          gh release upload "${TAG}" release-assets/DEPENDENCIES-screenpipe-rust-arm64.json --clobber
-          gh release upload "${TAG}" release-assets/THIRD-PARTY-NOTICES-screenpipe-rust-x64.txt --clobber
-          gh release upload "${TAG}" release-assets/DEPENDENCIES-screenpipe-rust-x64.json --clobber
-          gh release upload "${TAG}" release-assets/moya-sidecar-manifest.json --clobber
-          gh release upload "${TAG}" release-assets/moya-sidecar-manifest.sha256 --clobber
+          ensure_release_asset() {
+            local path="$1"
+            local name
+            local download_dir
+            name="$(basename "${path}")"
+
+            if gh release view "${TAG}" --json assets --jq '.assets[].name' | grep -Fxq "${name}"; then
+              download_dir="$(mktemp -d)"
+              gh release download "${TAG}" --pattern "${name}" --dir "${download_dir}"
+              if ! cmp -s "${path}" "${download_dir}/${name}"; then
+                echo "Refusing to replace non-identical draft asset ${name}." >&2
+                rm -rf "${download_dir}"
+                exit 1
+              fi
+              rm -rf "${download_dir}"
+              echo "Verified existing draft asset ${name}."
+            else
+              gh release upload "${TAG}" "${path}"
+            fi
+          }
+
+          ensure_release_asset release-assets/screenpipe-darwin-arm64
+          ensure_release_asset release-assets/screenpipe-darwin-x64
+          ensure_release_asset release-assets/screenpipe-darwin-universal
+          ensure_release_asset release-assets/LICENSE-screenpipe-MIT.md
+          ensure_release_asset release-assets/THIRD-PARTY-NOTICES-screenpipe-rust-arm64.txt
+          ensure_release_asset release-assets/DEPENDENCIES-screenpipe-rust-arm64.json
+          ensure_release_asset release-assets/THIRD-PARTY-NOTICES-screenpipe-rust-x64.txt
+          ensure_release_asset release-assets/DEPENDENCIES-screenpipe-rust-x64.json
+          ensure_release_asset release-assets/moya-sidecar-manifest.json
+          ensure_release_asset release-assets/moya-sidecar-manifest.sha256
+
+          gh release edit "${TAG}" --draft=false

@@ -13,7 +13,7 @@ use core_foundation::{
     base::{CFRelease, CFTypeRef, TCFType},
     string::CFString,
 };
-use screenpipe_a11y::browser_titles::titles_match;
+use screenpipe_a11y::browser_titles::native_window_titles_match;
 use screenpipe_a11y::macos_browser_apps::{title_correlated_browser_url, BrowserUrlLookup};
 use tracing::debug;
 use url::Url;
@@ -37,7 +37,11 @@ impl MacOSUrlDetector {
     /// captured native title. Browser scripting, AX, and SCK expose different
     /// window-id domains, so identity is bracketed separately by the scripted
     /// observation and the frontmost process check at the capture call site.
-    pub fn focused_window_matches(process_id: i32, expected_title: &str) -> bool {
+    pub fn focused_window_matches(
+        process_id: i32,
+        expected_title: &str,
+        application_name: &str,
+    ) -> bool {
         unsafe {
             let app_element = AXUIElementCreateApplication(process_id);
             let mut focused_window: CFTypeRef = std::ptr::null_mut();
@@ -61,7 +65,7 @@ impl MacOSUrlDetector {
                 && !title_value.is_null()
             {
                 let current_title = CFString::wrap_under_create_rule(title_value as _).to_string();
-                titles_match(expected_title, &current_title, None)
+                native_window_titles_match(expected_title, &current_title, application_name)
             } else {
                 false
             };

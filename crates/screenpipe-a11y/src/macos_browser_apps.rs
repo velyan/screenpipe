@@ -69,7 +69,7 @@ struct BrowserLookupIdentity {
 
 struct InFlightLookup {
     identity: BrowserLookupIdentity,
-    result: Mutex<Option<BrowserUrlLookup>>,
+    result: Mutex<Option<BrowserTabObservationLookup>>,
     changed: Condvar,
 }
 
@@ -195,9 +195,12 @@ end tell"#
     )
 }
 
-fn coordinated_lookup<F>(identity: BrowserLookupIdentity, fetch: F) -> BrowserUrlLookup
+fn coordinated_observation<F>(
+    identity: BrowserLookupIdentity,
+    fetch: F,
+) -> BrowserTabObservationLookup
 where
-    F: FnOnce() -> BrowserUrlLookup,
+    F: FnOnce() -> BrowserTabObservationLookup,
 {
     let coordinator = browser_lookup_coordinator();
     let mut fetch = Some(fetch);
@@ -213,7 +216,7 @@ where
             .retain(|_, unavailable_until| *unavailable_until > now);
 
         if state.unavailable_until.contains_key(&identity.process) {
-            return BrowserUrlLookup::Unavailable;
+            return BrowserTabObservationLookup::Unavailable;
         }
 
         if let Some(in_flight) = state.in_flight.get(&identity.process).cloned() {
@@ -229,7 +232,7 @@ where
                 .wait_timeout_while(result, wait, |result| result.is_none())
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if wait_result.timed_out() {
-                return BrowserUrlLookup::Unavailable;
+                return BrowserTabObservationLookup::Unavailable;
             }
             if same_identity {
                 return result
@@ -273,7 +276,7 @@ where
         {
             state.in_flight.remove(&identity.process);
         }
-        if result == BrowserUrlLookup::Unavailable {
+        if result == BrowserTabObservationLookup::Unavailable {
             state
                 .unavailable_until
                 .insert(identity.process, now + UNAVAILABLE_BACKOFF);
@@ -335,42 +338,53 @@ fn observation_as_url_lookup(observation: BrowserTabObservationLookup) -> Browse
     }
 }
 
-/// Perform an uncached browser observation for a capture boundary.
+/// Perform a fresh browser observation for a capture boundary.
 ///
-/// This deliberately bypasses the normal single-flight/backoff coordinator:
-/// both sides of a capture bracket must be real observations, otherwise a
-/// cache hit could manufacture equality across a same-title tab switch.
+/// Successful observations are never retained after the call completes, so
+/// both sides of a capture bracket remain real observations. Concurrent calls
+/// for the same process are single-flight, and an unavailable scripting bridge
+/// receives a short process-scoped backoff to avoid subprocess storms.
 pub fn observe_browser_tab_fresh(
     app_name: &str,
+    process_id: i32,
     window_title: &str,
 ) -> BrowserTabObservationLookup {
     let Some(application_name) = scriptable_browser_application_name(app_name) else {
         return BrowserTabObservationLookup::NotScriptable;
     };
-    let script = browser_tab_observation_script(application_name);
-
-    let Some(output) = run_osascript_bounded(&script) else {
-        return BrowserTabObservationLookup::Unavailable;
+    let identity = BrowserLookupIdentity {
+        process: BrowserProcessIdentity {
+            process_id,
+            application_name,
+        },
+        window_title: window_title.to_string(),
     };
-    if !output.status.success() {
-        debug!(
-            "browser_url: osascript failed for {} (exit={})",
-            application_name, output.status
-        );
-        return BrowserTabObservationLookup::Unavailable;
-    }
 
-    let Ok(raw) = String::from_utf8(output.stdout) else {
-        return BrowserTabObservationLookup::Rejected;
-    };
-    let result = parse_browser_observation(&raw, window_title, application_name);
-    if result == BrowserTabObservationLookup::Rejected {
-        debug!(
-            "browser_url: rejected AppleScript observation for {} because it was malformed, non-http(s), or title-mismatched",
-            application_name
-        );
-    }
-    result
+    coordinated_observation(identity, || {
+        let script = browser_tab_observation_script(application_name);
+        let Some(output) = run_osascript_bounded(&script) else {
+            return BrowserTabObservationLookup::Unavailable;
+        };
+        if !output.status.success() {
+            debug!(
+                "browser_url: osascript failed for {} (exit={})",
+                application_name, output.status
+            );
+            return BrowserTabObservationLookup::Unavailable;
+        }
+
+        let Ok(raw) = String::from_utf8(output.stdout) else {
+            return BrowserTabObservationLookup::Rejected;
+        };
+        let result = parse_browser_observation(&raw, window_title, application_name);
+        if result == BrowserTabObservationLookup::Rejected {
+            debug!(
+                "browser_url: rejected AppleScript observation for {} because it was malformed, non-http(s), or title-mismatched",
+                application_name
+            );
+        }
+        result
+    })
 }
 
 /// Return a URL only when two real observations around a capture are equal.
@@ -414,17 +428,11 @@ pub fn title_correlated_browser_url(
     if application_name == "Arc" {
         return BrowserUrlLookup::NotScriptable;
     }
-    let identity = BrowserLookupIdentity {
-        process: BrowserProcessIdentity {
-            process_id,
-            application_name,
-        },
-        window_title: window_title.to_string(),
-    };
-
-    coordinated_lookup(identity, || {
-        observation_as_url_lookup(observe_browser_tab_fresh(app_name, window_title))
-    })
+    observation_as_url_lookup(observe_browser_tab_fresh(
+        app_name,
+        process_id,
+        window_title,
+    ))
 }
 
 #[cfg(test)]
@@ -613,10 +621,14 @@ mod tests {
                 let identity = identity.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    coordinated_lookup(identity, || {
+                    coordinated_observation(identity, || {
                         calls.fetch_add(1, Ordering::SeqCst);
                         std::thread::sleep(Duration::from_millis(30));
-                        BrowserUrlLookup::Found("https://coalesced.example.test/".to_string())
+                        BrowserTabObservationLookup::Found(BrowserTabObservation {
+                            browser_window_id: Some("window-A".to_string()),
+                            tab_title: "Coalesced Example".to_string(),
+                            url: "https://coalesced.example.test/".to_string(),
+                        })
                     })
                 })
             })
@@ -626,7 +638,11 @@ mod tests {
         for handle in handles {
             assert_eq!(
                 handle.join().unwrap(),
-                BrowserUrlLookup::Found("https://coalesced.example.test/".to_string())
+                BrowserTabObservationLookup::Found(BrowserTabObservation {
+                    browser_window_id: Some("window-A".to_string()),
+                    tab_title: "Coalesced Example".to_string(),
+                    url: "https://coalesced.example.test/".to_string(),
+                })
             );
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -651,20 +667,74 @@ mod tests {
         };
 
         assert_eq!(
-            coordinated_lookup(first, || {
+            coordinated_observation(first, || {
                 calls.fetch_add(1, Ordering::SeqCst);
-                BrowserUrlLookup::Unavailable
+                BrowserTabObservationLookup::Unavailable
             }),
-            BrowserUrlLookup::Unavailable
+            BrowserTabObservationLookup::Unavailable
         );
         assert_eq!(
-            coordinated_lookup(second, || {
+            coordinated_observation(second, || {
                 calls.fetch_add(1, Ordering::SeqCst);
-                BrowserUrlLookup::Found("https://should-not-run.example.test/".to_string())
+                BrowserTabObservationLookup::Found(BrowserTabObservation {
+                    browser_window_id: Some("window-B".to_string()),
+                    tab_title: "Second Example".to_string(),
+                    url: "https://should-not-run.example.test/".to_string(),
+                })
             }),
-            BrowserUrlLookup::Unavailable
+            BrowserTabObservationLookup::Unavailable
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn different_titles_for_one_process_never_run_concurrently() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(3));
+        let process = BrowserProcessIdentity {
+            process_id: 91_004,
+            application_name: "Google Chrome",
+        };
+
+        let handles: Vec<_> = ["First Example", "Second Example"]
+            .into_iter()
+            .map(|window_title| {
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                let calls = Arc::clone(&calls);
+                let barrier = Arc::clone(&barrier);
+                let identity = BrowserLookupIdentity {
+                    process: process.clone(),
+                    window_title: window_title.to_string(),
+                };
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    coordinated_observation(identity, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now_active, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(30));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        BrowserTabObservationLookup::Rejected
+                    })
+                })
+            })
+            .collect();
+
+        barrier.wait();
+        for handle in handles {
+            assert_eq!(
+                handle.join().unwrap(),
+                BrowserTabObservationLookup::Rejected
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(peak.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -682,11 +752,19 @@ mod tests {
 
         for path in ["first", "second"] {
             assert_eq!(
-                coordinated_lookup(identity.clone(), || {
+                coordinated_observation(identity.clone(), || {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    BrowserUrlLookup::Found(format!("https://example.test/{path}"))
+                    BrowserTabObservationLookup::Found(BrowserTabObservation {
+                        browser_window_id: Some("window-A".to_string()),
+                        tab_title: "Same Title Example".to_string(),
+                        url: format!("https://example.test/{path}"),
+                    })
                 }),
-                BrowserUrlLookup::Found(format!("https://example.test/{path}"))
+                BrowserTabObservationLookup::Found(BrowserTabObservation {
+                    browser_window_id: Some("window-A".to_string()),
+                    tab_title: "Same Title Example".to_string(),
+                    url: format!("https://example.test/{path}"),
+                })
             );
         }
         assert_eq!(calls.load(Ordering::SeqCst), 2);

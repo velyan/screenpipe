@@ -23,7 +23,7 @@ use screenpipe_screen::snapshot_writer::SnapshotWriter;
 use std::sync::Arc;
 #[cfg(not(target_os = "windows"))]
 use std::sync::OnceLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 #[cfg(not(target_os = "windows"))]
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
@@ -49,10 +49,45 @@ fn strip_gutter_noise(text: &str) -> String {
 /// Limits concurrent OCR tasks to avoid CPU spikes when multiple monitors
 /// trigger capture simultaneously.
 #[cfg(not(target_os = "windows"))]
-static OCR_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+static OCR_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
 #[cfg(not(target_os = "windows"))]
-fn ocr_semaphore() -> &'static Semaphore {
-    OCR_SEMAPHORE.get_or_init(|| Semaphore::new(1))
+fn ocr_semaphore() -> Arc<Semaphore> {
+    Arc::clone(OCR_SEMAPHORE.get_or_init(|| Arc::new(Semaphore::new(1))))
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn run_blocking_ocr_with_gate<T, F>(
+    gate: Arc<Semaphore>,
+    timeout: Option<Duration>,
+    task: F,
+) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let work = async move {
+        let permit = gate.acquire_owned().await.ok()?;
+        tokio::task::spawn_blocking(move || {
+            // Keep the single-worker permit inside native work. If the caller
+            // times out, the native API cannot be cancelled, but later callers
+            // cannot start overlapping OCR or accumulate stale blocking work.
+            let _permit = permit;
+            task()
+        })
+        .await
+        .ok()
+    };
+
+    match timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, work).await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!("native OCR exceeded its caller budget; continuing without OCR");
+                None
+            }
+        },
+        None => work.await,
+    }
 }
 
 /// Context for a paired capture operation — replaces positional arguments.
@@ -74,6 +109,10 @@ pub struct CaptureContext<'a> {
     pub capture_trigger: &'a str,
     pub capture_provenance: Option<&'a str>,
     pub force_ocr: bool,
+    /// Optional caller-facing OCR budget. A timed-out native OCR operation
+    /// remains serialized in its single worker while this capture continues
+    /// with verified accessibility evidence.
+    pub ocr_timeout: Option<Duration>,
     pub use_pii_removal: bool,
     pub enable_main_body_distillation: bool,
     pub main_body_distillation_threshold: f32,
@@ -186,10 +225,9 @@ pub async fn paired_capture(
         // to limit concurrent OCR and avoid CPU spikes on multi-monitor setups.
         #[cfg(not(target_os = "windows"))]
         let raw = {
-            let _permit = ocr_semaphore().acquire().await.unwrap();
             let image_for_ocr = ctx.image.clone();
             let languages = ctx.languages.clone();
-            tokio::task::spawn_blocking(move || {
+            run_blocking_ocr_with_gate(ocr_semaphore(), ctx.ocr_timeout, move || {
                 #[cfg(target_os = "macos")]
                 {
                     let (text, json, _confidence) =
@@ -204,7 +242,7 @@ pub async fn paired_capture(
                 }
             })
             .await
-            .unwrap_or_else(|_| (String::new(), "[]".to_string()))
+            .unwrap_or_else(|| (String::new(), "[]".to_string()))
         };
 
         // Strip editor gutter noise (see strip_gutter_noise doc). Applied to
@@ -633,10 +671,53 @@ mod tests {
     use super::*;
     use image::{DynamicImage, RgbImage};
     use screenpipe_a11y::tree::AccessibilityTreeNode;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     fn test_image() -> Arc<DynamicImage> {
         Arc::new(DynamicImage::ImageRgb8(RgbImage::new(100, 100)))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_out_ocr_keeps_native_work_serialized_and_drops_queued_work() {
+        let gate = Arc::new(Semaphore::new(1));
+        let started = Arc::new(AtomicUsize::new(0));
+
+        let first_started = Arc::clone(&started);
+        let first = run_blocking_ocr_with_gate(
+            Arc::clone(&gate),
+            Some(Duration::from_millis(20)),
+            move || {
+                first_started.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(150));
+                1
+            },
+        )
+        .await;
+        assert_eq!(first, None);
+
+        let second_started = Arc::clone(&started);
+        let second = run_blocking_ocr_with_gate(
+            Arc::clone(&gate),
+            Some(Duration::from_millis(20)),
+            move || {
+                second_started.fetch_add(1, Ordering::SeqCst);
+                2
+            },
+        )
+        .await;
+        assert_eq!(second, None);
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+
+        tokio::time::sleep(Duration::from_millis(170)).await;
+        let third_started = Arc::clone(&started);
+        let third = run_blocking_ocr_with_gate(gate, Some(Duration::from_millis(100)), move || {
+            third_started.fetch_add(1, Ordering::SeqCst);
+            3
+        })
+        .await;
+        assert_eq!(third, Some(3));
+        assert_eq!(started.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -665,6 +746,7 @@ mod tests {
             capture_trigger: "click",
             capture_provenance: Some("focused_window"),
             force_ocr: false,
+            ocr_timeout: None,
             use_pii_removal: false,
             enable_main_body_distillation: false,
             main_body_distillation_threshold: 0.60,
@@ -707,6 +789,7 @@ mod tests {
             capture_trigger: "app_switch",
             capture_provenance: Some("focused_window"),
             force_ocr: false,
+            ocr_timeout: None,
             use_pii_removal: false,
             enable_main_body_distillation: false,
             main_body_distillation_threshold: 0.60,
@@ -777,6 +860,7 @@ mod tests {
             capture_trigger: "idle",
             capture_provenance: Some("focused_window"),
             force_ocr: false,
+            ocr_timeout: None,
             use_pii_removal: false,
             enable_main_body_distillation: false,
             main_body_distillation_threshold: 0.60,

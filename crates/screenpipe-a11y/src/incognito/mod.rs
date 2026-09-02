@@ -67,6 +67,16 @@ pub fn create_detector() -> Box<dyn IncognitoDetector> {
     return Box::new(linux::LinuxIncognitoDetector);
 }
 
+/// Return the process-wide detector used by short-lived tree walkers.
+///
+/// Active-window API requests construct a walker per request. Keeping the
+/// detector process-wide preserves its bounded platform-query cache across
+/// those walkers instead of paying an AppleScript round trip on every request.
+pub fn shared_detector() -> &'static dyn IncognitoDetector {
+    static DETECTOR: std::sync::OnceLock<Box<dyn IncognitoDetector>> = std::sync::OnceLock::new();
+    DETECTOR.get_or_init(create_detector).as_ref()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,6 +84,11 @@ mod tests {
     #[test]
     fn test_create_detector_returns_something() {
         let _ = create_detector();
+    }
+
+    #[test]
+    fn shared_detector_is_process_wide() {
+        assert!(std::ptr::eq(shared_detector(), shared_detector()));
     }
 
     // These tests use `is_title_private` directly to avoid platform-specific

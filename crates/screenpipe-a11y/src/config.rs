@@ -10,6 +10,75 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
+/// Match one capture-filter pattern against a concrete application/window.
+/// Legacy patterns match either field. Scoped patterns use `app::window`, with
+/// either side optionally empty (`Moya Beta::` is app-only).
+pub fn window_filter_pattern_matches_target(
+    pattern: &str,
+    app_name: &str,
+    window_title: &str,
+) -> bool {
+    let pattern = pattern.trim();
+    if pattern.is_empty() {
+        return false;
+    }
+    let app = app_name.to_lowercase();
+    let window = window_title.to_lowercase();
+    let pattern = pattern.to_lowercase();
+    normalized_window_filter_pattern_matches_target(&pattern, &app, &window)
+}
+
+/// Allocation-free matcher for callers that already cache lowercase patterns
+/// and target fields on a hot capture path.
+pub fn normalized_window_filter_pattern_matches_target(
+    pattern: &str,
+    app_name_lower: &str,
+    window_title_lower: &str,
+) -> bool {
+    if let Some((app_pattern, window_pattern)) = pattern.split_once("::") {
+        let app_pattern = app_pattern.trim();
+        let window_pattern = window_pattern.trim();
+        if app_pattern.is_empty() && window_pattern.is_empty() {
+            return false;
+        }
+        (app_pattern.is_empty() || app_name_lower.contains(app_pattern))
+            && (window_pattern.is_empty() || window_title_lower.contains(window_pattern))
+    } else {
+        app_name_lower.contains(pattern) || window_title_lower.contains(pattern)
+    }
+}
+
+/// Early app-only gate. A two-sided scoped rule waits for the window title.
+pub fn window_filter_pattern_matches_app(pattern: &str, app_name: &str) -> bool {
+    let pattern = pattern.trim();
+    if let Some((app_pattern, window_pattern)) = pattern.split_once("::") {
+        let app_pattern = app_pattern.trim();
+        return !app_pattern.is_empty()
+            && window_pattern.trim().is_empty()
+            && app_name
+                .to_lowercase()
+                .contains(&app_pattern.to_lowercase());
+    }
+    !pattern.is_empty() && app_name.to_lowercase().contains(&pattern.to_lowercase())
+}
+
+/// Early title-only gate. A two-sided scoped rule waits for the app identity.
+pub fn window_filter_pattern_matches_window(pattern: &str, window_title: &str) -> bool {
+    let pattern = pattern.trim();
+    if let Some((app_pattern, window_pattern)) = pattern.split_once("::") {
+        let window_pattern = window_pattern.trim();
+        return app_pattern.trim().is_empty()
+            && !window_pattern.is_empty()
+            && window_title
+                .to_lowercase()
+                .contains(&window_pattern.to_lowercase());
+    }
+    !pattern.is_empty()
+        && window_title
+            .to_lowercase()
+            .contains(&pattern.to_lowercase())
+}
+
 /// Configuration for UI event capture
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiCaptureConfig {
@@ -393,5 +462,34 @@ mod tests {
         assert!(config.is_password_field(None, Some("Enter Password")));
         assert!(config.is_password_field(None, Some("API Key")));
         assert!(!config.is_password_field(Some("AXTextField"), Some("Email")));
+    }
+
+    #[test]
+    fn scoped_window_filter_patterns_bind_the_intended_fields() {
+        assert!(window_filter_pattern_matches_target(
+            "Moya Beta::",
+            "Moya Beta",
+            ""
+        ));
+        assert!(!window_filter_pattern_matches_target(
+            "Moya Beta::",
+            "Google Chrome",
+            "Moya Beta release notes"
+        ));
+        assert!(window_filter_pattern_matches_target(
+            "Google Chrome::Example Domain",
+            "Google Chrome",
+            "Example Domain"
+        ));
+        assert!(window_filter_pattern_matches_target(
+            "::Private",
+            "Safari",
+            "Private Browsing"
+        ));
+        assert!(window_filter_pattern_matches_target(
+            "Example",
+            "Safari",
+            "Example Domain"
+        ));
     }
 }

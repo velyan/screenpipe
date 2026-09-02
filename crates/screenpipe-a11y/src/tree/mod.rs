@@ -474,6 +474,18 @@ pub struct TreeWalkerConfig {
     pub ignored_windows: Vec<String>,
     /// User-configured windows to include (whitelist — if non-empty, only these are captured).
     pub included_windows: Vec<String>,
+    /// Optional exact process selected by an API caller before an overlay takes
+    /// accessibility focus. When set, macOS walks that process' focused window
+    /// instead of the global AX focused application.
+    pub target_process_id: Option<i32>,
+    /// Optional CG/AX window number that must still identify the target window.
+    pub target_window_id: Option<u32>,
+    /// Optional title bracket used when a window number is unavailable or while
+    /// validating that the selected tab/window did not change during the walk.
+    pub target_window_title: Option<String>,
+    /// Optional absolute CG window bounds used to disambiguate Chromium
+    /// windows that do not expose AXWindowNumber.
+    pub target_window_bounds: Option<WindowBounds>,
     /// App-name substrings that should always be blocked by accessibility capture.
     pub blocked_apps: Vec<String>,
     /// Window-title substrings that should be blocked by accessibility capture.
@@ -524,6 +536,10 @@ impl Default for TreeWalkerConfig {
             element_timeout_secs: 0.2,
             ignored_windows: Vec::new(),
             included_windows: Vec::new(),
+            target_process_id: None,
+            target_window_id: None,
+            target_window_title: None,
+            target_window_bounds: None,
             blocked_apps: default_blocked_apps(),
             blocked_title_keywords: default_blocked_title_keywords(),
             monitor_x: 0.0,

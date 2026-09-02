@@ -390,6 +390,23 @@ fn focused_window_still_matches(
     }
 }
 
+fn window_bounds_match_target(
+    actual: Option<(f64, f64, f64, f64)>,
+    expected: Option<&WindowBounds>,
+) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    let Some((x, y, width, height)) = actual else {
+        return false;
+    };
+    const TOLERANCE_POINTS: f64 = 4.0;
+    (x - expected.x).abs() <= TOLERANCE_POINTS
+        && (y - expected.y).abs() <= TOLERANCE_POINTS
+        && (width - expected.width).abs() <= TOLERANCE_POINTS
+        && (height - expected.height).abs() <= TOLERANCE_POINTS
+}
+
 /// Shallow walk of AX children to find a text field containing a URL.
 fn find_url_in_children(elem: &ax::UiElement, depth: usize, max_depth: usize) -> Option<String> {
     if depth >= max_depth {
@@ -434,7 +451,7 @@ fn looks_like_url(s: &str) -> bool {
 /// macOS tree walker using cidre's AX bindings.
 pub struct MacosTreeWalker {
     config: TreeWalkerConfig,
-    incognito_detector: Box<dyn crate::incognito::IncognitoDetector>,
+    incognito_detector: &'static dyn crate::incognito::IncognitoDetector,
     /// Gates the per-walk `AXEnhancedUserInterface` toggle so we only poke a
     /// given renderer at most once per TTL instead of on every walk.
     enhanced_mode_cache: super::enhanced_mode_cache::EnhancedModeCache,
@@ -444,7 +461,7 @@ impl MacosTreeWalker {
     pub fn new(config: TreeWalkerConfig) -> Self {
         Self {
             config,
-            incognito_detector: crate::incognito::create_detector(),
+            incognito_detector: crate::incognito::shared_detector(),
             enhanced_mode_cache: super::enhanced_mode_cache::EnhancedModeCache::with_default_ttl(),
         }
     }
@@ -495,34 +512,41 @@ impl MacosTreeWalker {
     fn walk_focused_window_inner(&self) -> Result<TreeWalkResult> {
         let start = Instant::now();
 
-        // 1. Get the focused application via the AX system-wide element.
-        // This stays within the accessibility stack instead of relying on
-        // NSWorkspace's foreground-app state from a background thread.
-        let sys = ax::UiElement::sys_wide();
-        let pid = match sys.focused_app() {
-            Ok(app) => match app.pid() {
-                Ok(pid) => pid,
-                Err(_) => {
-                    log_no_snapshot("focused_app_pid_unavailable", None, None, None);
-                    return Ok(TreeWalkResult::NotFound);
+        // 1. Prefer an exact caller-selected process. This lets a nonactivating
+        // assistant overlay read the external window that was authoritative at
+        // invocation time. Legacy callers still use the global AX focus path.
+        let pid = if let Some(target_pid) = self.config.target_process_id {
+            if target_pid <= 0 {
+                return Ok(TreeWalkResult::NotFound);
+            }
+            target_pid
+        } else {
+            let sys = ax::UiElement::sys_wide();
+            match sys.focused_app() {
+                Ok(app) => match app.pid() {
+                    Ok(pid) => pid,
+                    Err(_) => {
+                        log_no_snapshot("focused_app_pid_unavailable", None, None, None);
+                        return Ok(TreeWalkResult::NotFound);
+                    }
+                },
+                Err(e) if should_retry_focused_app_lookup(e.into()) => {
+                    let detail = e.to_string();
+                    let Some((pid, source)) = retry_focused_app_pid() else {
+                        log_no_snapshot("focused_app_unavailable", None, None, Some(&detail));
+                        return Ok(TreeWalkResult::NotFound);
+                    };
+                    debug!(
+                        "tree walk: AX focused app unavailable ({}), retrying with {:?} pid={}",
+                        detail, source, pid
+                    );
+                    pid
                 }
-            },
-            Err(e) if should_retry_focused_app_lookup(e.into()) => {
-                let detail = e.to_string();
-                let Some((pid, source)) = retry_focused_app_pid() else {
+                Err(e) => {
+                    let detail = e.to_string();
                     log_no_snapshot("focused_app_unavailable", None, None, Some(&detail));
                     return Ok(TreeWalkResult::NotFound);
-                };
-                debug!(
-                    "tree walk: AX focused app unavailable ({}), retrying with {:?} pid={}",
-                    detail, source, pid
-                );
-                pid
-            }
-            Err(e) => {
-                let detail = e.to_string();
-                log_no_snapshot("focused_app_unavailable", None, None, Some(&detail));
-                return Ok(TreeWalkResult::NotFound);
+                }
             }
         };
         let Some(app) = ns::RunningApp::with_pid(pid) else {
@@ -546,10 +570,12 @@ impl MacosTreeWalker {
         }
 
         // Apply user-configured ignored windows (check app name)
-        if self.config.ignored_windows.iter().any(|pattern| {
-            let p = pattern.to_lowercase();
-            app_lower.contains(&p)
-        }) {
+        if self
+            .config
+            .ignored_windows
+            .iter()
+            .any(|pattern| crate::config::window_filter_pattern_matches_app(pattern, &app_name))
+        {
             return Ok(TreeWalkResult::Skipped(SkipReason::UserIgnored));
         }
 
@@ -602,6 +628,44 @@ impl MacosTreeWalker {
 
         let window_name = get_string_attr(window, ax::attr::title()).unwrap_or_default();
         let window_id = get_u32_attr_by_name(window, "AXWindowNumber");
+        let current_window_bounds = get_element_frame(window);
+
+        let target_title_matches = self
+            .config
+            .target_window_title
+            .as_deref()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .map(|expected_title| {
+                crate::browser_titles::native_window_titles_match(
+                    expected_title,
+                    &window_name,
+                    &app_name,
+                )
+            });
+        if target_title_matches == Some(false) {
+            return Ok(TreeWalkResult::NotFound);
+        }
+        let target_bounds_match = window_bounds_match_target(
+            current_window_bounds,
+            self.config.target_window_bounds.as_ref(),
+        );
+        if !target_bounds_match {
+            return Ok(TreeWalkResult::NotFound);
+        }
+        if let Some(expected_window_id) = self.config.target_window_id {
+            match window_id {
+                Some(actual_window_id) if actual_window_id != expected_window_id => {
+                    return Ok(TreeWalkResult::NotFound);
+                }
+                // Chromium frequently omits AXWindowNumber. In that case the
+                // exact normalized CG/AX title bracket remains mandatory.
+                None if target_title_matches != Some(true) => {
+                    return Ok(TreeWalkResult::NotFound);
+                }
+                _ => {}
+            }
+        }
 
         // Fast path: Arc (and potentially other browsers) tag incognito windows
         // with "Incognito" in AXIdentifier (e.g. "bigIncognitoBrowserWindow-...").
@@ -638,23 +702,21 @@ impl MacosTreeWalker {
         }
 
         if self.config.ignored_windows.iter().any(|pattern| {
-            let p = pattern.to_lowercase();
-            window_lower.contains(&p)
+            crate::config::window_filter_pattern_matches_target(pattern, &app_name, &window_name)
         }) {
             return Ok(TreeWalkResult::Skipped(SkipReason::UserIgnored));
         }
 
         // Apply user-configured included windows (also check window title)
         if !self.config.included_windows.is_empty() {
-            let matches_app = self.config.included_windows.iter().any(|pattern| {
-                let p = pattern.to_lowercase();
-                app_lower.contains(&p)
+            let matches_target = self.config.included_windows.iter().any(|pattern| {
+                crate::config::window_filter_pattern_matches_target(
+                    pattern,
+                    &app_name,
+                    &window_name,
+                )
             });
-            let matches_window = self.config.included_windows.iter().any(|pattern| {
-                let p = pattern.to_lowercase();
-                window_lower.contains(&p)
-            });
-            if !matches_app && !matches_window {
+            if !matches_target {
                 return Ok(TreeWalkResult::Skipped(SkipReason::NotInIncludeList));
             }
         }
@@ -666,7 +728,7 @@ impl MacosTreeWalker {
         };
         let browser_observation_before =
             if is_browser(&app_lower) && ax_document_url_before.is_none() {
-                Some(observe_browser_tab_fresh(&app_name, &window_name))
+                Some(observe_browser_tab_fresh(&app_name, pid, &window_name))
             } else {
                 None
             };
@@ -750,7 +812,7 @@ impl MacosTreeWalker {
                             .flatten()
                     }
                     Some(before @ BrowserTabObservationLookup::Found(_)) => {
-                        let after = observe_browser_tab_fresh(&app_name, &window_name);
+                        let after = observe_browser_tab_fresh(&app_name, pid, &window_name);
                         focused_window_still_matches(&ax_app, &window_name, window_id)
                             .then(|| stable_browser_url(before, &after))
                             .flatten()
@@ -773,6 +835,15 @@ impl MacosTreeWalker {
         } else {
             extract_document_path(window, &app_lower)
         };
+
+        // Revalidate the target after every potentially slow AX/scripted read.
+        // A tab or window transition must fail closed rather than returning a
+        // body that was captured under a stale caller-provided identity.
+        if self.config.target_process_id.is_some()
+            && !focused_window_still_matches(&ax_app, &window_name, window_id)
+        {
+            return Ok(TreeWalkResult::NotFound);
+        }
 
         debug!(
             "tree walk: app={}, window={}, nodes={}, text_len={}, url={:?}, doc={:?}, duration={:?}",
@@ -1641,5 +1712,23 @@ mod tests {
         let _ = walker.walk_focused_window();
         // Should complete reasonably quickly (< 5s even with IPC delays)
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn target_window_bounds_allow_small_cross_api_rounding_only() {
+        let expected = WindowBounds {
+            x: 100.0,
+            y: 200.0,
+            width: 800.0,
+            height: 600.0,
+        };
+        assert!(window_bounds_match_target(
+            Some((102.0, 198.0, 803.0, 597.0)),
+            Some(&expected)
+        ));
+        assert!(!window_bounds_match_target(
+            Some((110.0, 200.0, 800.0, 600.0)),
+            Some(&expected)
+        ));
     }
 }

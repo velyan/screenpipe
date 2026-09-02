@@ -13,10 +13,13 @@ use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
 use image::DynamicImage;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use tracing::{debug, error};
+
+static SNAPSHOT_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Writes JPEG snapshots to disk for event-driven capture.
 pub struct SnapshotWriter {
@@ -52,7 +55,7 @@ impl SnapshotWriter {
 
     /// Write a screenshot as JPEG. Returns the absolute path to the written file.
     ///
-    /// File layout: `{base_dir}/YYYY-MM-DD/{timestamp_ms}_m{monitor_id}.jpg`
+    /// File layout: `{base_dir}/YYYY-MM-DD/{timestamp_ms}_m{monitor_id}[_N].jpg`
     pub fn write(
         &self,
         image: &DynamicImage,
@@ -65,8 +68,21 @@ impl SnapshotWriter {
         fs::create_dir_all(&date_dir)?;
 
         let timestamp_ms = captured_at.timestamp_millis();
-        let filename = format!("{}_m{}.jpg", timestamp_ms, monitor_id);
-        let path = date_dir.join(&filename);
+        let (temp_path, temp_file) = loop {
+            let counter = SNAPSHOT_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = date_dir.join(format!(
+                ".{}_m{}.{}.{}.tmp",
+                timestamp_ms,
+                monitor_id,
+                std::process::id(),
+                counter
+            ));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => break (path, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
 
         let quality = self.quality.load(Ordering::Relaxed);
         let max_w = self.max_width.load(Ordering::Relaxed);
@@ -81,12 +97,48 @@ impl SnapshotWriter {
             image
         };
 
-        let file = fs::File::create(&path)?;
-        let mut writer = BufWriter::new(file);
-        let mut encoder = JpegEncoder::new_with_quality(&mut writer, quality);
-        encoder.encode_image(img)?;
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
+        let encode_result = (|| -> Result<()> {
+            let mut writer = BufWriter::new(temp_file);
+            let mut encoder = JpegEncoder::new_with_quality(&mut writer, quality);
+            encoder.encode_image(img)?;
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = encode_result {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+
+        let path = (0u32..)
+            .find_map(|suffix| {
+                let filename = if suffix == 0 {
+                    format!("{}_m{}.jpg", timestamp_ms, monitor_id)
+                } else {
+                    format!("{}_m{}_{}.jpg", timestamp_ms, monitor_id, suffix)
+                };
+                let path = date_dir.join(filename);
+                match fs::hard_link(&temp_path, &path) {
+                    Ok(()) => Some(Ok(path)),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .expect("snapshot suffix space is finite");
+        let path = match path {
+            Ok(path) => path,
+            Err(error) => {
+                let _ = fs::remove_file(&temp_path);
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = fs::remove_file(&temp_path) {
+            debug!(
+                "failed to remove published snapshot temp link {}: {}",
+                temp_path.display(),
+                error
+            );
+        }
 
         debug!(
             "snapshot written: {} ({}x{} -> {}x{}, q={})",
@@ -147,7 +199,7 @@ impl SnapshotWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::{DynamicImage, RgbImage};
+    use image::{DynamicImage, GenericImageView, RgbImage};
     use tempfile::TempDir;
 
     fn test_image(width: u32, height: u32) -> DynamicImage {
@@ -196,6 +248,21 @@ mod tests {
         let path = writer.write(&img, now, 2).unwrap();
         let filename = path.file_name().unwrap().to_string_lossy();
         assert!(filename.contains("_m2.jpg"));
+    }
+
+    #[test]
+    fn test_same_timestamp_and_monitor_allocate_distinct_files() {
+        let tmp = TempDir::new().unwrap();
+        let now = Utc::now();
+        let first_writer = SnapshotWriter::new(tmp.path(), 80, 0);
+        let second_writer = SnapshotWriter::new(tmp.path(), 80, 0);
+
+        let first = first_writer.write(&test_image(100, 100), now, 2).unwrap();
+        let second = second_writer.write(&test_image(200, 100), now, 2).unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(image::open(first).unwrap().dimensions(), (100, 100));
+        assert_eq!(image::open(second).unwrap().dimensions(), (200, 100));
     }
 
     #[test]

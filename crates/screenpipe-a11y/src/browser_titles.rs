@@ -97,6 +97,40 @@ fn strip_application_suffix<'a>(title: &'a str, application_name: Option<&str>) 
     title
 }
 
+fn strip_chromium_group_suffix(title: &str) -> &str {
+    for separator in [
+        " - Part of group ",
+        " — Part of group ",
+        " – Part of group ",
+    ] {
+        if let Some(index) = title.find(separator) {
+            return title.get(..index).unwrap_or(title).trim_end();
+        }
+    }
+    title
+}
+
+/// Match the same native browser window as reported by CGWindow and AX.
+///
+/// Chrome appends its tab-group label and application name to the AX window
+/// title while CGWindow reports only the page title. Strip only those known,
+/// structured suffixes and retain exact comparison for the page-title portion.
+pub fn native_window_titles_match(
+    cg_window_title: &str,
+    ax_window_title: &str,
+    application_name: &str,
+) -> bool {
+    let cg = strip_chromium_group_suffix(strip_application_suffix(
+        strip_title_badge(cg_window_title),
+        Some(application_name),
+    ));
+    let ax = strip_chromium_group_suffix(strip_application_suffix(
+        strip_title_badge(ax_window_title),
+        Some(application_name),
+    ));
+    !cg.is_empty() && !ax.is_empty() && cg.eq_ignore_ascii_case(ax)
+}
+
 /// Match two observations of a browser tab title without accepting substrings.
 ///
 /// Exact matching after known badge and application-suffix normalization keeps
@@ -160,5 +194,19 @@ mod tests {
         assert!(!is_browser_application("Example Editor"));
         assert!(!is_browser_application("Search"));
         assert!(!is_browser_application("Arcade"));
+    }
+
+    #[test]
+    fn matches_chrome_cg_and_ax_titles_with_group_suffix() {
+        assert!(native_window_titles_match(
+            "Example Domain",
+            "Example Domain – Part of group Example Workspace - Google Chrome",
+            "Google Chrome",
+        ));
+        assert!(!native_window_titles_match(
+            "Example Domain",
+            "Different Domain – Part of group Example Workspace - Google Chrome",
+            "Google Chrome",
+        ));
     }
 }

@@ -176,9 +176,17 @@ pub fn perform_ocr_apple(
         request.set_recognition_langs(&languages_array);
         request.set_uses_lang_correction(false);
         let requests = ns::Array::<vn::Request>::from_slice(&[&request]);
-        let result = handler.perform(&requests);
-
-        if result.is_err() {
+        let mut request_error = None;
+        let succeeded = unsafe { handler.perform_request_err(&requests, &mut request_error) };
+        if !succeeded {
+            if let Some(request_error) = request_error {
+                error!("Apple Vision OCR request failed: {:?}", request_error);
+            } else {
+                // Vision can return false without populating NSError on some macOS
+                // versions. Avoid cidre's safe wrapper here because it assumes the
+                // error is always non-null and uses unwrap_unchecked on that path.
+                error!("Apple Vision OCR request failed without an NSError");
+            }
             return default_ocr_result;
         }
 

@@ -16,7 +16,7 @@
 //! For non-Chromium browsers (Firefox, Safari) we fall back to title-based
 //! detection via [`super::titles::is_title_private`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,7 @@ use super::IncognitoDetector;
 /// AppleScript calls take ~150-200 ms.  Caching avoids repeated round-trips
 /// within a single capture cycle (typically 1-3 s).
 const CACHE_TTL: Duration = Duration::from_secs(2);
+const FAILURE_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Batch cache: stores incognito window titles from a single AppleScript call.
 struct BatchCache {
@@ -44,12 +45,16 @@ struct BatchCache {
 
 pub struct MacOSIncognitoDetector {
     cache: Mutex<Option<BatchCache>>,
+    query_gate: Mutex<()>,
+    unavailable_until: Mutex<HashMap<String, Instant>>,
 }
 
 impl MacOSIncognitoDetector {
     pub fn new() -> Self {
         Self {
             cache: Mutex::new(None),
+            query_gate: Mutex::new(()),
+            unavailable_until: Mutex::new(HashMap::new()),
         }
     }
 
@@ -140,6 +145,18 @@ end if"#,
     /// Check if a window title belongs to an incognito window, using the
     /// batch cache.  One AppleScript call per browser per TTL interval.
     fn check_with_cache(&self, app_name: &str, window_title: &str) -> Option<bool> {
+        self.check_with_cache_using(app_name, window_title, Self::query_incognito_titles)
+    }
+
+    fn check_with_cache_using<F>(
+        &self,
+        app_name: &str,
+        window_title: &str,
+        query: F,
+    ) -> Option<bool>
+    where
+        F: FnOnce(&str) -> Option<HashSet<String>>,
+    {
         {
             let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(entry) = cache.as_ref() {
@@ -151,7 +168,44 @@ end if"#,
             }
         }
 
-        let titles = Self::query_incognito_titles(app_name)?;
+        // Keep the process-wide detector's cold path single-flight. Without
+        // this recheck under a gate, concurrent tree walkers all observe an
+        // empty cache and each start an osascript child.
+        let _query_guard = self.query_gate.lock().unwrap_or_else(|e| e.into_inner());
+
+        {
+            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = cache.as_ref() {
+                if entry.app_name.eq_ignore_ascii_case(app_name)
+                    && entry.timestamp.elapsed() < CACHE_TTL
+                {
+                    return Some(entry.incognito_window_titles.contains(window_title));
+                }
+            }
+        }
+
+        let app_key = app_name.trim().to_ascii_lowercase();
+        {
+            let mut unavailable = self
+                .unavailable_until
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if unavailable
+                .get(&app_key)
+                .is_some_and(|deadline| *deadline > Instant::now())
+            {
+                return None;
+            }
+            unavailable.remove(&app_key);
+        }
+
+        let Some(titles) = query(app_name) else {
+            self.unavailable_until
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(app_key, Instant::now() + FAILURE_BACKOFF);
+            return None;
+        };
         let is_incognito = titles.contains(window_title);
 
         {
@@ -162,6 +216,10 @@ end if"#,
                 timestamp: Instant::now(),
             });
         }
+        self.unavailable_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&app_key);
         Some(is_incognito)
     }
 }
@@ -301,5 +359,55 @@ mod tests {
         if let Some(val) = result {
             let _ = val;
         }
+    }
+
+    #[test]
+    fn concurrent_cache_misses_share_one_query() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let detector = Arc::new(MacOSIncognitoDetector::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(10));
+
+        std::thread::scope(|scope| {
+            for _ in 0..10 {
+                let detector = Arc::clone(&detector);
+                let calls = Arc::clone(&calls);
+                let barrier = Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    let result =
+                        detector.check_with_cache_using("Google Chrome", "Example Page", |_| {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(40));
+                            Some(HashSet::new())
+                        });
+                    assert_eq!(result, Some(false));
+                });
+            }
+        });
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_query_is_backed_off_process_wide() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let detector = MacOSIncognitoDetector::new();
+        let calls = AtomicUsize::new(0);
+
+        for _ in 0..5 {
+            assert_eq!(
+                detector.check_with_cache_using("Google Chrome", "Example Page", |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    None
+                }),
+                None
+            );
+        }
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

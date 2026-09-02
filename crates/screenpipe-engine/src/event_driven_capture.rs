@@ -1364,6 +1364,7 @@ async fn do_capture(
         capture_trigger: trigger.as_str(),
         capture_provenance: None,
         force_ocr: false,
+        ocr_timeout: None,
         use_pii_removal: params.use_pii_removal,
         enable_main_body_distillation: false,
         main_body_distillation_threshold: 0.60,

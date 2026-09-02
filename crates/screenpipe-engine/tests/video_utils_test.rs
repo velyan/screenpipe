@@ -136,6 +136,7 @@ async fn test_extract_frames_and_ocr() -> Result<()> {
         process_id: 1234,
         window_id: None,
         browser_url: None,
+        browser_url_was_bracketed: false,
         window_x: 0,
         window_y: 0,
         window_width: first_frame.width(),
